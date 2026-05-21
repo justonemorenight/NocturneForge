@@ -686,7 +686,7 @@ pub struct WatcherRegistrationId(u32);
 struct WatcherRegistrationState {
     callback: Arc<dyn Fn(&notify::Event) + Send + Sync>,
     key: WatchKey,
-    path: Arc<SanitizedPath>,
+    watch_path: Arc<SanitizedPath>,
     mode: WatcherMode,
 }
 
@@ -785,7 +785,7 @@ impl WatcherState {
         let was_actually_watched = path_state.has_os_watcher;
         path_registrations.remove(&registration_state.key);
 
-        was_actually_watched.then_some((registration_state.path, registration_state.mode))
+        was_actually_watched.then_some((registration_state.watch_path, registration_state.mode))
     }
 }
 
@@ -826,12 +826,13 @@ impl GlobalWatcher {
         cb: impl Fn(&notify::Event) + Send + Sync + 'static,
     ) -> anyhow::Result<Option<WatcherRegistrationId>> {
         let path = SanitizedPath::from_arc(path);
-        let key = WatchKey::for_registration(&path, case_insensitive);
+        let watch_path = native_recursive_watch_path(&path, mode);
+        let key = WatchKey::for_registration(&watch_path, case_insensitive);
         let mut state = self.state.lock();
         let (path_already_covered, path_already_registered) = {
             let registrations_for_mode = state.path_registrations(mode);
             (
-                registrations_for_mode.covered_by_recursive_ancestor(&path, mode),
+                registrations_for_mode.covered_by_recursive_ancestor(&watch_path, mode),
                 registrations_for_mode.contains(&key),
             )
         };
@@ -842,10 +843,10 @@ impl GlobalWatcher {
             }
 
             drop(state);
-            match self.watch(path.as_path(), mode) {
+            match self.watch(watch_path.as_path(), mode) {
                 Ok(()) => {}
                 Err(error) if mode == WatcherMode::Native && is_max_files_watch_error(&error) => {
-                    self.start_native_watch_limit_cooldown(path.as_path());
+                    self.start_native_watch_limit_cooldown(watch_path.as_path());
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -859,7 +860,7 @@ impl GlobalWatcher {
         let registration_state = WatcherRegistrationState {
             callback: Arc::new(cb),
             key: key.clone(),
-            path,
+            watch_path,
             mode,
         };
         state.watchers.insert(id, registration_state);
@@ -1083,6 +1084,20 @@ fn is_max_files_watch_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<notify::Error>()
         .is_some_and(|error| matches!(&error.kind, notify::ErrorKind::MaxFilesWatch))
+}
+
+fn native_recursive_watch_path(path: &Arc<SanitizedPath>, mode: WatcherMode) -> Arc<SanitizedPath> {
+    if mode != WatcherMode::Native || !cfg!(any(target_os = "windows", target_os = "macos")) {
+        return path.clone();
+    }
+
+    if std::fs::symlink_metadata(path.as_path()).is_ok_and(|metadata| metadata.is_file())
+        && let Some(parent) = path.as_path().parent()
+    {
+        return SanitizedPath::new_arc(parent);
+    }
+
+    path.clone()
 }
 
 static POLL_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
@@ -1608,6 +1623,72 @@ mod tests {
         );
 
         assert_eq!(fired.lock().len(), 1);
+    }
+
+    #[test]
+    fn native_file_registrations_use_parent_directory_on_recursive_platforms() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let file = temp_dir.path().join("file.csproj");
+        std::fs::write(&file, "<Project />").expect("write test project file");
+
+        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let watcher = test_watcher_with_backends(Some(backend.clone()), None);
+        let file = Arc::<Path>::from(file.as_path());
+        let expected_watch_path = if cfg!(any(target_os = "windows", target_os = "macos")) {
+            temp_dir.path().to_path_buf()
+        } else {
+            file.to_path_buf()
+        };
+
+        let registration = watcher
+            .add(file.clone(), WatcherMode::Native, false, |_| {})
+            .expect("add file watch")
+            .expect("file watch registered");
+        watcher.remove(registration);
+
+        let backend = backend.lock();
+        assert_eq!(backend.watch_calls, &[expected_watch_path.clone()]);
+        assert_eq!(backend.unwatch_calls, &[expected_watch_path]);
+    }
+
+    #[test]
+    fn native_sibling_file_registrations_share_parent_directory_watcher() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let first_file = temp_dir.path().join("first.csproj");
+        let second_file = temp_dir.path().join("second.csproj");
+        std::fs::write(&first_file, "<Project />").expect("write first test project file");
+        std::fs::write(&second_file, "<Project />").expect("write second test project file");
+
+        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let watcher = test_watcher_with_backends(Some(backend.clone()), None);
+        let first_file = Arc::<Path>::from(first_file.as_path());
+        let second_file = Arc::<Path>::from(second_file.as_path());
+        let first_registration = watcher
+            .add(first_file.clone(), WatcherMode::Native, false, |_| {})
+            .expect("add first file watch")
+            .expect("first file watch registered");
+        let second_registration = watcher
+            .add(second_file.clone(), WatcherMode::Native, false, |_| {})
+            .expect("add second file watch")
+            .expect("second file watch registered");
+
+        watcher.remove(first_registration);
+        watcher.remove(second_registration);
+
+        let backend = backend.lock();
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert_eq!(backend.watch_calls, &[temp_dir.path().to_path_buf()]);
+            assert_eq!(backend.unwatch_calls, &[temp_dir.path().to_path_buf()]);
+        } else {
+            assert_eq!(
+                backend.watch_calls,
+                &[first_file.to_path_buf(), second_file.to_path_buf()]
+            );
+            assert_eq!(
+                backend.unwatch_calls,
+                &[first_file.to_path_buf(), second_file.to_path_buf()]
+            );
+        }
     }
 
     #[test]
