@@ -6054,8 +6054,6 @@ impl ThreadView {
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
 
-        let mut assistant_message_is_blank = false;
-
         let primary = match &entry {
             AgentThreadEntry::UserMessage(message) => {
                 let Some(editor) = self
@@ -6262,8 +6260,12 @@ impl ThreadView {
                                     }
 
                                     Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
+                                        self.render_virtualized_markdown(
+                                            md.clone(),
+                                            style.clone(),
+                                            cx,
+                                        )
+                                        .into_any_element(),
                                     )
                                 })
                             }
@@ -6289,8 +6291,6 @@ impl ThreadView {
                         },
                     ))
                     .into_any();
-
-                assistant_message_is_blank = is_blank;
 
                 if is_blank {
                     Empty.into_any()
@@ -6442,34 +6442,6 @@ impl ThreadView {
             primary
         };
 
-        let primary = if matches!(entry, AgentThreadEntry::AssistantMessage(_))
-            && !assistant_message_is_blank
-        {
-            let user_message_index = thread
-                .read(cx)
-                .entries()
-                .iter()
-                .take(entry_ix)
-                .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
-
-            v_flex()
-                .w_full()
-                .child(primary)
-                .child(self.render_thread_controls(
-                    &thread,
-                    entry_ix,
-                    Some(entry_ix),
-                    entry_ix + 1 == total_entries,
-                    user_message_index,
-                    cx,
-                ))
-                .into_any_element()
-        } else {
-            primary
-        };
-
-        let is_assistant = matches!(entry, AgentThreadEntry::AssistantMessage(_));
-
         let comments_editor = self.thread_feedback.comments_editor.clone();
 
         let primary = if entry_ix + 1 == total_entries {
@@ -6482,16 +6454,14 @@ impl ThreadView {
             v_flex()
                 .w_full()
                 .child(primary)
-                .when(!is_assistant, |this| {
-                    this.child(self.render_thread_controls(
-                        &thread,
-                        entry_ix,
-                        last_assistant_index,
-                        true,
-                        None,
-                        cx,
-                    ))
-                })
+                .child(self.render_thread_controls(
+                    &thread,
+                    entry_ix,
+                    last_assistant_index,
+                    true,
+                    None,
+                    cx,
+                ))
                 .when_some(comments_editor, |this, editor| {
                     this.child(Self::render_feedback_feedback_editor(editor, cx))
                 })
@@ -7402,7 +7372,7 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(self.render_markdown(
+                                .child(self.render_virtualized_markdown(
                                     chunk,
                                     MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
                                     cx,
@@ -11218,6 +11188,17 @@ impl ThreadView {
             &self.code_span_resolver,
             cx,
         )
+    }
+
+    fn render_virtualized_markdown(
+        &self,
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        cx: &App,
+    ) -> MarkdownElement {
+        // Only long, fill-width message bodies should skip off-screen blocks.
+        // Compact labels and cards rely on eager shrink-wrap layout.
+        self.render_markdown(markdown, style, cx).virtualized()
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
