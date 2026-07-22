@@ -53,6 +53,8 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+const COLLAPSED_LONG_CONTENT_LINES: usize = 18;
+const EXPANDED_LONG_CONTENT_LINES: usize = 36;
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -6129,6 +6131,7 @@ impl ThreadView {
             return None;
         }
         let preview = self.sticky_prompt_preview(entry_ix, cx)?;
+        let tooltip = preview.clone();
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         Some(
@@ -6154,6 +6157,7 @@ impl ThreadView {
                         .border_b_1()
                         .border_color(cx.theme().colors().border_variant)
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .tooltip(Tooltip::text(tooltip))
                         .child(
                             Icon::new(IconName::ArrowUp)
                                 .size(IconSize::XSmall)
@@ -6204,11 +6208,36 @@ impl ThreadView {
             return None;
         }
 
-        let label: SharedString = if self.unseen_entry_count == 0 {
-            "Latest".into()
-        } else {
-            format!("{} new", self.unseen_entry_count).into()
+        let is_generating = matches!(self.thread.read(cx).status(), ThreadStatus::Generating);
+        let label: SharedString = match (self.unseen_entry_count, is_generating) {
+            (0, false) => "Latest".into(),
+            (0, true) => "Generating…".into(),
+            (count, false) => format!("{count} new").into(),
+            (count, true) => format!("{count} new · Generating…").into(),
         };
+
+        let mut button = Button::new("jump-to-latest", label)
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Outlined);
+        if is_generating {
+            button = button
+                .start_icon(
+                    Icon::new(IconName::Circle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .end_icon(
+                    Icon::new(IconName::ArrowDown)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                );
+        } else {
+            button = button.start_icon(
+                Icon::new(IconName::ArrowDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
 
         Some(
             h_flex()
@@ -6217,19 +6246,9 @@ impl ThreadView {
                 .left_0()
                 .right_0()
                 .justify_center()
-                .child(
-                    Button::new("jump-to-latest", label)
-                        .start_icon(
-                            Icon::new(IconName::ArrowDown)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Outlined)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.scroll_to_end(cx);
-                        })),
-                )
+                .child(button.on_click(cx.listener(|this, _, _, cx| {
+                    this.scroll_to_end(cx);
+                })))
                 .into_any_element(),
         )
     }
@@ -10398,7 +10417,7 @@ impl ThreadView {
                     .into_any()
             });
         let output_key = (entry_ix, context_ix);
-        let can_expand = line_count > 18;
+        let can_expand = line_count > COLLAPSED_LONG_CONTENT_LINES;
         let is_expanded = self.expanded_tool_outputs.contains(&output_key);
         let output = if can_expand {
             let scroll_handle = self
@@ -10410,67 +10429,117 @@ impl ThreadView {
             let scroll_handle_for_wheel = scroll_handle.clone();
             let list_state = self.list_state.clone();
             let thread_view = cx.entity().downgrade();
-            let line_cap = if is_expanded { 36 } else { 18 };
+            let line_cap = if is_expanded {
+                EXPANDED_LONG_CONTENT_LINES
+            } else {
+                COLLAPSED_LONG_CONTENT_LINES
+            };
+            let visible_lines = line_cap.min(line_count);
+            let viewport_height = window.line_height() * line_cap as f32;
+            let estimated_thumb_height = viewport_height * visible_lines as f32 / line_count as f32;
+            let thumb_height = estimated_thumb_height.max(px(25.)).min(viewport_height);
+            let max_offset = scroll_handle.max_offset().y;
+            let current_offset = scroll_handle
+                .offset()
+                .y
+                .clamp(-max_offset, Pixels::ZERO)
+                .abs();
+            let thumb_top = if max_offset > Pixels::ZERO {
+                (current_offset / max_offset) * (viewport_height - thumb_height)
+            } else {
+                Pixels::ZERO
+            };
 
             v_flex()
                 .gap_1()
                 .child(
                     div()
-                        .id(format!("tool-output-viewport-{entry_ix}-{context_ix}"))
-                        .max_h(window.line_height() * line_cap as f32)
-                        .overflow_y_scroll()
-                        .track_scroll(&scroll_handle)
-                        .on_scroll_wheel(move |event, window, cx| {
-                            let delta = event.delta.pixel_delta(window.line_height()).y;
-                            if delta == Pixels::ZERO {
-                                return;
-                            }
-                            let current_offset = scroll_handle_for_wheel.offset();
-                            let current = current_offset.y;
-                            let max = scroll_handle_for_wheel.max_offset().y;
-                            let next = (current + delta).clamp(-max, Pixels::ZERO);
-                            if next == current {
-                                list_state.scroll_by(-delta);
-                                let visible_start = list_state.logical_scroll_top().item_ix;
-                                let is_following_tail = list_state.is_following_tail();
-                                let _ = thread_view.update(cx, |this, cx| {
-                                    this.sync_scroll_derived_state(
-                                        &list_state,
-                                        visible_start,
-                                        is_following_tail,
-                                        cx,
-                                    );
-                                });
-                            } else {
-                                scroll_handle_for_wheel
-                                    .set_offset(gpui::point(current_offset.x, next));
-                            }
-                            cx.stop_propagation();
-                            window.refresh();
-                        })
-                        .child(output),
+                        .relative()
+                        .child(
+                            div()
+                                .id(format!("tool-output-viewport-{entry_ix}-{context_ix}"))
+                                .max_h(viewport_height)
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll_handle)
+                                // List wheel routing is hit-test based, so occlusion
+                                // prevents the thread from moving while this inner
+                                // viewport can still consume the event.
+                                .occlude()
+                                .on_scroll_wheel(move |event, window, cx| {
+                                    let delta = event.delta.pixel_delta(window.line_height()).y;
+                                    if delta == Pixels::ZERO {
+                                        return;
+                                    }
+                                    let current_offset = scroll_handle_for_wheel.offset();
+                                    let current = current_offset.y;
+                                    let max = scroll_handle_for_wheel.max_offset().y;
+                                    let next = (current + delta).clamp(-max, Pixels::ZERO);
+                                    if next == current {
+                                        list_state.scroll_by(-delta);
+                                        let visible_start = list_state.logical_scroll_top().item_ix;
+                                        let is_following_tail = list_state.is_following_tail();
+                                        let _ = thread_view.update(cx, |this, cx| {
+                                            this.sync_scroll_derived_state(
+                                                &list_state,
+                                                visible_start,
+                                                is_following_tail,
+                                                cx,
+                                            );
+                                        });
+                                    } else {
+                                        scroll_handle_for_wheel
+                                            .set_offset(gpui::point(current_offset.x, next));
+                                    }
+                                    cx.stop_propagation();
+                                    window.refresh();
+                                })
+                                .child(output),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(thumb_top)
+                                .right(px(2.))
+                                .w(px(3.))
+                                .h(thumb_height)
+                                .rounded_full()
+                                .bg(cx.theme().colors().scrollbar_thumb_hover_background)
+                                .block_mouse_except_scroll(),
+                        ),
                 )
                 .child(
-                    h_flex().justify_end().child(
-                        Button::new(
-                            format!("tool-output-expand-{entry_ix}-{context_ix}"),
-                            if is_expanded {
-                                "Collapse viewport"
-                            } else {
-                                "Expand viewport"
-                            },
+                    h_flex()
+                        .justify_between()
+                        .child(
+                            Label::new(format!("{visible_lines} / {line_count} lines"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
                         )
-                        .label_size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.expanded_tool_outputs.remove(&output_key) {
-                                this.expanded_tool_outputs.insert(output_key);
-                            }
-                            this.list_state.remeasure_items(entry_ix..entry_ix + 1);
-                            cx.notify();
-                        })),
-                    ),
+                        .child(
+                            Button::new(
+                                format!("tool-output-expand-{entry_ix}-{context_ix}"),
+                                if is_expanded {
+                                    format!("Show {COLLAPSED_LONG_CONTENT_LINES} lines")
+                                } else {
+                                    format!(
+                                        "Show {} lines",
+                                        EXPANDED_LONG_CONTENT_LINES.min(line_count)
+                                    )
+                                },
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if !this.expanded_tool_outputs.remove(&output_key) {
+                                        this.expanded_tool_outputs.insert(output_key);
+                                    }
+                                    this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                                    cx.notify();
+                                },
+                            )),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -11525,20 +11594,24 @@ impl ThreadView {
         let thread_view = cx.entity().downgrade();
         self.render_markdown(markdown, style, cx)
             .virtualized()
-            .code_block_vertical_scroll(18, 36, move |distance, window, cx| {
-                list_state.scroll_by(distance);
-                let visible_start = list_state.logical_scroll_top().item_ix;
-                let is_following_tail = list_state.is_following_tail();
-                let _ = thread_view.update(cx, |this, cx| {
-                    this.sync_scroll_derived_state(
-                        &list_state,
-                        visible_start,
-                        is_following_tail,
-                        cx,
-                    );
-                });
-                window.refresh();
-            })
+            .code_block_vertical_scroll(
+                COLLAPSED_LONG_CONTENT_LINES,
+                EXPANDED_LONG_CONTENT_LINES,
+                move |distance, window, cx| {
+                    list_state.scroll_by(distance);
+                    let visible_start = list_state.logical_scroll_top().item_ix;
+                    let is_following_tail = list_state.is_following_tail();
+                    let _ = thread_view.update(cx, |this, cx| {
+                        this.sync_scroll_derived_state(
+                            &list_state,
+                            visible_start,
+                            is_following_tail,
+                            cx,
+                        );
+                    });
+                    window.refresh();
+                },
+            )
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
