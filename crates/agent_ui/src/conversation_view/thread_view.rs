@@ -643,6 +643,12 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    active_sticky_prompt: Option<usize>,
+    sticky_prompt_offset: Pixels,
+    pub(super) is_following_tail: bool,
+    pub(super) unseen_entry_count: usize,
+    expanded_tool_outputs: HashSet<(usize, usize)>,
+    tool_output_scroll_handles: RefCell<HashMap<(usize, usize), ScrollHandle>>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -765,6 +771,67 @@ pub fn open_markdown_in_workspace(
 }
 
 impl ThreadView {
+    fn sync_scroll_derived_state(
+        &mut self,
+        list_state: &ListState,
+        visible_start: usize,
+        is_following_tail: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (active_sticky_prompt, sticky_prompt_offset) = {
+            let thread = self.thread.read(cx);
+            let entries = thread.entries();
+            let active_sticky_prompt = (0..=visible_start.min(entries.len().saturating_sub(1)))
+                .rev()
+                .find(|&ix| {
+                    matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_)))
+                        && list_state.item_is_above_viewport(ix) == Some(true)
+                });
+            let sticky_prompt_offset = active_sticky_prompt
+                .and_then(|active_ix| {
+                    let next_ix = (active_ix + 1..entries.len()).find(|&ix| {
+                        matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_)))
+                    })?;
+                    let next_bounds = list_state.bounds_for_item(next_ix)?;
+                    let viewport_top = list_state.viewport_bounds().top();
+                    let overlap =
+                        (viewport_top + px(36.) - next_bounds.top()).clamp(Pixels::ZERO, px(36.));
+                    Some(-overlap)
+                })
+                .unwrap_or(Pixels::ZERO);
+            (active_sticky_prompt, sticky_prompt_offset)
+        };
+
+        let state_changed = self.active_sticky_prompt != active_sticky_prompt
+            || self.sticky_prompt_offset != sticky_prompt_offset
+            || self.is_following_tail != is_following_tail
+            || (is_following_tail && self.unseen_entry_count != 0);
+        self.active_sticky_prompt = active_sticky_prompt;
+        self.sticky_prompt_offset = sticky_prompt_offset;
+        self.is_following_tail = is_following_tail;
+        if is_following_tail {
+            self.unseen_entry_count = 0;
+        }
+        if state_changed {
+            cx.notify();
+        }
+    }
+
+    fn sync_after_programmatic_scroll(&mut self, cx: &mut Context<Self>) {
+        let list_state = self.list_state.clone();
+        let visible_start = list_state.logical_scroll_top().item_ix;
+        let is_following_tail = list_state.is_following_tail();
+        self.sync_scroll_derived_state(&list_state, visible_start, is_following_tail, cx);
+        self.schedule_save(cx);
+    }
+
+    pub(super) fn entries_removed(&mut self) {
+        self.active_sticky_prompt = None;
+        self.sticky_prompt_offset = Pixels::ZERO;
+        self.expanded_tool_outputs.clear();
+        self.tool_output_scroll_handles.borrow_mut().clear();
+    }
+
     pub(crate) fn new(
         root_thread_id: ThreadId,
         thread: Entity<AcpThread>,
@@ -971,6 +1038,7 @@ impl ThreadView {
             }));
         }));
 
+        let is_following_tail = list_state.is_following_tail();
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -1041,6 +1109,12 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            active_sticky_prompt: None,
+            sticky_prompt_offset: Pixels::ZERO,
+            is_following_tail,
+            unseen_entry_count: 0,
+            expanded_tool_outputs: HashSet::default(),
+            tool_output_scroll_handles: RefCell::new(HashMap::default()),
         };
 
         this.sync_generating_indicator(cx);
@@ -1050,7 +1124,9 @@ impl ThreadView {
         let thread_view = cx.entity().downgrade();
 
         this.list_state
-            .set_scroll_handler(move |_event, _window, cx| {
+            .set_scroll_handler(move |event, _window, cx| {
+                let visible_start = event.visible_range.start;
+                let is_following_tail = event.is_following_tail;
                 let list_state = list_state_for_scroll.clone();
                 let thread_view = thread_view.clone();
                 // N.B. We must defer because the scroll handler is called while the
@@ -1059,6 +1135,12 @@ impl ThreadView {
                 cx.defer(move |cx| {
                     let scroll_top = list_state.logical_scroll_top();
                     let _ = thread_view.update(cx, |this, cx| {
+                        this.sync_scroll_derived_state(
+                            &list_state,
+                            visible_start,
+                            is_following_tail,
+                            cx,
+                        );
                         if let Some(thread) = this.as_native_thread(cx) {
                             thread.update(cx, |thread, _cx| {
                                 thread.set_ui_scroll_position(Some(scroll_top));
@@ -1689,8 +1771,7 @@ impl ThreadView {
             })?;
 
             let _ = this.update(cx, |this, cx| {
-                this.list_state.scroll_to_end();
-                cx.notify();
+                this.scroll_to_end(cx);
             });
 
             let _stop_turn = defer({
@@ -6005,6 +6086,154 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    fn sticky_prompt_preview(&self, entry_ix: usize, cx: &App) -> Option<SharedString> {
+        let thread = self.thread.read(cx);
+        let AgentThreadEntry::UserMessage(message) = thread.entries().get(entry_ix)? else {
+            return None;
+        };
+
+        let mut text = String::new();
+        let mut attachment_count = 0;
+        for chunk in &message.chunks {
+            match chunk {
+                acp::ContentBlock::Text(content) => {
+                    if !text.is_empty() && !content.text.trim().is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&content.text);
+                }
+                _ => attachment_count += 1,
+            }
+        }
+
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut preview = if text.is_empty() {
+            "Prompt with attachments".to_string()
+        } else {
+            text
+        };
+        if attachment_count > 0 {
+            let noun = if attachment_count == 1 {
+                "attachment"
+            } else {
+                "attachments"
+            };
+            preview.push_str(&format!("  ·  {attachment_count} {noun}"));
+        }
+        Some(preview.into())
+    }
+
+    fn render_sticky_prompt(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let entry_ix = self.active_sticky_prompt?;
+        if self.thread_search_visible || self.editing_message == Some(entry_ix) {
+            return None;
+        }
+        let preview = self.sticky_prompt_preview(entry_ix, cx)?;
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
+        Some(
+            h_flex()
+                .absolute()
+                .top(self.sticky_prompt_offset)
+                .left_0()
+                .right_0()
+                .h(px(36.))
+                .px_2()
+                .justify_center()
+                .child(
+                    h_flex()
+                        .id(("sticky-user-prompt", entry_ix))
+                        .when_some(max_content_width, |this, max_w| this.max_w(max_w))
+                        .w_full()
+                        .h_full()
+                        .min_w_0()
+                        .px_3()
+                        .gap_2()
+                        .cursor_pointer()
+                        .bg(cx.theme().colors().editor_background)
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Icon::new(IconName::ArrowUp)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(preview)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active_sticky_prompt = None;
+                            this.scroll_to_user_message_index(Some(entry_ix), cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn has_floating_permission_prompt(&self, cx: &App) -> bool {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let main_prompt_is_floating = self
+            .conversation
+            .read(cx)
+            .pending_tool_call_for_session(&session_id, cx)
+            .and_then(|tool_call_id| {
+                self.thread
+                    .read(cx)
+                    .tool_call(&tool_call_id)
+                    .map(|(ix, _)| ix)
+            })
+            .is_some_and(|entry_ix| {
+                self.list_state.item_is_above_viewport(entry_ix) == Some(true)
+                    || self.list_state.item_is_below_viewport(entry_ix) == Some(true)
+            });
+
+        main_prompt_is_floating
+            || !self
+                .conversation
+                .read(cx)
+                .subagents_awaiting_permission(cx)
+                .is_empty()
+    }
+
+    fn render_jump_to_latest(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.is_following_tail || self.has_floating_permission_prompt(cx) {
+            return None;
+        }
+
+        let label: SharedString = if self.unseen_entry_count == 0 {
+            "Latest".into()
+        } else {
+            format!("{} new", self.unseen_entry_count).into()
+        };
+
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_2()
+                .left_0()
+                .right_0()
+                .justify_center()
+                .child(
+                    Button::new("jump-to-latest", label)
+                        .start_icon(
+                            Icon::new(IconName::ArrowDown)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Outlined)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.scroll_to_end(cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -6870,6 +7099,7 @@ impl ThreadView {
                 item_ix: ix,
                 offset_in_item: px(0.0),
             });
+            self.sync_after_programmatic_scroll(cx);
             cx.notify();
         } else {
             self.scroll_to_end(cx);
@@ -6877,7 +7107,13 @@ impl ThreadView {
     }
 
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.list_state.scroll_to_end();
+        self.is_following_tail = true;
+        self.unseen_entry_count = 0;
+        self.active_sticky_prompt = None;
+        self.sticky_prompt_offset = Pixels::ZERO;
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -6900,6 +7136,7 @@ impl ThreadView {
 
     pub(crate) fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to(ListOffset::default());
+        self.sync_after_programmatic_scroll(cx);
         cx.notify();
     }
 
@@ -6911,6 +7148,7 @@ impl ThreadView {
     ) {
         let page_height = self.list_state.viewport_bounds().size.height;
         self.list_state.scroll_by(-page_height * 0.9);
+        self.sync_after_programmatic_scroll(cx);
         cx.notify();
     }
 
@@ -6922,6 +7160,7 @@ impl ThreadView {
     ) {
         let page_height = self.list_state.viewport_bounds().size.height;
         self.list_state.scroll_by(page_height * 0.9);
+        self.sync_after_programmatic_scroll(cx);
         cx.notify();
     }
 
@@ -6932,6 +7171,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         self.list_state.scroll_by(-window.line_height() * 3.);
+        self.sync_after_programmatic_scroll(cx);
         cx.notify();
     }
 
@@ -6942,6 +7182,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         self.list_state.scroll_by(window.line_height() * 3.);
+        self.sync_after_programmatic_scroll(cx);
         cx.notify();
     }
 
@@ -6979,6 +7220,7 @@ impl ThreadView {
                 item_ix: target_ix,
                 offset_in_item: px(0.),
             });
+            self.sync_after_programmatic_scroll(cx);
             cx.notify();
         }
     }
@@ -6998,6 +7240,7 @@ impl ThreadView {
                 item_ix: target_ix,
                 offset_in_item: px(0.),
             });
+            self.sync_after_programmatic_scroll(cx);
             cx.notify();
         }
     }
@@ -10140,6 +10383,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let line_count = markdown.read(cx).source().lines().count();
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -10153,6 +10397,85 @@ impl ThreadView {
                 self.render_markdown(markdown, markdown_style, cx)
                     .into_any()
             });
+        let output_key = (entry_ix, context_ix);
+        let can_expand = line_count > 18;
+        let is_expanded = self.expanded_tool_outputs.contains(&output_key);
+        let output = if can_expand {
+            let scroll_handle = self
+                .tool_output_scroll_handles
+                .borrow_mut()
+                .entry(output_key)
+                .or_insert_with(ScrollHandle::new)
+                .clone();
+            let scroll_handle_for_wheel = scroll_handle.clone();
+            let list_state = self.list_state.clone();
+            let thread_view = cx.entity().downgrade();
+            let line_cap = if is_expanded { 36 } else { 18 };
+
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .id(format!("tool-output-viewport-{entry_ix}-{context_ix}"))
+                        .max_h(window.line_height() * line_cap as f32)
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll_handle)
+                        .on_scroll_wheel(move |event, window, cx| {
+                            let delta = event.delta.pixel_delta(window.line_height()).y;
+                            if delta == Pixels::ZERO {
+                                return;
+                            }
+                            let current_offset = scroll_handle_for_wheel.offset();
+                            let current = current_offset.y;
+                            let max = scroll_handle_for_wheel.max_offset().y;
+                            let next = (current + delta).clamp(-max, Pixels::ZERO);
+                            if next == current {
+                                list_state.scroll_by(-delta);
+                                let visible_start = list_state.logical_scroll_top().item_ix;
+                                let is_following_tail = list_state.is_following_tail();
+                                let _ = thread_view.update(cx, |this, cx| {
+                                    this.sync_scroll_derived_state(
+                                        &list_state,
+                                        visible_start,
+                                        is_following_tail,
+                                        cx,
+                                    );
+                                });
+                            } else {
+                                scroll_handle_for_wheel
+                                    .set_offset(gpui::point(current_offset.x, next));
+                            }
+                            cx.stop_propagation();
+                            window.refresh();
+                        })
+                        .child(output),
+                )
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new(
+                            format!("tool-output-expand-{entry_ix}-{context_ix}"),
+                            if is_expanded {
+                                "Collapse viewport"
+                            } else {
+                                "Expand viewport"
+                            },
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.expanded_tool_outputs.remove(&output_key) {
+                                this.expanded_tool_outputs.insert(output_key);
+                            }
+                            this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                            cx.notify();
+                        })),
+                    ),
+                )
+                .into_any_element()
+        } else {
+            output
+        };
 
         v_flex()
             .gap_2()
@@ -11194,11 +11517,28 @@ impl ThreadView {
         &self,
         markdown: Entity<Markdown>,
         style: MarkdownStyle,
-        cx: &App,
+        cx: &Context<Self>,
     ) -> MarkdownElement {
         // Only long, fill-width message bodies should skip off-screen blocks.
         // Compact labels and cards rely on eager shrink-wrap layout.
-        self.render_markdown(markdown, style, cx).virtualized()
+        let list_state = self.list_state.clone();
+        let thread_view = cx.entity().downgrade();
+        self.render_markdown(markdown, style, cx)
+            .virtualized()
+            .code_block_vertical_scroll(18, 36, move |distance, window, cx| {
+                list_state.scroll_by(distance);
+                let visible_start = list_state.logical_scroll_top().item_ix;
+                let is_following_tail = list_state.is_following_tail();
+                let _ = thread_view.update(cx, |this, cx| {
+                    this.sync_scroll_derived_state(
+                        &list_state,
+                        visible_start,
+                        is_following_tail,
+                        cx,
+                    );
+                });
+                window.refresh();
+            })
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
@@ -11868,21 +12208,30 @@ impl Render for ThreadView {
 
         let has_messages = self.list_state.item_count() > 0;
         let list_state = self.list_state.clone();
+        let sticky_prompt = self.render_sticky_prompt(cx);
+        let jump_to_latest = has_messages
+            .then(|| self.render_jump_to_latest(cx))
+            .flatten();
 
         let conversation = v_flex()
+            .relative()
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
-            .map(|this| {
-                if has_messages {
-                    this.flex_1()
+            .when(has_messages, |this| {
+                this.flex_1().size_full().child(
+                    v_flex()
+                        .flex_1()
                         .size_full()
                         .child(self.render_entries(cx))
-                        .vertical_scrollbar_for(&list_state, window, cx)
-                        .into_any()
-                } else {
-                    this.into_any()
-                }
+                        .vertical_scrollbar_for(&list_state, window, cx),
+                )
+            })
+            .when_some(sticky_prompt, |this, sticky_prompt| {
+                this.child(sticky_prompt)
+            })
+            .when_some(jump_to_latest, |this, jump_to_latest| {
+                this.child(jump_to_latest)
             });
 
         v_flex()

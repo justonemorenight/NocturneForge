@@ -706,7 +706,12 @@ impl ConversationView {
         };
 
         connected.navigate_to_thread(session_id);
-        if let Some(view) = self.active_thread() {
+        if let Some(view) = self.active_thread().cloned() {
+            view.update(cx, |view, cx| {
+                view.unseen_entry_count = 0;
+                view.is_following_tail = view.list_state.is_following_tail();
+                cx.notify();
+            });
             view.focus_handle(cx).focus(window, cx);
         }
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
@@ -1605,9 +1610,13 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        if !active.is_following_tail {
+                            active.unseen_entry_count = active.unseen_entry_count.saturating_add(1);
+                        }
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
+                        cx.notify();
                     });
                 }
             }
@@ -1633,6 +1642,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.entries_removed();
                         active.sync_editor_mode(cx);
                     });
                 }
