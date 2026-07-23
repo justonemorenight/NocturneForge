@@ -795,7 +795,7 @@ impl WrapSnapshot {
         let (.., item) = self.transforms.find::<WrapPoint, _>(
             (),
             &WrapPoint::new(row + WrapRow(1), 0),
-            Bias::Right,
+            Bias::Left,
         );
         item.and_then(|transform| {
             if transform.is_isomorphic() {
