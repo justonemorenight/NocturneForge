@@ -5643,6 +5643,16 @@ impl AgentPanel {
                                     });
                                 }
 
+                                let thread_id =
+                                    conversation_view.read(cx).thread_id.to_key_string();
+                                let workspace = workspace.clone();
+                                menu = menu.entry("Copy Thread ID", None, move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        thread_id.clone(),
+                                    ));
+                                    Self::show_deferred_toast(&workspace, "Thread ID copied", cx);
+                                });
+
                                 menu = menu.separator();
                             }
                         }

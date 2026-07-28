@@ -14,19 +14,21 @@ use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
+use collections::HashMap;
 use editor::{
-    Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
-    EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
+    Addon, Anchor, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent,
+    EditorMode, EditorStyle, FoldPlaceholder, Inlay, MultiBuffer, MultiBufferOffset,
+    MultiBufferSnapshot, ToOffset,
     actions::{Copy, Cut, Paste},
     code_context_menus::CodeContextMenu,
-    display_map::{CreaseId, CreaseSnapshot},
+    display_map::{Crease, CreaseId, CreaseMetadata, CreaseSnapshot},
     scroll::Autoscroll,
 };
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
-    TextStyle, WeakEntity,
+    Focusable, Image, ImageFormat, KeyContext, MouseButton, SharedString, Subscription, Task,
+    TaskExt, TextStyle, WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
@@ -39,10 +41,10 @@ use settings::Settings;
 use std::{cmp::min, fmt::Write, ops::Range, rc::Rc, sync::Arc};
 use text::LineEnding;
 use theme_settings::ThemeSettings;
-use ui::{ContextMenu, prelude::*};
+use ui::{ContextMenu, Tooltip, prelude::*};
 use util::paths::PathStyle;
 use util::{ResultExt, debug_panic};
-use workspace::{CollaboratorId, Workspace};
+use workspace::{CollaboratorId, Toast, Workspace, notifications::NotificationId};
 use zed_actions::agent::{Chat, PasteRaw};
 
 #[derive(Default)]
@@ -201,6 +203,8 @@ impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
 
 pub struct MessageEditor {
     mention_set: Entity<MentionSet>,
+    pasted_texts: HashMap<CreaseId, PastedText>,
+    next_pasted_text_id: u64,
     editor: Entity<Editor>,
     workspace: WeakEntity<Workspace>,
     session_capabilities: SharedSessionCapabilities,
@@ -209,6 +213,195 @@ pub struct MessageEditor {
     thread_store: Option<Entity<ThreadStore>>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
+}
+
+const LARGE_PASTE_LINE_THRESHOLD: usize = 6;
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
+const MAX_COMPACT_PASTE_BYTES: usize = 1024 * 1024;
+
+fn insert_pasted_text_crease(
+    anchor: text::Anchor,
+    content_len: usize,
+    pasted_text: PastedText,
+    editor: Entity<Editor>,
+    message_editor: WeakEntity<MessageEditor>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<CreaseId> {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let start = snapshot.anchor_in_excerpt(anchor)?.bias_right(&snapshot);
+        let end = snapshot.anchor_before(start.to_offset(&snapshot) + content_len);
+        let label = pasted_text.label();
+        let paste_id = pasted_text.id;
+
+        let render = Arc::new(move |_fold_id, _fold_range: Range<Anchor>, cx: &mut App| {
+            render_pasted_text_crease(paste_id, label.clone(), message_editor.clone(), cx)
+        });
+        let placeholder = FoldPlaceholder {
+            render,
+            merge_adjacent: false,
+            ..Default::default()
+        };
+        let crease = Crease::Inline {
+            range: start..end,
+            placeholder,
+            render_toggle: None,
+            render_trailer: None,
+            metadata: Some(CreaseMetadata {
+                label: pasted_text.label(),
+                icon_path: IconName::TextSnippet.path().into(),
+            }),
+        };
+        let ids = editor.insert_creases(vec![crease.clone()], cx);
+        editor.fold_creases(vec![crease], false, window, cx);
+        Some(ids[0])
+    })
+}
+
+fn render_pasted_text_crease(
+    paste_id: u64,
+    label: SharedString,
+    message_editor: WeakEntity<MessageEditor>,
+    cx: &mut App,
+) -> AnyElement {
+    let group = SharedString::from(format!("pasted-text-{paste_id}"));
+    let preview_editor = message_editor.clone();
+    let copy_editor = message_editor.clone();
+    let convert_editor = message_editor.clone();
+    let remove_editor = message_editor;
+    let read_only = preview_editor
+        .upgrade()
+        .is_none_or(|editor| editor.read(cx).editor.read(cx).read_only(cx));
+
+    h_flex()
+        .id(("pasted-text", paste_id))
+        .group(&group)
+        .gap_1()
+        .px_1()
+        .py_px()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().colors().border.opacity(0.8))
+        .bg(cx.theme().colors().element_background)
+        .hover(|style| style.bg(cx.theme().colors().element_hover))
+        .cursor_pointer()
+        .child(
+            Icon::new(IconName::TextSnippet)
+                .size(IconSize::XSmall)
+                .color(Color::Accent),
+        )
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(Color::Default),
+        )
+        .child(
+            h_flex()
+                .gap_0p5()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    IconButton::new(("copy-pasted-text", paste_id), IconName::Copy)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Copy Pasted Text"))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            copy_editor
+                                .update(cx, |editor, cx| editor.copy_pasted_text(paste_id, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    IconButton::new(("expand-pasted-text", paste_id), IconName::TextUnwrap)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(read_only)
+                        .visible_on_hover(&group)
+                        .tooltip(Tooltip::text("Convert to Text"))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            convert_editor
+                                .update(cx, |editor, cx| {
+                                    editor.convert_pasted_text(paste_id, window, cx)
+                                })
+                                .ok();
+                        }),
+                )
+                .child(
+                    IconButton::new(("remove-pasted-text", paste_id), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(read_only)
+                        .visible_on_hover(&group)
+                        .tooltip(Tooltip::text("Remove Pasted Text"))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            remove_editor
+                                .update(cx, |editor, cx| {
+                                    editor.remove_pasted_text(paste_id, window, cx)
+                                })
+                                .ok();
+                        }),
+                ),
+        )
+        .on_click(move |_, window, cx| {
+            preview_editor
+                .update(cx, |editor, cx| {
+                    editor.preview_pasted_text(paste_id, window, cx)
+                })
+                .ok();
+        })
+        .into_any_element()
+}
+
+#[derive(Clone)]
+struct PastedText {
+    id: u64,
+    line_count: usize,
+    byte_count: usize,
+    preview_editor: Option<WeakEntity<Editor>>,
+}
+
+impl PastedText {
+    fn label(&self) -> SharedString {
+        format!(
+            "Pasted text · {} lines · {}",
+            self.line_count,
+            format_byte_count(self.byte_count)
+        )
+        .into()
+    }
+}
+
+struct PastedTextTooLargeToast;
+struct PastedTextCopiedToast;
+
+fn format_byte_count(byte_count: usize) -> String {
+    if byte_count < 1024 {
+        format!("{byte_count} B")
+    } else if byte_count < 1024 * 1024 {
+        format!("{:.1} KB", byte_count as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", byte_count as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn pasted_text_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.as_bytes()
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1
+    }
+}
+
+fn should_compact_pasted_text(text: &str) -> bool {
+    pasted_text_line_count(text) >= LARGE_PASTE_LINE_THRESHOLD
+        || text.chars().count() > LARGE_PASTE_CHAR_THRESHOLD
 }
 
 #[derive(Clone, Debug)]
@@ -501,6 +694,7 @@ impl MessageEditor {
                         .action("Paste as Plain Text", Box::new(PasteRaw))
                 }))
             });
+            let has_editor_clipboard_selections = editor_clipboard_selections.is_some();
 
             editor
         });
@@ -563,6 +757,12 @@ impl MessageEditor {
                         let snapshot = editor.snapshot(window, cx);
                         this.mention_set
                             .update(cx, |mention_set, _cx| mention_set.remove_invalid(&snapshot));
+                        this.pasted_texts.retain(|crease_id, _| {
+                            snapshot.crease_snapshot.creases().any(|(id, crease)| {
+                                id == *crease_id
+                                    && crease.range().start.is_valid(snapshot.buffer_snapshot())
+                            })
+                        });
 
                         let new_hints = this
                             .command_hint(snapshot.buffer())
@@ -604,6 +804,8 @@ impl MessageEditor {
         Self {
             editor,
             mention_set,
+            pasted_texts: HashMap::default(),
+            next_pasted_text_id: 0,
             workspace,
             session_capabilities,
             local_commands,
@@ -728,6 +930,194 @@ impl MessageEditor {
 
     pub(crate) fn editor(&self) -> &Entity<Editor> {
         &self.editor
+    }
+
+    fn pasted_text_range(
+        &self,
+        paste_id: u64,
+        cx: &App,
+    ) -> Option<(CreaseId, Range<MultiBufferOffset>)> {
+        let crease_id = self
+            .pasted_texts
+            .iter()
+            .find_map(|(crease_id, pasted_text)| {
+                (pasted_text.id == paste_id).then_some(*crease_id)
+            })?;
+        let editor = self.editor.read(cx);
+        let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+        let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
+        let range = crease_snapshot.creases().find_map(|(id, crease)| {
+            (id == crease_id).then(|| crease.range().to_offset(&buffer_snapshot))
+        })?;
+        Some((crease_id, range))
+    }
+
+    fn pasted_text_content(&self, paste_id: u64, cx: &App) -> Option<String> {
+        let (_, range) = self.pasted_text_range(paste_id, cx)?;
+        let text = self.editor.read(cx).text(cx);
+        text.get(range.start.0..range.end.0).map(ToOwned::to_owned)
+    }
+
+    fn copy_pasted_text(&self, paste_id: u64, cx: &mut App) {
+        if let Some(content) = self.pasted_text_content(paste_id, cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(content));
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<PastedTextCopiedToast>(),
+                            "Pasted text copied",
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+        }
+    }
+
+    fn preview_pasted_text(&mut self, paste_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(content) = self.pasted_text_content(paste_id, cx) else {
+            return;
+        };
+        let Some(pasted_text) = self
+            .pasted_texts
+            .values()
+            .find(|pasted_text| pasted_text.id == paste_id)
+        else {
+            return;
+        };
+        let title = pasted_text.label().to_string();
+        let existing_preview = pasted_text
+            .preview_editor
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if let Some(existing_preview) = existing_preview {
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&existing_preview, true, true, window, cx);
+            });
+            return;
+        }
+
+        let preview_editor = workspace.update(cx, |workspace, cx| {
+            let buffer = cx.new(|cx| Buffer::local(content, cx));
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                editor.set_read_only(true);
+                editor
+                    .buffer()
+                    .update(cx, |buffer, cx| buffer.set_title(title, cx));
+                editor
+            });
+            let pane = workspace.active_pane().clone();
+            workspace.add_item(pane, Box::new(editor.clone()), None, true, true, window, cx);
+            editor.downgrade()
+        });
+        if let Some(pasted_text) = self
+            .pasted_texts
+            .values_mut()
+            .find(|pasted_text| pasted_text.id == paste_id)
+        {
+            pasted_text.preview_editor = Some(preview_editor);
+        }
+    }
+
+    fn convert_pasted_text(&mut self, paste_id: u64, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((crease_id, _)) = self.pasted_text_range(paste_id, cx) else {
+            return;
+        };
+        self.pasted_texts.remove(&crease_id);
+        self.editor
+            .update(cx, |editor, cx| editor.remove_creases(vec![crease_id], cx));
+        cx.notify();
+    }
+
+    fn remove_pasted_text(&mut self, paste_id: u64, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((crease_id, range)) = self.pasted_text_range(paste_id, cx) else {
+            return;
+        };
+        self.pasted_texts.remove(&crease_id);
+        self.editor.update(cx, |editor, cx| {
+            editor.remove_creases(vec![crease_id], cx);
+            editor.edit([(range, "")], cx);
+        });
+        cx.notify();
+    }
+
+    fn insert_compact_pasted_text(
+        &mut self,
+        mut content: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        LineEnding::normalize(&mut content);
+        if !should_compact_pasted_text(&content) {
+            return false;
+        }
+
+        if content.len() > MAX_COMPACT_PASTE_BYTES {
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<PastedTextTooLargeToast>(),
+                            "Pasted text is larger than 1 MB. Attach it as a file or use Paste as Plain Text.",
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+            return true;
+        }
+
+        if self.editor.read(cx).selections.disjoint_anchors().len() != 1 {
+            return false;
+        }
+
+        let content_len = content.len();
+        let text_anchor = self.editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx);
+            let snapshot = buffer.snapshot(cx);
+            let buffer_snapshot = snapshot.as_singleton()?;
+            let text_anchor = snapshot
+                .anchor_to_buffer_anchor(editor.selections.newest_anchor().start)?
+                .0
+                .bias_left(&buffer_snapshot);
+            editor.insert(&content, window, cx);
+            Some(text_anchor)
+        });
+        let Some(text_anchor) = text_anchor else {
+            return false;
+        };
+
+        let pasted_text = PastedText {
+            id: self.next_pasted_text_id,
+            line_count: pasted_text_line_count(&content),
+            byte_count: content_len,
+            preview_editor: None,
+        };
+        self.next_pasted_text_id = self.next_pasted_text_id.wrapping_add(1);
+        let Some(crease_id) = insert_pasted_text_crease(
+            text_anchor,
+            content_len,
+            pasted_text.clone(),
+            self.editor.clone(),
+            cx.weak_entity(),
+            window,
+            cx,
+        ) else {
+            // The text has already been inserted. If a transient display-map
+            // failure prevents folding it, keep the ordinary text instead of
+            // letting the caller paste a duplicate copy.
+            return true;
+        };
+        self.pasted_texts.insert(crease_id, pasted_text);
+        cx.notify();
+        true
     }
 
     pub fn is_empty(&self, cx: &App) -> bool {
@@ -882,6 +1272,7 @@ impl MessageEditor {
             .mention_set
             .update(cx, |store, cx| store.contents(full_mention_content, cx));
         let editor = self.editor.clone();
+        let pasted_texts = self.pasted_texts.clone();
         let supports_embedded_context =
             self.session_capabilities.read().supports_embedded_context();
 
@@ -897,9 +1288,13 @@ impl MessageEditor {
                     &buffer_snapshot,
                     supports_embedded_context,
                     |crease_id| {
-                        contents
-                            .remove(crease_id)
-                            .map(|(uri, mention)| (uri, Some(mention)))
+                        if pasted_texts.contains_key(crease_id) {
+                            Some(ResolvedEditorCrease::PastedText)
+                        } else {
+                            contents.remove(crease_id).map(|(uri, mention)| {
+                                ResolvedEditorCrease::Mention(uri, Some(mention))
+                            })
+                        }
                     },
                 )
             }))
@@ -921,23 +1316,31 @@ impl MessageEditor {
             &crease_snapshot,
             &buffer_snapshot,
             supports_embedded_context,
-            |crease_id| mention_set.resolved_mention_for_crease(crease_id),
+            |crease_id| {
+                if self.pasted_texts.contains_key(crease_id) {
+                    Some(ResolvedEditorCrease::PastedText)
+                } else {
+                    mention_set
+                        .resolved_mention_for_crease(crease_id)
+                        .map(|(uri, mention)| ResolvedEditorCrease::Mention(uri, mention))
+                }
+            },
         );
         chunks
     }
 
     pub fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut crease_ids = self.mention_set.update(cx, |mention_set, _cx| {
+            mention_set
+                .clear()
+                .map(|(crease_id, _)| crease_id)
+                .collect::<Vec<_>>()
+        });
+        crease_ids.extend(self.pasted_texts.keys().copied());
+        self.pasted_texts.clear();
         self.editor.update(cx, |editor, cx| {
             editor.clear(window, cx);
-            editor.remove_creases(
-                self.mention_set.update(cx, |mention_set, _cx| {
-                    mention_set
-                        .clear()
-                        .map(|(crease_id, _)| crease_id)
-                        .collect::<Vec<_>>()
-                }),
-                cx,
-            )
+            editor.remove_creases(crease_ids, cx)
         });
     }
 
@@ -1006,6 +1409,14 @@ impl MessageEditor {
 
     fn send_immediately(&mut self, _: &SendImmediately, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_empty(cx) {
+            return;
+        }
+
+        if !has_editor_clipboard_selections
+            && clipboard.entries().len() == 1
+            && let Some(clipboard_text) = clipboard_text
+            && self.insert_compact_pasted_text(clipboard_text, window, cx)
+        {
             return;
         }
 
@@ -1210,7 +1621,10 @@ impl MessageEditor {
             _ => None,
         });
         if let Some(clipboard_text) = clipboard_text.as_deref() {
-            if clipboard_text.contains("[@") {
+            let path_style = workspace.read(cx).project().read(cx).path_style(cx);
+            if clipboard_text.contains("[@")
+                && !parse_mention_links(clipboard_text, path_style).is_empty()
+            {
                 let selections_before = self.editor.update(cx, |editor, cx| {
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
                     editor
@@ -1231,8 +1645,6 @@ impl MessageEditor {
                 });
 
                 let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
-                let path_style = workspace.read(cx).project().read(cx).path_style(cx);
-
                 let mut all_mentions = Vec::new();
                 for (start_anchor, end_anchor) in selections_before {
                     let start_offset = start_anchor.to_offset(&snapshot);
@@ -1299,8 +1711,11 @@ impl MessageEditor {
                         // Drop the tx after inserting to signal the crease is ready
                         drop(tx);
                     }
-                    return;
                 }
+                // The clipboard text was already inserted above. Return even
+                // if auto-indent made a prevalidated mention unrecognizable,
+                // otherwise the fallback paste path would insert it twice.
+                return;
             }
         }
 
@@ -2069,12 +2484,17 @@ impl Addon for MessageEditorAddon {
 
 /// Walks the editor's creases in order, interleaving plain-text chunks from
 /// `text` with mention blocks produced from `resolve`.
+enum ResolvedEditorCrease {
+    Mention(MentionUri, Option<Mention>),
+    PastedText,
+}
+
 fn build_chunks_from_creases(
     text: &str,
     crease_snapshot: &CreaseSnapshot,
     buffer_snapshot: &MultiBufferSnapshot,
     supports_embedded_context: bool,
-    mut resolve: impl FnMut(&CreaseId) -> Option<(MentionUri, Option<Mention>)>,
+    mut resolve: impl FnMut(&CreaseId) -> Option<ResolvedEditorCrease>,
 ) -> (Vec<acp::ContentBlock>, Vec<Entity<Buffer>>) {
     let mut ix = text
         .char_indices()
@@ -2084,19 +2504,35 @@ fn build_chunks_from_creases(
     let mut tracked_buffers = Vec::new();
 
     for (crease_id, crease) in crease_snapshot.creases() {
-        let Some((uri, mention)) = resolve(&crease_id) else {
+        let Some(resolved_crease) = resolve(&crease_id) else {
             continue;
         };
         let crease_range = crease.range().to_offset(buffer_snapshot);
+        if crease_range.start.0 > text.len()
+            || crease_range.end.0 > text.len()
+            || crease_range.start > crease_range.end
+        {
+            continue;
+        }
         if crease_range.start.0 > ix {
             chunks.push(text[ix..crease_range.start.0].into());
         }
-        chunks.push(mention_to_content_block(
-            &uri,
-            mention.as_ref(),
-            supports_embedded_context,
-            &mut tracked_buffers,
-        ));
+        match resolved_crease {
+            ResolvedEditorCrease::Mention(uri, mention) => {
+                chunks.push(mention_to_content_block(
+                    &uri,
+                    mention.as_ref(),
+                    supports_embedded_context,
+                    &mut tracked_buffers,
+                ));
+            }
+            ResolvedEditorCrease::PastedText => {
+                let pasted_text = &text[crease_range.start.0..crease_range.end.0];
+                if !pasted_text.is_empty() {
+                    chunks.push(pasted_text.to_owned().into());
+                }
+            }
+        }
         ix = crease_range.end.0;
     }
 

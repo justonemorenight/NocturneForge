@@ -1832,6 +1832,10 @@
   },
   // Settings specific to the terminal
   "terminal": {
+    // Sets the theme used to render the terminal. When null, the terminal
+    // inherits the active Zed theme.
+    // "theme": "Gruvbox Dark",
+    "theme": null,
     // What shell to use when opening a terminal. May take 3 values:
     // 1. Use the system's default terminal configuration in /etc/passwd
     //      "shell": "system"

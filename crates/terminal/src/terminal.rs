@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
-use theme::{ActiveTheme, Theme};
+use theme::{ActiveTheme, Theme, ThemeRegistry};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
 
@@ -73,6 +73,18 @@ use crate::alacritty::{
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
+
+pub fn terminal_theme(cx: &App) -> Arc<Theme> {
+    let active_theme = cx.theme().clone();
+    let Some(theme_name) = TerminalSettings::get_global(cx).theme.as_deref() else {
+        return active_theme;
+    };
+
+    match ThemeRegistry::global(cx).get(theme_name) {
+        Ok(theme) => theme,
+        Err(_) => active_theme,
+    }
+}
 
 /// Process-wide flag set by headless hosts (e.g. the eval CLI) that have no
 /// controlling TTY. In such sandboxes PTY allocation and acquiring a
@@ -1580,8 +1592,10 @@ impl Terminal {
                 // we might respond with out of date value if a "set color" sequence is immediately
                 // followed by a color request sequence.
 
-                let color = self.term.lock().colors()[index]
-                    .unwrap_or_else(|| to_vte_rgb(get_color_at_index(index, cx.theme().as_ref())));
+                let terminal_theme = terminal_theme(cx);
+                let color = self.term.lock().colors()[index].unwrap_or_else(|| {
+                    to_vte_rgb(get_color_at_index(index, terminal_theme.as_ref()))
+                });
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {

@@ -20,9 +20,7 @@ use buffer_diff::BufferDiff;
 use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
-use editor::{
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
-};
+use editor::{Editor, EditorEvent, EditorMode, MultiBuffer, SelectionEffects, SizingBehavior};
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::FutureExt as _;
@@ -39,7 +37,7 @@ use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
 use parking_lot::{Mutex, RwLock};
-use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
+use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectItem, ProjectPath};
 
 use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -91,7 +89,7 @@ use crate::profile_selector::{ProfileProvider, ProfileSelector};
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
-    Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
+    Agent, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
     CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
@@ -1288,7 +1286,9 @@ impl ConversationView {
             list_state.scroll_to_end();
         }
 
-        AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        if thread.read(cx).parent_session_id().is_none() {
+            AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+        }
 
         let connection = thread.read(cx).connection().clone();
         let session_id = thread.read(cx).session_id().clone();
@@ -1610,6 +1610,7 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        active.entry_added(index, cx);
                         if !active.is_following_tail {
                             active.unseen_entry_count = active.unseen_entry_count.saturating_add(1);
                         }
@@ -1629,6 +1630,7 @@ impl ConversationView {
                     });
                     list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
+                        active.entry_updated(*index, cx);
                         active.sync_elicitation_state_for_entry(*index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
@@ -1642,7 +1644,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
-                        active.entries_removed();
+                        active.entries_removed(cx);
                         active.sync_editor_mode(cx);
                     });
                 }

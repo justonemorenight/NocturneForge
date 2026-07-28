@@ -70,6 +70,10 @@ pub struct ProjectTerminalSettingsContent {
 pub struct TerminalSettingsContent {
     #[serde(flatten)]
     pub project: ProjectTerminalSettingsContent,
+    /// Sets the theme used to render the terminal.
+    ///
+    /// If this option is not included, the terminal inherits the active Zed theme.
+    pub theme: Option<String>,
     /// Sets the terminal's font size.
     ///
     /// If this option is not included,

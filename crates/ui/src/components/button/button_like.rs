@@ -751,7 +751,10 @@ impl RenderOnce for ButtonLike {
 
         let is_outlined = matches!(
             self.style,
-            ButtonStyle::Outlined | ButtonStyle::OutlinedGhost | ButtonStyle::OutlinedCustom(_)
+            ButtonStyle::Tinted(_)
+                | ButtonStyle::Outlined
+                | ButtonStyle::OutlinedGhost
+                | ButtonStyle::OutlinedCustom(_)
         );
 
         self.base

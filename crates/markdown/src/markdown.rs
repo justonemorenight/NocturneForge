@@ -399,8 +399,6 @@ pub struct Markdown {
     copied_code_blocks: HashSet<ElementId>,
     wrapped_code_blocks: HashSet<usize>,
     code_block_scroll_handles: BTreeMap<usize, ScrollHandle>,
-    expanded_code_blocks: HashSet<usize>,
-    code_block_vertical_scroll_handles: BTreeMap<usize, ScrollHandle>,
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
@@ -607,8 +605,6 @@ impl Markdown {
             copied_code_blocks: HashSet::default(),
             wrapped_code_blocks: HashSet::default(),
             code_block_scroll_handles: BTreeMap::default(),
-            expanded_code_blocks: HashSet::default(),
-            code_block_vertical_scroll_handles: BTreeMap::default(),
             context_menu_link: None,
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
@@ -643,7 +639,6 @@ impl Markdown {
             self.wrapped_code_blocks.insert(id);
             self.code_block_scroll_handles.remove(&id);
         }
-        self.block_heights.clear();
     }
 
     fn code_block_scroll_handle(&mut self, id: usize) -> Option<ScrollHandle> {
@@ -659,27 +654,6 @@ impl Markdown {
     fn retain_code_block_scroll_handles(&mut self, ids: &HashSet<usize>) {
         self.code_block_scroll_handles
             .retain(|id, _| ids.contains(id));
-        self.code_block_vertical_scroll_handles
-            .retain(|id, _| ids.contains(id));
-        self.expanded_code_blocks.retain(|id| ids.contains(id));
-    }
-
-    fn code_block_vertical_scroll_handle(&mut self, id: usize) -> ScrollHandle {
-        self.code_block_vertical_scroll_handles
-            .entry(id)
-            .or_insert_with(ScrollHandle::new)
-            .clone()
-    }
-
-    fn is_code_block_expanded(&self, id: usize) -> bool {
-        self.expanded_code_blocks.contains(&id)
-    }
-
-    fn toggle_code_block_expansion(&mut self, id: usize) {
-        if !self.expanded_code_blocks.remove(&id) {
-            self.expanded_code_blocks.insert(id);
-        }
-        self.block_heights.clear();
     }
 
     pub fn invalidate_mermaid_cache(&mut self, cx: &mut Context<Self>) {
@@ -1327,15 +1301,6 @@ pub struct MarkdownElement {
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
     virtualized: bool,
-    code_block_vertical_scroll: Option<CodeBlockVerticalScroll>,
-}
-
-type ScrollBoundaryCallback = Rc<dyn Fn(Pixels, &mut Window, &mut App)>;
-
-struct CodeBlockVerticalScroll {
-    collapsed_lines: usize,
-    expanded_lines: usize,
-    on_boundary_scroll: ScrollBoundaryCallback,
 }
 
 impl MarkdownElement {
@@ -1356,7 +1321,6 @@ impl MarkdownElement {
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
             virtualized: false,
-            code_block_vertical_scroll: None,
         }
     }
 
@@ -1446,23 +1410,6 @@ impl MarkdownElement {
     /// what inline/tooltip/popover callers need.
     pub fn virtualized(mut self) -> Self {
         self.virtualized = true;
-        self
-    }
-
-    /// Constrain long code blocks to their own vertical viewport. Wheel input is
-    /// handed back to the surrounding scroller once the inner viewport reaches
-    /// either boundary.
-    pub fn code_block_vertical_scroll(
-        mut self,
-        collapsed_lines: usize,
-        expanded_lines: usize,
-        on_boundary_scroll: impl Fn(Pixels, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.code_block_vertical_scroll = Some(CodeBlockVerticalScroll {
-            collapsed_lines,
-            expanded_lines: expanded_lines.max(collapsed_lines),
-            on_boundary_scroll: Rc::new(on_boundary_scroll),
-        });
         self
     }
 
@@ -2474,27 +2421,6 @@ impl MarkdownElement {
                             } else {
                                 None
                             };
-                            let vertical_scroll =
-                                self.code_block_vertical_scroll.as_ref().map(|policy| {
-                                    let (scroll_handle, is_expanded) =
-                                        self.markdown.update(cx, |markdown, _| {
-                                            (
-                                                markdown
-                                                    .code_block_vertical_scroll_handle(range.start),
-                                                markdown.is_code_block_expanded(range.start),
-                                            )
-                                        });
-                                    let line_cap = if is_expanded {
-                                        policy.expanded_lines
-                                    } else {
-                                        policy.collapsed_lines
-                                    };
-                                    (
-                                        scroll_handle,
-                                        window.line_height() * line_cap as f32,
-                                        policy.on_boundary_scroll.clone(),
-                                    )
-                                });
 
                             match (&self.code_block_renderer, is_indented) {
                                 (CodeBlockRenderer::Default { .. }, _) | (_, true) => {
@@ -2549,59 +2475,6 @@ impl MarkdownElement {
                                                 code_block.w_full()
                                             }
                                         });
-
-                                    let code_block: AnyDiv = if let Some(vertical_scroll) =
-                                        vertical_scroll
-                                    {
-                                        let (scroll_handle, max_height, on_boundary_scroll) =
-                                            vertical_scroll;
-                                        let scroll_handle_for_wheel = scroll_handle.clone();
-                                        let scrollbars = Scrollbars::new(ScrollAxes::Vertical)
-                                            .id((
-                                                "markdown-code-block-vertical-scrollbar",
-                                                range.start,
-                                            ))
-                                            .tracked_scroll_handle(&scroll_handle)
-                                            .with_track_along(
-                                                ScrollAxes::Vertical,
-                                                cx.theme().colors().editor_background,
-                                            )
-                                            .notify_content();
-
-                                        code_block
-                                            .max_h(max_height)
-                                            .overflow_y_scroll()
-                                            .track_scroll(&scroll_handle)
-                                            // GPUI lists route wheel input by hit-test membership,
-                                            // so propagation alone is not enough to keep the outer
-                                            // thread from scrolling with this inner viewport.
-                                            .occlude()
-                                            .on_scroll_wheel(move |event, window, cx| {
-                                                let delta =
-                                                    event.delta.pixel_delta(window.line_height()).y;
-                                                if delta == Pixels::ZERO {
-                                                    return;
-                                                }
-                                                let current_offset =
-                                                    scroll_handle_for_wheel.offset();
-                                                let current = current_offset.y;
-                                                let max = scroll_handle_for_wheel.max_offset().y;
-                                                let next =
-                                                    (current + delta).clamp(-max, Pixels::ZERO);
-                                                if next == current {
-                                                    on_boundary_scroll(-delta, window, cx);
-                                                } else {
-                                                    scroll_handle_for_wheel
-                                                        .set_offset(point(current_offset.x, next));
-                                                }
-                                                cx.stop_propagation();
-                                                window.refresh();
-                                            })
-                                            .custom_scrollbars(scrollbars, window, cx)
-                                            .into()
-                                    } else {
-                                        code_block.into()
-                                    };
 
                                     builder.push_text_style(self.style.code_block.text.to_owned());
                                     builder.push_code_block(language);
@@ -2854,8 +2727,7 @@ impl MarkdownElement {
                             ..
                         } = &self.code_block_renderer
                             && (*copy_button_visibility != CopyButtonVisibility::Hidden
-                                || *wrap_button_visibility != WrapButtonVisibility::Hidden
-                                || self.code_block_vertical_scroll.is_some())
+                                || *wrap_button_visibility != WrapButtonVisibility::Hidden)
                         {
                             let copy_button_visibility = *copy_button_visibility;
                             let wrap_button_visibility = *wrap_button_visibility;
@@ -2867,13 +2739,6 @@ impl MarkdownElement {
                                     ..content_range.end + range.start;
 
                                 let code = parsed_markdown.source()[content_range].to_string();
-                                let line_count = code.lines().count();
-                                let expansion_lines = self
-                                    .code_block_vertical_scroll
-                                    .as_ref()
-                                    .map(|policy| (policy.collapsed_lines, policy.expanded_lines));
-                                let is_expanded =
-                                    self.markdown.read(cx).is_code_block_expanded(range.start);
 
                                 let any_hover = copy_button_visibility
                                     == CopyButtonVisibility::VisibleOnHover
@@ -2895,20 +2760,6 @@ impl MarkdownElement {
                                             this.top_1().right_1().visible_on_hover("code_block")
                                         },
                                         |this| this.top_1p5().right_1p5(),
-                                    )
-                                    .when_some(
-                                        expansion_lines
-                                            .filter(|(collapsed, _)| line_count > *collapsed),
-                                        |this, (collapsed_lines, expanded_lines)| {
-                                            this.child(render_expand_code_block_button(
-                                                range.start,
-                                                is_expanded,
-                                                line_count,
-                                                collapsed_lines,
-                                                expanded_lines,
-                                                self.markdown.clone(),
-                                            ))
-                                        },
                                     )
                                     .when(
                                         wrap_button_visibility != WrapButtonVisibility::Hidden,
@@ -3582,45 +3433,6 @@ fn render_wrap_code_block_button(
             markdown.update(cx, |markdown, cx| {
                 markdown.toggle_code_block_wrap(id);
                 cx.notify();
-                let markdown = cx.entity().downgrade();
-                cx.defer(move |cx| {
-                    markdown.update(cx, |_, cx| cx.notify()).ok();
-                });
-            });
-        })
-}
-
-fn render_expand_code_block_button(
-    id: usize,
-    is_expanded: bool,
-    line_count: usize,
-    collapsed_lines: usize,
-    expanded_lines: usize,
-    markdown: Entity<Markdown>,
-) -> impl IntoElement {
-    let (icon, target_lines) = if is_expanded {
-        (IconName::ChevronUp, collapsed_lines)
-    } else {
-        (IconName::ChevronDown, expanded_lines.min(line_count))
-    };
-    let tooltip = format!("Show {target_lines} of {line_count} lines");
-    let button_id = ElementId::NamedChild(
-        Arc::new(ElementId::from(("expand-code-block", markdown.entity_id()))),
-        id.to_string().into(),
-    );
-
-    IconButton::new(button_id, icon)
-        .icon_size(IconSize::Small)
-        .icon_color(Color::Muted)
-        .tooltip(Tooltip::text(tooltip))
-        .on_click(move |_event, _window, cx| {
-            markdown.update(cx, |markdown, cx| {
-                markdown.toggle_code_block_expansion(id);
-                cx.notify();
-                let markdown = cx.entity().downgrade();
-                cx.defer(move |cx| {
-                    markdown.update(cx, |_, cx| cx.notify()).ok();
-                });
             });
         })
 }

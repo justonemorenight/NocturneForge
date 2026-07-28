@@ -17,7 +17,7 @@ use terminal::{
     TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
     is_default_background_color, terminal_settings::TerminalSettings,
 };
-use theme::{ActiveTheme, Theme};
+use theme::Theme;
 use theme_settings::ThemeSettings;
 use ui::utils::ensure_minimum_contrast;
 use ui::{ParentElement, Tooltip};
@@ -378,7 +378,7 @@ impl TerminalElement {
         cx: &App,
     ) -> (Vec<LayoutRect>, Vec<BatchedTextRun>) {
         let start_time = Instant::now();
-        let theme = cx.theme();
+        let theme = terminal::terminal_theme(cx);
 
         // Pre-allocate with estimated capacity to reduce reallocations
         let estimated_cells = grid.size_hint().0;
@@ -415,7 +415,7 @@ impl TerminalElement {
 
                 // Collect background regions (skip default background)
                 if !is_default_background_color(bg) {
-                    let color = convert_color(&bg, theme);
+                    let color = convert_color(&bg, theme.as_ref());
                     let col = point.column as i32;
 
                     // Try to extend the last region if it's on the same line with the same color
@@ -453,7 +453,7 @@ impl TerminalElement {
                             cell,
                             fg,
                             bg,
-                            theme,
+                            theme.as_ref(),
                             text_style,
                             hyperlink,
                             minimum_contrast,
@@ -971,7 +971,7 @@ impl Element for TerminalElement {
                         }),
                 };
 
-                let theme = cx.theme().clone();
+                let theme = terminal::terminal_theme(cx);
 
                 let link_style = HighlightStyle {
                     color: Some(theme.colors().link_text_hover),

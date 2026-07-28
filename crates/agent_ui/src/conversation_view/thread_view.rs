@@ -53,8 +53,7 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
-const COLLAPSED_LONG_CONTENT_LINES: usize = 18;
-const EXPANDED_LONG_CONTENT_LINES: usize = 36;
+const STICKY_PROMPT_PREVIEW_CHARS: usize = 240;
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -645,12 +644,11 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    user_message_indices: Vec<usize>,
     active_sticky_prompt: Option<usize>,
-    sticky_prompt_offset: Pixels,
+    active_sticky_prompt_preview: Option<SharedString>,
     pub(super) is_following_tail: bool,
     pub(super) unseen_entry_count: usize,
-    expanded_tool_outputs: HashSet<(usize, usize)>,
-    tool_output_scroll_handles: RefCell<HashMap<(usize, usize), ScrollHandle>>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -780,36 +778,23 @@ impl ThreadView {
         is_following_tail: bool,
         cx: &mut Context<Self>,
     ) {
-        let (active_sticky_prompt, sticky_prompt_offset) = {
-            let thread = self.thread.read(cx);
-            let entries = thread.entries();
-            let active_sticky_prompt = (0..=visible_start.min(entries.len().saturating_sub(1)))
-                .rev()
-                .find(|&ix| {
-                    matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_)))
-                        && list_state.item_is_above_viewport(ix) == Some(true)
-                });
-            let sticky_prompt_offset = active_sticky_prompt
-                .and_then(|active_ix| {
-                    let next_ix = (active_ix + 1..entries.len()).find(|&ix| {
-                        matches!(entries.get(ix), Some(AgentThreadEntry::UserMessage(_)))
-                    })?;
-                    let next_bounds = list_state.bounds_for_item(next_ix)?;
-                    let viewport_top = list_state.viewport_bounds().top();
-                    let overlap =
-                        (viewport_top + px(36.) - next_bounds.top()).clamp(Pixels::ZERO, px(36.));
-                    Some(-overlap)
-                })
-                .unwrap_or(Pixels::ZERO);
-            (active_sticky_prompt, sticky_prompt_offset)
-        };
+        let prompt_end = self
+            .user_message_indices
+            .partition_point(|&entry_ix| entry_ix <= visible_start);
+        let active_sticky_prompt = self.user_message_indices[..prompt_end]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&entry_ix| list_state.item_is_above_viewport(entry_ix) == Some(true));
 
         let state_changed = self.active_sticky_prompt != active_sticky_prompt
-            || self.sticky_prompt_offset != sticky_prompt_offset
             || self.is_following_tail != is_following_tail
             || (is_following_tail && self.unseen_entry_count != 0);
+        if self.active_sticky_prompt != active_sticky_prompt {
+            self.active_sticky_prompt_preview =
+                active_sticky_prompt.and_then(|entry_ix| self.sticky_prompt_preview(entry_ix, cx));
+        }
         self.active_sticky_prompt = active_sticky_prompt;
-        self.sticky_prompt_offset = sticky_prompt_offset;
         self.is_following_tail = is_following_tail;
         if is_following_tail {
             self.unseen_entry_count = 0;
@@ -827,11 +812,34 @@ impl ThreadView {
         self.schedule_save(cx);
     }
 
-    pub(super) fn entries_removed(&mut self) {
+    pub(super) fn entry_added(&mut self, entry_ix: usize, cx: &App) {
+        if matches!(
+            self.thread.read(cx).entries().get(entry_ix),
+            Some(AgentThreadEntry::UserMessage(_))
+        ) {
+            self.user_message_indices.push(entry_ix);
+        }
+    }
+
+    pub(super) fn entry_updated(&mut self, entry_ix: usize, cx: &App) {
+        if self.active_sticky_prompt == Some(entry_ix) {
+            self.active_sticky_prompt_preview = self.sticky_prompt_preview(entry_ix, cx);
+        }
+    }
+
+    pub(super) fn entries_removed(&mut self, cx: &App) {
+        self.user_message_indices = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(entry_ix)
+            })
+            .collect();
         self.active_sticky_prompt = None;
-        self.sticky_prompt_offset = Pixels::ZERO;
-        self.expanded_tool_outputs.clear();
-        self.tool_output_scroll_handles.borrow_mut().clear();
+        self.active_sticky_prompt_preview = None;
     }
 
     pub(crate) fn new(
@@ -1041,6 +1049,15 @@ impl ThreadView {
         }));
 
         let is_following_tail = list_state.is_following_tail();
+        let user_message_indices = thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(entry_ix)
+            })
+            .collect();
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -1111,12 +1128,11 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            user_message_indices,
             active_sticky_prompt: None,
-            sticky_prompt_offset: Pixels::ZERO,
+            active_sticky_prompt_preview: None,
             is_following_tail,
             unseen_entry_count: 0,
-            expanded_tool_outputs: HashSet::default(),
-            tool_output_scroll_handles: RefCell::new(HashMap::default()),
         };
 
         this.sync_generating_indicator(cx);
@@ -1440,12 +1456,23 @@ impl ThreadView {
             return;
         };
 
+        let workspace = self.workspace.clone();
+        let thread = self.thread.clone();
         window
             .spawn(cx, async move |cx| {
                 let item = open_task.await?;
                 let Some(editor) = item.downcast::<Editor>() else {
                     return anyhow::Ok(());
                 };
+                cx.update(|window, cx| {
+                    AgentDiff::review_editor_from_thread_navigation(
+                        &workspace,
+                        thread,
+                        editor.clone(),
+                        window,
+                        cx,
+                    );
+                })?;
                 editor.update_in(cx, |editor, window, cx| {
                     editor.change_selections(
                         SelectionEffects::scroll(Autoscroll::center()),
@@ -2973,17 +3000,36 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = &self.thread;
+        let Some(project_path) = buffer.read(cx).project_path(cx) else {
+            return;
+        };
 
-        let Some(diff) =
-            AgentDiffPane::deploy(thread.clone(), self.workspace.clone(), window, cx).log_err()
+        let Some(open_task) = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path(project_path, None, true, window, cx)
+            })
+            .log_err()
         else {
             return;
         };
 
-        diff.update(cx, |diff, cx| {
-            diff.move_to_path(PathKey::for_buffer(buffer, cx), window, cx)
-        })
+        let workspace = self.workspace.clone();
+        let thread = self.thread.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let item = open_task.await?;
+                let Some(editor) = item.downcast::<Editor>() else {
+                    return anyhow::Ok(());
+                };
+                cx.update(|window, cx| {
+                    AgentDiff::review_editor_from_thread_navigation(
+                        &workspace, thread, editor, window, cx,
+                    );
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
     }
 
     // thread stuff
@@ -3306,7 +3352,6 @@ impl ThreadView {
                             action_log,
                             &telemetry,
                             pending_edits,
-                            editor_bg_color,
                             cx,
                         );
 
@@ -3374,9 +3419,13 @@ impl ThreadView {
         action_log: &Entity<ActionLog>,
         telemetry: &ActionLogTelemetry,
         pending_edits: bool,
-        editor_bg_color: Hsla,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let controls_background = Hsla {
+            a: 1.,
+            ..cx.theme().colors().elevated_surface_background
+        };
+
         h_flex()
             .id("edited-buttons-container")
             .visible_on_hover("edited-code")
@@ -3384,7 +3433,9 @@ impl ThreadView {
             .right_0()
             .px_1()
             .gap_1()
-            .bg(editor_bg_color)
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .bg(controls_background)
             .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
                 if *is_hovered {
                     this.hovered_edited_file_buttons = Some(index);
@@ -3395,6 +3446,7 @@ impl ThreadView {
             }))
             .child(
                 Button::new("review", "Review")
+                    .style(ButtonStyle::Outlined)
                     .label_size(LabelSize::Small)
                     .on_click({
                         let buffer = buffer.clone();
@@ -3405,6 +3457,7 @@ impl ThreadView {
             )
             .child(
                 Button::new(("reject-file", index), "Reject")
+                    .style(ButtonStyle::Tinted(TintColor::Error))
                     .label_size(LabelSize::Small)
                     .disabled(pending_edits)
                     .on_click({
@@ -3430,6 +3483,7 @@ impl ThreadView {
             )
             .child(
                 Button::new(("keep-file", index), "Keep")
+                    .style(ButtonStyle::Tinted(TintColor::Success))
                     .label_size(LabelSize::Small)
                     .disabled(pending_edits)
                     .on_click({
@@ -4197,6 +4251,7 @@ impl ThreadView {
                     .child(Divider::vertical().color(DividerColor::Border))
                     .child(
                         Button::new("reject-all-changes", "Reject All")
+                            .style(ButtonStyle::Tinted(TintColor::Error))
                             .label_size(LabelSize::Small)
                             .disabled(pending_edits)
                             .when(pending_edits, |this| {
@@ -4212,6 +4267,7 @@ impl ThreadView {
                     )
                     .child(
                         Button::new("keep-all-changes", "Keep All")
+                            .style(ButtonStyle::Tinted(TintColor::Success))
                             .label_size(LabelSize::Small)
                             .disabled(pending_edits)
                             .when(pending_edits, |this| {
@@ -6094,26 +6150,50 @@ impl ThreadView {
             return None;
         };
 
-        let mut text = String::new();
+        let mut preview = String::new();
+        let mut preview_chars = 0;
+        let mut truncated = false;
         let mut attachment_count = 0;
         for chunk in &message.chunks {
             match chunk {
                 acp::ContentBlock::Text(content) => {
-                    if !text.is_empty() && !content.text.trim().is_empty() {
-                        text.push(' ');
+                    if truncated {
+                        continue;
                     }
-                    text.push_str(&content.text);
+                    for word in content.text.split_whitespace() {
+                        let separator_chars = usize::from(!preview.is_empty());
+                        let remaining = STICKY_PROMPT_PREVIEW_CHARS
+                            .saturating_sub(preview_chars + separator_chars);
+                        if remaining == 0 {
+                            truncated = true;
+                            break;
+                        }
+
+                        if separator_chars > 0 {
+                            preview.push(' ');
+                            preview_chars += 1;
+                        }
+
+                        let word_chars = word.chars().count();
+                        if word_chars > remaining {
+                            preview.extend(word.chars().take(remaining));
+                            preview_chars += remaining;
+                            truncated = true;
+                            break;
+                        }
+                        preview.push_str(word);
+                        preview_chars += word_chars;
+                    }
                 }
                 _ => attachment_count += 1,
             }
         }
 
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut preview = if text.is_empty() {
-            "Prompt with attachments".to_string()
-        } else {
-            text
-        };
+        if preview.is_empty() {
+            preview.push_str("Prompt with attachments");
+        } else if truncated {
+            preview.push('…');
+        }
         if attachment_count > 0 {
             let noun = if attachment_count == 1 {
                 "attachment"
@@ -6130,14 +6210,14 @@ impl ThreadView {
         if self.thread_search_visible || self.editing_message == Some(entry_ix) {
             return None;
         }
-        let preview = self.sticky_prompt_preview(entry_ix, cx)?;
+        let preview = self.active_sticky_prompt_preview.clone()?;
         let tooltip = preview.clone();
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         Some(
             h_flex()
                 .absolute()
-                .top(self.sticky_prompt_offset)
+                .top_0()
                 .left_0()
                 .right_0()
                 .h(px(36.))
@@ -6171,6 +6251,7 @@ impl ThreadView {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.active_sticky_prompt = None;
+                            this.active_sticky_prompt_preview = None;
                             this.scroll_to_user_message_index(Some(entry_ix), cx);
                         })),
                 )
@@ -6508,7 +6589,7 @@ impl ThreadView {
                                     }
 
                                     Some(
-                                        self.render_virtualized_markdown(
+                                        self.render_conversation_markdown(
                                             md.clone(),
                                             style.clone(),
                                             cx,
@@ -7131,7 +7212,7 @@ impl ThreadView {
         self.is_following_tail = true;
         self.unseen_entry_count = 0;
         self.active_sticky_prompt = None;
-        self.sticky_prompt_offset = Pixels::ZERO;
+        self.active_sticky_prompt_preview = None;
         self.schedule_save(cx);
         cx.notify();
     }
@@ -7634,7 +7715,7 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(self.render_virtualized_markdown(
+                                .child(self.render_conversation_markdown(
                                     chunk,
                                     MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
                                     cx,
@@ -10131,6 +10212,8 @@ impl ThreadView {
                 }
             })
             .log_err()?;
+        let workspace = self.workspace.clone();
+        let thread = self.thread.clone();
         window
             .spawn(cx, async move |cx| {
                 let item = open_task.await?;
@@ -10138,6 +10221,16 @@ impl ThreadView {
                 let Some(active_editor) = item.downcast::<Editor>() else {
                     return anyhow::Ok(());
                 };
+
+                cx.update(|window, cx| {
+                    AgentDiff::review_editor_from_thread_navigation(
+                        &workspace,
+                        thread,
+                        active_editor.clone(),
+                        window,
+                        cx,
+                    );
+                })?;
 
                 active_editor.update_in(cx, |editor, window, cx| {
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -10402,7 +10495,6 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-        let line_count = markdown.read(cx).source().lines().count();
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -10416,135 +10508,6 @@ impl ThreadView {
                 self.render_markdown(markdown, markdown_style, cx)
                     .into_any()
             });
-        let output_key = (entry_ix, context_ix);
-        let can_expand = line_count > COLLAPSED_LONG_CONTENT_LINES;
-        let is_expanded = self.expanded_tool_outputs.contains(&output_key);
-        let output = if can_expand {
-            let scroll_handle = self
-                .tool_output_scroll_handles
-                .borrow_mut()
-                .entry(output_key)
-                .or_insert_with(ScrollHandle::new)
-                .clone();
-            let scroll_handle_for_wheel = scroll_handle.clone();
-            let list_state = self.list_state.clone();
-            let thread_view = cx.entity().downgrade();
-            let line_cap = if is_expanded {
-                EXPANDED_LONG_CONTENT_LINES
-            } else {
-                COLLAPSED_LONG_CONTENT_LINES
-            };
-            let visible_lines = line_cap.min(line_count);
-            let viewport_height = window.line_height() * line_cap as f32;
-            let estimated_thumb_height = viewport_height * visible_lines as f32 / line_count as f32;
-            let thumb_height = estimated_thumb_height.max(px(25.)).min(viewport_height);
-            let max_offset = scroll_handle.max_offset().y;
-            let current_offset = scroll_handle
-                .offset()
-                .y
-                .clamp(-max_offset, Pixels::ZERO)
-                .abs();
-            let thumb_top = if max_offset > Pixels::ZERO {
-                (current_offset / max_offset) * (viewport_height - thumb_height)
-            } else {
-                Pixels::ZERO
-            };
-
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .relative()
-                        .child(
-                            div()
-                                .id(format!("tool-output-viewport-{entry_ix}-{context_ix}"))
-                                .max_h(viewport_height)
-                                .overflow_y_scroll()
-                                .track_scroll(&scroll_handle)
-                                // List wheel routing is hit-test based, so occlusion
-                                // prevents the thread from moving while this inner
-                                // viewport can still consume the event.
-                                .occlude()
-                                .on_scroll_wheel(move |event, window, cx| {
-                                    let delta = event.delta.pixel_delta(window.line_height()).y;
-                                    if delta == Pixels::ZERO {
-                                        return;
-                                    }
-                                    let current_offset = scroll_handle_for_wheel.offset();
-                                    let current = current_offset.y;
-                                    let max = scroll_handle_for_wheel.max_offset().y;
-                                    let next = (current + delta).clamp(-max, Pixels::ZERO);
-                                    if next == current {
-                                        list_state.scroll_by(-delta);
-                                        let visible_start = list_state.logical_scroll_top().item_ix;
-                                        let is_following_tail = list_state.is_following_tail();
-                                        let _ = thread_view.update(cx, |this, cx| {
-                                            this.sync_scroll_derived_state(
-                                                &list_state,
-                                                visible_start,
-                                                is_following_tail,
-                                                cx,
-                                            );
-                                        });
-                                    } else {
-                                        scroll_handle_for_wheel
-                                            .set_offset(gpui::point(current_offset.x, next));
-                                    }
-                                    cx.stop_propagation();
-                                    window.refresh();
-                                })
-                                .child(output),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(thumb_top)
-                                .right(px(2.))
-                                .w(px(3.))
-                                .h(thumb_height)
-                                .rounded_full()
-                                .bg(cx.theme().colors().scrollbar_thumb_hover_background)
-                                .block_mouse_except_scroll(),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(
-                            Label::new(format!("{visible_lines} / {line_count} lines"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Button::new(
-                                format!("tool-output-expand-{entry_ix}-{context_ix}"),
-                                if is_expanded {
-                                    format!("Show {COLLAPSED_LONG_CONTENT_LINES} lines")
-                                } else {
-                                    format!(
-                                        "Show {} lines",
-                                        EXPANDED_LONG_CONTENT_LINES.min(line_count)
-                                    )
-                                },
-                            )
-                            .label_size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .style(ButtonStyle::Subtle)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    if !this.expanded_tool_outputs.remove(&output_key) {
-                                        this.expanded_tool_outputs.insert(output_key);
-                                    }
-                                    this.list_state.remeasure_items(entry_ix..entry_ix + 1);
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            output
-        };
 
         v_flex()
             .gap_2()
@@ -11582,36 +11545,17 @@ impl ThreadView {
         )
     }
 
-    fn render_virtualized_markdown(
+    fn render_conversation_markdown(
         &self,
         markdown: Entity<Markdown>,
         style: MarkdownStyle,
-        cx: &Context<Self>,
+        cx: &App,
     ) -> MarkdownElement {
-        // Only long, fill-width message bodies should skip off-screen blocks.
-        // Compact labels and cards rely on eager shrink-wrap layout.
-        let list_state = self.list_state.clone();
-        let thread_view = cx.entity().downgrade();
+        // Keep conversation markdown eager. A list item's height may change on every
+        // streaming update, while virtualized root blocks use estimated heights until
+        // they enter the viewport. Mixing those models can make the tail overlap and
+        // causes visible corrections when high-resolution scrolling crosses a block.
         self.render_markdown(markdown, style, cx)
-            .virtualized()
-            .code_block_vertical_scroll(
-                COLLAPSED_LONG_CONTENT_LINES,
-                EXPANDED_LONG_CONTENT_LINES,
-                move |distance, window, cx| {
-                    list_state.scroll_by(distance);
-                    let visible_start = list_state.logical_scroll_top().item_ix;
-                    let is_following_tail = list_state.is_following_tail();
-                    let _ = thread_view.update(cx, |this, cx| {
-                        this.sync_scroll_derived_state(
-                            &list_state,
-                            visible_start,
-                            is_following_tail,
-                            cx,
-                        );
-                    });
-                    window.refresh();
-                },
-            )
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
