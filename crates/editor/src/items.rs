@@ -964,7 +964,13 @@ impl Item for Editor {
         } else {
             buffers
                 .into_iter()
-                .filter(|buffer| buffer.read(cx).is_dirty())
+                // Skip untitled buffers: a multi-buffer (e.g. project search results) can
+                // excerpt a buffer with no file on disk, which can only be persisted via
+                // `save_as`. Trying to save it here errors and aborts the whole save.
+                .filter(|buffer| {
+                    let buffer = buffer.read(cx);
+                    buffer.is_dirty() && buffer.file().is_some()
+                })
                 .collect()
         };
 
