@@ -7785,28 +7785,34 @@ impl ThreadView {
                             },
                         );
 
-                    let selected_markdown = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let markdown = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            markdown.and_then(|markdown| {
-                                markdown.read(cx).context_menu_selected_markdown().cloned()
+                    let context_menu_markdown = chunks.and_then(|chunks| {
+                        chunks
+                            .iter()
+                            .filter_map(|chunk| {
+                                let markdown = match chunk {
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdown()
+                                    }
+                                    AssistantMessageChunk::Thought { block, .. } => {
+                                        block.markdown()
+                                    }
+                                }?;
+                                let generation =
+                                    markdown.read(cx).context_menu_capture_generation();
+                                (generation > 0).then_some((generation, markdown))
                             })
-                        })
+                            .max_by_key(|(generation, _)| *generation)
+                            .map(|(_, markdown)| markdown)
+                    });
+
+                    let selected_markdown = context_menu_markdown.as_ref().and_then(|markdown| {
+                        markdown.read(cx).context_menu_selected_markdown().cloned()
                     });
                     let has_selection = selected_markdown.is_some();
 
-                    let context_menu_link = chunks.and_then(|chunks| {
-                        chunks.iter().find_map(|chunk| {
-                            let md = match chunk {
-                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
-                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
-                            };
-                            md.and_then(|m| m.read(cx).context_menu_link().cloned())
-                        })
-                    });
+                    let context_menu_link = context_menu_markdown
+                        .as_ref()
+                        .and_then(|markdown| markdown.read(cx).context_menu_link().cloned());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({

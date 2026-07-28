@@ -27,7 +27,10 @@ use std::mem;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use collections::{HashMap, HashSet};
@@ -378,6 +381,8 @@ impl MarkdownStyle {
     }
 }
 
+static NEXT_CONTEXT_MENU_CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 pub struct Markdown {
     source: SharedString,
     selection: Selection,
@@ -402,6 +407,7 @@ pub struct Markdown {
     context_menu_link: Option<SharedString>,
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
+    context_menu_capture_generation: u64,
     search_highlights: Vec<Range<usize>>,
     active_search_highlight: Option<usize>,
     /// Measured (width, height) per block, keyed by source range so it survives
@@ -608,6 +614,7 @@ impl Markdown {
             context_menu_link: None,
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
+            context_menu_capture_generation: 0,
             search_highlights: Vec::new(),
             active_search_highlight: None,
             block_heights: HashMap::default(),
@@ -905,6 +912,8 @@ impl Markdown {
         link: Option<SharedString>,
         rendered_text: Option<&RenderedText>,
     ) {
+        self.context_menu_capture_generation =
+            NEXT_CONTEXT_MENU_CAPTURE_GENERATION.fetch_add(1, Ordering::Relaxed);
         let range = self.selection.start..self.selection.end;
         if range.end > range.start {
             self.context_menu_selected_markdown = Some(SharedString::new(
@@ -940,6 +949,12 @@ impl Markdown {
     /// [`ParsedMarkdown::rebalanced_markdown_for_selection`].
     pub fn context_menu_selected_markdown(&self) -> Option<&SharedString> {
         self.context_menu_selected_markdown.as_ref()
+    }
+
+    /// Returns a monotonically increasing generation identifying the most recent
+    /// context menu capture across all Markdown views.
+    pub fn context_menu_capture_generation(&self) -> u64 {
+        self.context_menu_capture_generation
     }
 
     fn parse(&mut self, cx: &mut Context<Self>) {
