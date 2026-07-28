@@ -8257,7 +8257,7 @@ impl ThreadView {
                 if layout == ToolCallLayout::Floating {
                     this.child(
                         div()
-                            .id(("floating-tool-call-body", entry_ix))
+                            .id(("floating-terminal-tool-call-body", terminal.entity_id()))
                             .max_h_40()
                             .overflow_y_scroll()
                             .when(is_expanded && terminal_view.is_some(), |this| {
