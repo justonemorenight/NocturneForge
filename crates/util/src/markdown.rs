@@ -57,6 +57,23 @@ pub fn split_local_url_fragment(url: &str) -> (&str, Option<&str>) {
     }
 }
 
+pub fn source_position_from_fragment(fragment: &str) -> Option<(u32, u32)> {
+    let fragment = fragment.strip_prefix('L').unwrap_or(fragment);
+    let (line, column) = match fragment.split_once([',', ':']) {
+        Some((line, column)) => (line, Some(column)),
+        None => (
+            fragment.split_once('-').map_or(fragment, |(line, _)| line),
+            None,
+        ),
+    };
+    let line = line.parse::<u32>().ok()?.checked_sub(1)?;
+    let column = column
+        .and_then(|column| column.parse::<u32>().ok())
+        .and_then(|column| column.checked_sub(1))
+        .unwrap_or(0);
+    Some((line, column))
+}
+
 /// Indicates that the wrapped `String` is markdown text.
 #[derive(Debug, Clone)]
 pub struct MarkdownString(pub String);

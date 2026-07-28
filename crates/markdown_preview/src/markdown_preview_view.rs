@@ -14,7 +14,7 @@ use gpui::{
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
     ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
 };
-use language::LanguageRegistry;
+use language::{LanguageRegistry, Point};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
@@ -26,7 +26,7 @@ use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
-use util::markdown::split_local_url_fragment;
+use util::markdown::{source_position_from_fragment, split_local_url_fragment};
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
 use workspace::notifications::NotifyResultExt;
 use workspace::searchable::{
@@ -1033,6 +1033,7 @@ fn handle_url_click(
     } else {
         open_preview_url(
             SharedString::from(path_part.to_string()),
+            fragment.map(|fragment| SharedString::from(fragment.to_string())),
             base_directory,
             workspace,
             window,
@@ -1043,15 +1044,30 @@ fn handle_url_click(
 
 fn open_preview_url(
     url: SharedString,
+    fragment: Option<SharedString>,
     base_directory: Option<PathBuf>,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (path_text, _) = split_preview_url(url.as_ref());
+    let decoded_path = urlencoding::decode(&url).unwrap_or_else(|_| Cow::Borrowed(&url));
 
-    // URL-decode the path for proper handling of encoded characters
-    let decoded_path = urlencoding::decode(path_text).unwrap_or_else(|_| Cow::Borrowed(path_text));
+    if let Some(row) = fragment
+        .as_deref()
+        .and_then(|fragment| fragment.strip_prefix('L'))
+        .and_then(source_position_from_fragment)
+        .map(|(row, _)| row)
+        && open_preview_path_at_line(
+            decoded_path.to_string(),
+            base_directory.clone(),
+            workspace,
+            row,
+            window,
+            cx,
+        )
+    {
+        return;
+    }
 
     if let Some(workspace) = workspace.upgrade() {
         workspace.update(cx, |workspace, cx| {
@@ -1062,11 +1078,75 @@ fn open_preview_url(
     }
 }
 
-fn split_preview_url(url: &str) -> (&str, Option<&str>) {
-    match url.split_once('#') {
-        Some((path, fragment)) => (path, Some(fragment)),
-        None => (url, None),
-    }
+enum PreviewPathTarget {
+    Project(ProjectPath),
+    Absolute(PathBuf),
+}
+
+fn open_preview_path_at_line(
+    path: String,
+    base_directory: Option<PathBuf>,
+    workspace: &WeakEntity<Workspace>,
+    row: u32,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let Some(workspace) = workspace.upgrade() else {
+        return false;
+    };
+    let project = workspace.read(cx).project().clone();
+    let path_style = project.read(cx).path_style(cx);
+    let target = if path_style.is_absolute(&path) {
+        Some(PreviewPathTarget::Absolute(PathBuf::from(path)))
+    } else if project.read(cx).is_local()
+        && let Some(resolved) = base_directory
+            .as_deref()
+            .map(|base_directory| base_directory.join(&path))
+        && resolved.exists()
+    {
+        Some(PreviewPathTarget::Absolute(resolved))
+    } else {
+        project
+            .update(cx, |project, cx| project.find_project_path(&path, cx))
+            .map(PreviewPathTarget::Project)
+    };
+    let Some(target) = target else {
+        return false;
+    };
+
+    let task = workspace.update(cx, |workspace, cx| match target {
+        PreviewPathTarget::Project(project_path) => {
+            workspace.open_path(project_path, None, true, window, cx)
+        }
+        PreviewPathTarget::Absolute(abs_path) => workspace.open_abs_path(
+            abs_path,
+            workspace::OpenOptions {
+                focus: Some(true),
+                ..Default::default()
+            },
+            window,
+            cx,
+        ),
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let item = task.await?;
+            let Some(editor) = item.downcast::<Editor>() else {
+                return anyhow::Ok(());
+            };
+            editor.update_in(cx, |editor, window, cx| {
+                let point = Point::new(row, 0);
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([point..point]),
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    true
 }
 
 fn resolve_preview_image(

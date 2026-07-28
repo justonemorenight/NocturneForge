@@ -17,7 +17,9 @@ use settings::Settings;
 use std::{ops::Range, str::FromStr as _, sync::LazyLock};
 use text::OffsetRangeExt;
 use theme::ActiveTheme as _;
-use util::{ResultExt, TryFutureExt as _, paths::PathWithPosition};
+use util::{
+    ResultExt, TryFutureExt as _, markdown::source_position_from_fragment, paths::PathWithPosition,
+};
 
 #[derive(Debug)]
 pub struct HoveredLinkState {
@@ -103,17 +105,8 @@ pub fn document_link_target_to_hover_link(target: &str, server_id: LanguageServe
 /// language server attach this fragment to `file://` document link
 /// targets to point at a specific row/column inside the file.
 fn parse_uri_fragment_position(fragment: &str) -> Option<lsp::Position> {
-    let stripped = fragment.strip_prefix('L').unwrap_or(fragment);
-    let (line_str, column_str) = match stripped.split_once([',', ':']) {
-        Some((line, column)) => (line, Some(column)),
-        None => (stripped, None),
-    };
-    let line = line_str.parse::<u32>().ok()?.checked_sub(1)?;
-    let character = column_str
-        .and_then(|column| column.parse::<u32>().ok())
-        .and_then(|column| column.checked_sub(1))
-        .unwrap_or(0);
-    Some(lsp::Position { line, character })
+    source_position_from_fragment(fragment)
+        .map(|(line, character)| lsp::Position { line, character })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
