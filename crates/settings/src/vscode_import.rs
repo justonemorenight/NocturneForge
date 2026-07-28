@@ -883,6 +883,7 @@ impl VsCodeSettings {
         let (font_family, font_fallbacks) = self.read_fonts("terminal.integrated.fontFamily");
         skip_default(TerminalSettingsContent {
             theme: None,
+            external: None,
             alternate_scroll: None,
             blinking: self
                 .read_bool("terminal.integrated.cursorBlinking")

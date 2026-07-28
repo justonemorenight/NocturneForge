@@ -303,6 +303,8 @@ actions!(
         OpenFiles,
         /// Opens the current location in terminal.
         OpenInTerminal,
+        /// Opens the current location in the configured external terminal.
+        OpenInExternalTerminal,
         /// Opens the component preview.
         OpenComponentPreview,
         /// Reloads the active item.
@@ -637,6 +639,15 @@ pub struct OpenTerminal {
     /// If true, creates a local terminal even in remote projects.
     #[serde(default)]
     pub local: bool,
+}
+
+/// Opens the configured external terminal with an optional working directory.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = terminal)]
+#[serde(deny_unknown_fields)]
+pub struct OpenExternalTerminal {
+    #[serde(default)]
+    pub working_directory: Option<PathBuf>,
 }
 
 #[derive(

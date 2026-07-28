@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 pub use settings::AlternateScroll;
 
 use settings::{
-    IntoGpui, PathHyperlinkRegex, RegisterSetting, ShowScrollbar, TerminalBell, TerminalBlink,
-    TerminalDockPosition, TerminalLineHeight, VenvSettings, WorkingDirectory,
-    merge_from::MergeFrom,
+    ExternalTerminalSettingsContent, IntoGpui, PathHyperlinkRegex, RegisterSetting, ShowScrollbar,
+    TerminalBell, TerminalBlink, TerminalDockPosition, TerminalLineHeight, VenvSettings,
+    WorkingDirectory, merge_from::MergeFrom,
 };
 use task::Shell;
 use theme_settings::FontFamilyName;
@@ -23,6 +23,7 @@ pub struct TerminalSettings {
     pub shell: Shell,
     pub working_directory: WorkingDirectory,
     pub theme: Option<String>,
+    pub external: Option<ExternalTerminalSettingsContent>,
     pub font_size: Option<Pixels>, // todo(settings_refactor) can be non-optional...
     pub font_family: Option<FontFamilyName>,
     pub font_fallbacks: Option<FontFallbacks>,
@@ -88,6 +89,7 @@ impl settings::Settings for TerminalSettings {
             shell: settings_shell_to_task_shell(project_content.shell.unwrap()),
             working_directory: project_content.working_directory.unwrap(),
             theme: user_content.theme,
+            external: user_content.external,
             font_size: user_content.font_size.map(|s| s.into_gpui()),
             font_family: user_content.font_family,
             font_fallbacks: user_content.font_fallbacks.map(|fallbacks| {

@@ -184,6 +184,37 @@ impl SharedThread {
 impl DbThread {
     pub const VERSION: &'static str = "0.3.0";
 
+    /// Extracts only authored transcript text that is rendered as conversation
+    /// content. Context mentions, images, thinking, tool traffic, resume
+    /// markers, and compaction summaries are intentionally excluded.
+    pub fn searchable_transcript(&self) -> Vec<(language_model::Role, String)> {
+        let mut transcript = Vec::new();
+        for message in &self.messages {
+            match message.as_ref() {
+                crate::Message::User(message) => {
+                    for content in message.content.iter() {
+                        if let UserMessageContent::Text(text) = content
+                            && !text.is_empty()
+                        {
+                            transcript.push((language_model::Role::User, text.clone()));
+                        }
+                    }
+                }
+                crate::Message::Agent(message) => {
+                    for content in &message.content {
+                        if let AgentMessageContent::Text(text) = content
+                            && !text.is_empty()
+                        {
+                            transcript.push((language_model::Role::Assistant, text.clone()));
+                        }
+                    }
+                }
+                crate::Message::Resume | crate::Message::Compaction(_) => {}
+            }
+        }
+        transcript
+    }
+
     pub fn to_markdown(&self) -> String {
         crate::messages_to_markdown(&self.messages)
     }

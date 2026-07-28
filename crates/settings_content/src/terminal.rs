@@ -7,6 +7,17 @@ use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{FontFamilyName, FontFeaturesContent, FontSize, FontWeightContent};
 
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct ExternalTerminalSettingsContent {
+    /// The program used to launch an external terminal.
+    pub program: String,
+    /// Arguments passed directly to the program. Every occurrence of
+    /// `{working_directory}` is replaced with the resolved working directory.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct ProjectTerminalSettingsContent {
     /// What shell to use when opening a terminal.
@@ -74,6 +85,10 @@ pub struct TerminalSettingsContent {
     ///
     /// If this option is not included, the terminal inherits the active Zed theme.
     pub theme: Option<String>,
+    /// Configures the launcher used by the `terminal: Open External Terminal` action.
+    ///
+    /// The launcher is only available for local projects.
+    pub external: Option<ExternalTerminalSettingsContent>,
     /// Sets the terminal's font size.
     ///
     /// If this option is not included,

@@ -1,11 +1,16 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::agent_connection_store::AgentConnectionStore;
 
 use crate::thread_metadata_store::{
     ThreadId, ThreadMetadata, ThreadMetadataStore, worktree_info_from_thread_paths,
+};
+use crate::thread_transcript_search::{
+    ThreadSearchHit, ThreadSearchNavigation, ThreadSearchSnippet, ThreadTranscriptSearchStore,
+    normalize_search_text,
 };
 use crate::{Agent, ArchiveSelectedThread, DEFAULT_THREAD_TITLE, RemoveSelectedThread};
 
@@ -22,7 +27,6 @@ use gpui::{
     ListState, Render, SharedString, Subscription, Task, TaskExt, WeakEntity, Window, list,
     prelude::*, px,
 };
-use itertools::Itertools as _;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use picker::{
     Picker, PickerDelegate,
@@ -56,10 +60,29 @@ enum ThreadFilter {
 #[derive(Clone)]
 enum ArchiveListItem {
     BucketSeparator(TimeBucket),
+    SearchGroupSeparator(SearchMatchKind),
     Entry {
         thread: ThreadMetadata,
         highlight_positions: Vec<usize>,
+        search_snippet: Option<ThreadSearchSnippet>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SearchMatchKind {
+    Title,
+    Transcript,
+    Project,
+}
+
+impl SearchMatchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Title matches",
+            Self::Transcript => "Conversation matches",
+            Self::Project => "Project matches",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,24 +125,30 @@ impl TimeBucket {
 }
 
 pub fn fuzzy_match_positions(query: &str, candidate: &str) -> Option<Vec<usize>> {
-    let query_chars: Vec<char> = query.chars().collect();
+    let query_chars = query
+        .chars()
+        .map(|character| character.to_lowercase().collect::<String>())
+        .collect::<Vec<_>>();
     if query_chars.is_empty() {
         return Some(Vec::new());
     }
 
-    let candidate_chars: Vec<(usize, char)> = candidate.char_indices().collect();
+    let candidate_chars = candidate
+        .char_indices()
+        .map(|(index, character)| (index, character.to_lowercase().collect::<String>()))
+        .collect::<Vec<_>>();
     let window_count = candidate_chars.len().checked_sub(query_chars.len() - 1)?;
 
     'outer: for window_start in 0..window_count {
-        for (qi, &query_char) in query_chars.iter().enumerate() {
-            let (_, cand_char) = candidate_chars[window_start + qi];
-            if !cand_char.eq_ignore_ascii_case(&query_char) {
+        for (query_index, query_character) in query_chars.iter().enumerate() {
+            let (_, candidate_character) = &candidate_chars[window_start + query_index];
+            if candidate_character != query_character {
                 continue 'outer;
             }
         }
         return Some(
             (0..query_chars.len())
-                .map(|qi| candidate_chars[window_start + qi].0)
+                .map(|query_index| candidate_chars[window_start + query_index].0)
                 .collect(),
         );
     }
@@ -156,6 +185,10 @@ pub struct ThreadsArchiveView {
     archived_branch_names: HashMap<ThreadId, HashMap<PathBuf, String>>,
     _load_branch_names_task: Task<()>,
     thread_filter: ThreadFilter,
+    transcript_hits: HashMap<ThreadId, ThreadSearchHit>,
+    search_generation: usize,
+    _search_task: Option<Task<()>>,
+    is_indexing: bool,
 }
 
 impl ThreadsArchiveView {
@@ -177,7 +210,7 @@ impl ThreadsArchiveView {
         let filter_editor_subscription =
             cx.subscribe(&filter_editor, |this: &mut Self, _, event, cx| {
                 if let editor::EditorEvent::BufferEdited = event {
-                    this.update_items(cx);
+                    this.query_changed(cx);
                 }
             });
 
@@ -197,10 +230,27 @@ impl ThreadsArchiveView {
         let thread_metadata_store_subscription = cx.observe(
             &ThreadMetadataStore::global(cx),
             |this: &mut Self, _, cx| {
-                this.update_items(cx);
+                let query = this.filter_editor.read(cx).text(cx);
+                if normalize_search_text(&query).chars().count() >= 3 {
+                    this.schedule_transcript_search(Duration::from_millis(75), false, cx);
+                } else {
+                    this.update_items(cx);
+                }
                 this.reload_branch_names_if_threads_changed(cx);
             },
         );
+        let transcript_search_store = ThreadTranscriptSearchStore::global(cx);
+        let transcript_search_store_subscription =
+            cx.observe(&transcript_search_store, |this: &mut Self, store, cx| {
+                this.is_indexing = store.read(cx).is_indexing();
+                let query = this.filter_editor.read(cx).text(cx);
+                if normalize_search_text(&query).chars().count() >= 3 {
+                    this.schedule_transcript_search(Duration::from_millis(75), false, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        let is_indexing = transcript_search_store.read(cx).is_indexing();
 
         cx.on_focus_out(&focus_handle, window, |this: &mut Self, _, _window, cx| {
             this.selection = None;
@@ -220,6 +270,7 @@ impl ThreadsArchiveView {
             _subscriptions: vec![
                 filter_editor_subscription,
                 thread_metadata_store_subscription,
+                transcript_search_store_subscription,
             ],
             _refresh_history_task: Task::ready(()),
             workspace,
@@ -230,6 +281,10 @@ impl ThreadsArchiveView {
             archived_branch_names: HashMap::default(),
             _load_branch_names_task: Task::ready(()),
             thread_filter: ThreadFilter::All,
+            transcript_hits: HashMap::default(),
+            search_generation: 0,
+            _search_task: None,
+            is_indexing,
         };
 
         this.update_items(cx);
@@ -267,6 +322,64 @@ impl ThreadsArchiveView {
             .is_focused(window)
     }
 
+    fn query_changed(&mut self, cx: &mut Context<Self>) {
+        self.transcript_hits.clear();
+        self.schedule_transcript_search(Duration::from_millis(75), true, cx);
+    }
+
+    fn schedule_transcript_search(
+        &mut self,
+        debounce: Duration,
+        clear_stale_results: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        let query = self.filter_editor.read(cx).text(cx);
+
+        if clear_stale_results {
+            self.transcript_hits.clear();
+        }
+        self.update_items(cx);
+        let archived_only = self.thread_filter == ThreadFilter::ArchivedOnly;
+
+        if normalize_search_text(&query).chars().count() < 3 {
+            self._search_task = None;
+            return;
+        }
+
+        self._search_task = Some(cx.spawn(async move |this, cx| {
+            if !debounce.is_zero() {
+                cx.background_executor().timer(debounce).await;
+            }
+            let search_task = cx.update(|cx| {
+                ThreadTranscriptSearchStore::global(cx).read(cx).search(
+                    query.clone(),
+                    archived_only,
+                    cx,
+                )
+            });
+            let hits = match search_task.await {
+                Ok(hits) => hits,
+                Err(error) => {
+                    log::warn!("failed to search conversation transcripts: {error:#}");
+                    Vec::new()
+                }
+            };
+
+            this.update(cx, |this, cx| {
+                if this.search_generation != generation
+                    || this.filter_editor.read(cx).text(cx) != query
+                {
+                    return;
+                }
+                this.transcript_hits = hits.into_iter().map(|hit| (hit.thread_id, hit)).collect();
+                this.update_items(cx);
+            })
+            .ok();
+        }));
+    }
+
     fn update_items(&mut self, cx: &mut Context<Self>) {
         let store = ThreadMetadataStore::global(cx).read(cx);
 
@@ -286,63 +399,106 @@ impl ThreadsArchiveView {
                 ThreadFilter::All => true,
                 ThreadFilter::ArchivedOnly => t.archived,
             })
-            .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
-            .rev()
             .cloned()
             .collect::<Vec<_>>();
 
-        let query = self.filter_editor.read(cx).text(cx).to_lowercase();
+        let query = normalize_search_text(&self.filter_editor.read(cx).text(cx));
         let today = Local::now().naive_local().date();
+        let selected_thread_id = self.selection.and_then(|ix| match self.items.get(ix) {
+            Some(ArchiveListItem::Entry { thread, .. }) => Some(thread.thread_id),
+            _ => None,
+        });
+        let hovered_thread_id = self.hovered_index.and_then(|ix| match self.items.get(ix) {
+            Some(ArchiveListItem::Entry { thread, .. }) => Some(thread.thread_id),
+            _ => None,
+        });
+        let previous_selection = self.selection;
 
-        let mut items = Vec::with_capacity(sessions.len() + 5);
-        let mut current_bucket: Option<TimeBucket> = None;
+        let mut ranked_sessions = sessions
+            .into_iter()
+            .filter_map(|session| {
+                if query.is_empty() {
+                    return Some((None, session, Vec::new(), None));
+                }
 
-        for session in sessions {
-            let highlight_positions = if !query.is_empty() {
-                let title = session
-                    .title
+                let display_title = session.title();
+                let title = display_title
                     .as_ref()
-                    .map(|t| t.as_ref())
+                    .map(|title| title.as_ref())
                     .unwrap_or(DEFAULT_THREAD_TITLE);
                 if let Some(positions) = fuzzy_match_positions(&query, title) {
-                    positions
+                    return Some((Some(SearchMatchKind::Title), session, positions, None));
+                }
+
+                if let Some(hit) = self.transcript_hits.get(&session.thread_id) {
+                    return Some((
+                        Some(SearchMatchKind::Transcript),
+                        session,
+                        Vec::new(),
+                        Some(hit.snippet.clone()),
+                    ));
+                }
+
+                let project_matches = session.folder_paths().paths().iter().any(|path| {
+                    path.as_path()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| fuzzy_match_positions(&query, name).is_some())
+                });
+                project_matches.then_some((
+                    Some(SearchMatchKind::Project),
+                    session,
+                    Vec::new(),
+                    None,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        ranked_sessions.sort_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| {
+                if query.is_empty() {
+                    right
+                        .1
+                        .created_at
+                        .unwrap_or(right.1.updated_at)
+                        .cmp(&left.1.created_at.unwrap_or(left.1.updated_at))
                 } else {
-                    // If title didn't match, also try matching the project name
-                    // (the basename of any of the thread's worktree paths), so
-                    // typing a project name surfaces its threads here too.
-                    let worktree_matched = session.folder_paths().paths().iter().any(|p| {
-                        p.as_path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| fuzzy_match_positions(&query, name).is_some())
-                    });
-                    if !worktree_matched {
-                        continue;
-                    }
-                    Vec::new()
+                    right.1.updated_at.cmp(&left.1.updated_at)
+                }
+            })
+        });
+        if !query.is_empty() {
+            ranked_sessions.truncate(100);
+        }
+
+        let mut items = Vec::with_capacity(ranked_sessions.len() + 5);
+        let mut current_bucket: Option<TimeBucket> = None;
+        let mut current_search_group: Option<SearchMatchKind> = None;
+
+        for (search_group, session, highlight_positions, search_snippet) in ranked_sessions {
+            if let Some(search_group) = search_group {
+                if Some(search_group) != current_search_group {
+                    current_search_group = Some(search_group);
+                    items.push(ArchiveListItem::SearchGroupSeparator(search_group));
                 }
             } else {
-                Vec::new()
-            };
-
-            let entry_bucket = {
                 let entry_date = session
                     .created_at
                     .unwrap_or(session.updated_at)
                     .with_timezone(&Local)
                     .naive_local()
                     .date();
-                TimeBucket::from_dates(today, entry_date)
-            };
-
-            if Some(entry_bucket) != current_bucket {
-                current_bucket = Some(entry_bucket);
-                items.push(ArchiveListItem::BucketSeparator(entry_bucket));
+                let entry_bucket = TimeBucket::from_dates(today, entry_date);
+                if Some(entry_bucket) != current_bucket {
+                    current_bucket = Some(entry_bucket);
+                    items.push(ArchiveListItem::BucketSeparator(entry_bucket));
+                }
             }
 
             items.push(ArchiveListItem::Entry {
                 thread: session,
                 highlight_positions,
+                search_snippet,
             });
         }
 
@@ -354,16 +510,28 @@ impl ThreadsArchiveView {
         self.list_state.reset(items.len());
         self.items = items;
 
-        if let Some(ix) = self.hovered_index {
-            if ix >= self.items.len() || !self.is_selectable_item(ix) {
-                self.hovered_index = None;
-            }
-        }
+        self.hovered_index = hovered_thread_id.and_then(|hovered_thread_id| {
+            self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    ArchiveListItem::Entry { thread, .. }
+                        if thread.thread_id == hovered_thread_id
+                )
+            })
+        });
 
         self.list_state.scroll_to(saved_scroll);
 
-        if preserve {
-            if let Some(ix) = self.selection {
+        if let Some(selected_thread_id) = selected_thread_id {
+            self.selection = self.items.iter().position(|item| {
+                matches!(
+                    item,
+                    ArchiveListItem::Entry { thread, .. }
+                        if thread.thread_id == selected_thread_id
+                )
+            });
+        } else if preserve {
+            if let Some(ix) = previous_selection {
                 let next = self.find_next_selectable(ix).or_else(|| {
                     ix.checked_sub(1)
                         .and_then(|i| self.find_previous_selectable(i))
@@ -459,6 +627,28 @@ impl ThreadsArchiveView {
         self.selection = None;
         self.reset_filter_editor_text(window, cx);
         cx.emit(ThreadsArchiveViewEvent::Activate { thread });
+    }
+
+    fn open_thread(
+        &mut self,
+        thread: ThreadMetadata,
+        search_snippet: Option<ThreadSearchSnippet>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(search_snippet) = search_snippet {
+            let query = self.filter_editor.read(cx).text(cx);
+            ThreadTranscriptSearchStore::queue_navigation(
+                thread.thread_id,
+                ThreadSearchNavigation {
+                    query,
+                    role: search_snippet.role,
+                    fingerprint: search_snippet.fingerprint,
+                },
+                cx,
+            );
+        }
+        self.unarchive_thread(thread, window, cx);
     }
 
     fn show_project_picker_for_thread(
@@ -584,11 +774,16 @@ impl ThreadsArchiveView {
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selection else { return };
-        let Some(ArchiveListItem::Entry { thread, .. }) = self.items.get(ix) else {
+        let Some(ArchiveListItem::Entry {
+            thread,
+            search_snippet,
+            ..
+        }) = self.items.get(ix)
+        else {
             return;
         };
 
-        self.unarchive_thread(thread.clone(), window, cx);
+        self.open_thread(thread.clone(), search_snippet.clone(), window, cx);
     }
 
     fn render_list_entry(
@@ -613,9 +808,21 @@ impl ThreadsArchiveView {
                         .color(Color::Muted),
                 )
                 .into_any_element(),
+            ArchiveListItem::SearchGroupSeparator(group) => div()
+                .w_full()
+                .px_2p5()
+                .pt_3()
+                .pb_1()
+                .child(
+                    Label::new(group.label())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
             ArchiveListItem::Entry {
                 thread,
                 highlight_positions,
+                search_snippet,
             } => {
                 let id = SharedString::from(format!("archive-entry-{}", ix));
 
@@ -671,6 +878,13 @@ impl ThreadsArchiveView {
                     })
                     .timestamp(timestamp)
                     .highlight_positions(highlight_positions.clone())
+                    .when_some(search_snippet.clone(), |this, snippet| {
+                        this.search_snippet(
+                            snippet.role.label(),
+                            snippet.text,
+                            snippet.highlight_positions,
+                        )
+                    })
                     .project_paths(thread.folder_paths().paths_owned())
                     .worktrees(worktrees)
                     .focused(is_focused)
@@ -739,8 +953,9 @@ impl ThreadsArchiveView {
                     )
                     .on_click({
                         let thread = thread.clone();
+                        let search_snippet = search_snippet.clone();
                         cx.listener(move |this, _, window, cx| {
-                            this.unarchive_thread(thread.clone(), window, cx);
+                            this.open_thread(thread.clone(), search_snippet.clone(), window, cx);
                         })
                     })
                     .into_any_element()
@@ -769,13 +984,14 @@ impl ThreadsArchiveView {
                     )
                     .on_click({
                         let thread = thread.clone();
+                        let search_snippet = search_snippet.clone();
                         cx.listener(move |this, _, window, cx| {
                             telemetry::event!(
                                 "Archived Thread Opened",
                                 agent = thread.agent_id.as_ref(),
                                 side = crate::agent_sidebar_side(cx)
                             );
-                            this.unarchive_thread(thread.clone(), window, cx);
+                            this.open_thread(thread.clone(), search_snippet.clone(), window, cx);
                         })
                     })
                     .into_any_element()
@@ -906,6 +1122,13 @@ impl ThreadsArchiveView {
             .when(show_focus_keybinding, |this| {
                 this.child(KeyBinding::for_action(&FocusSidebarFilter, cx))
             })
+            .when(self.is_indexing, |this| {
+                this.child(
+                    Label::new("Indexing conversations…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
             .when(has_query, |this| {
                 this.child(
                     IconButton::new("clear-filter", IconName::Close)
@@ -1007,7 +1230,7 @@ impl ThreadsArchiveView {
                                     } else {
                                         ThreadFilter::ArchivedOnly
                                     };
-                                this.update_items(cx);
+                                this.schedule_transcript_search(Duration::ZERO, true, cx);
                             })),
                     ),
             )

@@ -73,8 +73,9 @@ use util::{
     rel_path::{RelPath, RelPathBuf},
 };
 use workspace::{
-    DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
-    SelectedEntry, SplitDirection, Workspace, WorkspaceSettings,
+    DraggedSelection, OpenExternalTerminal, OpenInExternalTerminal, OpenInTerminal, OpenMode,
+    OpenOptions, OpenVisible, PreviewTabsSettings, SelectedEntry, SplitDirection, Workspace,
+    WorkspaceSettings,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
@@ -1092,6 +1093,7 @@ impl ProjectPanel {
             let is_remote = project.is_remote();
             let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
+            let supports_external_terminal = project.is_local();
             let is_markdown = !is_dir && MarkdownPreviewView::is_markdown_path(&*entry.path);
 
             let settings = ProjectPanelSettings::get_global(cx);
@@ -1141,6 +1143,11 @@ impl ProjectPanel {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
+                            .action_disabled_when(
+                                !supports_external_terminal,
+                                "Open in External Terminal",
+                                Box::new(OpenInExternalTerminal),
+                            )
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                             })
@@ -3851,6 +3858,36 @@ impl ProjectPanel {
                     .boxed_clone(),
                     cx,
                 )
+            }
+        }
+    }
+
+    fn open_in_external_terminal(
+        &mut self,
+        _: &OpenInExternalTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((worktree, entry)) = self.selected_sub_entry(cx) {
+            let abs_path = match &entry.canonical_path {
+                Some(canonical_path) => canonical_path.to_path_buf(),
+                None => worktree.read(cx).absolutize(&entry.path),
+            };
+
+            let working_directory = if entry.is_dir() {
+                Some(abs_path)
+            } else {
+                abs_path.parent().map(Path::to_path_buf)
+            };
+
+            if let Some(working_directory) = working_directory {
+                window.dispatch_action(
+                    OpenExternalTerminal {
+                        working_directory: Some(working_directory),
+                    }
+                    .boxed_clone(),
+                    cx,
+                );
             }
         }
     }
@@ -7048,6 +7085,7 @@ impl Render for ProjectPanel {
                         el.on_action(cx.listener(Self::reveal_in_finder))
                             .on_action(cx.listener(Self::open_system))
                             .on_action(cx.listener(Self::open_in_terminal))
+                            .on_action(cx.listener(Self::open_in_external_terminal))
                     },
                 )
                 .when(project.is_via_remote_server(), |el| {

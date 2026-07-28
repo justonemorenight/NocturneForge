@@ -39,6 +39,7 @@ use std::{
     borrow::Cow,
     cmp::{self, min},
     fmt::{self, Display, Formatter},
+    future::Future,
     ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
     path::{Path, PathBuf},
     process::ExitStatus,
@@ -73,6 +74,33 @@ use crate::alacritty::{
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
+
+/// How long the shell and its foreground job get to exit gracefully after a
+/// closed terminal sends SIGHUP/SIGTERM, before being SIGKILLed. Must stay
+/// comfortably below [`gpui::SHUTDOWN_TIMEOUT`] so the escalation also
+/// completes when the whole app is quitting.
+const PROCESS_KILL_GRACE_PERIOD: Duration = Duration::from_millis(100);
+
+/// Sends SIGTERM to the terminal's shell and foreground process groups, and
+/// returns a future that SIGKILLs whatever survives [`PROCESS_KILL_GRACE_PERIOD`].
+/// Closing the PTY only delivers SIGHUP, and a foreground job that ignores
+/// SIGHUP/SIGTERM would otherwise be orphaned (#47412).
+///
+/// Must be called while the PTY master is still open (i.e. before
+/// `pty_tx.shutdown()`): reading the foreground process group requires
+/// `tcgetpgrp` on the PTY fd.
+fn terminate_processes_with_grace_period(
+    info: Arc<PtyProcessInfo>,
+    executor: BackgroundExecutor,
+) -> impl Future<Output = ()> {
+    let process_ids = info.capture_process_ids();
+    process_ids.terminate();
+    async move {
+        executor.timer(PROCESS_KILL_GRACE_PERIOD).await;
+        process_ids.kill();
+        info.kill_child_process();
+    }
+}
 
 pub fn terminal_theme(cx: &App) -> Arc<Theme> {
     let active_theme = cx.theme().clone();
@@ -1325,6 +1353,32 @@ impl TerminalBuilder {
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
+        // `Terminal::drop` escalates to SIGKILL on a detached background task,
+        // which never gets to run when the whole app quits: the process exits
+        // as soon as the `on_app_quit` futures resolve. Perform the same
+        // escalation in a quit observer, whose future keeps the app alive for
+        // the grace period, so that processes ignoring SIGHUP/SIGTERM don't
+        // outlive Zed (#47412). The subscription can't be stored on `Terminal`
+        // (`Subscription` is not `Send`, and `TerminalBuilder` is built on a
+        // background thread), so its lifetime is tied to the entity's release
+        // instead.
+        let app_quit_subscription = cx.on_app_quit(|terminal, cx| {
+            let kill_processes = match &terminal.terminal_type {
+                TerminalType::Pty { info, .. } => Some(terminate_processes_with_grace_period(
+                    info.clone(),
+                    cx.background_executor().clone(),
+                )),
+                TerminalType::DisplayOnly => None,
+            };
+            async move {
+                if let Some(kill_processes) = kill_processes {
+                    kill_processes.await;
+                }
+            }
+        });
+        cx.on_release(move |_, _| drop(app_quit_subscription))
+            .detach();
+
         //Event loop
         self.terminal.event_loop_task = cx.spawn(async move |terminal, cx| {
             while let Some(event) = self.events_rx.next().await {
@@ -3130,16 +3184,10 @@ impl Drop for Terminal {
         if let TerminalType::Pty { pty_tx, info } =
             std::mem::replace(&mut self.terminal_type, TerminalType::DisplayOnly)
         {
+            let kill_processes =
+                terminate_processes_with_grace_period(info, self.background_executor.clone());
             pty_tx.shutdown();
-            info.terminate_child_process();
-
-            let timer = self.background_executor.timer(Duration::from_millis(100));
-            self.background_executor
-                .spawn(async move {
-                    timer.await;
-                    info.kill_child_process();
-                })
-                .detach();
+            self.background_executor.spawn(kill_processes).detach();
         }
     }
 }

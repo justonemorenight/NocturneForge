@@ -25,6 +25,9 @@ use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::paths::PathMatcher;
 
 use crate::entry_view_state::EntryViewState;
+use crate::thread_transcript_search::{
+    ThreadSearchNavigation, ThreadSearchRole, search_context_fingerprint,
+};
 
 actions!(
     agent,
@@ -82,6 +85,8 @@ struct ThreadMatch {
     entry_ix: usize,
     target: MatchTarget,
     source_range: Range<usize>,
+    role: Option<ThreadSearchRole>,
+    fingerprint: Option<String>,
 }
 
 impl ThreadMatch {
@@ -105,11 +110,13 @@ struct MatchKey {
 enum SearchTarget {
     Editor {
         entry_ix: usize,
+        role: Option<ThreadSearchRole>,
         editor: Entity<Editor>,
         snapshot: MultiBufferSnapshot,
     },
     Markdown {
         entry_ix: usize,
+        role: Option<ThreadSearchRole>,
         markdown: Entity<Markdown>,
         source: SharedString,
     },
@@ -118,14 +125,18 @@ enum SearchTarget {
 enum ScannedTarget {
     Editor {
         entry_ix: usize,
+        role: Option<ThreadSearchRole>,
         editor: Entity<Editor>,
         ranges: Vec<Range<usize>>,
+        fingerprints: Option<Vec<String>>,
         anchor_ranges: Vec<Range<Anchor>>,
     },
     Markdown {
         entry_ix: usize,
+        role: Option<ThreadSearchRole>,
         markdown: Entity<Markdown>,
         ranges: Vec<Range<usize>>,
+        fingerprints: Option<Vec<String>>,
     },
 }
 
@@ -142,6 +153,7 @@ pub struct ThreadSearchBar {
     entry_view_state: Entity<EntryViewState>,
     on_activate_match: Arc<dyn Fn(usize, &mut Window, &mut App)>,
     is_active: bool,
+    pending_navigation: Option<ThreadSearchNavigation>,
     _update_matches_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -149,6 +161,7 @@ pub struct ThreadSearchBar {
 
 pub enum ThreadSearchBarEvent {
     Dismissed,
+    PreferredMatchUnavailable,
 }
 
 impl EventEmitter<ThreadSearchBarEvent> for ThreadSearchBar {}
@@ -219,6 +232,7 @@ impl ThreadSearchBar {
             entry_view_state,
             on_activate_match,
             is_active: false,
+            pending_navigation: None,
             _update_matches_task: None,
             _search_task: None,
             _subscriptions: vec![editor_subscription, thread_subscription],
@@ -228,6 +242,22 @@ impl ThreadSearchBar {
     pub fn focus_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.is_active = true;
         self.focus_query_and_select_all(window, cx);
+        self.update_matches(window, cx);
+    }
+
+    pub(crate) fn open_at_navigation(
+        &mut self,
+        navigation: ThreadSearchNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.options = SearchOptions::NONE;
+        self.pending_navigation = Some(navigation.clone());
+        self.is_active = true;
+        self.query_editor.update(cx, |editor, cx| {
+            editor.set_text(navigation.query, window, cx);
+        });
+        self.query_editor.focus_handle(cx).focus(window, cx);
         self.update_matches(window, cx);
     }
 
@@ -325,6 +355,7 @@ impl ThreadSearchBar {
         };
 
         let mut targets: Vec<SearchTarget> = Vec::new();
+        let should_fingerprint = self.pending_navigation.is_some();
         let thread = self.thread.read(cx);
         let entry_view_state = self.entry_view_state.read(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
@@ -341,15 +372,23 @@ impl ThreadSearchBar {
                     let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
                     targets.push(SearchTarget::Editor {
                         entry_ix,
+                        role: Some(ThreadSearchRole::User),
                         editor,
                         snapshot,
                     });
                 }
                 _ => {
+                    let role = matches!(
+                        entry,
+                        AgentThreadEntry::AssistantMessage(message)
+                            if !message.is_subagent_output
+                    )
+                    .then_some(ThreadSearchRole::Assistant);
                     for markdown in collect_markdowns(entry_ix, entry, &entry_view_state, cx) {
                         let source = markdown.read(cx).source().clone();
                         targets.push(SearchTarget::Markdown {
                             entry_ix,
+                            role,
                             markdown,
                             source,
                         });
@@ -372,13 +411,23 @@ impl ThreadSearchBar {
                         .filter_map(|target| match target {
                             SearchTarget::Editor {
                                 entry_ix,
+                                role,
                                 editor,
                                 snapshot,
                             } => {
-                                let ranges = query.search_str(&snapshot.text());
+                                let source = snapshot.text();
+                                let ranges = query.search_str(&source);
                                 if ranges.is_empty() {
                                     return None;
                                 }
+                                let fingerprints = should_fingerprint.then(|| {
+                                    ranges
+                                        .iter()
+                                        .map(|range| {
+                                            search_context_fingerprint(&source, range.clone())
+                                        })
+                                        .collect()
+                                });
                                 let anchor_ranges = ranges
                                     .iter()
                                     .map(|range| {
@@ -388,13 +437,16 @@ impl ThreadSearchBar {
                                     .collect();
                                 Some(ScannedTarget::Editor {
                                     entry_ix,
+                                    role,
                                     editor,
                                     ranges,
+                                    fingerprints,
                                     anchor_ranges,
                                 })
                             }
                             SearchTarget::Markdown {
                                 entry_ix,
+                                role,
                                 markdown,
                                 source,
                             } => {
@@ -402,10 +454,20 @@ impl ThreadSearchBar {
                                 if ranges.is_empty() {
                                     return None;
                                 }
+                                let fingerprints = should_fingerprint.then(|| {
+                                    ranges
+                                        .iter()
+                                        .map(|range| {
+                                            search_context_fingerprint(&source, range.clone())
+                                        })
+                                        .collect()
+                                });
                                 Some(ScannedTarget::Markdown {
                                     entry_ix,
+                                    role,
                                     markdown,
                                     ranges,
+                                    fingerprints,
                                 })
                             }
                         })
@@ -441,8 +503,10 @@ impl ThreadSearchBar {
             match target {
                 ScannedTarget::Editor {
                     entry_ix,
+                    role,
                     editor,
                     ranges,
+                    fingerprints,
                     anchor_ranges,
                 } => {
                     let weak_editor = editor.downgrade();
@@ -456,14 +520,21 @@ impl ThreadSearchBar {
                                 editor_match_ix: ix,
                             },
                             source_range: range.clone(),
+                            role,
+                            fingerprint: fingerprints
+                                .as_ref()
+                                .and_then(|fingerprints| fingerprints.get(ix))
+                                .cloned(),
                         });
                     }
                     self.highlighted_editors.push(weak_editor);
                 }
                 ScannedTarget::Markdown {
                     entry_ix,
+                    role,
                     markdown,
                     ranges,
+                    fingerprints,
                 } => {
                     let weak = markdown.downgrade();
                     for (ix, range) in ranges.iter().enumerate() {
@@ -474,6 +545,11 @@ impl ThreadSearchBar {
                                 markdown_match_ix: ix,
                             },
                             source_range: range.clone(),
+                            role,
+                            fingerprint: fingerprints
+                                .as_ref()
+                                .and_then(|fingerprints| fingerprints.get(ix))
+                                .cloned(),
                         });
                     }
                     self.highlighted_markdowns.push(weak);
@@ -485,15 +561,44 @@ impl ThreadSearchBar {
         }
 
         if !self.matches.is_empty() {
-            let preserved_ix = previous_active_key
-                .as_ref()
-                .and_then(|key| self.matches.iter().position(|m| &m.key() == key));
-            let active_match_ix = preserved_ix
-                .or_else(|| previous_active_match_ix.filter(|ix| *ix < self.matches.len()))
-                .unwrap_or(0);
-            let scroll_to_match = preserved_ix.is_none();
+            let pending_navigation = self.pending_navigation.take();
+            let preferred_ix = pending_navigation.as_ref().and_then(|navigation| {
+                self.matches.iter().position(|candidate| {
+                    candidate.role == Some(navigation.role)
+                        && candidate.fingerprint.as_ref().is_some_and(|fingerprint| {
+                            fingerprint == &navigation.fingerprint
+                                || fingerprint.contains(&navigation.fingerprint)
+                                || navigation.fingerprint.contains(fingerprint)
+                        })
+                })
+            });
+            let (active_match_ix, scroll_to_match) = if let Some(navigation) =
+                pending_navigation.as_ref()
+            {
+                let same_role_ix = self
+                    .matches
+                    .iter()
+                    .position(|candidate| candidate.role == Some(navigation.role));
+                (preferred_ix.or(same_role_ix).unwrap_or(0), true)
+            } else {
+                let preserved_ix = previous_active_key
+                    .as_ref()
+                    .and_then(|key| self.matches.iter().position(|m| &m.key() == key));
+                (
+                    preserved_ix
+                        .or_else(|| previous_active_match_ix.filter(|ix| *ix < self.matches.len()))
+                        .unwrap_or(0),
+                    preserved_ix.is_none(),
+                )
+            };
             self.activate_match(active_match_ix, scroll_to_match, window, cx);
+            if pending_navigation.is_some() && preferred_ix.is_none() {
+                cx.emit(ThreadSearchBarEvent::PreferredMatchUnavailable);
+            }
         } else {
+            if self.pending_navigation.take().is_some() {
+                cx.emit(ThreadSearchBarEvent::PreferredMatchUnavailable);
+            }
             cx.notify();
         }
     }

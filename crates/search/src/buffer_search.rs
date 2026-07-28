@@ -1008,6 +1008,11 @@ impl BufferSearchBar {
         let search = self
             .query_suggestion(seed_query_override, window, cx)
             .map(|suggestion| {
+                let suggestion = if self.default_options.contains(SearchOptions::REGEX) {
+                    regex::escape(&suggestion)
+                } else {
+                    suggestion
+                };
                 self.search(&suggestion, Some(self.default_options), true, window, cx)
             });
 

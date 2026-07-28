@@ -1365,7 +1365,7 @@ pub enum ThreadMetadataStoreEvent {
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
 
-struct ThreadMetadataDb(ThreadSafeConnection);
+pub(crate) struct ThreadMetadataDb(ThreadSafeConnection);
 
 impl Domain for ThreadMetadataDb {
     const NAME: &str = stringify!(ThreadMetadataDb);
@@ -1461,6 +1461,29 @@ impl Domain for ThreadMetadataDb {
         ),
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
+        ),
+        sql!(
+            CREATE TABLE thread_transcript_documents(
+                id INTEGER PRIMARY KEY,
+                thread_id BLOB NOT NULL,
+                segment_id TEXT NOT NULL,
+                document_ordinal INTEGER NOT NULL,
+                chunk_ordinal INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                body TEXT NOT NULL,
+                normalized_body TEXT NOT NULL,
+                UNIQUE(thread_id, segment_id, document_ordinal, chunk_ordinal)
+            ) STRICT;
+
+            CREATE INDEX thread_transcript_documents_thread
+            ON thread_transcript_documents(thread_id);
+
+            CREATE TABLE thread_transcript_index_state(
+                thread_id BLOB PRIMARY KEY,
+                source_updated_at TEXT NOT NULL,
+                extractor_version INTEGER NOT NULL,
+                history_complete INTEGER NOT NULL
+            ) STRICT;
         ),
     ];
 }
@@ -1572,10 +1595,26 @@ impl ThreadMetadataDb {
     /// Delete metadata for a single thread.
     pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
         self.write(move |conn| {
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
+            conn.with_savepoint("delete_thread_metadata", || {
+                let mut stmt = Statement::prepare(
+                    conn,
+                    "DELETE FROM thread_transcript_documents WHERE thread_id = ?",
+                )?;
+                stmt.bind(&thread_id, 1)?;
+                stmt.exec()?;
+
+                let mut stmt = Statement::prepare(
+                    conn,
+                    "DELETE FROM thread_transcript_index_state WHERE thread_id = ?",
+                )?;
+                stmt.bind(&thread_id, 1)?;
+                stmt.exec()?;
+
+                let mut stmt =
+                    Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
+                stmt.bind(&thread_id, 1)?;
+                stmt.exec()
+            })
         })
         .await
     }

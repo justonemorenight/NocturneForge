@@ -1840,6 +1840,10 @@
     // inherits the active Zed theme.
     // "theme": "Gruvbox Dark",
     "theme": null,
+    // Configures a local external terminal launcher. Arguments are passed
+    // directly to the program, and `{working_directory}` is replaced with the
+    // directory selected by the action.
+    "external": null,
     // What shell to use when opening a terminal. May take 3 values:
     // 1. Use the system's default terminal configuration in /etc/passwd
     //      "shell": "system"
@@ -2695,7 +2699,19 @@
   // Settings overrides to use when using Linux.
   "linux": {},
   // Settings overrides to use when using macOS.
-  "macos": {},
+  "macos": {
+    "terminal": {
+      "external": {
+        "program": "/usr/bin/open",
+        "args": [
+          "-na",
+          "Ghostty",
+          "--args",
+          "--working-directory={working_directory}",
+        ],
+      },
+    },
+  },
   // Settings overrides to use when using Windows.
   "windows": {
     "languages": {

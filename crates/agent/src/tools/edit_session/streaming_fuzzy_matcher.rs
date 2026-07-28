@@ -4,6 +4,9 @@ use std::{cmp, ops::Range};
 const REPLACEMENT_COST: u32 = 1;
 const INSERTION_COST: u32 = 3;
 const DELETION_COST: u32 = 10;
+// Two matches are enough to prove ambiguity, so stop scanning early; exact
+// matches are byte-identical and can't be ranked.
+const MAX_EXACT_MATCHES: usize = 2;
 
 /// A streaming fuzzy matcher that can process text chunks incrementally
 /// and return the best match found so far at each step.
@@ -12,6 +15,7 @@ pub struct StreamingFuzzyMatcher {
     query_lines: Vec<String>,
     line_hint: Option<u32>,
     incomplete_line: String,
+    raw_query: String,
     matches: Vec<SearchMatch>,
     matrix: SearchMatrix,
 }
@@ -19,9 +23,15 @@ pub struct StreamingFuzzyMatcher {
 /// A match candidate: the matched byte range plus the 0-based
 /// `(query_row, buffer_row)` line pairs the search aligned to produce it.
 #[derive(Clone, Debug)]
-struct SearchMatch {
-    range: Range<usize>,
-    line_pairs: Vec<(u32, u32)>,
+pub(super) struct SearchMatch {
+    pub(super) range: Range<usize>,
+    pub(super) line_pairs: Vec<(u32, u32)>,
+}
+
+#[derive(Debug)]
+pub(super) enum SearchMatches {
+    Exact(Vec<SearchMatch>),
+    Fuzzy(Vec<SearchMatch>),
 }
 
 impl StreamingFuzzyMatcher {
@@ -32,6 +42,7 @@ impl StreamingFuzzyMatcher {
             query_lines: Vec::new(),
             line_hint: None,
             incomplete_line: String::new(),
+            raw_query: String::new(),
             matches: Vec::new(),
             matrix: SearchMatrix::new(buffer_line_count + 1),
         }
@@ -40,23 +51,6 @@ impl StreamingFuzzyMatcher {
     /// Returns the query lines.
     pub fn query_lines(&self) -> &[String] {
         &self.query_lines
-    }
-
-    /// Returns the 0-based `(query_row, buffer_row)` line pairs that the
-    /// search aligned for the match with the given range. Lines that were
-    /// skipped on either side of the alignment are absent.
-    pub fn line_pairs(&self, range: &Range<usize>) -> Option<&[(u32, u32)]> {
-        self.matches
-            .iter()
-            .find(|search_match| search_match.range == *range)
-            .map(|search_match| search_match.line_pairs.as_slice())
-    }
-
-    fn match_ranges(&self) -> Vec<Range<usize>> {
-        self.matches
-            .iter()
-            .map(|search_match| search_match.range.clone())
-            .collect()
     }
 
     /// Push a new chunk of text and get the best match found so far.
@@ -70,6 +64,7 @@ impl StreamingFuzzyMatcher {
     /// query so far, or `None` if no suitable match exists yet.
     pub fn push(&mut self, chunk: &str, line_hint: Option<u32>) -> Option<Range<usize>> {
         // Add the chunk to our incomplete line buffer
+        self.raw_query.push_str(chunk);
         self.incomplete_line.push_str(chunk);
         self.line_hint = line_hint;
 
@@ -98,7 +93,26 @@ impl StreamingFuzzyMatcher {
     ///
     /// This processes any remaining incomplete line before returning the final
     /// match result.
-    pub fn finish(&mut self) -> Vec<Range<usize>> {
+    pub fn finish(&mut self) -> SearchMatches {
+        let exact_ranges = find_exact_matches(&self.snapshot, &self.raw_query);
+        if !exact_ranges.is_empty() {
+            if !self.incomplete_line.is_empty() {
+                self.query_lines
+                    .push(std::mem::take(&mut self.incomplete_line));
+            }
+            let matches = exact_ranges
+                .into_iter()
+                .map(|range| {
+                    let start_row = self.snapshot.offset_to_point(range.start).row;
+                    let line_pairs = (0..self.query_lines.len())
+                        .map(|query_row| (query_row as u32, start_row + query_row as u32))
+                        .collect();
+                    SearchMatch { range, line_pairs }
+                })
+                .collect();
+            return SearchMatches::Exact(matches);
+        }
+
         // Process any remaining incomplete line
         if !self.incomplete_line.is_empty() {
             if let [only_match] = self.matches.as_mut_slice() {
@@ -118,7 +132,7 @@ impl StreamingFuzzyMatcher {
                     only_match
                         .line_pairs
                         .push(((self.query_lines.len() - 1) as u32, extended_row));
-                    return self.match_ranges();
+                    return SearchMatches::Fuzzy(self.matches.clone());
                 }
             }
 
@@ -126,7 +140,7 @@ impl StreamingFuzzyMatcher {
                 .push(std::mem::take(&mut self.incomplete_line));
             self.matches = self.resolve_location_fuzzy();
         }
-        self.match_ranges()
+        SearchMatches::Fuzzy(self.matches.clone())
     }
 
     fn resolve_location_fuzzy(&mut self) -> Vec<SearchMatch> {
@@ -283,6 +297,62 @@ impl StreamingFuzzyMatcher {
 
         best_match
     }
+}
+
+// Aho-Corasick's overlapping search requires a contiguous haystack, while its
+// streaming search skips overlapping matches. KMP detects overlapping ambiguity
+// while scanning rope chunks without copying the buffer.
+fn find_exact_matches(snapshot: &TextBufferSnapshot, query: &str) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let query = query.as_bytes();
+    let trailing_line_ending_len = if query.ends_with(b"\r\n") {
+        2
+    } else if query.ends_with(b"\n") {
+        1
+    } else {
+        0
+    };
+    let mut prefix_lengths = vec![0; query.len()];
+    let mut prefix_length = 0;
+    for query_index in 1..query.len() {
+        while prefix_length > 0 && query[query_index] != query[prefix_length] {
+            prefix_length = prefix_lengths[prefix_length - 1];
+        }
+        if query[query_index] == query[prefix_length] {
+            prefix_length += 1;
+            prefix_lengths[query_index] = prefix_length;
+        }
+    }
+
+    let mut matches = Vec::new();
+    let mut matched_length = 0;
+    for (offset, byte) in snapshot
+        .bytes_in_range(0..snapshot.len())
+        .flatten()
+        .copied()
+        .enumerate()
+    {
+        while matched_length > 0 && byte != query[matched_length] {
+            matched_length = prefix_lengths[matched_length - 1];
+        }
+        if byte == query[matched_length] {
+            matched_length += 1;
+        }
+        if matched_length == query.len() {
+            let raw_end = offset + 1;
+            let start = raw_end - query.len();
+            let end = raw_end - trailing_line_ending_len;
+            matches.push(start..end);
+            if matches.len() == MAX_EXACT_MATCHES {
+                break;
+            }
+            matched_length = prefix_lengths[matched_length - 1];
+        }
+    }
+    matches
 }
 
 fn fuzzy_eq(left: &str, right: &str) -> bool {

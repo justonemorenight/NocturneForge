@@ -4,6 +4,7 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use anyhow::{Context as _, anyhow, bail};
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -49,11 +50,12 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal,
+    OpenExternalTerminal, Pane, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    notifications::NotifyTaskExt,
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -111,8 +113,72 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(TerminalView::deploy);
+        workspace.register_action(open_external_terminal);
     })
     .detach();
+}
+
+fn open_external_terminal(
+    workspace: &mut Workspace,
+    action: &OpenExternalTerminal,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let is_remote = workspace.project().read(cx).is_remote();
+    let external = TerminalSettings::get_global(cx).external.clone();
+    let working_directory = action
+        .working_directory
+        .clone()
+        .or_else(|| default_working_directory(workspace, cx));
+
+    cx.background_spawn(async move {
+        if is_remote {
+            bail!("External terminals are only available for local projects");
+        }
+
+        let external = external
+            .ok_or_else(|| anyhow!("No external terminal is configured in terminal.external"))?;
+        let working_directory =
+            working_directory.ok_or_else(|| anyhow!("Could not determine a working directory"))?;
+        let working_directory_text = working_directory.to_string_lossy();
+        let args = external
+            .args
+            .iter()
+            .map(|arg| arg.replace("{working_directory}", &working_directory_text))
+            .collect::<Vec<_>>();
+
+        let output = util::command::new_command(&external.program)
+            .args(args)
+            .current_dir(&working_directory)
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to launch external terminal program `{}`",
+                    external.program
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                bail!(
+                    "External terminal launcher `{}` exited with {}",
+                    external.program,
+                    output.status
+                );
+            }
+            bail!(
+                "External terminal launcher `{}` failed: {}",
+                external.program,
+                detail
+            );
+        }
+
+        anyhow::Ok(())
+    })
+    .detach_and_notify_err(workspace.weak_handle(), window, cx);
 }
 
 pub struct BlockProperties {

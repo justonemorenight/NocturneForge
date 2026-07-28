@@ -4,6 +4,7 @@ use crate::{
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
+    thread_transcript_search::ThreadSearchNavigation,
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
@@ -7386,68 +7387,108 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.thread_search_bar.is_none() {
-            let thread = self.thread.clone();
-            let view = cx.entity().downgrade();
-            let on_activate =
-                Arc::new(move |entry_ix: usize, _window: &mut Window, cx: &mut App| {
-                    // Avoid re-entering `ThreadView` when search navigation is forwarded
-                    // from a `ThreadView` action handler.
-                    let view = view.clone();
-                    cx.defer(move |cx| {
-                        view.update(cx, |this, cx| {
-                            this.list_state.scroll_to(gpui::ListOffset {
-                                item_ix: entry_ix,
-                                offset_in_item: gpui::px(0.),
-                            });
-                            cx.notify();
-                        })
-                        .ok();
-                    });
-                });
-            let search_bar = cx.new(|cx| {
-                ThreadSearchBar::new(
-                    thread,
-                    self.entry_view_state.clone(),
-                    on_activate,
-                    window,
-                    cx,
-                )
-            });
-            self._subscriptions.push(cx.subscribe_in(
-                &search_bar,
-                window,
-                |this, _bar, event, window, cx| {
-                    if matches!(event, ThreadSearchBarEvent::Dismissed) {
-                        this.thread_search_visible = false;
-                        this.message_editor.focus_handle(cx).focus(window, cx);
-                        cx.notify();
-                    }
-                },
-            ));
-            self.thread_search_bar = Some(search_bar);
-        }
+        let search_bar = self.ensure_thread_search_bar(window, cx);
 
         // Re-focus an open bar unless it already owns focus.
-        let search_bar_focused = self
-            .thread_search_bar
-            .as_ref()
-            .is_some_and(|bar| bar.focus_handle(cx).contains_focused(window, cx));
+        let search_bar_focused = search_bar.focus_handle(cx).contains_focused(window, cx);
 
         if self.thread_search_visible && search_bar_focused {
-            if let Some(bar) = &self.thread_search_bar {
-                bar.update(cx, |bar, cx| bar.clear_highlights(cx));
-            }
+            search_bar.update(cx, |bar, cx| bar.clear_highlights(cx));
             self.thread_search_visible = false;
             self.message_editor.focus_handle(cx).focus(window, cx);
             cx.notify();
         } else {
             self.thread_search_visible = true;
-            if let Some(bar) = self.thread_search_bar.clone() {
-                bar.update(cx, |bar, cx| bar.focus_and_refresh(window, cx));
-            }
+            search_bar.update(cx, |bar, cx| bar.focus_and_refresh(window, cx));
             cx.notify();
         }
+    }
+
+    fn ensure_thread_search_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ThreadSearchBar> {
+        if let Some(search_bar) = &self.thread_search_bar {
+            return search_bar.clone();
+        }
+
+        let thread = self.thread.clone();
+        let view = cx.entity().downgrade();
+        let on_activate = Arc::new(move |entry_ix: usize, _window: &mut Window, cx: &mut App| {
+            // Avoid re-entering `ThreadView` when search navigation is forwarded
+            // from a `ThreadView` action handler.
+            let view = view.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| {
+                    this.list_state.scroll_to(gpui::ListOffset {
+                        item_ix: entry_ix,
+                        offset_in_item: gpui::px(0.),
+                    });
+                    cx.notify();
+                })
+                .ok();
+            });
+        });
+        let search_bar = cx.new(|cx| {
+            ThreadSearchBar::new(
+                thread,
+                self.entry_view_state.clone(),
+                on_activate,
+                window,
+                cx,
+            )
+        });
+        self._subscriptions.push(cx.subscribe_in(
+            &search_bar,
+            window,
+            |this, _bar, event, window, cx| match event {
+                ThreadSearchBarEvent::Dismissed => {
+                    this.thread_search_visible = false;
+                    this.message_editor.focus_handle(cx).focus(window, cx);
+                    cx.notify();
+                }
+                ThreadSearchBarEvent::PreferredMatchUnavailable => {
+                    this.show_search_navigation_unavailable_toast(cx);
+                }
+            },
+        ));
+        self.thread_search_bar = Some(search_bar.clone());
+        search_bar
+    }
+
+    pub(crate) fn open_thread_search(
+        &mut self,
+        navigation: ThreadSearchNavigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let search_bar = self.ensure_thread_search_bar(window, cx);
+        self.thread_search_visible = true;
+        search_bar.update(cx, |bar, cx| {
+            bar.open_at_navigation(navigation, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn show_search_navigation_unavailable_toast(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(
+                "Matched history is unavailable from this agent",
+                cx,
+                |this, _cx| {
+                    this.icon(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                },
+            );
+            workspace.toggle_status_toast(toast, cx);
+        });
     }
 
     pub fn open_thread_as_markdown(

@@ -31,6 +31,7 @@ pub mod terminal_thread_metadata_store;
 pub mod test_support;
 mod thread_import;
 pub mod thread_metadata_store;
+pub(crate) mod thread_transcript_search;
 pub mod thread_worktree_archive;
 
 pub mod threads_archive_view;
@@ -616,6 +617,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    thread_transcript_search::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
@@ -929,6 +931,7 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         .thread_summary_model
         .as_ref()
         .map(to_selected_model);
+    let compaction = settings.compaction_model.as_ref().map(to_selected_model);
     let inline_alternatives = settings
         .inline_alternatives
         .iter()
@@ -940,6 +943,7 @@ fn update_active_language_model_from_settings(cx: &mut App) {
         registry.select_inline_assistant_model(inline_assistant.as_ref(), cx);
         registry.select_commit_message_model(commit_message.as_ref(), cx);
         registry.select_thread_summary_model(thread_summary.as_ref(), cx);
+        registry.select_compaction_model(compaction.as_ref(), cx);
         registry.select_inline_alternative_models(inline_alternatives, cx);
         registry.set_should_use_fallback(should_use_fallback);
     });

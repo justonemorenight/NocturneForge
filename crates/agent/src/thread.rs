@@ -2512,8 +2512,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         let model = self
-            .model()
-            .cloned()
+            .compaction_model(cx)
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
 
         // Flush any pending message and cancel an in-flight turn before we
@@ -2526,11 +2525,12 @@ impl Thread {
             self.advance_prompt_id();
             let request = self.build_compaction_request(request_end_ix, &model, cx);
             self.current_request_token_usage = TokenUsage::default();
-            (model, request)
+            (model.clone(), request)
         });
 
         if compaction.is_some() {
-            self.pending_compaction_telemetry = self.build_compaction_telemetry("manual", cx);
+            self.pending_compaction_telemetry =
+                self.build_compaction_telemetry("manual", &model, cx);
         }
 
         self.clear_summary();
@@ -3087,13 +3087,14 @@ impl Thread {
     ) -> Result<ControlFlow<()>> {
         let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
             let insertion_ix = this.compaction_message_target_ix(cx)?;
-            let model = this.model().cloned()?;
+            let model = this.compaction_model(cx)?;
             let request = this.build_compaction_request(insertion_ix, &model, cx);
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
             if this.pending_compaction_telemetry.is_none() {
-                this.pending_compaction_telemetry = this.build_compaction_telemetry("auto", cx);
+                this.pending_compaction_telemetry =
+                    this.build_compaction_telemetry("auto", &model, cx);
             }
             Some((model, request, insertion_ix))
         })?
@@ -4253,11 +4254,10 @@ impl Thread {
         extend_request_history_until(&self.messages, request_messages, end_ix);
     }
 
-    /// Captures the data for an `"Agent Compaction Completed"` telemetry event
-    /// at the moment a compaction starts. Returns `None` if there's no model.
     fn build_compaction_telemetry(
         &self,
         trigger: &'static str,
+        compaction_model: &Arc<dyn LanguageModel>,
         cx: &App,
     ) -> Option<CompactionTelemetry> {
         let model = self.model()?;
@@ -4273,7 +4273,7 @@ impl Thread {
             parent_thread_id: self.parent_thread_id().map(|id| id.to_string()),
             prompt_id: self.prompt_id.to_string(),
             model: model.telemetry_id(),
-            model_provider: model.provider_id().to_string(),
+            compaction_model: compaction_model.telemetry_id(),
             thinking_effort: self.thinking_effort.clone(),
             max_tokens,
             tokens_before,
@@ -4364,6 +4364,13 @@ impl Thread {
             return None;
         }
         Some(self.messages.len())
+    }
+
+    fn compaction_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        LanguageModelRegistry::read_global(cx)
+            .compaction_model()
+            .map(|configured| configured.model)
+            .or_else(|| self.model().cloned())
     }
 
     fn build_compaction_request(
@@ -4543,7 +4550,7 @@ struct CompactionTelemetry {
     parent_thread_id: Option<String>,
     prompt_id: String,
     model: String,
-    model_provider: String,
+    compaction_model: String,
     thinking_effort: Option<String>,
     max_tokens: u64,
     /// Tokens in the context window immediately before compaction.
@@ -4567,7 +4574,7 @@ impl CompactionTelemetry {
             parent_thread_id = self.parent_thread_id,
             prompt_id = self.prompt_id,
             model = self.model,
-            model_provider = self.model_provider,
+            compaction_model = self.compaction_model,
             thinking_effort = self.thinking_effort,
             max_tokens = self.max_tokens,
             tokens_before = self.tokens_before,

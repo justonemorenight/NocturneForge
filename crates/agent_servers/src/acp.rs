@@ -10,7 +10,7 @@ use agent_client_protocol::schema::{
 use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
 use anyhow::anyhow;
 use async_channel;
-use collections::{HashMap, HashSet};
+use collections::{HashMap, HashSet, IndexMap, IndexSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
@@ -27,7 +27,11 @@ use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::{any::Any, cell::RefCell, collections::VecDeque};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+};
 use task::{Shell, ShellBuilder, SpawnInTerminal};
 use thiserror::Error;
 use util::ResultExt as _;
@@ -41,7 +45,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -265,11 +269,100 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
     }
 }
 
+const MAX_PENDING_NOTIFICATIONS_PER_SESSION: usize = 256;
+const MAX_PENDING_NOTIFICATION_SESSION_IDS: usize = 64;
+const MAX_CLOSED_SESSION_IDS: usize = 256;
+
+#[derive(Default)]
+struct SessionNotificationState {
+    pending: RefCell<IndexMap<acp::SessionId, VecDeque<acp::SessionNotification>>>,
+    pending_new_sessions: Cell<usize>,
+    closed_sessions: RefCell<IndexSet<acp::SessionId>>,
+}
+
+impl SessionNotificationState {
+    fn begin_new_session(self: &Rc<Self>) -> PendingNewSessionGuard {
+        self.pending_new_sessions
+            .set(self.pending_new_sessions.get().saturating_add(1));
+        PendingNewSessionGuard(self.clone())
+    }
+
+    fn should_buffer(&self, session_id: &acp::SessionId) -> bool {
+        self.pending_new_sessions.get() > 0 && !self.closed_sessions.borrow().contains(session_id)
+    }
+
+    fn register_session(&self, session_id: &acp::SessionId) {
+        self.closed_sessions.borrow_mut().shift_remove(session_id);
+    }
+
+    fn close_session(&self, session_id: acp::SessionId) {
+        self.pending.borrow_mut().shift_remove(&session_id);
+        let mut closed_sessions = self.closed_sessions.borrow_mut();
+        if closed_sessions.len() >= MAX_CLOSED_SESSION_IDS && !closed_sessions.contains(&session_id)
+        {
+            drop(closed_sessions.shift_remove_index(0));
+        }
+        closed_sessions.insert(session_id);
+    }
+
+    fn forget_session(&self, session_id: &acp::SessionId) {
+        self.pending.borrow_mut().shift_remove(session_id);
+    }
+
+    fn take_pending(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<VecDeque<acp::SessionNotification>> {
+        self.pending.borrow_mut().shift_remove(session_id)
+    }
+
+    fn buffer(&self, notification: acp::SessionNotification) {
+        let session_id = notification.session_id.clone();
+        let mut pending = self.pending.borrow_mut();
+
+        if pending.len() >= MAX_PENDING_NOTIFICATION_SESSION_IDS
+            && !pending.contains_key(&session_id)
+        {
+            if let Some(evicted) = pending.keys().next().cloned() {
+                log::warn!(
+                    "Dropping buffered notifications for oldest unknown session {evicted:?} \
+                     (capacity of {MAX_PENDING_NOTIFICATION_SESSION_IDS} unknown sessions reached)",
+                );
+                pending.shift_remove(&evicted);
+            }
+        }
+
+        let queue = pending.entry(session_id).or_default();
+        if queue.len() >= MAX_PENDING_NOTIFICATIONS_PER_SESSION {
+            queue.pop_front();
+            log::warn!(
+                "Dropping oldest buffered notification for unknown session {:?} \
+                 (per-session capacity of {MAX_PENDING_NOTIFICATIONS_PER_SESSION} reached)",
+                notification.session_id,
+            );
+        }
+        queue.push_back(notification);
+    }
+}
+
+struct PendingNewSessionGuard(Rc<SessionNotificationState>);
+
+impl Drop for PendingNewSessionGuard {
+    fn drop(&mut self) {
+        let remaining = self.0.pending_new_sessions.get().saturating_sub(1);
+        self.0.pending_new_sessions.set(remaining);
+        if remaining == 0 {
+            self.0.pending.borrow_mut().clear();
+        }
+    }
+}
+
 /// Holds state needed by foreground work dispatched from background handler closures.
 struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
+    session_notification_state: Rc<SessionNotificationState>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -389,9 +482,11 @@ pub struct AcpConnection {
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
+    claude_config_dir: Option<PathBuf>,
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     pending_sessions: Rc<RefCell<HashMap<acp::SessionId, PendingAcpSession>>>,
+    session_notification_state: Rc<SessionNotificationState>,
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
@@ -834,6 +929,18 @@ impl AcpConnection {
                     command.env.unwrap_or_default(),
                 )
             });
+        let claude_config_dir = if agent_id.as_ref() == CLAUDE_AGENT_ID
+            && project.read_with(cx, |project, _cx| project.is_local())
+        {
+            Some(
+                env.get("CLAUDE_CONFIG_DIR")
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| util::paths::home_dir().join(".claude")),
+            )
+        } else {
+            None
+        };
 
         let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
         let mut child = builder.build_std_command(Some(path.clone()), &args);
@@ -856,6 +963,7 @@ impl AcpConnection {
         log::trace!("Spawned (pid: {})", child.id());
 
         let sessions = Rc::new(RefCell::new(HashMap::default()));
+        let session_notification_state = Rc::new(SessionNotificationState::default());
         let debug_log = AcpDebugLog::default();
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -959,6 +1067,7 @@ impl AcpConnection {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            session_notification_state: session_notification_state.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -1078,8 +1187,10 @@ impl AcpConnection {
             connection,
             telemetry_id,
             agent_version,
+            claude_config_dir,
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
+            session_notification_state,
             agent_capabilities: response.agent_capabilities,
             request_elicitations,
             defaults,
@@ -1102,6 +1213,7 @@ impl AcpConnection {
     fn new_for_test(
         connection: ConnectionTo<Agent>,
         sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+        session_notification_state: Rc<SessionNotificationState>,
         agent_capabilities: acp::AgentCapabilities,
         request_elicitations: Entity<ElicitationStore>,
         agent_server_store: WeakEntity<AgentServerStore>,
@@ -1120,11 +1232,13 @@ impl AcpConnection {
             connection,
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
+            session_notification_state,
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
             request_elicitations,
             defaults,
+            claude_config_dir: None,
             child: None,
             session_list: None,
             debug_log: AcpDebugLog::default(),
@@ -1211,16 +1325,7 @@ impl AcpConnection {
                     // `session/update` notifications that arrive during the call
                     // (e.g. history replay during `session/load`) can find the thread.
                     // Modes/config are filled in once the response arrives.
-                    this.sessions.borrow_mut().insert(
-                        session_id.clone(),
-                        AcpSession {
-                            thread: thread.downgrade(),
-                            suppress_abort_err: false,
-                            session_modes: None,
-                            config_options: None,
-                            ref_count: 1,
-                        },
-                    );
+                    this.pre_register_session(&session_id, &thread);
 
                     let response =
                         match rpc_call(this.connection.clone(), session_id.clone(), directories)
@@ -1228,8 +1333,7 @@ impl AcpConnection {
                         {
                             Ok(response) => response,
                             Err(err) => {
-                                this.sessions.borrow_mut().remove(&session_id);
-                                this.pending_sessions.borrow_mut().remove(&session_id);
+                                this.close_local_session(&session_id);
                                 return Err(Arc::new(err));
                             }
                         };
@@ -1263,6 +1367,8 @@ impl AcpConnection {
                         session.config_options = config_options.map(ConfigOptions::new);
                         session.ref_count = ref_count;
                     }
+
+                    this.drain_pending_notifications(&session_id, cx);
 
                     Ok(thread)
                 }
@@ -1415,6 +1521,54 @@ impl AcpConnection {
             }
         }
     }
+
+    fn drain_pending_notifications(&self, session_id: &acp::SessionId, cx: &mut AsyncApp) {
+        let Some(buffered) = self.session_notification_state.take_pending(session_id) else {
+            return;
+        };
+        let ctx = ClientContext {
+            sessions: self.sessions.clone(),
+            session_list: Rc::new(RefCell::new(self.session_list.clone())),
+            request_elicitations: self.request_elicitations.clone(),
+            session_notification_state: self.session_notification_state.clone(),
+        };
+        for notification in buffered {
+            handle_session_notification(notification, cx, &ctx);
+        }
+    }
+
+    fn pre_register_session(&self, session_id: &acp::SessionId, thread: &Entity<AcpThread>) {
+        self.session_notification_state.register_session(session_id);
+        self.sessions.borrow_mut().insert(
+            session_id.clone(),
+            AcpSession {
+                thread: thread.downgrade(),
+                suppress_abort_err: false,
+                session_modes: None,
+                config_options: None,
+                ref_count: 1,
+            },
+        );
+    }
+
+    fn forget_session(&self, session_id: &acp::SessionId) {
+        self.sessions.borrow_mut().remove(session_id);
+        self.pending_sessions.borrow_mut().remove(session_id);
+        self.session_notification_state.forget_session(session_id);
+    }
+
+    fn close_local_session(&self, session_id: &acp::SessionId) {
+        self.forget_session(session_id);
+        self.session_notification_state
+            .close_session(session_id.clone());
+    }
+
+    fn session_meta(&self, cx: &App) -> Task<Option<acp::Meta>> {
+        let Some(config_dir) = self.claude_config_dir.clone() else {
+            return Task::ready(None);
+        };
+        cx.background_spawn(async move { claude_code_session_meta(&config_dir) })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1424,31 +1578,156 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    fn into_new_session_request(
+        self,
+        mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
+    ) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::LoadSessionRequest {
         acp::LoadSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCodeSettings {
+    #[serde(default)]
+    enabled_plugins: HashMap<String, bool>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeCodeInstalledPlugins {
+    #[serde(default)]
+    plugins: HashMap<String, ClaudeCodePluginInstallations>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClaudeCodePluginInstallations {
+    Multiple(Vec<ClaudeCodePluginInstallation>),
+    Single(ClaudeCodePluginInstallation),
+}
+
+impl ClaudeCodePluginInstallations {
+    fn user_installation(&self) -> Option<&ClaudeCodePluginInstallation> {
+        match self {
+            Self::Multiple(installations) => installations
+                .iter()
+                .find(|installation| installation.is_user_scoped()),
+            Self::Single(installation) => installation.is_user_scoped().then_some(installation),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCodePluginInstallation {
+    #[serde(default)]
+    scope: Option<String>,
+    install_path: PathBuf,
+}
+
+impl ClaudeCodePluginInstallation {
+    fn is_user_scoped(&self) -> bool {
+        self.scope.as_deref() == Some("user") || self.scope.is_none()
+    }
+}
+
+fn load_json_file<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            log::warn!("Failed to read {}: {error}", path.display());
+            return None;
+        }
+    };
+
+    match serde_json::from_str(&contents) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            log::warn!("Failed to parse {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+fn claude_code_session_meta(config_dir: &std::path::Path) -> Option<acp::Meta> {
+    let settings: ClaudeCodeSettings = load_json_file(&config_dir.join("settings.json"))?;
+    let enabled_plugins = settings
+        .enabled_plugins
+        .into_iter()
+        .filter_map(|(plugin, enabled)| enabled.then_some(plugin))
+        .collect::<HashSet<_>>();
+    if enabled_plugins.is_empty() {
+        return None;
+    }
+
+    let installed: ClaudeCodeInstalledPlugins =
+        load_json_file(&config_dir.join("plugins").join("installed_plugins.json"))?;
+    let mut plugin_paths = enabled_plugins
+        .into_iter()
+        .filter_map(|plugin| {
+            let installations = installed.plugins.get(&plugin)?;
+            let installation = installations.user_installation()?;
+
+            if installation.install_path.is_dir() {
+                Some(installation.install_path.clone())
+            } else {
+                log::warn!(
+                    "Enabled Claude Code plugin `{plugin}` is missing at {}",
+                    installation.install_path.display()
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    plugin_paths.sort();
+    plugin_paths.dedup();
+    if plugin_paths.is_empty() {
+        return None;
+    }
+
+    Some(acp::Meta::from_iter([(
+        "claudeCode".to_string(),
+        serde_json::json!({
+            "options": {
+                "plugins": plugin_paths.into_iter().map(|path| {
+                    serde_json::json!({
+                        "type": "local",
+                        "path": path,
+                    })
+                }).collect::<Vec<_>>(),
+            }
+        }),
+    )]))
 }
 
 fn session_directories_from_work_dirs(
@@ -1591,14 +1870,37 @@ impl AgentConnection for AcpConnection {
         };
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = self.session_meta(cx);
 
         cx.spawn(async move |cx| {
+            let session_meta = session_meta.await;
+            let pending_new_session = self.session_notification_state.begin_new_session();
             let response = self
                 .connection
-                .send_request(directories.into_new_session_request(mcp_servers))
+                .send_request(directories.into_new_session_request(mcp_servers, session_meta))
                 .block_task()
             .await
             .map_err(map_acp_error)?;
+
+            let session_id = response.session_id.clone();
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread: Entity<AcpThread> = cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    Some(work_dirs),
+                    self.clone(),
+                    project,
+                    action_log,
+                    session_id.clone(),
+                    // ACP doesn't currently support per-session prompt capabilities or changing capabilities dynamically.
+                    watch::Receiver::constant(
+                        self.agent_capabilities.prompt_capabilities.clone(),
+                    ),
+                    cx,
+                )
+            });
+            self.pre_register_session(&session_id, &thread);
 
             let (modes, config_options) = config_state(response.modes, response.config_options);
 
@@ -1616,7 +1918,7 @@ impl AgentConnection for AcpConnection {
 
                         cx.spawn({
                             let default_mode = default_mode.clone();
-                            let session_id = response.session_id.clone();
+                            let session_id = session_id.clone();
                             let modes = modes.clone();
                             let conn = self.connection.clone();
                             async move |_| {
@@ -1653,37 +1955,18 @@ impl AgentConnection for AcpConnection {
             }
 
             if let Some(config_opts) = config_options.as_ref() {
-                self.apply_default_config_options(&response.session_id, config_opts, cx);
+                self.apply_default_config_options(&session_id, config_opts, cx);
             }
 
-            let action_log = cx.new(|_| ActionLog::new(project.clone()));
-            let thread: Entity<AcpThread> = cx.new(|cx| {
-                AcpThread::new(
-                    None,
-                    None,
-                    Some(work_dirs),
-                    self.clone(),
-                    project,
-                    action_log,
-                    response.session_id.clone(),
-                    // ACP doesn't currently support per-session prompt capabilities or changing capabilities dynamically.
-                    watch::Receiver::constant(
-                        self.agent_capabilities.prompt_capabilities.clone(),
-                    ),
-                    cx,
-                )
-            });
-
-            self.sessions.borrow_mut().insert(
-                response.session_id,
-                AcpSession {
-                    thread: thread.downgrade(),
-                    suppress_abort_err: false,
-                    session_modes: modes,
-                    config_options: config_options.map(ConfigOptions::new),
-                    ref_count: 1,
-                },
-            );
+            {
+                let mut sessions = self.sessions.borrow_mut();
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.session_modes = modes;
+                    session.config_options = config_options.map(ConfigOptions::new);
+                }
+            }
+            self.drain_pending_notifications(&session_id, cx);
+            drop(pending_new_session);
 
             Ok(thread)
         })
@@ -1722,6 +2005,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = self.session_meta(cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1729,10 +2013,13 @@ impl AgentConnection for AcpConnection {
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
+                    let session_meta = session_meta.await;
                     let response = connection
-                        .send_request(
-                            directories.into_load_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_load_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -1766,6 +2053,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = self.session_meta(cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1773,11 +2061,13 @@ impl AgentConnection for AcpConnection {
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
+                    let session_meta = session_meta.await;
                     let response = connection
-                        .send_request(
-                            directories
-                                .into_resume_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_resume_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -1822,8 +2112,7 @@ impl AgentConnection for AcpConnection {
         };
         match pending_ref_count {
             Some(0) => {
-                self.pending_sessions.borrow_mut().remove(session_id);
-                self.sessions.borrow_mut().remove(session_id);
+                self.close_local_session(session_id);
 
                 let conn = self.connection.clone();
                 let session_id = session_id.clone();
@@ -1848,8 +2137,8 @@ impl AgentConnection for AcpConnection {
             return Task::ready(Ok(()));
         }
 
-        sessions.remove(session_id);
         drop(sessions);
+        self.close_local_session(session_id);
 
         let conn = self.connection.clone();
         let session_id = session_id.clone();
@@ -2550,10 +2839,12 @@ pub mod test_support {
         let agent_capabilities = response.agent_capabilities;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let session_notification_state = Rc::new(SessionNotificationState::default());
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            session_notification_state: session_notification_state.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2571,6 +2862,7 @@ pub mod test_support {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                session_notification_state,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -3173,12 +3465,15 @@ mod tests {
         );
 
         let session_id = acp::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
-        let load_session_request = directories
+        let new_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_new_session_request(Vec::new(), None);
+        let load_session_request =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, Vec::new(), None);
 
         assert_eq!(
             new_session_request.cwd,
@@ -3590,6 +3885,7 @@ mod tests {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                Rc::new(SessionNotificationState::default()),
                 acp::AgentCapabilities::default(),
                 request_elicitations,
                 WeakEntity::new_invalid(),
@@ -3865,10 +4161,12 @@ mod tests {
         let agent_capabilities = response.agent_capabilities;
 
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let session_notification_state = Rc::new(SessionNotificationState::default());
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            session_notification_state: session_notification_state.clone(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -3891,6 +4189,7 @@ mod tests {
             AcpConnection::new_for_test(
                 client_conn,
                 sessions,
+                session_notification_state,
                 agent_capabilities,
                 request_elicitations,
                 agent_server_store,
@@ -4704,10 +5003,22 @@ fn handle_session_notification(
     let (thread, session_modes, config_opts_data) = {
         let sessions = ctx.sessions.borrow();
         let Some(session) = sessions.get(&notification.session_id) else {
-            log::warn!(
-                "Received session notification for unknown session: {:?}",
-                notification.session_id
-            );
+            drop(sessions);
+            if ctx
+                .session_notification_state
+                .should_buffer(&notification.session_id)
+            {
+                log::debug!(
+                    "Buffering session update while a new session is registering: {:?}",
+                    notification.session_id
+                );
+                ctx.session_notification_state.buffer(notification);
+            } else {
+                log::debug!(
+                    "Dropping session update for inactive session: {:?}",
+                    notification.session_id
+                );
+            }
             return;
         };
         (

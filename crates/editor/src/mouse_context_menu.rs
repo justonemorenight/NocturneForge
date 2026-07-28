@@ -281,7 +281,7 @@ pub fn deploy_context_menu(
                     }),
                 )
                 .when(!disable_ai && has_selections, |this| {
-                    this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                    this.action("Add Selection to Chat", Box::new(AddSelectionToThread))
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

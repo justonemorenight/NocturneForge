@@ -825,6 +825,9 @@ impl Editor {
         // Hence, clear all excerpts' hints in the multi buffer: later, the invalidated ones will re-trigger the LSP query, the rest will be restored
         // from the cache.
         if invalidate_cache.should_invalidate() {
+            for hint_id in &visible_inlay_hint_ids {
+                inlay_hints.added_hints.remove(hint_id);
+            }
             hints_to_remove.extend(visible_inlay_hint_ids);
 
             // When invalidating, this task removes ALL visible hints for the buffer

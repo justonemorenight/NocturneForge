@@ -45,6 +45,7 @@ pub struct ThreadItem {
     title_label_color: Option<Color>,
     title_generating: bool,
     highlight_positions: Vec<usize>,
+    search_snippet: Option<(SharedString, SharedString, Vec<usize>)>,
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
@@ -80,6 +81,7 @@ impl ThreadItem {
             title_label_color: None,
             title_generating: false,
             highlight_positions: Vec::new(),
+            search_snippet: None,
             timestamp: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
@@ -161,6 +163,16 @@ impl ThreadItem {
 
     pub fn highlight_positions(mut self, positions: Vec<usize>) -> Self {
         self.highlight_positions = positions;
+        self
+    }
+
+    pub fn search_snippet(
+        mut self,
+        role: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        highlight_positions: Vec<usize>,
+    ) -> Self {
+        self.search_snippet = Some((role.into(), text.into(), highlight_positions));
         self
     }
 
@@ -403,6 +415,7 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let search_snippet = self.search_snippet;
 
         let show_tooltip = matches!(
             self.status,
@@ -483,6 +496,28 @@ impl RenderOnce for ThreadItem {
                         })
                     }),
             )
+            .when_some(search_snippet, |this, (role, text, highlight_positions)| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .w_full()
+                        .gap_1p5()
+                        .child(icon_container())
+                        .child(
+                            Label::new(role)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .flex_none(),
+                        )
+                        .child(
+                            HighlightedLabel::new(text, highlight_positions)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .flex_1()
+                                .truncate(),
+                        ),
+                )
+            })
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
