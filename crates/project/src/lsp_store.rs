@@ -3848,9 +3848,6 @@ impl LocalLspStore {
                 .to_file_path() else {
                     return;
                 };
-                if LocalLspStore::language_server_line_length_limit_exceeded(buffer, cx).is_some() {
-                    continue;
-                }
 
                 let path = glob_literal_prefix(Path::new(&rp.pattern));
                 let pattern = Path::new(&rp.pattern)
@@ -12270,6 +12267,9 @@ impl LspStore {
                     Some(language) => language,
                     None => continue,
                 };
+                if LocalLspStore::language_server_line_length_limit_exceeded(buffer, cx).is_some() {
+                    continue;
+                }
 
                 if !worktrees_using_server.contains(&file.worktree.read(cx).id())
                     || !lsp_adapters

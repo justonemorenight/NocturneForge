@@ -12,7 +12,7 @@ use crate::thread_transcript_search::{
     ThreadSearchHit, ThreadSearchNavigation, ThreadSearchSnippet, ThreadTranscriptSearchStore,
     normalize_search_text,
 };
-use crate::{Agent, ArchiveSelectedThread, DEFAULT_THREAD_TITLE, RemoveSelectedThread};
+use crate::{Agent, ArchiveSelectedThread, RemoveSelectedThread};
 
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
@@ -421,12 +421,8 @@ impl ThreadsArchiveView {
                     return Some((None, session, Vec::new(), None));
                 }
 
-                let display_title = session.title();
-                let title = display_title
-                    .as_ref()
-                    .map(|title| title.as_ref())
-                    .unwrap_or(DEFAULT_THREAD_TITLE);
-                if let Some(positions) = fuzzy_match_positions(&query, title) {
+                let title = session.display_title();
+                if let Some(positions) = fuzzy_match_positions(&query, title.as_ref()) {
                     return Some((Some(SearchMatchKind::Title), session, positions, None));
                 }
 
@@ -1515,11 +1511,7 @@ impl PickerDelegate for ProjectPickerDelegate {
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         format!(
             "Associate the \"{}\" thread with...",
-            self.thread
-                .title
-                .as_ref()
-                .map(|t| t.as_ref())
-                .unwrap_or(DEFAULT_THREAD_TITLE)
+            self.thread.display_title()
         )
         .into()
     }

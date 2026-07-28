@@ -1174,6 +1174,7 @@ pub struct AgentPanel {
     _project_subscription: Subscription,
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
+    persist_last_used_agent: Task<()>,
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
@@ -1567,6 +1568,7 @@ impl AgentPanel {
             focus_handle: cx.focus_handle(),
             context_server_registry,
             draft_thread: None,
+            persist_last_used_agent: Task::ready(()),
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
@@ -1927,13 +1929,12 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        cx.background_spawn({
-            let kvp = KeyValueStore::global(cx);
-            async move {
-                write_global_last_used_agent(kvp, agent).await;
-            }
-        })
-        .detach();
+        let kvp = KeyValueStore::global(cx);
+        let previous = std::mem::replace(&mut self.persist_last_used_agent, Task::ready(()));
+        self.persist_last_used_agent = cx.background_spawn(async move {
+            previous.await;
+            write_global_last_used_agent(kvp, agent).await;
+        });
     }
 
     /// Sets the panel's selected agent without opening the panel or focusing

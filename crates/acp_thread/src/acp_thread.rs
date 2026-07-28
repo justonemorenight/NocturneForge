@@ -1168,8 +1168,8 @@ impl ToolCall {
     }
 }
 
-// Separate so we can hold a strong reference to the buffer
-// for saving on the thread
+// Holds the buffer alive until resolution finishes: `shared_buffers`
+// and `AgentLocation` only keep weak handles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedLocation {
     buffer: Entity<Buffer>,
@@ -2088,7 +2088,7 @@ pub struct AcpThread {
     action_log: Entity<ActionLog>,
     _git_store_subscription: Subscription,
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
-    shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
+    shared_buffers: HashMap<WeakEntity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
     connection: Rc<dyn AgentConnection>,
@@ -3324,9 +3324,12 @@ impl AcpThread {
             this.update(cx, |this, cx| {
                 let project = this.project.clone();
 
+                this.prune_dead_shared_buffers();
                 for location in resolved_locations.iter().flatten() {
-                    this.shared_buffers
-                        .insert(location.buffer.clone(), location.buffer.read(cx).snapshot());
+                    this.shared_buffers.insert(
+                        location.buffer.downgrade(),
+                        location.buffer.read(cx).snapshot(),
+                    );
                 }
                 let Some((ix, tool_call)) = this.tool_call_mut(&id) else {
                     return;
@@ -4178,6 +4181,11 @@ impl AcpThread {
         })
     }
 
+    fn prune_dead_shared_buffers(&mut self) {
+        self.shared_buffers
+            .retain(|buffer, _| buffer.is_upgradable());
+    }
+
     pub fn read_text_file(
         &self,
         path: PathBuf,
@@ -4206,7 +4214,7 @@ impl AcpThread {
 
             let snapshot = if reuse_shared_snapshot {
                 this.read_with(cx, |this, _| {
-                    this.shared_buffers.get(&buffer.clone()).cloned()
+                    this.shared_buffers.get(&buffer.downgrade()).cloned()
                 })
                 .log_err()
                 .flatten()
@@ -4223,7 +4231,9 @@ impl AcpThread {
 
                 let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
                 this.update(cx, |this, _| {
-                    this.shared_buffers.insert(buffer.clone(), snapshot.clone());
+                    this.prune_dead_shared_buffers();
+                    this.shared_buffers
+                        .insert(buffer.downgrade(), snapshot.clone());
                 })?;
                 snapshot
             };
@@ -4277,7 +4287,7 @@ impl AcpThread {
             let buffer = load?.await?;
             let snapshot = this.update(cx, |this, cx| {
                 this.shared_buffers
-                    .get(&buffer)
+                    .get(&buffer.downgrade())
                     .cloned()
                     .unwrap_or_else(|| buffer.read(cx).snapshot())
             })?;

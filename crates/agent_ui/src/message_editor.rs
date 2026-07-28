@@ -694,8 +694,6 @@ impl MessageEditor {
                         .action("Paste as Plain Text", Box::new(PasteRaw))
                 }))
             });
-            let has_editor_clipboard_selections = editor_clipboard_selections.is_some();
-
             editor
         });
         let mention_set = cx.new(|_cx| MentionSet::new(project, thread_store.clone()));
@@ -1412,14 +1410,6 @@ impl MessageEditor {
             return;
         }
 
-        if !has_editor_clipboard_selections
-            && clipboard.entries().len() == 1
-            && let Some(clipboard_text) = clipboard_text
-            && self.insert_compact_pasted_text(clipboard_text, window, cx)
-        {
-            return;
-        }
-
         self.editor.update(cx, |editor, cx| {
             editor.clear_inlay_hints(cx);
         });
@@ -1487,6 +1477,7 @@ impl MessageEditor {
                 }
                 _ => None,
             });
+        let has_editor_clipboard_selections = editor_clipboard_selections.is_some();
 
         // Insert creases for pasted clipboard selections that:
         // 1. Contain exactly one selection
@@ -1717,6 +1708,14 @@ impl MessageEditor {
                 // otherwise the fallback paste path would insert it twice.
                 return;
             }
+        }
+
+        if !has_editor_clipboard_selections
+            && clipboard.entries().len() == 1
+            && let Some(clipboard_text) = clipboard_text
+            && self.insert_compact_pasted_text(clipboard_text, window, cx)
+        {
+            return;
         }
 
         if self.handle_pasted_context(clipboard, window, cx) {
@@ -2014,6 +2013,7 @@ impl MessageEditor {
                 anchor..anchor,
                 self.editor.downgrade(),
                 self.mention_set.downgrade(),
+                self.workspace.clone(),
                 Some(selection),
             )
         else {

@@ -526,7 +526,7 @@ pub(crate) enum PermissionSelection {
     Choice(usize),
     /// "Select options…" mode where individual command patterns can be toggled.
     /// Contains the indices of checked patterns in the `patterns` list.
-    /// All patterns start checked when this mode is first activated.
+    /// Only the pattern the user clicked is checked when this mode is first activated.
     SelectedPatterns(Vec<usize>),
 }
 
@@ -2866,42 +2866,13 @@ impl ThreadView {
         let tool_call_id = acp::ToolCallId::new(action.tool_call_id.clone());
 
         match self.permission_selections.get_mut(&tool_call_id) {
-            Some(PermissionSelection::SelectedPatterns(checked)) => {
-                // Already in pattern mode — toggle the individual pattern.
-                if let Some(pos) = checked.iter().position(|&i| i == action.pattern_index) {
-                    checked.swap_remove(pos);
-                } else {
-                    checked.push(action.pattern_index);
-                }
+            Some(selection @ PermissionSelection::SelectedPatterns(_)) => {
+                selection.toggle_pattern(action.pattern_index);
             }
             _ => {
-                // First click: activate "Select options" with all patterns checked.
-                let thread = self.thread.read(cx);
-                let pattern_count = thread
-                    .entries()
-                    .iter()
-                    .find_map(|entry| {
-                        if let AgentThreadEntry::ToolCall(call) = entry {
-                            if call.id == tool_call_id {
-                                if let ToolCallStatus::WaitingForConfirmation { options, .. } =
-                                    &call.status
-                                {
-                                    if let PermissionOptions::DropdownWithPatterns {
-                                        patterns,
-                                        ..
-                                    } = options
-                                    {
-                                        return Some(patterns.len());
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .unwrap_or(0);
                 self.permission_selections.insert(
                     tool_call_id,
-                    PermissionSelection::SelectedPatterns((0..pattern_count).collect()),
+                    PermissionSelection::SelectedPatterns(vec![action.pattern_index]),
                 );
             }
         }
@@ -7814,21 +7785,18 @@ impl ThreadView {
                             },
                         );
 
-                    let has_selection = chunks
-                        .map(|chunks| {
-                            chunks.iter().any(|chunk| {
-                                let md = match chunk {
-                                    AssistantMessageChunk::Message { block, .. } => {
-                                        block.markdown()
-                                    }
-                                    AssistantMessageChunk::Thought { block, .. } => {
-                                        block.markdown()
-                                    }
-                                };
-                                md.map_or(false, |m| m.read(cx).has_selection())
+                    let selected_markdown = chunks.and_then(|chunks| {
+                        chunks.iter().find_map(|chunk| {
+                            let markdown = match chunk {
+                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
+                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
+                            };
+                            markdown.and_then(|markdown| {
+                                markdown.read(cx).context_menu_selected_markdown().cloned()
                             })
                         })
-                        .unwrap_or(false);
+                    });
+                    let has_selection = selected_markdown.is_some();
 
                     let context_menu_link = chunks.and_then(|chunks| {
                         chunks.iter().find_map(|chunk| {
@@ -7851,6 +7819,38 @@ impl ThreadView {
                                     {
                                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                                     }
+                                });
+                            }
+                        });
+
+                    let add_selection_to_chat = ContextMenuEntry::new("Add Selection to Chat")
+                        .disabled(!has_selection)
+                        .handler({
+                            let entity = entity.clone();
+                            move |window, cx| {
+                                let Some(selected_markdown) = selected_markdown.as_deref() else {
+                                    return;
+                                };
+                                entity.update(cx, |this, cx| {
+                                    let mut quoted_selection = String::new();
+                                    if !this.message_editor.read(cx).text(cx).is_empty() {
+                                        quoted_selection.push_str("\n\n");
+                                    }
+                                    for (line_ix, line) in selected_markdown.lines().enumerate() {
+                                        if line_ix > 0 {
+                                            quoted_selection.push('\n');
+                                        }
+                                        quoted_selection.push('>');
+                                        if !line.is_empty() {
+                                            quoted_selection.push(' ');
+                                            quoted_selection.push_str(line);
+                                        }
+                                    }
+                                    quoted_selection.push_str("\n\n");
+                                    this.message_editor.update(cx, |editor, cx| {
+                                        editor.insert_text(&quoted_selection, window, cx);
+                                    });
+                                    this.message_editor.focus_handle(cx).focus(window, cx);
                                 });
                             }
                         });
@@ -7902,6 +7902,7 @@ impl ThreadView {
                             "Copy Selection",
                             Box::new(markdown::CopyAsMarkdown),
                         )
+                        .item(add_selection_to_chat)
                         .item(copy_this_agent_response)
                         .separator()
                         .item(scroll_item)
@@ -9755,7 +9756,6 @@ impl ThreadView {
             })
             .collect();
 
-        let pattern_count = patterns.len();
         let permission_dropdown_handle = self.permission_dropdown_handle.clone();
         let view = cx.entity().downgrade();
 
@@ -9852,26 +9852,22 @@ impl ThreadView {
                                 None,
                                 move |_window, cx| {
                                     view.update(cx, |this, cx| {
-                                        let selection = this
+                                        match this
                                             .permission_selections
-                                            .get_mut(&tool_call_id_for_pattern);
-
-                                        match selection {
-                                            Some(PermissionSelection::SelectedPatterns(_)) => {
-                                                // Already in pattern mode — toggle.
-                                                this.permission_selections
-                                                    .get_mut(&tool_call_id_for_pattern)
-                                                    .expect("just matched above")
-                                                    .toggle_pattern(pattern_index);
+                                            .get_mut(&tool_call_id_for_pattern)
+                                        {
+                                            Some(
+                                                selection
+                                                @ PermissionSelection::SelectedPatterns(_),
+                                            ) => {
+                                                selection.toggle_pattern(pattern_index);
                                             }
                                             _ => {
-                                                // First click: activate pattern mode
-                                                // with all patterns checked.
                                                 this.permission_selections.insert(
                                                     tool_call_id_for_pattern.clone(),
-                                                    PermissionSelection::SelectedPatterns(
-                                                        (0..pattern_count).collect(),
-                                                    ),
+                                                    PermissionSelection::SelectedPatterns(vec![
+                                                        pattern_index,
+                                                    ]),
                                                 );
                                             }
                                         }
