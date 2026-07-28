@@ -22,3 +22,4 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+ZED_UPDATE_EXPLANATION = "Updates are disabled in this custom Zed Preview build. Rebuild and install the fork manually to update it."
