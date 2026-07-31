@@ -47,6 +47,7 @@ use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
 use rope::Point;
 use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -843,8 +844,12 @@ impl ConversationView {
                 }
             }
         }));
+        subscriptions.push(cx.on_app_quit(Self::flush_draft_prompt_on_quit));
 
         cx.on_release(|this, cx| {
+            if let Some(persist) = this.draft_prompt_persist_task(true, cx) {
+                persist.detach_and_log_err(cx);
+            }
             this.request_elicitation_form_states.clear();
             if let Some(connected) = this.as_connected() {
                 connected.close_all_sessions(cx).detach();
@@ -1877,31 +1882,50 @@ impl ConversationView {
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.thread_id;
         self.draft_prompt_persist_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(DRAFT_PROMPT_PERSIST_DEBOUNCE)
                 .await;
-            let persist = this.update(cx, |this, cx| {
-                let thread = this.root_thread(cx)?;
-                let thread = thread.read(cx);
-                if !thread.is_draft_thread() {
-                    return None;
-                }
-                let snapshot: Vec<acp::ContentBlock> = thread
-                    .draft_prompt()
-                    .map(|p| p.to_vec())
-                    .unwrap_or_default();
-                Some(if snapshot.is_empty() {
-                    crate::draft_prompt_store::delete(thread_id, cx)
-                } else {
-                    crate::draft_prompt_store::write(thread_id, &snapshot, cx)
-                })
-            });
+            let persist = this.update(cx, |this, cx| this.draft_prompt_persist_task(false, cx));
             if let Ok(Some(persist)) = persist {
                 persist.await.log_err();
             }
         }));
+    }
+
+    fn draft_prompt_persist_task(
+        &self,
+        capture_live_draft: bool,
+        cx: &App,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let thread = self.root_thread(cx)?;
+        let thread = thread.read(cx);
+        if !thread.is_draft_thread() {
+            return None;
+        }
+
+        let snapshot = if capture_live_draft {
+            thread.draft_prompt_snapshot(cx).unwrap_or_default()
+        } else {
+            thread.draft_prompt().map(Vec::from).unwrap_or_default()
+        };
+        Some(if snapshot.is_empty() {
+            crate::draft_prompt_store::delete(self.thread_id, cx)
+        } else {
+            crate::draft_prompt_store::write(self.thread_id, &snapshot, cx)
+        })
+    }
+
+    fn flush_draft_prompt_on_quit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        let persist = self.draft_prompt_persist_task(true, cx);
+        async move {
+            if let Some(persist) = persist {
+                persist.await.log_err();
+            }
+        }
     }
 
     fn authenticate(
@@ -6902,8 +6926,7 @@ pub(crate) mod tests {
             );
         });
 
-        // The subagent's edits predate the regenerated prompt, so they must be
-        // auto-kept rather than rejected by the rewind.
+        // Editing conversation history must not silently resolve pending edits.
         buffer.read_with(cx, |buffer, _| {
             assert_eq!(
                 buffer.text(),
@@ -6914,8 +6937,8 @@ pub(crate) mod tests {
         parent_action_log.read_with(cx, |log, cx| {
             assert_eq!(
                 log.changed_buffers(cx).count(),
-                0,
-                "the subagent edit should have been auto-kept"
+                1,
+                "the subagent edit should remain pending review"
             );
         });
     }

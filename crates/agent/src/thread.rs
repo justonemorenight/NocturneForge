@@ -70,6 +70,9 @@ use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
+const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
+    "Permission denied: user sent a follow-up message instead of approving the tool call.";
+pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
@@ -122,6 +125,10 @@ pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
+const COMPACTION_REQUEST_BYTES_PER_TOKEN: u64 = 3;
+const COMPACTION_REQUEST_HEADROOM_PERCENT: u64 = 80;
+const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
+const MAX_HIERARCHICAL_COMPACTION_PASSES: usize = 32;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -1151,6 +1158,16 @@ pub struct ToolCallAuthorization {
     pub response: oneshot::Sender<acp_thread::SelectedPermissionOutcome>,
     pub context: Option<ToolPermissionContext>,
     pub kind: acp_thread::AuthorizationKind,
+}
+
+fn ensure_tool_call_authorization_not_interrupted(
+    outcome: &acp_thread::SelectedPermissionOutcome,
+) -> Result<()> {
+    if outcome.option_id.0.as_ref() == FOLLOW_UP_PERMISSION_DENIED_OPTION_ID {
+        Err(anyhow!(TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE))
+    } else {
+        Ok(())
+    }
 }
 
 fn auto_resolve_permission_outcome(
@@ -2523,9 +2540,11 @@ impl Thread {
 
         let compaction = self.forced_compaction_target_ix().map(|request_end_ix| {
             self.advance_prompt_id();
-            let request = self.build_compaction_request(request_end_ix, &model, cx);
             self.current_request_token_usage = TokenUsage::default();
-            (model.clone(), request)
+            (
+                model.clone(),
+                CompactionTarget::new(&self.messages, request_end_ix),
+            )
         });
 
         if compaction.is_some() {
@@ -2542,14 +2561,14 @@ impl Thread {
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
-                let result = if let Some((model, request)) = compaction {
-                    Self::stream_compaction(
+                let result = if let Some((model, target)) = compaction {
+                    Self::stream_bounded_compaction(
                         &this,
                         &event_stream,
                         cancellation_rx.clone(),
                         model,
-                        request,
-                        CompactionInsertion::Manual { marker_id: id },
+                        target,
+                        CompactionMode::Manual { marker_id: id },
                         cx,
                     )
                     .await
@@ -3085,10 +3104,9 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
-        let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
+        let Some((model, target)) = this.update(cx, |this, cx| {
             let insertion_ix = this.compaction_message_target_ix(cx)?;
             let model = this.compaction_model(cx)?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx);
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
@@ -3096,22 +3114,136 @@ impl Thread {
                 this.pending_compaction_telemetry =
                     this.build_compaction_telemetry("auto", &model, cx);
             }
-            Some((model, request, insertion_ix))
+            Some((model, CompactionTarget::new(&this.messages, insertion_ix)))
         })?
         else {
             return Ok(ControlFlow::Continue(()));
         };
 
-        Self::stream_compaction(
+        Self::stream_bounded_compaction(
             this,
             event_stream,
             cancellation_rx,
             model,
-            request,
-            CompactionInsertion::Auto { insertion_ix },
+            target,
+            CompactionMode::Auto,
             cx,
         )
         .await
+    }
+
+    async fn stream_bounded_compaction(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        cancellation_rx: watch::Receiver<bool>,
+        model: Arc<dyn LanguageModel>,
+        target: CompactionTarget,
+        mode: CompactionMode,
+        cx: &mut AsyncApp,
+    ) -> Result<ControlFlow<()>> {
+        let mut completed_passes = 0;
+        let mut learned_retained_user_byte_budget = None;
+
+        loop {
+            let mut maximum_end_ix = None;
+            let mut retained_user_byte_budget = learned_retained_user_byte_budget;
+            let mut failed_request = None;
+
+            loop {
+                let plan = this.update(cx, |this, cx| {
+                    let target_ix = target.resolve(&this.messages)?;
+                    this.build_compaction_plan(
+                        target_ix,
+                        maximum_end_ix,
+                        retained_user_byte_budget,
+                        &model,
+                        cx,
+                    )
+                })??;
+                let Some(plan) = plan else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+
+                if failed_request
+                    .as_ref()
+                    .is_some_and(|failed_request| failed_request == &plan.serialized_request)
+                {
+                    return Err(anyhow!(
+                        "Compaction could not reduce the request below the model's context window"
+                    ));
+                }
+
+                let insertion = if plan.reaches_target {
+                    mode.insertion(plan.insertion_ix)
+                } else {
+                    CompactionInsertion::Auto {
+                        insertion_ix: plan.insertion_ix,
+                    }
+                };
+                let request_for_retry = plan.serialized_request;
+
+                match Self::stream_compaction(
+                    this,
+                    event_stream,
+                    cancellation_rx.clone(),
+                    model.clone(),
+                    plan.request,
+                    insertion,
+                    cx,
+                )
+                .await
+                {
+                    Ok(ControlFlow::Break(())) => return Ok(ControlFlow::Break(())),
+                    Ok(ControlFlow::Continue(())) => {
+                        completed_passes += 1;
+                        if plan.reaches_target {
+                            return Ok(ControlFlow::Continue(()));
+                        }
+                        learned_retained_user_byte_budget = Some(plan.retained_user_byte_budget);
+                        if completed_passes >= MAX_HIERARCHICAL_COMPACTION_PASSES {
+                            return Err(anyhow!(
+                                "Compaction required more than {MAX_HIERARCHICAL_COMPACTION_PASSES} passes"
+                            ));
+                        }
+                        break;
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<LanguageModelCompletionError>()
+                            .is_some_and(|error| {
+                                matches!(error, LanguageModelCompletionError::PromptTooLarge { .. })
+                            }) =>
+                    {
+                        this.update(cx, |this, _| {
+                            if let Some(telemetry) = this.pending_compaction_telemetry.as_mut() {
+                                telemetry.retries += 1;
+                            }
+                        })?;
+
+                        failed_request = Some(request_for_retry);
+                        let summarized_message_count =
+                            plan.insertion_ix.saturating_sub(plan.progress_start_ix);
+                        if summarized_message_count > 1 {
+                            maximum_end_ix = Some(
+                                plan.progress_start_ix + (summarized_message_count / 2).max(1),
+                            );
+                            continue;
+                        }
+
+                        if plan.retained_user_byte_budget > 0 {
+                            retained_user_byte_budget = Some(plan.retained_user_byte_budget / 2);
+                            maximum_end_ix = Some(plan.insertion_ix);
+                            continue;
+                        }
+
+                        return Err(error.context(
+                            "Even the smallest safe compaction request exceeds the model's context window",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
     }
 
     async fn stream_compaction(
@@ -3134,12 +3266,25 @@ impl Thread {
             _ = cancellation_rx.changed().fuse() => {
                 if *cancellation_rx.borrow() {
                     log::debug!("Compaction cancelled before request started");
+                    event_stream.update_context_compaction_status(
+                        compaction_id,
+                        acp_thread::ContextCompactionStatus::Canceled,
+                    );
                     return Ok(ControlFlow::Break(()));
                 }
                 return Ok(ControlFlow::Continue(()));
             }
         };
-        let mut stream = stream?;
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                event_stream.update_context_compaction_status(
+                    compaction_id,
+                    acp_thread::ContextCompactionStatus::Canceled,
+                );
+                return Err(error.into());
+            }
+        };
 
         let mut summary = String::new();
         loop {
@@ -3148,6 +3293,10 @@ impl Thread {
                 _ = cancellation_rx.changed().fuse() => {
                     if *cancellation_rx.borrow() {
                         log::debug!("Compaction cancelled while summarizing");
+                        event_stream.update_context_compaction_status(
+                            compaction_id,
+                            acp_thread::ContextCompactionStatus::Canceled,
+                        );
                         return Ok(ControlFlow::Break(()));
                     }
                     continue;
@@ -3158,7 +3307,18 @@ impl Thread {
                 break;
             };
 
-            match event? {
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    event_stream.update_context_compaction_status(
+                        compaction_id,
+                        acp_thread::ContextCompactionStatus::Canceled,
+                    );
+                    return Err(error.into());
+                }
+            };
+
+            match event {
                 LanguageModelCompletionEvent::Text(text) => {
                     summary.push_str(&text);
                     event_stream.send_context_compaction_update(compaction_id.clone(), &text);
@@ -3183,22 +3343,25 @@ impl Thread {
 
         if *cancellation_rx.borrow() {
             log::debug!("Compaction cancelled after summarizing");
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Canceled,
+            );
             return Ok(ControlFlow::Break(()));
         }
 
         let summary = summary.trim().to_string();
         if summary.is_empty() {
             log::warn!("Compaction produced an empty summary");
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Canceled,
+            );
             return Err(anyhow::anyhow!("Compaction produced an empty summary"));
         }
 
         log::debug!("Compaction succeeded:\n{summary}");
-        event_stream.update_context_compaction_status(
-            compaction_id,
-            acp_thread::ContextCompactionStatus::Completed,
-        );
-
-        this.update(cx, |this, cx| {
+        let insert_result = this.update(cx, |this, cx| {
             let compaction = Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
             match insertion {
                 CompactionInsertion::Auto { insertion_ix } => {
@@ -3217,7 +3380,18 @@ impl Thread {
                 }
             }
             cx.notify();
-        })?;
+        });
+        if let Err(error) = insert_result {
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Canceled,
+            );
+            return Err(error);
+        }
+        event_stream.update_context_compaction_status(
+            compaction_id,
+            acp_thread::ContextCompactionStatus::Completed,
+        );
 
         Ok(ControlFlow::Continue(()))
     }
@@ -4211,6 +4385,21 @@ impl Thread {
         end_ix: usize,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
+        self.build_request_messages_until_with_retained_user_budget(
+            available_tools,
+            end_ix,
+            COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET,
+            cx,
+        )
+    }
+
+    fn build_request_messages_until_with_retained_user_budget(
+        &self,
+        available_tools: Vec<SharedString>,
+        end_ix: usize,
+        retained_user_byte_budget: usize,
+        cx: &App,
+    ) -> Vec<LanguageModelRequestMessage> {
         let end_ix = end_ix.min(self.messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
@@ -4237,7 +4426,12 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
-        self.extend_request_history_until(&mut messages, end_ix);
+        extend_request_history_until(
+            &self.messages,
+            &mut messages,
+            end_ix,
+            retained_user_byte_budget,
+        );
 
         if let Some(last_message) = messages.last_mut() {
             last_message.cache = true;
@@ -4251,7 +4445,12 @@ impl Thread {
         request_messages: &mut Vec<LanguageModelRequestMessage>,
         end_ix: usize,
     ) {
-        extend_request_history_until(&self.messages, request_messages, end_ix);
+        extend_request_history_until(
+            &self.messages,
+            request_messages,
+            end_ix,
+            COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET,
+        );
     }
 
     fn build_compaction_telemetry(
@@ -4376,6 +4575,7 @@ impl Thread {
     fn build_compaction_request(
         &self,
         insertion_ix: usize,
+        retained_user_byte_budget: usize,
         model: &Arc<dyn LanguageModel>,
         cx: &App,
     ) -> LanguageModelRequest {
@@ -4384,7 +4584,12 @@ impl Thread {
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(model, cx),
-            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
+            messages: self.build_request_messages_until_with_retained_user_budget(
+                Vec::new(),
+                insertion_ix,
+                retained_user_byte_budget,
+                cx,
+            ),
             ..Default::default()
         };
 
@@ -4396,6 +4601,111 @@ impl Thread {
         });
 
         request
+    }
+
+    fn build_compaction_plan(
+        &self,
+        target_ix: usize,
+        maximum_end_ix: Option<usize>,
+        retained_user_byte_budget: Option<usize>,
+        model: &Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> Result<Option<CompactionPlan>> {
+        let target_ix = target_ix.min(self.messages.len());
+        let progress_start_ix =
+            latest_compaction_message_ix_before(&self.messages, target_ix).map_or(0, |ix| ix + 1);
+        if progress_start_ix >= target_ix {
+            return Ok(None);
+        }
+
+        let request_byte_budget = compaction_request_byte_budget(model.as_ref());
+        let retained_user_byte_budget = retained_user_byte_budget.unwrap_or_else(|| {
+            COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET.min(
+                request_byte_budget
+                    .checked_div(COMPACTION_RETAINED_CONTEXT_DIVISOR)
+                    .unwrap_or_default(),
+            )
+        });
+        let minimum_end_ix = progress_start_ix + 1;
+        let maximum_end_ix = maximum_end_ix
+            .unwrap_or(target_ix)
+            .clamp(minimum_end_ix, target_ix);
+
+        let build_request = |end_ix| -> Result<(LanguageModelRequest, Vec<u8>)> {
+            let request =
+                self.build_compaction_request(end_ix, retained_user_byte_budget, model, cx);
+            let serialized_request =
+                serde_json::to_vec(&request).context("failed to size compaction request")?;
+            Ok((request, serialized_request))
+        };
+
+        let (minimum_request, minimum_serialized_request) = build_request(minimum_end_ix)?;
+        if minimum_serialized_request.len() > request_byte_budget
+            || maximum_end_ix == minimum_end_ix
+        {
+            return Ok(Some(CompactionPlan {
+                request: minimum_request,
+                serialized_request: minimum_serialized_request,
+                insertion_ix: minimum_end_ix,
+                progress_start_ix,
+                reaches_target: minimum_end_ix == target_ix,
+                retained_user_byte_budget,
+            }));
+        }
+
+        let mut best = (minimum_end_ix, minimum_request, minimum_serialized_request);
+        let mut lower_bound = minimum_end_ix;
+        let mut step = 1;
+        let upper_bound = loop {
+            let candidate_ix = lower_bound.saturating_add(step).min(maximum_end_ix);
+            let (candidate_request, candidate_serialized_request) = build_request(candidate_ix)?;
+            if candidate_serialized_request.len() > request_byte_budget {
+                break candidate_ix;
+            }
+
+            best = (
+                candidate_ix,
+                candidate_request,
+                candidate_serialized_request,
+            );
+            lower_bound = candidate_ix;
+            if candidate_ix == maximum_end_ix {
+                return Ok(Some(CompactionPlan {
+                    request: best.1,
+                    serialized_request: best.2,
+                    insertion_ix: best.0,
+                    progress_start_ix,
+                    reaches_target: best.0 == target_ix,
+                    retained_user_byte_budget,
+                }));
+            }
+            step = step.saturating_mul(2);
+        };
+
+        let mut upper_bound = upper_bound;
+        while lower_bound + 1 < upper_bound {
+            let candidate_ix = lower_bound + (upper_bound - lower_bound) / 2;
+            let (candidate_request, candidate_serialized_request) = build_request(candidate_ix)?;
+            if candidate_serialized_request.len() <= request_byte_budget {
+                lower_bound = candidate_ix;
+                best = (
+                    candidate_ix,
+                    candidate_request,
+                    candidate_serialized_request,
+                );
+            } else {
+                upper_bound = candidate_ix;
+            }
+        }
+
+        Ok(Some(CompactionPlan {
+            request: best.1,
+            serialized_request: best.2,
+            insertion_ix: best.0,
+            progress_start_ix,
+            reaches_target: best.0 == target_ix,
+            retained_user_byte_budget,
+        }))
     }
 
     pub fn to_markdown(&self) -> String {
@@ -4666,14 +4976,72 @@ fn take_text_within_byte_budget(text: String, remaining_bytes: &mut usize) -> Op
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// Describes where a streamed compaction summary should land in the thread
-/// once it completes successfully.
+struct CompactionPlan {
+    request: LanguageModelRequest,
+    serialized_request: Vec<u8>,
+    insertion_ix: usize,
+    progress_start_ix: usize,
+    reaches_target: bool,
+    retained_user_byte_budget: usize,
+}
+
+enum CompactionTarget {
+    End,
+    Before(Arc<Message>),
+}
+
+impl CompactionTarget {
+    fn new(messages: &[Arc<Message>], target_ix: usize) -> Self {
+        messages
+            .get(target_ix)
+            .cloned()
+            .map_or(Self::End, Self::Before)
+    }
+
+    fn resolve(&self, messages: &[Arc<Message>]) -> Result<usize> {
+        match self {
+            Self::End => Ok(messages.len()),
+            Self::Before(target) => messages
+                .iter()
+                .position(|message| Arc::ptr_eq(message, target))
+                .ok_or_else(|| anyhow!("Compaction target is no longer present in the thread")),
+        }
+    }
+}
+
+enum CompactionMode {
+    Auto,
+    Manual { marker_id: ClientUserMessageId },
+}
+
+impl CompactionMode {
+    fn insertion(&self, insertion_ix: usize) -> CompactionInsertion {
+        match self {
+            Self::Auto => CompactionInsertion::Auto { insertion_ix },
+            Self::Manual { marker_id } => CompactionInsertion::Manual {
+                marker_id: marker_id.clone(),
+            },
+        }
+    }
+}
+
 enum CompactionInsertion {
     /// Automatic compaction inserts the summary at an index computed up front
     /// (which may be before a trailing not-yet-answered user message).
     Auto { insertion_ix: usize },
     /// Manual `/compact` appends a zero-content user message followed by the summary.
     Manual { marker_id: ClientUserMessageId },
+}
+
+fn compaction_request_byte_budget(model: &dyn LanguageModel) -> usize {
+    let max_input_tokens = model
+        .max_token_count()
+        .saturating_sub(model.max_output_tokens().unwrap_or_default());
+    let byte_budget = max_input_tokens
+        .saturating_mul(COMPACTION_REQUEST_BYTES_PER_TOKEN)
+        .saturating_mul(COMPACTION_REQUEST_HEADROOM_PERCENT)
+        / 100;
+    usize::try_from(byte_budget).unwrap_or(usize::MAX)
 }
 
 struct RunningTurn {
@@ -4739,6 +5107,7 @@ fn extend_request_history_until(
     messages: &[Arc<Message>],
     request_messages: &mut Vec<LanguageModelRequestMessage>,
     end_ix: usize,
+    retained_user_byte_budget: usize,
 ) {
     let end_ix = end_ix.min(messages.len());
     let Some(compaction_ix) = latest_compaction_message_ix_before(messages, end_ix) else {
@@ -4755,6 +5124,7 @@ fn extend_request_history_until(
         request_messages.extend(retained_user_request_messages_before(
             messages,
             compaction_ix,
+            retained_user_byte_budget,
         ));
     }
 
@@ -4772,8 +5142,9 @@ fn latest_compaction_message_ix_before(messages: &[Arc<Message>], end_ix: usize)
 fn retained_user_request_messages_before(
     messages: &[Arc<Message>],
     compaction_ix: usize,
+    retained_user_byte_budget: usize,
 ) -> Vec<LanguageModelRequestMessage> {
-    let mut remaining_bytes = COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET;
+    let mut remaining_bytes = retained_user_byte_budget;
     let mut retained_messages = Vec::new();
 
     for message in messages[..compaction_ix].iter().rev() {
@@ -4813,7 +5184,12 @@ pub fn build_thread_title_request(
         temperature,
         ..Default::default()
     };
-    extend_request_history_until(messages, &mut request.messages, messages.len());
+    extend_request_history_until(
+        messages,
+        &mut request.messages,
+        messages.len(),
+        COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET,
+    );
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![SUMMARIZE_THREAD_PROMPT.into()],
@@ -4858,10 +5234,10 @@ impl EventEmitter<ModelChanged> for Thread {}
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///
 /// For non-streaming tools, created via `ToolInput::ready()` so `.recv()` resolves immediately.
-/// For streaming tools, partial JSON snapshots arrive via `.recv_partial()` as the LLM streams
-/// them, followed by the final complete input available through `.recv()`.
+/// For streaming tools, the latest partial JSON snapshot arrives via `.next()` as the LLM
+/// streams it, followed by the final complete input available through `.recv()`.
 pub struct ToolInput<T> {
-    rx: mpsc::UnboundedReceiver<ToolInputPayload<serde_json::Value>>,
+    rx: watch::Receiver<Option<ToolInputPayload<serde_json::Value>>>,
     _phantom: PhantomData<T>,
 }
 
@@ -4873,8 +5249,8 @@ impl<T: DeserializeOwned> ToolInput<T> {
     }
 
     pub fn ready(value: serde_json::Value) -> Self {
-        let (tx, rx) = mpsc::unbounded();
-        tx.unbounded_send(ToolInputPayload::Full(value)).ok();
+        let (mut tx, rx) = watch::channel(None);
+        tx.send(Some(ToolInputPayload::Full(value))).ok();
         Self {
             rx,
             _phantom: PhantomData,
@@ -4882,8 +5258,8 @@ impl<T: DeserializeOwned> ToolInput<T> {
     }
 
     pub fn invalid_json(error_message: String) -> Self {
-        let (tx, rx) = mpsc::unbounded();
-        tx.unbounded_send(ToolInputPayload::InvalidJson { error_message })
+        let (mut tx, rx) = watch::channel(None);
+        tx.send(Some(ToolInputPayload::InvalidJson { error_message }))
             .ok();
         Self {
             rx,
@@ -4913,20 +5289,23 @@ impl<T: DeserializeOwned> ToolInput<T> {
     }
 
     pub async fn next(&mut self) -> Result<ToolInputPayload<T>> {
-        let value = self
-            .rx
-            .next()
+        self.rx
+            .changed()
             .await
+            .map_err(|_| anyhow!("tool input was not fully received"))?;
+        let value = self.rx.borrow();
+        let value = value
+            .as_ref()
             .ok_or_else(|| anyhow!("tool input was not fully received"))?;
 
         Ok(match value {
-            ToolInputPayload::Partial(payload) => ToolInputPayload::Partial(payload),
+            ToolInputPayload::Partial(payload) => ToolInputPayload::Partial(payload.clone()),
             ToolInputPayload::Full(payload) => {
-                ToolInputPayload::Full(serde_json::from_value(payload)?)
+                ToolInputPayload::Full(serde_json::from_value(payload.clone())?)
             }
-            ToolInputPayload::InvalidJson { error_message } => {
-                ToolInputPayload::InvalidJson { error_message }
-            }
+            ToolInputPayload::InvalidJson { error_message } => ToolInputPayload::InvalidJson {
+                error_message: error_message.clone(),
+            },
         })
     }
 
@@ -4946,12 +5325,12 @@ pub enum ToolInputPayload<T> {
 
 pub struct ToolInputSender {
     has_received_final: bool,
-    tx: mpsc::UnboundedSender<ToolInputPayload<serde_json::Value>>,
+    tx: watch::Sender<Option<ToolInputPayload<serde_json::Value>>>,
 }
 
 impl ToolInputSender {
     pub(crate) fn channel() -> (Self, ToolInput<serde_json::Value>) {
-        let (tx, rx) = mpsc::unbounded();
+        let (tx, rx) = watch::channel(None);
         let sender = Self {
             tx,
             has_received_final: false,
@@ -4968,20 +5347,20 @@ impl ToolInputSender {
     }
 
     pub fn send_partial(&mut self, payload: serde_json::Value) {
-        self.tx
-            .unbounded_send(ToolInputPayload::Partial(payload))
-            .ok();
+        if !self.has_received_final {
+            self.tx.send(Some(ToolInputPayload::Partial(payload))).ok();
+        }
     }
 
     pub fn send_full(&mut self, payload: serde_json::Value) {
         self.has_received_final = true;
-        self.tx.unbounded_send(ToolInputPayload::Full(payload)).ok();
+        self.tx.send(Some(ToolInputPayload::Full(payload))).ok();
     }
 
     pub fn send_invalid_json(&mut self, error_message: String) {
         self.has_received_final = true;
         self.tx
-            .unbounded_send(ToolInputPayload::InvalidJson { error_message })
+            .send(Some(ToolInputPayload::InvalidJson { error_message }))
             .ok();
     }
 }
@@ -5771,8 +6150,8 @@ impl ToolCallEventStream {
                 };
                 futures::select_biased! {
                     outcome = (&mut response_rx).fuse() => {
-                        let outcome = outcome
-                            .map_err(|_| anyhow!("authorization channel closed"))?;
+                        let outcome = outcome.map_err(|_| anyhow!("authorization channel closed"))?;
+                        ensure_tool_call_authorization_not_interrupted(&outcome)?;
                         return Self::handle_sandbox_permission_outcome(
                             &outcome,
                             &request,
@@ -6062,6 +6441,7 @@ impl ToolCallEventStream {
             let outcome = response_rx
                 .await
                 .map_err(|_| anyhow!("authorization channel closed"))?;
+            ensure_tool_call_authorization_not_interrupted(&outcome)?;
 
             let option_id = outcome.option_id.0.as_ref();
             if option_id == acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID {
@@ -6161,6 +6541,7 @@ impl ToolCallEventStream {
             let outcome = response_rx
                 .await
                 .map_err(|_| anyhow!("authorization channel closed"))?;
+            ensure_tool_call_authorization_not_interrupted(&outcome)?;
             Ok(outcome.option_id)
         })
     }
@@ -6235,6 +6616,7 @@ impl ToolCallEventStream {
                 let outcome = response_rx
                     .await
                     .map_err(|_| anyhow!("authorization channel closed"))?;
+                ensure_tool_call_authorization_not_interrupted(&outcome)?;
 
                 return Self::persist_permission_outcome(&outcome, fs, cx);
             };
@@ -6262,8 +6644,8 @@ impl ToolCallEventStream {
                 };
                 futures::select_biased! {
                     outcome = (&mut response_rx).fuse() => {
-                        let outcome = outcome
-                            .map_err(|_| anyhow!("authorization channel closed"))?;
+                        let outcome = outcome.map_err(|_| anyhow!("authorization channel closed"))?;
+                        ensure_tool_call_authorization_not_interrupted(&outcome)?;
                         return Self::persist_permission_outcome(&outcome, fs.clone(), cx);
                     }
                     _ = settings_changed.fuse() => {
@@ -6586,7 +6968,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use language_model::LanguageModelToolUseId;
-    use language_model::fake_provider::FakeLanguageModel;
+    use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -6594,6 +6976,7 @@ mod tests {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
+            language_model::init(cx);
         });
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
@@ -6628,6 +7011,25 @@ mod tests {
         let mut settings = AgentSettings::get_global(cx).clone();
         settings.auto_compact = auto_compact;
         AgentSettings::override_global(settings, cx);
+    }
+
+    fn set_compaction_model(model: Arc<FakeLanguageModel>, cx: &mut App) {
+        let model: Arc<dyn LanguageModel> = model;
+        let provider = Arc::new(
+            FakeLanguageModelProvider::new(
+                LanguageModelProviderId::from("compaction-test".to_string()),
+                language_model::LanguageModelProviderName::from("Compaction Test".to_string()),
+            )
+            .with_models(vec![model.clone()]),
+        );
+        let registry = LanguageModelRegistry::global(cx);
+        registry.update(cx, |registry, cx| {
+            registry.register_provider(provider.clone(), cx);
+            registry.set_compaction_model(
+                Some(language_model::ConfiguredModel { provider, model }),
+                cx,
+            );
+        });
     }
 
     #[test]
@@ -7157,6 +7559,146 @@ mod tests {
                 assert!(matches!(&*thread.messages[1], Message::Agent(_)));
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_manual_compaction_uses_smaller_configured_model_in_bounded_passes(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let active_model = Arc::new(FakeLanguageModel::default());
+        let compaction_model = Arc::new(FakeLanguageModel::default());
+        compaction_model.set_max_token_count(40_000);
+        let compact_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            set_compaction_model(compaction_model.clone(), cx);
+            thread.update(cx, |thread, cx| {
+                thread.set_model(active_model.clone(), cx);
+                for ix in 0..3 {
+                    thread.messages.push(user_text_message(
+                        ClientUserMessageId::new(),
+                        &format!("user-{ix}-{}", "u".repeat(30_000)),
+                    ));
+                    thread.messages.push(agent_text_message(&format!(
+                        "assistant-{ix}-{}",
+                        "a".repeat(30_000)
+                    )));
+                }
+            });
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.compact(compact_message_id.clone(), cx)
+                })
+            })
+            .unwrap();
+
+        let mut request_count = 0;
+        while !thread.read_with(cx, |thread, _cx| thread.is_turn_complete()) {
+            cx.run_until_parked();
+            let request = compaction_model
+                .pending_completions()
+                .last()
+                .cloned()
+                .expect("expected a bounded compaction request");
+            assert_eq!(
+                request.intent,
+                Some(CompletionIntent::ThreadContextSummarization)
+            );
+            assert!(
+                serde_json::to_vec(&request).unwrap().len()
+                    <= compaction_request_byte_budget(compaction_model.as_ref())
+            );
+
+            request_count += 1;
+            compaction_model.send_completion_stream_text_chunk(
+                &request,
+                format!("bounded summary {request_count}"),
+            );
+            compaction_model.end_completion_stream(&request);
+            cx.run_until_parked();
+            assert!(
+                request_count < 16,
+                "compaction did not make bounded progress"
+            );
+        }
+
+        assert!(request_count > 1);
+        assert!(active_model.pending_completions().is_empty());
+        thread.read_with(cx, |thread, _cx| {
+            assert!(matches!(
+                thread.messages.last().map(|message| &**message),
+                Some(Message::Compaction(CompactionInfo::Summary(_)))
+            ));
+            assert!(matches!(
+                thread.messages.get(thread.messages.len().saturating_sub(2)).map(|message| &**message),
+                Some(Message::User(UserMessage { id, content }))
+                    if id == &compact_message_id && content.is_empty()
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prompt_too_large_replans_without_repeating_request(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                for ix in 0..4 {
+                    thread.messages.push(user_text_message(
+                        ClientUserMessageId::new(),
+                        &format!("user {ix}"),
+                    ));
+                    thread
+                        .messages
+                        .push(agent_text_message(&format!("assistant {ix}")));
+                }
+            });
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.compact(ClientUserMessageId::new(), cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let oversized_request = model.pending_completions().last().cloned().unwrap();
+        model.send_completion_stream_error(
+            &oversized_request,
+            LanguageModelCompletionError::PromptTooLarge { tokens: None },
+        );
+        model.end_completion_stream(&oversized_request);
+        cx.run_until_parked();
+
+        let replanned_request = model.pending_completions().last().cloned().unwrap();
+        assert_ne!(replanned_request, oversized_request);
+        assert!(
+            serde_json::to_vec(&replanned_request).unwrap().len()
+                < serde_json::to_vec(&oversized_request).unwrap().len()
+        );
+
+        let mut successful_passes = 0;
+        while !thread.read_with(cx, |thread, _cx| thread.is_turn_complete()) {
+            let request = model.pending_completions().last().cloned().unwrap();
+            successful_passes += 1;
+            model.send_completion_stream_text_chunk(
+                &request,
+                format!("retry summary {successful_passes}"),
+            );
+            model.end_completion_stream(&request);
+            cx.run_until_parked();
+            assert!(successful_passes < 16, "compaction retry did not converge");
+        }
+
+        assert!(successful_passes > 1);
     }
 
     /// Cancelling an in-flight manual compaction must not leave the zero-content

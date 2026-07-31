@@ -617,6 +617,7 @@ pub struct ThreadView {
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
+    draft_revision: u64,
     _sandbox_status_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
@@ -929,6 +930,28 @@ impl ThreadView {
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
 
+        let draft_provider_id = message_editor.entity_id();
+        thread.update(cx, |thread, _cx| {
+            let message_editor = message_editor.downgrade();
+            thread.register_draft_prompt_snapshot_provider(
+                draft_provider_id,
+                Rc::new(move |cx| {
+                    message_editor
+                        .read_with(cx, |editor, cx| editor.draft_content_blocks_snapshot(cx))
+                        .ok()
+                }),
+            );
+        });
+        let thread_for_release = thread.downgrade();
+        cx.on_release(move |_this, cx| {
+            if let Err(error) = thread_for_release.update(cx, |thread, _cx| {
+                thread.unregister_draft_prompt_snapshot_provider(draft_provider_id);
+            }) {
+                log::debug!("failed to unregister draft snapshot provider: {error:#}");
+            }
+        })
+        .detach();
+
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
                 let resolver = code_span_resolver.clone();
@@ -1026,30 +1049,6 @@ impl ThreadView {
             }
         }
 
-        subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
-            let is_empty = editor.read(cx).text(cx).is_empty();
-            let draft_contents_task = if is_empty {
-                None
-            } else {
-                Some(editor.update(cx, |editor, cx| editor.draft_contents(cx)))
-            };
-            this._draft_resolve_task = Some(cx.spawn(async move |this, cx| {
-                let draft = if let Some(task) = draft_contents_task {
-                    let blocks = task.await.ok().filter(|b| !b.is_empty());
-                    blocks
-                } else {
-                    None
-                };
-                this.update(cx, |this, cx| {
-                    this.thread.update(cx, |thread, cx| {
-                        thread.set_draft_prompt(draft, cx);
-                    });
-                    this.schedule_save(cx);
-                })
-                .ok();
-            }));
-        }));
-
         let is_following_tail = list_state.is_following_tail();
         let user_message_indices = thread
             .read(cx)
@@ -1110,6 +1109,7 @@ impl ThreadView {
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
+            draft_revision: 0,
             _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
             in_flight_prompt: None,
@@ -1193,6 +1193,70 @@ impl ThreadView {
         }));
     }
 
+    fn request_save_now(&self, cx: &mut Context<Self>) {
+        if let Some(thread) = self.as_native_thread(cx) {
+            thread.update(cx, |_thread, cx| cx.notify());
+        }
+    }
+
+    fn schedule_draft_sync(&mut self, cx: &mut Context<Self>) {
+        let provider_id = self.message_editor.entity_id();
+        self.thread.update(cx, |thread, _cx| {
+            thread.activate_draft_prompt_snapshot_provider(provider_id);
+        });
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        let revision = self.draft_revision;
+        self._draft_resolve_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SERIALIZATION_THROTTLE_TIME)
+                .await;
+
+            let draft_task = this
+                .update(cx, |this, cx| {
+                    if this.draft_revision != revision {
+                        return None;
+                    }
+                    Some(
+                        this.message_editor
+                            .update(cx, |editor, cx| editor.draft_contents(cx)),
+                    )
+                })
+                .ok()
+                .flatten();
+            let Some(draft_task) = draft_task else {
+                return;
+            };
+
+            let draft = match draft_task.await {
+                Ok(draft) => draft,
+                Err(error) => {
+                    log::warn!("failed to resolve agent draft prompt: {error:#}");
+                    return;
+                }
+            };
+
+            this.update(cx, |this, cx| {
+                if this.draft_revision != revision {
+                    return;
+                }
+                this.thread.update(cx, |thread, cx| {
+                    thread.set_draft_prompt((!draft.is_empty()).then_some(draft), cx);
+                });
+                this.request_save_now(cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn clear_draft_after_editor_clear(&mut self, cx: &mut Context<Self>) {
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        self._draft_resolve_task = None;
+        self.thread.update(cx, |thread, cx| {
+            thread.set_draft_prompt(None, cx);
+        });
+        self.request_save_now(cx);
+    }
+
     pub fn handle_message_editor_event(
         &mut self,
         _editor: &Entity<MessageEditor>,
@@ -1238,7 +1302,7 @@ impl ThreadView {
                 self.run_local_command(*command, window, cx);
             }
             MessageEditorEvent::InputAttempted { .. } => {}
-            MessageEditorEvent::Edited => {}
+            MessageEditorEvent::Edited => self.schedule_draft_sync(cx),
         }
     }
 
@@ -1621,6 +1685,7 @@ impl ThreadView {
                     .any(|available_command| available_command.name == "logout");
             if can_login && !logout_supported {
                 message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+                self.clear_draft_after_editor_clear(cx);
                 self.clear_external_source_prompt_warning(cx);
 
                 let connection = self.thread.read(cx).connection().clone();
@@ -1682,6 +1747,9 @@ impl ThreadView {
                     message_editor.clear(window, cx);
                 });
             })?;
+            this.update(cx, |this, cx| {
+                this.clear_draft_after_editor_clear(cx);
+            })?;
 
             // Strip the leading `/command` from the first text block; whatever
             // remains (including any later mention blocks) becomes the queued
@@ -1740,18 +1808,21 @@ impl ThreadView {
                 .ok();
         }
 
-        let contents_task = cx.spawn_in(window, async move |_this, cx| {
+        let contents_task = cx.spawn_in(window, async move |this, cx| {
             let (contents, tracked_buffers) = contents.await?;
 
             if contents.is_empty() {
                 return Ok(None);
             }
 
-            let _ = cx.update(|window, cx| {
+            cx.update(|window, cx| {
                 message_editor.update(cx, |message_editor, cx| {
                     message_editor.clear(window, cx);
                 });
-            });
+            })?;
+            this.update(cx, |this, cx| {
+                this.clear_draft_after_editor_clear(cx);
+            })?;
 
             Ok(Some((contents, tracked_buffers)))
         });
@@ -2131,37 +2202,10 @@ impl ThreadView {
         };
 
         cx.spawn_in(window, async move |this, cx| {
-            // Check if there are any edits from prompts before the one being regenerated.
-            //
-            // If there are, we keep/accept them since we're not regenerating the prompt that created them.
-            //
-            // If editing the prompt that generated the edits, they are auto-rejected
-            // through the `rewind` function in the `acp_thread`.
-            //
-            // Subagent edits never show up as diffs in the parent thread's entries (they
-            // are only forwarded to the parent's action log), so treat any earlier
-            // subagent tool call as potentially having edits. Keeping all edits is a
-            // no-op when the subagent didn't make any.
-            let has_earlier_edits = thread.read_with(cx, |thread, _| {
-                thread.entries().iter().take(entry_ix).any(|entry| {
-                    entry.diffs().next().is_some()
-                        || matches!(
-                            entry,
-                            AgentThreadEntry::ToolCall(tool_call) if tool_call.is_subagent()
-                        )
-                })
-            });
-
-            if has_earlier_edits {
-                thread.update(cx, |thread, cx| {
-                    thread.action_log().update(cx, |action_log, cx| {
-                        action_log.keep_all_edits(None, cx);
-                    });
-                });
-            }
-
             thread
-                .update(cx, |thread, cx| thread.rewind(client_id, cx))
+                .update(cx, |thread, cx| {
+                    thread.rewind_preserving_edits(client_id, cx)
+                })
                 .await?;
             this.update_in(cx, |thread, window, cx| {
                 cx.emit(AcpThreadViewEvent::Interacted);
@@ -2202,6 +2246,7 @@ impl ThreadView {
                 message_editor.update(cx, |message_editor, cx| {
                     message_editor.clear(window, cx);
                 });
+                this.clear_draft_after_editor_clear(cx);
                 cx.notify();
             })?;
             Ok(())
@@ -8019,10 +8064,11 @@ impl ThreadView {
         let command_text = command_source
             .strip_prefix("```\n")
             .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source)
+            .unwrap_or(command_source)
             .to_string();
 
-        let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx);
+        let mut style =
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
         style.container_style.text.font_size = Some(rems_from_px(12.).into());
         style.container_style.text.line_height = Some(rems_from_px(17.).into());
         style.height_is_multiple_of_line_height = true;
@@ -8848,8 +8894,11 @@ impl ThreadView {
                                                                     let base_text = diff_data
                                                                         .base_text()
                                                                         .clone();
-                                                                    let buffer =
-                                                                        diff_data.buffer().clone();
+                                                                    let Some(buffer) =
+                                                                        diff_data.buffer()
+                                                                    else {
+                                                                        return;
+                                                                    };
                                                                     buffer.update(
                                                                         cx,
                                                                         |buffer, cx| {

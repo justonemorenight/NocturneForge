@@ -6,8 +6,8 @@ use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use editor::{
-    Anchor, Editor, EditorSnapshot, FoldPlaceholder, ToOffset,
-    display_map::{Crease, CreaseId, CreaseMetadata, FoldId},
+    Anchor, Editor, EditorSnapshot, FoldPlaceholder, MultiBufferSnapshot, ToOffset,
+    display_map::{Crease, CreaseId, CreaseMetadata, CreaseSnapshot, FoldId},
     scroll::Autoscroll,
 };
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
@@ -102,8 +102,16 @@ impl MentionSet {
     }
 
     pub fn remove_invalid(&mut self, snapshot: &EditorSnapshot) {
-        for (crease_id, crease) in snapshot.crease_snapshot.creases() {
-            if !crease.range().start.is_valid(snapshot.buffer_snapshot()) {
+        self.remove_invalid_from_snapshots(&snapshot.crease_snapshot, snapshot.buffer_snapshot());
+    }
+
+    pub fn remove_invalid_from_snapshots(
+        &mut self,
+        crease_snapshot: &CreaseSnapshot,
+        buffer_snapshot: &MultiBufferSnapshot,
+    ) {
+        for (crease_id, crease) in crease_snapshot.creases() {
+            if !crease.range().start.is_valid(buffer_snapshot) {
                 self.mentions.remove(&crease_id);
                 self.crease_entities.remove(&crease_id);
             }

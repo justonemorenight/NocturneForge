@@ -59,12 +59,12 @@ pub fn split_local_url_fragment(url: &str) -> (&str, Option<&str>) {
 
 pub fn source_position_from_fragment(fragment: &str) -> Option<(u32, u32)> {
     let fragment = fragment.strip_prefix('L').unwrap_or(fragment);
-    let (line, column) = match fragment.split_once([',', ':']) {
+    let fragment = fragment
+        .split_once('-')
+        .map_or(fragment, |(start, _)| start);
+    let (line, column) = match fragment.split_once([',', ':', 'C']) {
         Some((line, column)) => (line, Some(column)),
-        None => (
-            fragment.split_once('-').map_or(fragment, |(line, _)| line),
-            None,
-        ),
+        None => (fragment, None),
     };
     let line = line.parse::<u32>().ok()?.checked_sub(1)?;
     let column = column

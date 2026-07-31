@@ -66,9 +66,13 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use util::ResultExt;
 use util::path_list::PathList;
 use util::rel_path::RelPath;
+
+const THREAD_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const THREAD_SAVE_MAX_LATENCY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSnapshot {
@@ -207,6 +211,9 @@ struct Session {
     acp_thread: Entity<acp_thread::AcpThread>,
     project_id: EntityId,
     pending_save: Task<Result<()>>,
+    scheduled_save: Task<()>,
+    save_generation: u64,
+    save_window_started_at: Option<Instant>,
     _subscriptions: Vec<Subscription>,
     ref_count: usize,
 }
@@ -818,7 +825,7 @@ impl NativeAgent {
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
-                this.save_thread(thread, cx)
+                this.schedule_thread_save(thread, cx)
             }),
         ];
 
@@ -830,6 +837,9 @@ impl NativeAgent {
                 project_id,
                 _subscriptions: subscriptions,
                 pending_save: Task::ready(Ok(())),
+                scheduled_save: Task::ready(()),
+                save_generation: 0,
+                save_window_started_at: None,
                 ref_count,
             },
         );
@@ -1718,7 +1728,7 @@ impl NativeAgent {
         }
 
         let thread = session.thread.clone();
-        self.save_thread(thread, cx);
+        self.save_thread(thread, true, cx);
         let Some(session) = self.sessions.remove(session_id) else {
             return Task::ready(Ok(()));
         };
@@ -1733,12 +1743,54 @@ impl NativeAgent {
         session.pending_save
     }
 
-    fn save_thread(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
+    fn schedule_thread_save(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
+        let id = thread.read(cx).id().clone();
+        let now = cx.background_executor().now();
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+
+        let window_started_at = session.save_window_started_at.get_or_insert(now);
+        let max_latency_remaining =
+            THREAD_SAVE_MAX_LATENCY.saturating_sub(now.duration_since(*window_started_at));
+        let delay = THREAD_SAVE_DEBOUNCE.min(max_latency_remaining);
+        session.save_generation = session.save_generation.wrapping_add(1);
+        let generation = session.save_generation;
+        let save_id = id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                let should_save = this.sessions.get_mut(&save_id).is_some_and(|session| {
+                    if session.save_generation != generation {
+                        return false;
+                    }
+                    session.save_window_started_at = None;
+                    true
+                });
+                if should_save {
+                    this.save_thread(thread, false, cx);
+                }
+            })
+            .ok();
+        });
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.scheduled_save = task;
+        }
+    }
+
+    fn save_thread(
+        &mut self,
+        thread: Entity<Thread>,
+        capture_live_draft: bool,
+        cx: &mut Context<Self>,
+    ) {
         let id = thread.read(cx).id().clone();
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let Some((id, folder_paths, db_thread)) = self.thread_save_payload(session, cx) else {
+        let Some((id, folder_paths, db_thread)) =
+            self.thread_save_payload(session, capture_live_draft, cx)
+        else {
             return;
         };
 
@@ -1767,6 +1819,7 @@ impl NativeAgent {
     fn thread_save_payload(
         &self,
         session: &Session,
+        capture_live_draft: bool,
         cx: &mut App,
     ) -> Option<(acp::SessionId, PathList, Task<DbThread>)> {
         if session.thread.read(cx).is_empty() {
@@ -1781,7 +1834,11 @@ impl NativeAgent {
                 .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                 .collect::<Vec<_>>(),
         );
-        let draft_prompt = session.acp_thread.read(cx).draft_prompt().map(Vec::from);
+        let draft_prompt = if capture_live_draft {
+            session.acp_thread.read(cx).draft_prompt_snapshot(cx)
+        } else {
+            session.acp_thread.read(cx).draft_prompt().map(Vec::from)
+        };
         let id = session.thread.read(cx).id().clone();
         let db_thread = session.thread.update(cx, |thread, cx| {
             thread.set_draft_prompt(draft_prompt);
@@ -1800,7 +1857,7 @@ impl NativeAgent {
 
         let mut saves = Vec::new();
         for session in self.sessions.values() {
-            saves.extend(self.thread_save_payload(session, cx));
+            saves.extend(self.thread_save_payload(session, true, cx));
         }
 
         async move {
@@ -2208,16 +2265,22 @@ impl NativeAgentConnection {
                                     )
                                 })??;
                                 cx.background_spawn(async move {
-                                    if let acp_thread::RequestPermissionOutcome::Selected(outcome) =
-                                        outcome_task.await
-                                    {
-                                        response
-                                            .send(outcome)
-                                            .map_err(|_| {
-                                                anyhow!("authorization receiver was dropped")
-                                            })
-                                            .log_err();
-                                    }
+                                    let outcome = match outcome_task.await {
+                                        acp_thread::RequestPermissionOutcome::Selected(outcome) => outcome,
+                                        acp_thread::RequestPermissionOutcome::InterruptedByFollowUp => {
+                                            acp_thread::SelectedPermissionOutcome::new(
+                                                acp::PermissionOptionId::new(
+                                                    FOLLOW_UP_PERMISSION_DENIED_OPTION_ID,
+                                                ),
+                                                acp::PermissionOptionKind::RejectOnce,
+                                            )
+                                        }
+                                        acp_thread::RequestPermissionOutcome::Cancelled => return,
+                                    };
+                                    response
+                                        .send(outcome)
+                                        .map_err(|_| anyhow!("authorization receiver was dropped"))
+                                        .log_err();
                                 })
                                 .detach();
                             }

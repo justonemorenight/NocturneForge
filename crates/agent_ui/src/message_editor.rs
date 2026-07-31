@@ -14,7 +14,7 @@ use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
     Addon, Anchor, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent,
     EditorMode, EditorStyle, FoldPlaceholder, Inlay, MultiBuffer, MultiBufferOffset,
@@ -726,7 +726,7 @@ impl MessageEditor {
         let mut subscriptions = Vec::new();
 
         subscriptions.push(cx.subscribe_in(&editor, window, {
-            move |this, editor, event, window, cx| {
+            move |this, editor, event, _window, cx| {
                 let input_attempted_text = match event {
                     EditorEvent::InputHandled { text, .. } => Some(text),
                     EditorEvent::InputIgnored { text } => Some(text),
@@ -752,18 +752,9 @@ impl MessageEditor {
                 {
                     cx.emit(MessageEditorEvent::Edited);
                     editor.update(cx, |editor, cx| {
-                        let snapshot = editor.snapshot(window, cx);
-                        this.mention_set
-                            .update(cx, |mention_set, _cx| mention_set.remove_invalid(&snapshot));
-                        this.pasted_texts.retain(|crease_id, _| {
-                            snapshot.crease_snapshot.creases().any(|(id, crease)| {
-                                id == *crease_id
-                                    && crease.range().start.is_valid(snapshot.buffer_snapshot())
-                            })
-                        });
-
+                        let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
                         let new_hints = this
-                            .command_hint(snapshot.buffer())
+                            .command_hint(&buffer_snapshot)
                             .into_iter()
                             .collect::<Vec<_>>();
                         let has_new_hint = !new_hints.is_empty();
@@ -833,7 +824,39 @@ impl MessageEditor {
             return None;
         }
 
-        let parsed_command = SlashCommandCompletion::try_parse(&snapshot.text(), 0)?;
+        let end = snapshot.len();
+        let max_candidate_bytes = available_commands
+            .iter()
+            .map(|command| command.name.len().saturating_add(1))
+            .max()?;
+        let mut candidate_start = end.0;
+        let mut candidate_end = end.0;
+        let mut found_non_whitespace = false;
+        for character in snapshot.reversed_chars_at(end) {
+            if character.is_whitespace() && found_non_whitespace {
+                break;
+            }
+            if !character.is_whitespace() {
+                found_non_whitespace = true;
+            }
+            candidate_start = candidate_start.saturating_sub(character.len_utf8());
+            if !found_non_whitespace {
+                candidate_end = candidate_start;
+            } else if candidate_end.saturating_sub(candidate_start) > max_candidate_bytes {
+                return None;
+            }
+        }
+
+        if !found_non_whitespace
+            || snapshot.chars_at(MultiBufferOffset(candidate_start)).next() != Some('/')
+        {
+            return None;
+        }
+
+        let candidate = snapshot
+            .text_for_range(MultiBufferOffset(candidate_start)..MultiBufferOffset(candidate_end))
+            .collect::<String>();
+        let parsed_command = SlashCommandCompletion::try_parse(&candidate, candidate_start)?;
         if parsed_command.argument.is_some() {
             return None;
         }
@@ -1227,10 +1250,11 @@ impl MessageEditor {
     }
 
     pub fn contents(
-        &self,
+        &mut self,
         full_mention_content: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
+        self.prune_invalid_contexts(cx);
         let text = self.editor.read(cx).text(cx);
         let (available_commands, available_skills) = {
             let session_capabilities = self.session_capabilities.read();
@@ -1253,7 +1277,11 @@ impl MessageEditor {
         })
     }
 
-    pub fn draft_contents(&self, cx: &mut Context<Self>) -> Task<Result<Vec<acp::ContentBlock>>> {
+    pub fn draft_contents(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<acp::ContentBlock>>> {
+        self.prune_invalid_contexts(cx);
         let build_task = self.build_content_blocks(false, cx);
         cx.spawn(async move |_, _cx| {
             let (blocks, _tracked_buffers) = build_task.await?;
@@ -1297,6 +1325,28 @@ impl MessageEditor {
                 )
             }))
         })
+    }
+
+    fn prune_invalid_contexts(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self
+            .editor
+            .update(cx, |editor, cx| editor.display_snapshot(cx));
+        let crease_snapshot = &snapshot.crease_snapshot;
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        self.mention_set.update(cx, |mention_set, _cx| {
+            mention_set.remove_invalid_from_snapshots(crease_snapshot, buffer_snapshot)
+        });
+
+        if !self.pasted_texts.is_empty() {
+            let valid_crease_ids = crease_snapshot
+                .creases()
+                .filter_map(|(id, crease)| {
+                    crease.range().start.is_valid(buffer_snapshot).then_some(id)
+                })
+                .collect::<HashSet<_>>();
+            self.pasted_texts
+                .retain(|crease_id, _| valid_crease_ids.contains(crease_id));
+        }
     }
 
     /// Snapshots the editor's current draft into a list of `ContentBlock`s
@@ -2433,7 +2483,7 @@ impl Render for MessageEditor {
 
                 let text_style = TextStyle {
                     color: cx.theme().colors().text,
-                    font_family: settings.buffer_font.family.clone(),
+                    font_family: settings.agent_buffer_font_family().clone(),
                     font_fallbacks: settings.buffer_font.fallbacks.clone(),
                     font_features: settings.buffer_font.features.clone(),
                     font_size: settings.agent_buffer_font_size(cx).into(),

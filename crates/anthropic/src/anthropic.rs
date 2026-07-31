@@ -647,6 +647,10 @@ pub enum RequestContent {
     #[serde(rename = "compaction")]
     Compaction {
         content: Option<Arc<str>>,
+        /// Opaque metadata from a prior compaction that must be round-tripped
+        /// verbatim for Anthropic to recognize the block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<Arc<str>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -682,7 +686,11 @@ pub enum ResponseContent {
         input: serde_json::Value,
     },
     #[serde(rename = "compaction")]
-    Compaction { content: Option<Arc<str>> },
+    Compaction {
+        content: Option<Arc<str>>,
+        #[serde(default)]
+        encrypted_content: Option<Arc<str>>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -935,7 +943,11 @@ pub enum ContentDelta {
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
     #[serde(rename = "compaction_delta")]
-    CompactionDelta { content: Option<Arc<str>> },
+    CompactionDelta {
+        content: Option<Arc<str>>,
+        #[serde(default)]
+        encrypted_content: Option<Arc<str>>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

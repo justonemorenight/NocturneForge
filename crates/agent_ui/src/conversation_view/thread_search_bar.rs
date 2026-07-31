@@ -45,6 +45,7 @@ actions!(
 /// chunk. Query edits are handled immediately instead (see the query editor
 /// subscription in `ThreadSearchBar::new`).
 pub(super) const SEARCH_UPDATE_DEBOUNCE: Duration = Duration::from_millis(150);
+const MAX_THREAD_SEARCH_MATCHES: usize = 10_000;
 
 /// Search hits can be painted on either markdown or past-message editors.
 #[derive(Clone)]
@@ -385,7 +386,7 @@ impl ThreadSearchBar {
                     )
                     .then_some(ThreadSearchRole::Assistant);
                     for markdown in collect_markdowns(entry_ix, entry, &entry_view_state, cx) {
-                        let source = markdown.read(cx).source().clone();
+                        let source = markdown.read(cx).source_snapshot();
                         targets.push(SearchTarget::Markdown {
                             entry_ix,
                             role,
@@ -406,9 +407,10 @@ impl ThreadSearchBar {
         self._search_task = Some(cx.spawn_in(window, async move |this, cx| {
             let scanned = cx
                 .background_spawn(async move {
-                    targets
-                        .into_iter()
-                        .filter_map(|target| match target {
+                    let mut scanned = Vec::new();
+                    let mut remaining = MAX_THREAD_SEARCH_MATCHES;
+                    for target in targets {
+                        let scanned_target = match target {
                             SearchTarget::Editor {
                                 entry_ix,
                                 role,
@@ -416,9 +418,9 @@ impl ThreadSearchBar {
                                 snapshot,
                             } => {
                                 let source = snapshot.text();
-                                let ranges = query.search_str(&source);
+                                let ranges = query.search_str_with_limit(&source, remaining);
                                 if ranges.is_empty() {
-                                    return None;
+                                    continue;
                                 }
                                 let fingerprints = should_fingerprint.then(|| {
                                     ranges
@@ -435,14 +437,14 @@ impl ThreadSearchBar {
                                             ..snapshot.anchor_after(MultiBufferOffset(range.end))
                                     })
                                     .collect();
-                                Some(ScannedTarget::Editor {
+                                ScannedTarget::Editor {
                                     entry_ix,
                                     role,
                                     editor,
                                     ranges,
                                     fingerprints,
                                     anchor_ranges,
-                                })
+                                }
                             }
                             SearchTarget::Markdown {
                                 entry_ix,
@@ -450,9 +452,9 @@ impl ThreadSearchBar {
                                 markdown,
                                 source,
                             } => {
-                                let ranges = query.search_str(&source);
+                                let ranges = query.search_str_with_limit(&source, remaining);
                                 if ranges.is_empty() {
-                                    return None;
+                                    continue;
                                 }
                                 let fingerprints = should_fingerprint.then(|| {
                                     ranges
@@ -462,16 +464,25 @@ impl ThreadSearchBar {
                                         })
                                         .collect()
                                 });
-                                Some(ScannedTarget::Markdown {
+                                ScannedTarget::Markdown {
                                     entry_ix,
                                     role,
                                     markdown,
                                     ranges,
                                     fingerprints,
-                                })
+                                }
                             }
-                        })
-                        .collect::<Vec<_>>()
+                        };
+                        remaining = remaining.saturating_sub(match &scanned_target {
+                            ScannedTarget::Editor { ranges, .. }
+                            | ScannedTarget::Markdown { ranges, .. } => ranges.len(),
+                        });
+                        scanned.push(scanned_target);
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    scanned
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {

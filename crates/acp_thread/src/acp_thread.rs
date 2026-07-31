@@ -12,8 +12,8 @@ pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    WeakEntity,
+    AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, SharedString, Subscription,
+    Task, WeakEntity,
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
@@ -1218,16 +1218,18 @@ impl From<SelectedPermissionOutcome> for acp::SelectedPermissionOutcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RequestPermissionOutcome {
     Cancelled,
+    InterruptedByFollowUp,
     Selected(SelectedPermissionOutcome),
 }
 
 impl From<RequestPermissionOutcome> for acp::RequestPermissionOutcome {
     fn from(value: RequestPermissionOutcome) -> Self {
         match value {
-            RequestPermissionOutcome::Cancelled => Self::Cancelled,
+            RequestPermissionOutcome::Cancelled
+            | RequestPermissionOutcome::InterruptedByFollowUp => Self::Cancelled,
             RequestPermissionOutcome::Selected(outcome) => Self::Selected(outcome.into()),
         }
     }
@@ -1258,7 +1260,7 @@ pub enum ToolCallStatus {
     WaitingForConfirmation {
         current_status: acp::ToolCallStatus,
         options: PermissionOptions,
-        respond_tx: oneshot::Sender<SelectedPermissionOutcome>,
+        respond_tx: oneshot::Sender<RequestPermissionOutcome>,
         kind: AuthorizationKind,
     },
     /// The tool call is currently running.
@@ -1463,8 +1465,7 @@ impl ContentBlock {
         };
         let new_content = &text_content.text;
         markdown.update(cx, |markdown, cx| {
-            let current = markdown.source().to_string();
-            match new_content.strip_prefix(&current) {
+            match new_content.strip_prefix(markdown.source()) {
                 Some("") => {}
                 Some(suffix) => markdown.append(suffix, cx),
                 None => markdown.reset(new_content.clone().into(), cx),
@@ -2075,6 +2076,10 @@ struct RunningTurn {
     send_task: Task<()>,
 }
 
+/// Supplies the editor's authoritative draft at lifecycle boundaries where the
+/// debounced `draft_prompt` cache may not have caught up yet.
+pub type DraftPromptSnapshotProvider = Rc<dyn Fn(&App) -> Option<Vec<acp::ContentBlock>>>;
+
 pub struct AcpThread {
     session_id: acp::SessionId,
     work_dirs: Option<PathList>,
@@ -2103,6 +2108,9 @@ pub struct AcpThread {
     had_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
+    /// Kept separate from `draft_prompt` so typing never has to rebuild rich content eagerly.
+    draft_prompt_snapshot_providers: HashMap<EntityId, DraftPromptSnapshotProvider>,
+    active_draft_prompt_snapshot_provider: Option<EntityId>,
     /// The initial scroll position for the thread view, set during session registration.
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Buffer for smooth text streaming. Holds text that has been received from
@@ -2115,12 +2123,20 @@ pub struct AcpThread {
 struct StreamingTextBuffer {
     /// Text received from the model but not yet appended to the Markdown source.
     pending: String,
+    /// Byte offset of the first byte that has not yet been revealed.
+    revealed_bytes: usize,
     /// The number of bytes to reveal per timer turn.
     bytes_to_reveal_per_tick: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
+}
+
+#[derive(Clone, Copy)]
+enum RewindEditPolicy {
+    RejectPending,
+    PreservePending,
 }
 
 impl StreamingTextBuffer {
@@ -2315,6 +2331,8 @@ impl AcpThread {
             pending_terminal_exit: HashMap::default(),
             had_error: false,
             draft_prompt: None,
+            draft_prompt_snapshot_providers: HashMap::new(),
+            active_draft_prompt_snapshot_provider: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
         }
@@ -2338,6 +2356,44 @@ impl AcpThread {
 
     pub fn draft_prompt(&self) -> Option<&[acp::ContentBlock]> {
         self.draft_prompt.as_deref()
+    }
+
+    pub fn draft_prompt_snapshot(&self, cx: &App) -> Option<Vec<acp::ContentBlock>> {
+        if let Some(provider_id) = self.active_draft_prompt_snapshot_provider
+            && let Some(provider) = self.draft_prompt_snapshot_providers.get(&provider_id)
+            && let Some(snapshot) = provider(cx)
+        {
+            return (!snapshot.is_empty()).then_some(snapshot);
+        }
+
+        self.draft_prompt.clone()
+    }
+
+    pub fn register_draft_prompt_snapshot_provider(
+        &mut self,
+        provider_id: EntityId,
+        provider: DraftPromptSnapshotProvider,
+    ) {
+        self.draft_prompt_snapshot_providers
+            .insert(provider_id, provider);
+        self.active_draft_prompt_snapshot_provider = Some(provider_id);
+    }
+
+    pub fn activate_draft_prompt_snapshot_provider(&mut self, provider_id: EntityId) {
+        if self
+            .draft_prompt_snapshot_providers
+            .contains_key(&provider_id)
+        {
+            self.active_draft_prompt_snapshot_provider = Some(provider_id);
+        }
+    }
+
+    pub fn unregister_draft_prompt_snapshot_provider(&mut self, provider_id: EntityId) {
+        self.draft_prompt_snapshot_providers.remove(&provider_id);
+        if self.active_draft_prompt_snapshot_provider == Some(provider_id) {
+            self.active_draft_prompt_snapshot_provider =
+                self.draft_prompt_snapshot_providers.keys().next().copied();
+        }
     }
 
     pub fn set_draft_prompt(
@@ -2906,7 +2962,8 @@ impl AcpThread {
             if buffer.target.entity_id() == markdown.entity_id() {
                 buffer.pending.push_str(&text);
 
-                buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
+                let remaining = buffer.pending.len().saturating_sub(buffer.revealed_bytes);
+                buffer.bytes_to_reveal_per_tick = (remaining as f32
                     / StreamingTextBuffer::REVEAL_TARGET
                     * StreamingTextBuffer::TASK_UPDATE_MS as f32)
                     .ceil() as usize;
@@ -2923,6 +2980,7 @@ impl AcpThread {
             .ceil() as usize;
         self.streaming_text_buffer = Some(StreamingTextBuffer {
             pending: text,
+            revealed_bytes: 0,
             bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
             _reveal_task,
@@ -2935,10 +2993,10 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) {
         if let Some(buffer) = streaming_text_buffer.take() {
-            if !buffer.pending.is_empty() {
-                buffer
-                    .target
-                    .update(cx, |markdown, cx| markdown.append(&buffer.pending, cx));
+            if buffer.revealed_bytes < buffer.pending.len() {
+                buffer.target.update(cx, |markdown, cx| {
+                    markdown.append(&buffer.pending[buffer.revealed_bytes..], cx)
+                });
             }
         }
     }
@@ -2959,21 +3017,24 @@ impl AcpThread {
                             return false;
                         };
 
-                        if buffer.pending.is_empty() {
+                        if buffer.revealed_bytes == buffer.pending.len() {
+                            buffer.pending.clear();
+                            buffer.revealed_bytes = 0;
                             return true;
                         }
 
-                        let pending_len = buffer.pending.len();
+                        let remaining = &buffer.pending[buffer.revealed_bytes..];
 
-                        let byte_boundary = buffer
-                            .pending
+                        let byte_count = remaining
                             .ceil_char_boundary(buffer.bytes_to_reveal_per_tick)
-                            .min(pending_len);
+                            .min(remaining.len());
+                        let byte_boundary = buffer.revealed_bytes + byte_count;
 
                         buffer.target.update(cx, |markdown: &mut Markdown, cx| {
-                            markdown.append(&buffer.pending[..byte_boundary], cx);
-                            buffer.pending.drain(..byte_boundary);
+                            markdown
+                                .append(&buffer.pending[buffer.revealed_bytes..byte_boundary], cx);
                         });
+                        buffer.revealed_bytes = byte_boundary;
 
                         true
                     })
@@ -3400,10 +3461,7 @@ impl AcpThread {
         ));
 
         Ok(cx.spawn(async move |this, cx| {
-            let outcome = match rx.await {
-                Ok(outcome) => RequestPermissionOutcome::Selected(outcome),
-                Err(oneshot::Canceled) => RequestPermissionOutcome::Cancelled,
-            };
+            let outcome = rx.await.unwrap_or(RequestPermissionOutcome::Cancelled);
             this.update(cx, |_this, cx| {
                 cx.emit(AcpThreadEvent::ToolAuthorizationReceived(tool_call_id))
             })
@@ -3464,7 +3522,9 @@ impl AcpThread {
         let curr_status = mem::replace(&mut call.status, new_status);
 
         if let ToolCallStatus::WaitingForConfirmation { respond_tx, .. } = curr_status {
-            respond_tx.send(outcome).ok();
+            respond_tx
+                .send(RequestPermissionOutcome::Selected(outcome))
+                .ok();
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
@@ -3733,7 +3793,7 @@ impl AcpThread {
         self.had_error = false;
 
         let (tx, rx) = oneshot::channel();
-        let cancel_task = self.cancel(cx);
+        let cancel_task = self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx);
 
         self.turn_id += 1;
         let turn_id = self.turn_id;
@@ -3892,13 +3952,21 @@ impl AcpThread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.cancel_inner(RequestPermissionOutcome::Cancelled, cx)
+    }
+
+    fn cancel_inner(
+        &mut self,
+        permission_outcome: RequestPermissionOutcome,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.cancel_outstanding_elicitations(cx);
 
         let Some(turn) = self.running_turn.take() else {
             return Task::ready(());
         };
-        self.mark_pending_entries_as_canceled(cx);
+        self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.connection.cancel(&self.session_id, cx);
         cx.emit(AcpThreadEvent::StatusChanged);
 
@@ -3907,11 +3975,15 @@ impl AcpThread {
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
-        self.mark_pending_entries_as_canceled(cx);
+        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, cx);
         self.cancel_outstanding_elicitations(cx);
     }
 
-    fn mark_pending_entries_as_canceled(&mut self, cx: &mut Context<Self>) {
+    fn mark_pending_entries_as_canceled(
+        &mut self,
+        permission_outcome: RequestPermissionOutcome,
+        cx: &mut Context<Self>,
+    ) {
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
@@ -3922,7 +3994,16 @@ impl AcpThread {
                             | ToolCallStatus::InProgress
                     );
                     if cancel {
-                        call.status = ToolCallStatus::Canceled;
+                        let previous_status =
+                            mem::replace(&mut call.status, ToolCallStatus::Canceled);
+                        if let ToolCallStatus::WaitingForConfirmation { respond_tx, .. } =
+                            previous_status
+                            && respond_tx.send(permission_outcome.clone()).is_err()
+                        {
+                            log::debug!(
+                                "Permission request closed before cancellation was delivered"
+                            );
+                        }
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
                     }
                 }
@@ -3992,6 +4073,27 @@ impl AcpThread {
         client_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.rewind_with_edit_policy(client_id, RewindEditPolicy::RejectPending, cx)
+    }
+
+    /// Rewinds the conversation without resolving edits that are still awaiting review.
+    ///
+    /// This is used when editing or regenerating a message: changing conversation history
+    /// must not silently accept or reject unrelated working-tree changes.
+    pub fn rewind_preserving_edits(
+        &mut self,
+        client_id: ClientUserMessageId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.rewind_with_edit_policy(client_id, RewindEditPolicy::PreservePending, cx)
+    }
+
+    fn rewind_with_edit_policy(
+        &mut self,
+        client_id: ClientUserMessageId,
+        edit_policy: RewindEditPolicy,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let Some(truncate) = self.connection.truncate(&self.session_id, cx) else {
             return Task::ready(Err(anyhow!("not supported")));
         };
@@ -4000,7 +4102,7 @@ impl AcpThread {
         let telemetry = ActionLogTelemetry::from(&*self);
         cx.spawn(async move |this, cx| {
             cx.update(|cx| truncate.run(client_id.clone(), cx)).await?;
-            this.update(cx, |this, cx| {
+            let reject_edits = this.update(cx, |this, cx| {
                 if let Some((ix, _)) = this.user_message_mut(&client_id) {
                     // Collect all terminals from entries that will be removed
                     let terminals_to_remove: Vec<acp::TerminalId> = this.entries[ix..]
@@ -4022,11 +4124,18 @@ impl AcpThread {
                         }
                     }
                 }
-                this.action_log().update(cx, |action_log, cx| {
-                    action_log.reject_all_edits(Some(telemetry), cx)
-                })
-            })?
-            .await;
+                match edit_policy {
+                    RewindEditPolicy::RejectPending => {
+                        Some(this.action_log().update(cx, |action_log, cx| {
+                            action_log.reject_all_edits(Some(telemetry), cx)
+                        }))
+                    }
+                    RewindEditPolicy::PreservePending => None,
+                }
+            })?;
+            if let Some(reject_edits) = reject_edits {
+                reject_edits.await;
+            }
             Ok(())
         })
     }
@@ -6485,7 +6594,8 @@ mod tests {
                 assert_eq!(outcome.option_id, allow_option_id);
                 assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
             }
-            RequestPermissionOutcome::Cancelled => {
+            RequestPermissionOutcome::Cancelled
+            | RequestPermissionOutcome::InterruptedByFollowUp => {
                 panic!("permission request should remain open after duplicate tool call update")
             }
         }
@@ -6597,7 +6707,8 @@ mod tests {
                 assert_eq!(outcome.option_id, acp::PermissionOptionId::new("allow"));
                 assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
             }
-            RequestPermissionOutcome::Cancelled => {
+            RequestPermissionOutcome::Cancelled
+            | RequestPermissionOutcome::InterruptedByFollowUp => {
                 panic!("resolved permission request should select an outcome")
             }
         }
@@ -6681,7 +6792,8 @@ mod tests {
                 assert_eq!(outcome.option_id, acp::PermissionOptionId::new("allow"));
                 assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
             }
-            RequestPermissionOutcome::Cancelled => {
+            RequestPermissionOutcome::Cancelled
+            | RequestPermissionOutcome::InterruptedByFollowUp => {
                 panic!("permission request should resolve after authorization")
             }
         }
@@ -6735,7 +6847,8 @@ mod tests {
 
         match permission_task.await {
             RequestPermissionOutcome::Cancelled => {}
-            RequestPermissionOutcome::Selected(_) => {
+            RequestPermissionOutcome::InterruptedByFollowUp
+            | RequestPermissionOutcome::Selected(_) => {
                 panic!("cancelled permission request should not select an outcome")
             }
         }
@@ -6797,7 +6910,8 @@ mod tests {
 
         match permission_task.await {
             RequestPermissionOutcome::Cancelled => {}
-            RequestPermissionOutcome::Selected(_) => {
+            RequestPermissionOutcome::InterruptedByFollowUp
+            | RequestPermissionOutcome::Selected(_) => {
                 panic!("terminal tool call update should close pending permission request")
             }
         }
@@ -9392,10 +9506,24 @@ mod tests {
         // Send first message (turn_id=1) - handler will block
         let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
         assert_eq!(thread.read_with(cx, |t, _| t.turn_id), 1);
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new("permission", "Needs permission").into(),
+                    PermissionOptions::Flat(Vec::new()),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
 
         // Send second message (turn_id=2) while first is still blocked
         // This calls cancel() which takes turn 1's running_turn and sets turn 2's
         let second_request = thread.update(cx, |thread, cx| thread.send_raw("second", cx));
+        assert!(matches!(
+            permission_task.await,
+            RequestPermissionOutcome::InterruptedByFollowUp
+        ));
         assert_eq!(thread.read_with(cx, |t, _| t.turn_id), 2);
 
         let running_turn_after_second_send =

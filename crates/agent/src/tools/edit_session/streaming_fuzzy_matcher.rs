@@ -34,6 +34,15 @@ pub(super) enum SearchMatches {
     Fuzzy(Vec<SearchMatch>),
 }
 
+impl SearchMatches {
+    #[cfg(test)]
+    fn as_slice(&self) -> &[SearchMatch] {
+        match self {
+            Self::Exact(matches) | Self::Fuzzy(matches) => matches,
+        }
+    }
+}
+
 impl StreamingFuzzyMatcher {
     pub fn new(snapshot: TextBufferSnapshot) -> Self {
         let buffer_line_count = snapshot.max_point().row as usize + 1;
@@ -633,7 +642,7 @@ mod tests {
         assert_location_resolution(
             concat!(
                 "    Lorem\n",
-                "«    ipsum»\n",
+                "    «ipsum»\n",
                 "    dolor sit amet\n",
                 "    consecteur",
             ),
@@ -875,14 +884,16 @@ mod tests {
         let matches = matcher.finish();
 
         // The match should include the line containing "fn render_search".
-        let matched_text = matches
-            .first()
-            .map(|range| snapshot.text_for_range(range.clone()).collect::<String>());
+        let matched_text = matches.as_slice().first().map(|search_match| {
+            snapshot
+                .text_for_range(search_match.range.clone())
+                .collect::<String>()
+        });
 
         assert!(
-            matches.len() == 1,
+            matches.as_slice().len() == 1,
             "Expected exactly one match, got {}: {:?}",
-            matches.len(),
+            matches.as_slice().len(),
             matched_text,
         );
 
@@ -915,12 +926,17 @@ mod tests {
         // If no expected ranges, we expect no match
         if expected_ranges.is_empty() {
             assert!(
-                actual_ranges.is_empty(),
+                actual_ranges.as_slice().is_empty(),
                 "Expected no match for query: {:?}, but found: {:?}",
                 query,
                 actual_ranges
             );
         } else {
+            let actual_ranges = actual_ranges
+                .as_slice()
+                .iter()
+                .map(|search_match| search_match.range.clone())
+                .collect::<Vec<_>>();
             let text_with_actual_range = generate_marked_text(&text, &actual_ranges, false);
             pretty_assertions::assert_eq!(
                 text_with_actual_range,
@@ -976,10 +992,10 @@ mod tests {
         );
         let matches = matcher.finish();
 
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.as_slice().len(), 1);
         assert_eq!(
-            matcher.line_pairs(&matches[0]),
-            Some(&[(0, 3), (1, 5), (2, 6), (3, 7)][..])
+            matches.as_slice()[0].line_pairs,
+            [(0, 3), (1, 5), (2, 6), (3, 7)]
         );
     }
 
@@ -1008,10 +1024,10 @@ mod tests {
         matcher.push("}\n\n\n\nfn render_search", None);
         let matches = matcher.finish();
 
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.as_slice().len(), 1);
         assert_eq!(
-            matcher.line_pairs(&matches[0]),
-            Some(&[(0, 2), (1, 3), (2, 4), (3, 5), (4, 6)][..])
+            matches.as_slice()[0].line_pairs,
+            [(0, 2), (1, 3), (2, 4), (3, 5), (4, 6)]
         );
         assert_eq!(matcher.query_lines().len(), 5);
     }
@@ -1040,8 +1056,10 @@ mod tests {
     fn finish(mut finder: StreamingFuzzyMatcher) -> Option<String> {
         let snapshot = finder.snapshot.clone();
         let matches = finder.finish();
-        matches
-            .first()
-            .map(|range| snapshot.text_for_range(range.clone()).collect::<String>())
+        matches.as_slice().first().map(|search_match| {
+            snapshot
+                .text_for_range(search_match.range.clone())
+                .collect::<String>()
+        })
     }
 }

@@ -3,7 +3,7 @@ use buffer_diff::BufferDiff;
 use clock;
 use collections::{BTreeMap, HashMap};
 use fs::MTime;
-use futures::{FutureExt, StreamExt, channel::mpsc};
+use futures::FutureExt;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity,
 };
@@ -161,7 +161,7 @@ impl ActionLog {
                 let language_registry = buffer.read(cx).language_registry();
                 let diff =
                     cx.new(|cx| BufferDiff::new(&text_snapshot, language, language_registry, cx));
-                let (diff_update_tx, diff_update_rx) = mpsc::unbounded();
+                let (diff_update_tx, diff_update_rx) = watch::channel(());
                 let diff_base;
                 let unreviewed_edits;
                 if is_created {
@@ -183,6 +183,7 @@ impl ActionLog {
                     version: buffer.read(cx).version(),
                     diff,
                     diff_update: diff_update_tx,
+                    pending_diff_update: None,
                     _open_lsp_handle: open_lsp_handle,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
@@ -268,7 +269,7 @@ impl ActionLog {
     async fn maintain_diff(
         this: WeakEntity<Self>,
         buffer: Entity<Buffer>,
-        mut buffer_updates: mpsc::UnboundedReceiver<(ChangeAuthor, text::BufferSnapshot)>,
+        mut buffer_updates: watch::Receiver<()>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let git_diff = this
@@ -294,11 +295,17 @@ impl ActionLog {
 
         loop {
             futures::select_biased! {
-                buffer_update = buffer_updates.next() => {
+                buffer_update = buffer_updates.changed().fuse() => {
+                    if buffer_update.is_err() {
+                        break;
+                    }
+                    let buffer_update = this.update(cx, |this, _cx| {
+                        this.tracked_buffers
+                            .get_mut(&buffer)
+                            .and_then(|tracked_buffer| tracked_buffer.pending_diff_update.take())
+                    })?;
                     if let Some((author, buffer_snapshot)) = buffer_update {
                         Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
-                    } else {
-                        break;
                     }
                 }
                 _ = git_diff_updates_rx.changed().fuse() => {
@@ -617,7 +624,8 @@ impl ActionLog {
             linked_action_log.update(cx, |log, cx| log.will_delete_buffer(buffer.clone(), cx));
         }
 
-        if has_linked_action_log && let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) {
+        if has_linked_action_log && let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer)
+        {
             tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
         }
 
@@ -1260,7 +1268,8 @@ pub struct TrackedBuffer {
     version: clock::Global,
     diff: Entity<BufferDiff>,
     snapshot: text::BufferSnapshot,
-    diff_update: mpsc::UnboundedSender<(ChangeAuthor, text::BufferSnapshot)>,
+    diff_update: watch::Sender<()>,
+    pending_diff_update: Option<(ChangeAuthor, text::BufferSnapshot)>,
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
@@ -1286,10 +1295,21 @@ impl TrackedBuffer {
             .is_some()
     }
 
-    fn schedule_diff_update(&self, author: ChangeAuthor, cx: &App) {
-        self.diff_update
-            .unbounded_send((author, self.buffer.read(cx).text_snapshot()))
-            .ok();
+    fn schedule_diff_update(&mut self, author: ChangeAuthor, cx: &App) {
+        let snapshot = self.buffer.read(cx).text_snapshot();
+        if let Some((pending_author, pending_snapshot)) = &mut self.pending_diff_update {
+            // If agent and user changes arrive while a prior diff is still being
+            // computed, treating the combined delta as agent-authored is the safe
+            // fallback: it may show a user change for review, but it can never
+            // silently accept an agent edit into the diff base.
+            if matches!(author, ChangeAuthor::Agent) {
+                *pending_author = ChangeAuthor::Agent;
+            }
+            *pending_snapshot = snapshot;
+        } else {
+            self.pending_diff_update = Some((author, snapshot));
+        }
+        self.diff_update.send(()).ok();
     }
 }
 

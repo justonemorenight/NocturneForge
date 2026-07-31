@@ -145,6 +145,7 @@ members = [
     "crates/oauth_callback_server",
     "crates/ollama",
     "crates/onboarding",
+    "crates/openai_subscribed",
     "crates/opencode",
     "crates/open_ai",
     "crates/open_path_prompt",
@@ -409,6 +410,7 @@ notifications = { path = "crates/notifications" }
 oauth_callback_server = { path = "crates/oauth_callback_server" }
 ollama = { path = "crates/ollama" }
 onboarding = { path = "crates/onboarding" }
+openai_subscribed = { path = "crates/openai_subscribed" }
 opencode = { path = "crates/opencode" }
 open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
@@ -769,6 +771,7 @@ runtimelib = { version = "1.4.0", default-features = false, features = [
 ] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
+rustix = { version = "1.1", features = ["fs"] }
 rustls = { version = "0.23.26" }
 rustls-platform-verifier = "0.5.0"
 # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io

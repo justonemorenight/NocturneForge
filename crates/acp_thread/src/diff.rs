@@ -1,6 +1,6 @@
 use anyhow::Result;
 use buffer_diff::BufferDiff;
-use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
 use itertools::Itertools;
 use language::{
     Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, TextBuffer,
@@ -79,7 +79,7 @@ impl Diff {
             multibuffer,
             path,
             base_text,
-            new_buffer,
+            new_buffer: new_buffer.downgrade(),
             _update_diff: task,
         })
     }
@@ -133,11 +133,11 @@ impl Diff {
         }
     }
 
-    /// Returns the buffer being edited (for pending diffs) or the snapshot buffer (for finalized diffs).
-    pub fn buffer(&self) -> &Entity<Buffer> {
+    /// Returns the buffer being edited, if it is still alive.
+    pub fn buffer(&self) -> Option<Entity<Buffer>> {
         match self {
-            Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer,
-            Self::Finalized(FinalizedDiff { new_buffer, .. }) => new_buffer,
+            Self::Pending(PendingDiff { new_buffer, .. }) => Some(new_buffer.clone()),
+            Self::Finalized(FinalizedDiff { new_buffer, .. }) => new_buffer.upgrade(),
         }
     }
 
@@ -202,7 +202,9 @@ impl Diff {
                 ..
             }) => {
                 base_text.as_ref() != old_text
-                    || !new_buffer.read(cx).as_rope().chunks().equals_str(new_text)
+                    || new_buffer.upgrade().is_none_or(|new_buffer| {
+                        !new_buffer.read(cx).as_rope().chunks().equals_str(new_text)
+                    })
             }
         }
     }
@@ -310,7 +312,7 @@ impl PendingDiff {
             path,
             base_text: self.base_text.clone(),
             multibuffer: self.multibuffer.clone(),
-            new_buffer: self.new_buffer.clone(),
+            new_buffer: self.new_buffer.downgrade(),
             _update_diff: update_diff,
         }
     }
@@ -373,7 +375,7 @@ impl PendingDiff {
 pub struct FinalizedDiff {
     path: String,
     base_text: Arc<str>,
-    new_buffer: Entity<Buffer>,
+    new_buffer: WeakEntity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
     _update_diff: Task<Result<()>>,
 }

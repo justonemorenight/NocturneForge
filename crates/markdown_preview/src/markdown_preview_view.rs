@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use editor::items::open_resolved_target;
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
 use gpui::{
@@ -14,7 +15,7 @@ use gpui::{
     InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
     ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
 };
-use language::{LanguageRegistry, Point};
+use language::{Buffer, LanguageRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
@@ -26,9 +27,13 @@ use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
-use util::markdown::{source_position_from_fragment, split_local_url_fragment};
+use util::{
+    markdown::{source_position_from_fragment, split_local_url_fragment},
+    paths::PathWithPosition,
+};
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
-use workspace::notifications::NotifyResultExt;
+use workspace::notifications::{NotifyResultExt, NotifyTaskExt};
+use workspace::path_link::{PathMatching, resolve_open_target};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
@@ -85,6 +90,11 @@ impl MarkdownPreviewMode {
 struct EditorState {
     editor: Entity<Editor>,
     _subscription: Subscription,
+}
+
+enum PreviewLinkTarget {
+    Heading(SharedString),
+    Position { row: u32, column: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,28 +182,28 @@ impl MarkdownPreviewView {
         let target_buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
         pane.items_of_type::<MarkdownPreviewView>()
             .find(|view| {
-                let view_read = view.read(cx);
                 // Only look for independent (Default mode) previews, not Follow previews.
                 // Match by buffer entity rather than editor entity so the lookup survives
                 // workspace restoration, where the preview's bound editor may differ from
                 // the editor the user is currently invoking the action on even though both
                 // wrap the same source buffer.
-                view_read.mode == MarkdownPreviewMode::Default
-                    && view_read
-                        .active_editor
-                        .as_ref()
-                        .is_some_and(|active_editor| {
-                            active_editor
-                                .editor
-                                .read(cx)
-                                .buffer()
-                                .read(cx)
-                                .as_singleton()
-                                .as_ref()
-                                == Some(&target_buffer)
-                        })
+                view.read(cx).mode == MarkdownPreviewMode::Default
+                    && view.read(cx).is_previewing(&target_buffer, cx)
             })
             .and_then(|view| pane.index_for_item(&view))
+    }
+
+    fn is_previewing(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        self.active_editor.as_ref().is_some_and(|state| {
+            state
+                .editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .as_ref()
+                == Some(buffer)
+        })
     }
 
     pub fn resolve_active_item_as_markdown_editor(
@@ -339,10 +349,10 @@ impl MarkdownPreviewView {
         }
     }
 
-    pub fn is_markdown_path(path: impl AsRef<Path>) -> bool {
-        path.as_ref().extension().is_some_and(|ext| {
-            ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-        })
+    pub fn is_markdown_path(path: impl AsRef<Path>, languages: &Arc<LanguageRegistry>) -> bool {
+        languages
+            .language_for_file_path(path.as_ref())
+            .is_some_and(|language| language.name().as_ref() == "Markdown")
     }
 
     pub fn open_for_project_path(
@@ -595,6 +605,47 @@ impl MarkdownPreviewView {
         self.markdown.update(cx, |markdown, cx| {
             markdown.set_active_root_for_source_index(self.active_source_index, cx);
         });
+    }
+
+    fn navigate_to_link_target(
+        &mut self,
+        target: Option<PreviewLinkTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            None => {}
+            Some(PreviewLinkTarget::Heading(slug)) => {
+                self.markdown.update(cx, |markdown, cx| {
+                    markdown.scroll_to_heading_when_parsed(slug, cx);
+                });
+            }
+            Some(PreviewLinkTarget::Position { row, column }) => {
+                let Some(editor) = self
+                    .active_editor
+                    .as_ref()
+                    .map(|state| state.editor.clone())
+                else {
+                    return;
+                };
+                let Some(source_index) =
+                    editor
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .map(|buffer| {
+                            let snapshot = buffer.read(cx).snapshot();
+                            let point = snapshot.point_from_external_input(row, column);
+                            snapshot.point_to_offset(point)
+                        })
+                else {
+                    return;
+                };
+                Self::change_selection_to_source_index(&editor, source_index, false, window, cx);
+                self.sync_preview_to_source_index(source_index, true, cx);
+            }
+        }
     }
 
     fn change_selection_to_source_index(
@@ -1035,6 +1086,7 @@ fn handle_url_click(
             SharedString::from(path_part.to_string()),
             fragment.map(|fragment| SharedString::from(fragment.to_string())),
             base_directory,
+            Some(view.clone()),
             workspace,
             window,
             cx,
@@ -1046,27 +1098,78 @@ fn open_preview_url(
     url: SharedString,
     fragment: Option<SharedString>,
     base_directory: Option<PathBuf>,
+    source_view: Option<WeakEntity<MarkdownPreviewView>>,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let decoded_path = urlencoding::decode(&url).unwrap_or_else(|_| Cow::Borrowed(&url));
 
-    if let Some(row) = fragment
-        .as_deref()
-        .and_then(|fragment| fragment.strip_prefix('L'))
-        .and_then(source_position_from_fragment)
-        .map(|(row, _)| row)
-        && open_preview_path_at_line(
-            decoded_path.to_string(),
-            base_directory.clone(),
-            workspace,
-            row,
-            window,
-            cx,
-        )
-    {
-        return;
+    // Only `://` URLs skip local handling (a scheme check would misclassify
+    // `main.rs:2`); ambiguous links like `tel:123` are tried as files first.
+    if !decoded_path.contains("://") {
+        let parsed_path = PathWithPosition::parse_str(&decoded_path);
+        let fragment_position = fragment
+            .as_deref()
+            .and_then(|fragment| fragment.strip_prefix('L'))
+            .and_then(source_position_from_fragment);
+
+        if !window.modifiers().alt
+            && workspace
+                .read_with(cx, |workspace, cx| {
+                    MarkdownPreviewView::is_markdown_path(
+                        &parsed_path.path,
+                        workspace.project().read(cx).languages(),
+                    )
+                })
+                .is_ok_and(|is_markdown| is_markdown)
+        {
+            let link_target = if let Some(row) = parsed_path.row {
+                Some(PreviewLinkTarget::Position {
+                    row: row.saturating_sub(1),
+                    column: parsed_path.column.unwrap_or(1).saturating_sub(1),
+                })
+            } else if let Some((row, column)) = fragment_position {
+                Some(PreviewLinkTarget::Position { row, column })
+            } else {
+                fragment.map(PreviewLinkTarget::Heading)
+            };
+            open_markdown_link_in_preview(
+                parsed_path.path.to_string_lossy().into_owned(),
+                link_target,
+                decoded_path.into_owned(),
+                base_directory,
+                source_view,
+                workspace,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let path_with_position = if parsed_path.row.is_some() {
+            Some(decoded_path.to_string())
+        } else {
+            fragment_position.map(|(row, column)| {
+                if column == 0 {
+                    format!("{decoded_path}:{}", row + 1)
+                } else {
+                    format!("{decoded_path}:{}:{}", row + 1, column + 1)
+                }
+            })
+        };
+
+        if let Some(path_with_position) = path_with_position {
+            open_preview_path_with_position(
+                path_with_position,
+                decoded_path.into_owned(),
+                base_directory,
+                workspace,
+                window,
+                cx,
+            );
+            return;
+        }
     }
 
     if let Some(workspace) = workspace.upgrade() {
@@ -1078,75 +1181,145 @@ fn open_preview_url(
     }
 }
 
-enum PreviewPathTarget {
-    Project(ProjectPath),
-    Absolute(PathBuf),
+fn find_preview_for_buffer(
+    workspace: &Workspace,
+    buffer: &Entity<Buffer>,
+    cx: &App,
+) -> Option<Entity<MarkdownPreviewView>> {
+    workspace
+        .items_of_type::<MarkdownPreviewView>(cx)
+        .find(|view| {
+            view.read(cx).mode == MarkdownPreviewMode::Default
+                && view.read(cx).is_previewing(buffer, cx)
+        })
 }
 
-fn open_preview_path_at_line(
+fn open_markdown_link_in_preview(
     path: String,
+    link_target: Option<PreviewLinkTarget>,
+    fallback_url: String,
     base_directory: Option<PathBuf>,
+    source_view: Option<WeakEntity<MarkdownPreviewView>>,
     workspace: &WeakEntity<Workspace>,
-    row: u32,
     window: &mut Window,
     cx: &mut App,
-) -> bool {
-    let Some(workspace) = workspace.upgrade() else {
-        return false;
-    };
-    let project = workspace.read(cx).project().clone();
-    let path_style = project.read(cx).path_style(cx);
-    let target = if path_style.is_absolute(&path) {
-        Some(PreviewPathTarget::Absolute(PathBuf::from(path)))
-    } else if project.read(cx).is_local()
-        && let Some(resolved) = base_directory
-            .as_deref()
-            .map(|base_directory| base_directory.join(&path))
-        && resolved.exists()
-    {
-        Some(PreviewPathTarget::Absolute(resolved))
-    } else {
-        project
-            .update(cx, |project, cx| project.find_project_path(&path, cx))
-            .map(PreviewPathTarget::Project)
-    };
-    let Some(target) = target else {
-        return false;
-    };
-
-    let task = workspace.update(cx, |workspace, cx| match target {
-        PreviewPathTarget::Project(project_path) => {
-            workspace.open_path(project_path, None, true, window, cx)
-        }
-        PreviewPathTarget::Absolute(abs_path) => workspace.open_abs_path(
-            abs_path,
-            workspace::OpenOptions {
-                focus: Some(true),
-                ..Default::default()
-            },
-            window,
-            cx,
-        ),
-    });
-    window
-        .spawn(cx, async move |cx| {
-            let item = task.await?;
-            let Some(editor) = item.downcast::<Editor>() else {
-                return anyhow::Ok(());
-            };
-            editor.update_in(cx, |editor, window, cx| {
-                let point = Point::new(row, 0);
-                editor.change_selections(
-                    SelectionEffects::scroll(Autoscroll::center()),
-                    window,
-                    cx,
-                    |selections| selections.select_ranges([point..point]),
-                );
+) {
+    let open_target = resolve_open_target(
+        workspace,
+        PathMatching::Exact,
+        &path,
+        base_directory.as_deref(),
+        cx,
+    );
+    let workspace = workspace.clone();
+    let workspace_for_error = workspace.clone();
+    let task = window.spawn(cx, async move |cx| {
+        let target_path = open_target
+            .await
+            .filter(|open_target| open_target.is_file())
+            .map(|open_target| open_target.path().path.clone());
+        let Some(abs_path) = target_path else {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(&fallback_url, base_directory.as_deref(), window, cx);
             })?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    true
+            return anyhow::Ok(());
+        };
+
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+        let (worktree, relative_path) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(abs_path, false, cx)
+            })
+            .await
+            .context("resolving Markdown preview link worktree")?;
+        let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    ProjectPath {
+                        worktree_id,
+                        path: relative_path,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .context("opening Markdown preview link buffer")?;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            if let Some(source_view) = source_view.as_ref().and_then(|view| view.upgrade())
+                && source_view.read(cx).is_previewing(&buffer, cx)
+            {
+                source_view.update(cx, |view, cx| {
+                    view.navigate_to_link_target(link_target, window, cx);
+                });
+                return;
+            }
+
+            if let Some(existing_view) = find_preview_for_buffer(workspace, &buffer, cx) {
+                workspace.activate_item(&existing_view, true, true, window, cx);
+                existing_view.update(cx, |view, cx| {
+                    view.navigate_to_link_target(link_target, window, cx);
+                });
+                return;
+            }
+
+            let editor = cx.new(|cx| {
+                Editor::for_buffer(buffer, Some(workspace.project().clone()), window, cx)
+            });
+            let preview = MarkdownPreviewView::create_markdown_view(workspace, editor, window, cx);
+            let pane = source_view
+                .as_ref()
+                .and_then(|view| view.upgrade())
+                .and_then(|view| workspace.pane_for(&view))
+                .unwrap_or_else(|| workspace.active_pane().clone());
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(preview.clone()), true, true, None, window, cx);
+            });
+            preview.update(cx, |view, cx| {
+                view.navigate_to_link_target(link_target, window, cx);
+            });
+        })?;
+        anyhow::Ok(())
+    });
+    task.detach_and_notify_err(workspace_for_error, window, cx);
+}
+
+fn open_preview_path_with_position(
+    path_with_position: String,
+    fallback_path: String,
+    base_directory: Option<PathBuf>,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let open_target = resolve_open_target(
+        workspace,
+        PathMatching::Exact,
+        &path_with_position,
+        base_directory.as_deref(),
+        cx,
+    );
+    let workspace = workspace.clone();
+    let workspace_for_error = workspace.clone();
+    let task = window.spawn(cx, async move |cx| {
+        let opened = if let Some(open_target) = open_target.await {
+            open_resolved_target(&workspace, &open_target, cx)
+                .await
+                .context("opening Markdown preview link")?
+        } else {
+            false
+        };
+
+        if !opened {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_url_or_file(&fallback_path, base_directory.as_deref(), window, cx);
+            })?;
+        }
+
+        anyhow::Ok(())
+    });
+    task.detach_and_notify_err(workspace_for_error, window, cx);
 }
 
 fn resolve_preview_image(

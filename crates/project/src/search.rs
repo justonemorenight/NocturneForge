@@ -705,7 +705,11 @@ impl SearchQuery {
     }
 
     pub fn search_str(&self, text: &str) -> Vec<Range<usize>> {
-        if self.as_str().is_empty() {
+        self.search_str_with_limit(text, usize::MAX)
+    }
+
+    pub fn search_str_with_limit(&self, text: &str, limit: usize) -> Vec<Range<usize>> {
+        if self.as_str().is_empty() || limit == 0 {
             return Vec::new();
         }
 
@@ -727,6 +731,9 @@ impl SearchQuery {
                         }
                     }
                     matches.push(mat.start()..mat.end());
+                    if matches.len() == limit {
+                        break;
+                    }
                 }
             }
             Self::Regex {
@@ -738,15 +745,21 @@ impl SearchQuery {
                 if *multiline {
                     for mat in regex.find_iter(text).flatten() {
                         matches.push(mat.start()..mat.end());
+                        if matches.len() == limit {
+                            break;
+                        }
                     }
                 } else {
                     let mut line_offset = 0;
                     for line in text.split('\n') {
                         for mat in regex.find_iter(line).flatten() {
                             matches.push((line_offset + mat.start())..(line_offset + mat.end()));
-                            if *one_match_per_line {
+                            if *one_match_per_line || matches.len() == limit {
                                 break;
                             }
+                        }
+                        if matches.len() == limit {
+                            break;
                         }
                         line_offset += line.len() + 1;
                     }
