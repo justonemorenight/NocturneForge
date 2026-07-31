@@ -3,7 +3,7 @@ use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::B
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
 };
-use serde::{Deserialize, Serialize, ser::SerializeSeq as _};
+use serde::{Deserialize, Serialize, de::DeserializeOwned, ser::SerializeSeq as _};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -59,6 +59,19 @@ impl Request {
             service_tier: self.service_tier,
         }
     }
+
+    pub fn into_codex_compact_request(self) -> CodexCompactRequest {
+        CodexCompactRequest {
+            model: self.model,
+            instructions: self.instructions,
+            input: self.input,
+            tools: self.tools,
+            parallel_tool_calls: self.parallel_tool_calls.unwrap_or(false),
+            reasoning: self.reasoning,
+            service_tier: self.service_tier,
+            prompt_cache_key: self.prompt_cache_key,
+        }
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -73,6 +86,27 @@ pub struct CompactRequest {
     pub service_tier: Option<ServiceTier>,
 }
 
+/// The ChatGPT Codex backend accepts the same model-visible request fields as
+/// Codex CLI's canonical compaction input. In particular, tool definitions and
+/// reasoning settings must survive conversion when the history contains tool
+/// calls.
+#[derive(Serialize, Debug)]
+pub struct CodexCompactRequest {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub input: ResponseInput,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct CompactedResponse {
     pub id: String,
@@ -83,6 +117,27 @@ pub struct CompactedResponse {
 }
 
 impl CompactedResponse {
+    pub fn into_compacted_context(
+        self,
+        owner: LanguageModelProviderId,
+    ) -> Result<CompactedContext> {
+        Ok(CompactedContext::ProviderState(
+            provider_compaction_state_from_items(owner, self.output)?,
+        ))
+    }
+}
+
+/// ChatGPT's Codex endpoint returns a canonical replacement window. Unlike
+/// the public OpenAI API response, metadata and usage are not guaranteed to be
+/// present, so only `output` is required.
+#[derive(Deserialize, Debug)]
+pub struct CodexCompactedResponse {
+    pub output: Vec<Value>,
+    #[serde(default)]
+    pub usage: Option<ResponseUsage>,
+}
+
+impl CodexCompactedResponse {
     pub fn into_compacted_context(
         self,
         owner: LanguageModelProviderId,
@@ -711,6 +766,44 @@ pub async fn compact_response(
     request: CompactRequest,
     extra_headers: &CustomHeaders,
 ) -> Result<CompactedResponse, RequestError> {
+    compact_response_with_request(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        extra_headers,
+    )
+    .await
+}
+
+pub async fn compact_codex_response(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: CodexCompactRequest,
+    extra_headers: &CustomHeaders,
+) -> Result<CodexCompactedResponse, RequestError> {
+    compact_response_with_request(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        extra_headers,
+    )
+    .await
+}
+
+async fn compact_response_with_request<Response: DeserializeOwned>(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: impl Serialize,
+    extra_headers: &CustomHeaders,
+) -> Result<Response, RequestError> {
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(format!("{api_url}/responses/compact"))

@@ -40,12 +40,12 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
+    Role, SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -128,7 +128,9 @@ const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 const COMPACTION_REQUEST_BYTES_PER_TOKEN: u64 = 3;
 const COMPACTION_REQUEST_HEADROOM_PERCENT: u64 = 80;
 const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
-const MAX_HIERARCHICAL_COMPACTION_PASSES: usize = 32;
+const MAX_HIERARCHICAL_COMPACTION_PASSES: usize = 8;
+const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
+const MIN_USER_MESSAGES_BEFORE_RECOMPACTION: usize = 2;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -196,6 +198,9 @@ pub enum Message {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompactionInfo {
     Summary(SharedString),
+    ProviderContext(CompactedContext),
+    // Kept for persisted threads created by the first native-compaction
+    // prototype. New compactions use `ProviderContext`.
     ProviderNative {
         provider: LanguageModelProviderId,
         items: Vec<serde_json::Value>,
@@ -212,6 +217,12 @@ impl CompactionInfo {
                     summary
                 )
                 .into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            Self::ProviderContext(context) => vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Compaction(context.clone())],
                 cache: false,
                 reasoning_details: None,
             }],
@@ -1540,7 +1551,8 @@ impl Thread {
                             );
                             stream.send_context_compaction_update(compaction_id.clone(), summary);
                         }
-                        CompactionInfo::ProviderNative { .. } => {
+                        CompactionInfo::ProviderContext(_)
+                        | CompactionInfo::ProviderNative { .. } => {
                             stream.send_context_compaction(
                                 compaction_id,
                                 acp_thread::ContextCompactionStatus::Completed,
@@ -2521,35 +2533,36 @@ impl Thread {
         self.run_turn(cx)
     }
 
-    /// Force a manual context compaction using the summary strategy,
-    /// regardless of the current token usage or context window size.
+    /// Force a manual context compaction regardless of the current token usage
+    /// or context window size.
     pub fn compact(
         &mut self,
         id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
-        let model = self
-            .compaction_model(cx)
-            .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-
         // Flush any pending message and cancel an in-flight turn before we
         // start, mirroring `run_turn` so a stray completion can't race with the
         // compaction we're about to perform.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
 
-        let compaction = self.forced_compaction_target_ix().map(|request_end_ix| {
-            self.advance_prompt_id();
-            self.current_request_token_usage = TokenUsage::default();
-            (
-                model.clone(),
-                CompactionTarget::new(&self.messages, request_end_ix),
-            )
-        });
+        let compaction = self
+            .forced_compaction_target_ix()
+            .map(|request_end_ix| {
+                let target = CompactionTarget::new(&self.messages, request_end_ix)?;
+                let operation = self.compaction_operation(&target, cx)?;
+                anyhow::Ok((target, operation))
+            })
+            .transpose()?
+            .map(|(target, operation)| {
+                self.advance_prompt_id();
+                self.current_request_token_usage = TokenUsage::default();
+                (target, operation)
+            });
 
-        if compaction.is_some() {
+        if let Some((_, operation)) = compaction.as_ref() {
             self.pending_compaction_telemetry =
-                self.build_compaction_telemetry("manual", &model, cx);
+                self.build_compaction_telemetry("manual", operation.model(), cx);
         }
 
         self.clear_summary();
@@ -2561,14 +2574,14 @@ impl Thread {
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
-                let result = if let Some((model, target)) = compaction {
-                    Self::stream_bounded_compaction(
+                let result = if let Some((target, operation)) = compaction {
+                    Self::run_compaction(
                         &this,
                         &event_stream,
                         cancellation_rx.clone(),
-                        model,
                         target,
                         CompactionMode::Manual { marker_id: id },
+                        operation,
                         cx,
                     )
                     .await
@@ -2726,6 +2739,7 @@ impl Thread {
     ) -> Result<()> {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
+        let mut auto_compactions = 0;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
         loop {
@@ -2733,6 +2747,7 @@ impl Thread {
                 this,
                 event_stream,
                 cancellation_rx.clone(),
+                auto_compactions,
                 cx,
             )
             .await
@@ -2741,7 +2756,10 @@ impl Thread {
                 // completion below reports usage, so we can record an
                 // accurate post-compaction context size (see
                 // `handle_completion_event`).
-                Ok(ControlFlow::Continue(())) => {}
+                Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded)) => {}
+                Ok(ControlFlow::Continue(CompactionRunStatus::Completed)) => {
+                    auto_compactions += 1;
+                }
                 Ok(ControlFlow::Break(())) => {
                     this.update(cx, |this, _| {
                         this.emit_compaction_telemetry_outcome("canceled", None)
@@ -3102,45 +3120,197 @@ impl Thread {
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
+        completed_auto_compactions: usize,
         cx: &mut AsyncApp,
-    ) -> Result<ControlFlow<()>> {
-        let Some((model, target)) = this.update(cx, |this, cx| {
-            let insertion_ix = this.compaction_message_target_ix(cx)?;
-            let model = this.compaction_model(cx)?;
+    ) -> Result<ControlFlow<(), CompactionRunStatus>> {
+        let Some((target, operation)) = this.update(cx, |this, cx| {
+            let Some(insertion_ix) = this.auto_compaction_target_ix(cx)? else {
+                return anyhow::Ok(None);
+            };
+            if completed_auto_compactions >= MAX_AUTO_COMPACTIONS_PER_TURN {
+                return Err(anyhow!(
+                    "Automatic compaction did not create enough headroom to continue this turn. \
+                     Start a new thread or remove large images and tool output."
+                ));
+            }
+
+            let target = CompactionTarget::new(&this.messages, insertion_ix)?;
+            let operation = this.compaction_operation(&target, cx)?;
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
             if this.pending_compaction_telemetry.is_none() {
                 this.pending_compaction_telemetry =
-                    this.build_compaction_telemetry("auto", &model, cx);
+                    this.build_compaction_telemetry("auto", operation.model(), cx);
             }
-            Some((model, CompactionTarget::new(&this.messages, insertion_ix)))
-        })?
+            anyhow::Ok(Some((target, operation)))
+        })??
         else {
-            return Ok(ControlFlow::Continue(()));
+            return Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded));
         };
 
-        Self::stream_bounded_compaction(
+        match Self::run_compaction(
             this,
             event_stream,
             cancellation_rx,
-            model,
             target,
             CompactionMode::Auto,
+            operation,
             cx,
         )
-        .await
+        .await?
+        {
+            ControlFlow::Break(()) => Ok(ControlFlow::Break(())),
+            ControlFlow::Continue(()) => Ok(ControlFlow::Continue(CompactionRunStatus::Completed)),
+        }
     }
 
-    async fn stream_bounded_compaction(
+    async fn run_compaction(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
-        cancellation_rx: watch::Receiver<bool>,
-        model: Arc<dyn LanguageModel>,
+        mut cancellation_rx: watch::Receiver<bool>,
         target: CompactionTarget,
         mode: CompactionMode,
+        operation: CompactionOperation,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
+        let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
+        event_stream.send_context_compaction(
+            compaction_id.clone(),
+            acp_thread::ContextCompactionStatus::InProgress,
+        );
+
+        let result = match operation {
+            CompactionOperation::ProviderNative {
+                model,
+                request,
+                fallback_model,
+            } => {
+                match Self::run_native_compaction(this, cancellation_rx.clone(), model, request, cx)
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(native_error) => {
+                        log::warn!(
+                            "Provider-native compaction failed; falling back to summary: \
+                             {native_error:#}"
+                        );
+                        Self::run_atomic_summary_compaction(
+                            this,
+                            event_stream,
+                            &compaction_id,
+                            cancellation_rx.clone(),
+                            fallback_model,
+                            &target,
+                            cx,
+                        )
+                        .await
+                        .map_err(|fallback_error| {
+                            fallback_error.context(format!(
+                                "Provider-native compaction also failed: {native_error:#}"
+                            ))
+                        })
+                    }
+                }
+            }
+            CompactionOperation::Summary { model } => {
+                Self::run_atomic_summary_compaction(
+                    this,
+                    event_stream,
+                    &compaction_id,
+                    cancellation_rx.clone(),
+                    model,
+                    &target,
+                    cx,
+                )
+                .await
+            }
+        };
+
+        let compaction = match result {
+            Ok(Some(compaction)) => compaction,
+            Ok(None) => {
+                event_stream.update_context_compaction_status(
+                    compaction_id,
+                    acp_thread::ContextCompactionStatus::Canceled,
+                );
+                return Ok(ControlFlow::Break(()));
+            }
+            Err(error) => {
+                event_stream.update_context_compaction_status(
+                    compaction_id,
+                    acp_thread::ContextCompactionStatus::Canceled,
+                );
+                return Err(error);
+            }
+        };
+
+        if *cancellation_rx.borrow() {
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Canceled,
+            );
+            return Ok(ControlFlow::Break(()));
+        }
+
+        if let Err(error) = this.update(cx, |this, cx| {
+            let insertion_ix = target.resolve(&this.messages)?;
+            mode.install(&mut this.messages, insertion_ix, compaction)?;
+            this.updated_at = Utc::now();
+            this.clear_summary();
+            cx.notify();
+            anyhow::Ok(())
+        })? {
+            event_stream.update_context_compaction_status(
+                compaction_id,
+                acp_thread::ContextCompactionStatus::Canceled,
+            );
+            return Err(error);
+        }
+
+        event_stream.update_context_compaction_status(
+            compaction_id,
+            acp_thread::ContextCompactionStatus::Completed,
+        );
+        Ok(ControlFlow::Continue(()))
+    }
+
+    async fn run_native_compaction(
+        this: &WeakEntity<Self>,
+        mut cancellation_rx: watch::Receiver<bool>,
+        model: Arc<dyn LanguageModel>,
+        request: LanguageModelRequest,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<CompactionInfo>> {
+        let result = futures::select! {
+            result = model.compact(request, cx).fuse() => result,
+            _ = cancellation_rx.changed().fuse() => {
+                if *cancellation_rx.borrow() {
+                    return Ok(None);
+                }
+                return Err(anyhow!("Compaction cancellation channel changed unexpectedly"));
+            }
+        }?;
+
+        this.update(cx, |this, _| {
+            this.accumulate_token_usage(result.usage);
+        })?;
+        Ok(Some(CompactionInfo::ProviderContext(result.context)))
+    }
+
+    async fn run_atomic_summary_compaction(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        compaction_id: &acp_thread::ContextCompactionId,
+        cancellation_rx: watch::Receiver<bool>,
+        model: Arc<dyn LanguageModel>,
+        target: &CompactionTarget,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<CompactionInfo>> {
+        let mut working_messages = this.update(cx, |this, _| {
+            let target_ix = target.resolve(&this.messages)?;
+            anyhow::Ok(this.messages[..target_ix].to_vec())
+        })??;
         let mut completed_passes = 0;
         let mut learned_retained_user_byte_budget = None;
 
@@ -3151,9 +3321,9 @@ impl Thread {
 
             loop {
                 let plan = this.update(cx, |this, cx| {
-                    let target_ix = target.resolve(&this.messages)?;
                     this.build_compaction_plan(
-                        target_ix,
+                        &working_messages,
+                        working_messages.len(),
                         maximum_end_ix,
                         retained_user_byte_budget,
                         &model,
@@ -3161,7 +3331,7 @@ impl Thread {
                     )
                 })??;
                 let Some(plan) = plan else {
-                    return Ok(ControlFlow::Continue(()));
+                    return Err(anyhow!("Compaction did not produce replacement context"));
                 };
 
                 if failed_request
@@ -3173,32 +3343,41 @@ impl Thread {
                     ));
                 }
 
-                let insertion = if plan.reaches_target {
-                    mode.insertion(plan.insertion_ix)
-                } else {
-                    CompactionInsertion::Auto {
-                        insertion_ix: plan.insertion_ix,
-                    }
-                };
                 let request_for_retry = plan.serialized_request;
 
-                match Self::stream_compaction(
+                match Self::stream_summary_compaction_request(
                     this,
                     event_stream,
+                    compaction_id,
                     cancellation_rx.clone(),
                     model.clone(),
                     plan.request,
-                    insertion,
+                    plan.reaches_target,
                     cx,
                 )
                 .await
                 {
-                    Ok(ControlFlow::Break(())) => return Ok(ControlFlow::Break(())),
-                    Ok(ControlFlow::Continue(())) => {
+                    Ok(None) => return Ok(None),
+                    Ok(Some(summary)) => {
                         completed_passes += 1;
                         if plan.reaches_target {
-                            return Ok(ControlFlow::Continue(()));
+                            return Ok(Some(CompactionInfo::Summary(summary.into())));
                         }
+
+                        let previous_progress_start_ix = plan.progress_start_ix;
+                        working_messages.insert(
+                            plan.insertion_ix,
+                            Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into()))),
+                        );
+                        let next_progress_start_ix = latest_compaction_message_ix_before(
+                            &working_messages,
+                            working_messages.len(),
+                        )
+                        .map_or(0, |ix| ix + 1);
+                        if next_progress_start_ix <= previous_progress_start_ix {
+                            return Err(anyhow!("Compaction did not make forward progress"));
+                        }
+
                         learned_retained_user_byte_budget = Some(plan.retained_user_byte_budget);
                         if completed_passes >= MAX_HIERARCHICAL_COMPACTION_PASSES {
                             return Err(anyhow!(
@@ -3246,45 +3425,27 @@ impl Thread {
         }
     }
 
-    async fn stream_compaction(
+    async fn stream_summary_compaction_request(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
+        compaction_id: &acp_thread::ContextCompactionId,
         mut cancellation_rx: watch::Receiver<bool>,
         model: Arc<dyn LanguageModel>,
         request: LanguageModelRequest,
-        insertion: CompactionInsertion,
+        publish_summary: bool,
         cx: &mut AsyncApp,
-    ) -> Result<ControlFlow<()>> {
-        log::debug!("Running compaction");
-        let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
-        event_stream.send_context_compaction(
-            compaction_id.clone(),
-            acp_thread::ContextCompactionStatus::InProgress,
-        );
+    ) -> Result<Option<String>> {
         let stream = futures::select! {
             result = model.stream_completion(request, cx).fuse() => result,
             _ = cancellation_rx.changed().fuse() => {
                 if *cancellation_rx.borrow() {
                     log::debug!("Compaction cancelled before request started");
-                    event_stream.update_context_compaction_status(
-                        compaction_id,
-                        acp_thread::ContextCompactionStatus::Canceled,
-                    );
-                    return Ok(ControlFlow::Break(()));
+                    return Ok(None);
                 }
-                return Ok(ControlFlow::Continue(()));
+                return Err(anyhow!("Compaction cancellation channel changed unexpectedly"));
             }
         };
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                event_stream.update_context_compaction_status(
-                    compaction_id,
-                    acp_thread::ContextCompactionStatus::Canceled,
-                );
-                return Err(error.into());
-            }
-        };
+        let mut stream = stream?;
 
         let mut summary = String::new();
         loop {
@@ -3293,11 +3454,7 @@ impl Thread {
                 _ = cancellation_rx.changed().fuse() => {
                     if *cancellation_rx.borrow() {
                         log::debug!("Compaction cancelled while summarizing");
-                        event_stream.update_context_compaction_status(
-                            compaction_id,
-                            acp_thread::ContextCompactionStatus::Canceled,
-                        );
-                        return Ok(ControlFlow::Break(()));
+                        return Ok(None);
                     }
                     continue;
                 }
@@ -3307,21 +3464,14 @@ impl Thread {
                 break;
             };
 
-            let event = match event {
-                Ok(event) => event,
-                Err(error) => {
-                    event_stream.update_context_compaction_status(
-                        compaction_id,
-                        acp_thread::ContextCompactionStatus::Canceled,
-                    );
-                    return Err(error.into());
-                }
-            };
+            let event = event?;
 
             match event {
                 LanguageModelCompletionEvent::Text(text) => {
                     summary.push_str(&text);
-                    event_stream.send_context_compaction_update(compaction_id.clone(), &text);
+                    if publish_summary {
+                        event_stream.send_context_compaction_update(compaction_id.clone(), &text);
+                    }
                 }
                 LanguageModelCompletionEvent::UsageUpdate(usage) => {
                     this.update(cx, |this, _cx| {
@@ -3343,57 +3493,17 @@ impl Thread {
 
         if *cancellation_rx.borrow() {
             log::debug!("Compaction cancelled after summarizing");
-            event_stream.update_context_compaction_status(
-                compaction_id,
-                acp_thread::ContextCompactionStatus::Canceled,
-            );
-            return Ok(ControlFlow::Break(()));
+            return Ok(None);
         }
 
         let summary = summary.trim().to_string();
         if summary.is_empty() {
             log::warn!("Compaction produced an empty summary");
-            event_stream.update_context_compaction_status(
-                compaction_id,
-                acp_thread::ContextCompactionStatus::Canceled,
-            );
             return Err(anyhow::anyhow!("Compaction produced an empty summary"));
         }
 
         log::debug!("Compaction succeeded:\n{summary}");
-        let insert_result = this.update(cx, |this, cx| {
-            let compaction = Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())));
-            match insertion {
-                CompactionInsertion::Auto { insertion_ix } => {
-                    if insertion_ix <= this.messages.len() {
-                        this.messages.insert(insertion_ix, compaction);
-                    } else {
-                        this.messages.push(compaction);
-                    }
-                }
-                CompactionInsertion::Manual { marker_id } => {
-                    this.messages.push(Arc::new(Message::User(UserMessage {
-                        id: marker_id,
-                        content: Arc::from([]),
-                    })));
-                    this.messages.push(compaction);
-                }
-            }
-            cx.notify();
-        });
-        if let Err(error) = insert_result {
-            event_stream.update_context_compaction_status(
-                compaction_id,
-                acp_thread::ContextCompactionStatus::Canceled,
-            );
-            return Err(error);
-        }
-        event_stream.update_context_compaction_status(
-            compaction_id,
-            acp_thread::ContextCompactionStatus::Completed,
-        );
-
-        Ok(ControlFlow::Continue(()))
+        Ok(Some(summary))
     }
 
     fn process_tool_result(
@@ -4400,7 +4510,24 @@ impl Thread {
         retained_user_byte_budget: usize,
         cx: &App,
     ) -> Vec<LanguageModelRequestMessage> {
-        let end_ix = end_ix.min(self.messages.len());
+        self.build_request_messages_for_history_until_with_retained_user_budget(
+            &self.messages,
+            available_tools,
+            end_ix,
+            retained_user_byte_budget,
+            cx,
+        )
+    }
+
+    fn build_request_messages_for_history_until_with_retained_user_budget(
+        &self,
+        history_messages: &[Arc<Message>],
+        available_tools: Vec<SharedString>,
+        end_ix: usize,
+        retained_user_byte_budget: usize,
+        cx: &App,
+    ) -> Vec<LanguageModelRequestMessage> {
+        let end_ix = end_ix.min(history_messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
@@ -4427,7 +4554,7 @@ impl Thread {
             reasoning_details: None,
         }];
         extend_request_history_until(
-            &self.messages,
+            history_messages,
             &mut messages,
             end_ix,
             retained_user_byte_budget,
@@ -4553,6 +4680,34 @@ impl Thread {
         Some(insertion_ix)
     }
 
+    fn auto_compaction_target_ix(&self, cx: &App) -> Result<Option<usize>> {
+        let Some(insertion_ix) = self.compaction_message_target_ix(cx) else {
+            return Ok(None);
+        };
+
+        if let Some(compaction_ix) =
+            latest_compaction_message_ix_before(&self.messages, insertion_ix)
+        {
+            let user_messages_after_compaction = self.messages[compaction_ix + 1..insertion_ix]
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &***message,
+                        Message::User(UserMessage { content, .. }) if !content.is_empty()
+                    )
+                })
+                .count();
+            if user_messages_after_compaction < MIN_USER_MESSAGES_BEFORE_RECOMPACTION {
+                return Err(anyhow!(
+                    "Context is still above the automatic compaction threshold immediately after \
+                     compaction. Start a new thread or remove large images and tool output."
+                ));
+            }
+        }
+
+        Ok(Some(insertion_ix))
+    }
+
     /// Insertion point for a manually-triggered compaction.
     /// Returns `None` only when there is nothing to summarize (no messages, or the thread already ends in a compaction).
     fn forced_compaction_target_ix(&self) -> Option<usize> {
@@ -4572,8 +4727,56 @@ impl Thread {
             .or_else(|| self.model().cloned())
     }
 
-    fn build_compaction_request(
+    fn compaction_operation(
         &self,
+        target: &CompactionTarget,
+        cx: &App,
+    ) -> Result<CompactionOperation> {
+        let target_ix = target.resolve(&self.messages)?;
+        if let Some(model) = self
+            .model()
+            .filter(|model| model.supports_explicit_compaction())
+            .cloned()
+        {
+            let request = self.build_provider_compaction_request(target_ix, &model, cx);
+            let fallback_model = self
+                .compaction_model(cx)
+                .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+            return Ok(CompactionOperation::ProviderNative {
+                model,
+                request,
+                fallback_model,
+            });
+        }
+
+        let model = self
+            .compaction_model(cx)
+            .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+        Ok(CompactionOperation::Summary { model })
+    }
+
+    fn build_provider_compaction_request(
+        &self,
+        insertion_ix: usize,
+        model: &Arc<dyn LanguageModel>,
+        cx: &App,
+    ) -> LanguageModelRequest {
+        LanguageModelRequest {
+            thread_id: Some(self.id.to_string()),
+            prompt_id: Some(self.prompt_id.to_string()),
+            intent: Some(CompletionIntent::ThreadContextSummarization),
+            temperature: AgentSettings::temperature_for_model(model, cx),
+            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
+            thinking_allowed: self.thinking_enabled || !model.supports_disabling_thinking(),
+            thinking_effort: self.thinking_effort.clone(),
+            speed: self.speed(),
+            ..Default::default()
+        }
+    }
+
+    fn build_summary_compaction_request(
+        &self,
+        messages: &[Arc<Message>],
         insertion_ix: usize,
         retained_user_byte_budget: usize,
         model: &Arc<dyn LanguageModel>,
@@ -4584,7 +4787,8 @@ impl Thread {
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(model, cx),
-            messages: self.build_request_messages_until_with_retained_user_budget(
+            messages: self.build_request_messages_for_history_until_with_retained_user_budget(
+                messages,
                 Vec::new(),
                 insertion_ix,
                 retained_user_byte_budget,
@@ -4605,15 +4809,16 @@ impl Thread {
 
     fn build_compaction_plan(
         &self,
+        messages: &[Arc<Message>],
         target_ix: usize,
         maximum_end_ix: Option<usize>,
         retained_user_byte_budget: Option<usize>,
         model: &Arc<dyn LanguageModel>,
         cx: &App,
     ) -> Result<Option<CompactionPlan>> {
-        let target_ix = target_ix.min(self.messages.len());
+        let target_ix = target_ix.min(messages.len());
         let progress_start_ix =
-            latest_compaction_message_ix_before(&self.messages, target_ix).map_or(0, |ix| ix + 1);
+            latest_compaction_message_ix_before(messages, target_ix).map_or(0, |ix| ix + 1);
         if progress_start_ix >= target_ix {
             return Ok(None);
         }
@@ -4632,8 +4837,13 @@ impl Thread {
             .clamp(minimum_end_ix, target_ix);
 
         let build_request = |end_ix| -> Result<(LanguageModelRequest, Vec<u8>)> {
-            let request =
-                self.build_compaction_request(end_ix, retained_user_byte_budget, model, cx);
+            let request = self.build_summary_compaction_request(
+                messages,
+                end_ix,
+                retained_user_byte_budget,
+                model,
+                cx,
+            );
             let serialized_request =
                 serde_json::to_vec(&request).context("failed to size compaction request")?;
             Ok((request, serialized_request))
@@ -4985,25 +5195,34 @@ struct CompactionPlan {
     retained_user_byte_budget: usize,
 }
 
+#[derive(Clone)]
 enum CompactionTarget {
-    End,
     Before(Arc<Message>),
+    Through(Arc<Message>),
 }
 
 impl CompactionTarget {
-    fn new(messages: &[Arc<Message>], target_ix: usize) -> Self {
+    fn new(messages: &[Arc<Message>], target_ix: usize) -> Result<Self> {
+        if let Some(message) = messages.get(target_ix) {
+            return Ok(Self::Before(message.clone()));
+        }
         messages
-            .get(target_ix)
+            .get(target_ix.saturating_sub(1))
             .cloned()
-            .map_or(Self::End, Self::Before)
+            .map(Self::Through)
+            .ok_or_else(|| anyhow!("Compaction target has no messages"))
     }
 
     fn resolve(&self, messages: &[Arc<Message>]) -> Result<usize> {
         match self {
-            Self::End => Ok(messages.len()),
             Self::Before(target) => messages
                 .iter()
                 .position(|message| Arc::ptr_eq(message, target))
+                .ok_or_else(|| anyhow!("Compaction target is no longer present in the thread")),
+            Self::Through(target) => messages
+                .iter()
+                .position(|message| Arc::ptr_eq(message, target))
+                .map(|ix| ix + 1)
                 .ok_or_else(|| anyhow!("Compaction target is no longer present in the thread")),
         }
     }
@@ -5015,22 +5234,56 @@ enum CompactionMode {
 }
 
 impl CompactionMode {
-    fn insertion(&self, insertion_ix: usize) -> CompactionInsertion {
+    fn install(
+        &self,
+        messages: &mut Vec<Arc<Message>>,
+        insertion_ix: usize,
+        compaction: CompactionInfo,
+    ) -> Result<()> {
+        if insertion_ix > messages.len() {
+            return Err(anyhow!("Compaction insertion point is outside the thread"));
+        }
+
+        let compaction = Arc::new(Message::Compaction(compaction));
         match self {
-            Self::Auto => CompactionInsertion::Auto { insertion_ix },
-            Self::Manual { marker_id } => CompactionInsertion::Manual {
-                marker_id: marker_id.clone(),
-            },
+            Self::Auto => messages.insert(insertion_ix, compaction),
+            Self::Manual { marker_id } => {
+                messages.insert(
+                    insertion_ix,
+                    Arc::new(Message::User(UserMessage {
+                        id: marker_id.clone(),
+                        content: Arc::from([]),
+                    })),
+                );
+                messages.insert(insertion_ix + 1, compaction);
+            }
+        }
+        Ok(())
+    }
+}
+
+enum CompactionOperation {
+    ProviderNative {
+        model: Arc<dyn LanguageModel>,
+        request: LanguageModelRequest,
+        fallback_model: Arc<dyn LanguageModel>,
+    },
+    Summary {
+        model: Arc<dyn LanguageModel>,
+    },
+}
+
+impl CompactionOperation {
+    fn model(&self) -> &Arc<dyn LanguageModel> {
+        match self {
+            Self::ProviderNative { model, .. } | Self::Summary { model } => model,
         }
     }
 }
 
-enum CompactionInsertion {
-    /// Automatic compaction inserts the summary at an index computed up front
-    /// (which may be before a trailing not-yet-answered user message).
-    Auto { insertion_ix: usize },
-    /// Manual `/compact` appends a zero-content user message followed by the summary.
-    Manual { marker_id: ClientUserMessageId },
+enum CompactionRunStatus {
+    NotNeeded,
+    Completed,
 }
 
 fn compaction_request_byte_budget(model: &dyn LanguageModel) -> usize {
@@ -5117,15 +5370,26 @@ fn extend_request_history_until(
         return;
     };
 
-    if matches!(
-        &*messages[compaction_ix],
-        Message::Compaction(CompactionInfo::Summary(_))
-    ) {
-        request_messages.extend(retained_user_request_messages_before(
-            messages,
-            compaction_ix,
-            retained_user_byte_budget,
-        ));
+    match &*messages[compaction_ix] {
+        Message::Compaction(
+            CompactionInfo::Summary(_)
+            | CompactionInfo::ProviderContext(CompactedContext::Summary { .. }),
+        ) => {
+            request_messages.extend(retained_user_request_messages_before(
+                messages,
+                compaction_ix,
+                retained_user_byte_budget,
+            ));
+        }
+        Message::Compaction(CompactionInfo::ProviderContext(CompactedContext::ProviderState(
+            _,
+        ))) => {
+            for message in &messages[..compaction_ix] {
+                request_messages.extend(message.to_request());
+            }
+        }
+        Message::Compaction(CompactionInfo::ProviderNative { .. }) => {}
+        Message::User(_) | Message::Agent(_) | Message::Resume => {}
     }
 
     for message in &messages[compaction_ix..end_ix] {

@@ -9,11 +9,15 @@ use http_client::{
     http::{HeaderName, HeaderValue},
 };
 use language_model::{
-    LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    CompactionResult, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice, RateLimiter,
 };
-use open_ai::{ReasoningEffort, responses::stream_response};
+use open_ai::{
+    ReasoningEffort,
+    completion::token_usage_from_response_usage,
+    responses::{compact_codex_response, stream_response},
+};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -445,6 +449,77 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         format!("openai-subscribed/{}", self.model.id())
     }
 
+    fn supports_explicit_compaction(&self) -> bool {
+        true
+    }
+
+    fn compact(
+        &self,
+        mut request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<CompactionResult, LanguageModelCompletionError>> {
+        if !self.model.supports_priority() {
+            request.speed = None;
+        }
+
+        let mut responses_request = match into_open_ai_response(
+            request,
+            self.model.id(),
+            self.model.supports_parallel_tool_calls(),
+            self.model.supports_prompt_cache_key(),
+            /*max_output_tokens*/ None,
+            self.model.default_reasoning_effort(),
+            self.model
+                .supported_reasoning_efforts()
+                .contains(&ReasoningEffort::None),
+            &PROVIDER_ID,
+        ) {
+            Ok(request) => request,
+            Err(error) => return async move { Err(error.into()) }.boxed(),
+        };
+        responses_request.store = Some(false);
+        responses_request.instructions.get_or_insert_default();
+        let compact_request = responses_request.into_codex_compact_request();
+
+        let state = self.state.downgrade();
+        let http_client = self.http_client.clone();
+        let request_limiter = self.request_limiter.clone();
+        let future = cx.spawn(async move |cx| {
+            let creds = get_fresh_credentials(&state, &http_client, cx).await?;
+            let extra_headers = codex_headers(&creds);
+            let access_token = creds.access_token.clone();
+
+            request_limiter
+                .run(async move {
+                    compact_codex_response(
+                        http_client.as_ref(),
+                        PROVIDER_NAME.0.as_str(),
+                        CODEX_BASE_URL,
+                        &access_token,
+                        compact_request,
+                        &extra_headers,
+                    )
+                    .await
+                    .map_err(LanguageModelCompletionError::from)
+                })
+                .await
+        });
+
+        async move {
+            let response = future.await?;
+            let usage = response
+                .usage
+                .as_ref()
+                .map(token_usage_from_response_usage)
+                .unwrap_or_default();
+            let context = response
+                .into_compacted_context(PROVIDER_ID)
+                .map_err(LanguageModelCompletionError::Other)?;
+            Ok(CompactionResult { context, usage })
+        }
+        .boxed()
+    }
+
     fn max_token_count(&self) -> u64 {
         self.model.max_token_count()
     }
@@ -503,26 +578,7 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
 
         let future = cx.spawn(async move |cx| {
             let creds = get_fresh_credentials(&state, &http_client, cx).await?;
-
-            let mut header_pairs: Vec<(HeaderName, HeaderValue)> = vec![
-                (
-                    HeaderName::from_static("originator"),
-                    HeaderValue::from_static("zed"),
-                ),
-                (
-                    HeaderName::from_static("openai-beta"),
-                    HeaderValue::from_static("responses=experimental"),
-                ),
-            ];
-            if let Some(ref id) = creds.account_id {
-                if !id.is_empty() {
-                    if let Ok(value) = HeaderValue::from_str(id) {
-                        header_pairs.push((HeaderName::from_static("chatgpt-account-id"), value));
-                    }
-                }
-            }
-            let extra_headers = CustomHeaders::new(header_pairs);
-
+            let extra_headers = codex_headers(&creds);
             let access_token = creds.access_token.clone();
             request_limiter
                 .stream(async move {
@@ -546,6 +602,26 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         }
         .boxed()
     }
+}
+
+fn codex_headers(creds: &CodexCredentials) -> CustomHeaders {
+    let mut header_pairs: Vec<(HeaderName, HeaderValue)> = vec![
+        (
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("zed"),
+        ),
+        (
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("responses=experimental"),
+        ),
+    ];
+    if let Some(ref id) = creds.account_id
+        && !id.is_empty()
+        && let Ok(value) = HeaderValue::from_str(id)
+    {
+        header_pairs.push((HeaderName::from_static("chatgpt-account-id"), value));
+    }
+    CustomHeaders::new(header_pairs)
 }
 
 async fn get_fresh_credentials(
