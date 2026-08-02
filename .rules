@@ -135,6 +135,54 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+## macOS release build and installation
+
+For the local fork, run source checks before packaging. On this machine the supported release target is Apple Silicon (`aarch64-apple-darwin`). Keep the currently installed app recoverable until the new bundle passes verification and smoke testing.
+
+### Build
+
+`script/bundle-mac` already builds `zed`, `cli`, and `remote_server` before invoking `cargo bundle`. Set `CARGO_BUNDLE_SKIP_BUILD=1` to prevent cargo-bundle from compiling the same targets a second time. Use a color-capable `TERM`; `TERM=dumb` can make cargo-bundle panic while formatting an error.
+
+```bash
+TERM=xterm-256color \
+CARGO_BUNDLE_SKIP_BUILD=1 \
+./script/bundle-mac aarch64-apple-darwin
+```
+
+The release bundle is written under `target/aarch64-apple-darwin/release/bundle/osx/`. Do not run multiple bundle commands concurrently because Cargo's artifact lock will serialize them and can trigger redundant builds. Do not use the script's `-i` install path for the release flow; prepare and sign the bundle first, then install it explicitly.
+
+### Prepare the local Beta bundle
+
+When the fork is distributed as `Zed Preview Beta`, make the app identity consistent before signing:
+
+- `Contents/MacOS/zed`, `cli`, and `git` must be present and executable.
+- `Contents/embedded.provisionprofile` and `Contents/Resources/Document.icns` must be present.
+- If cargo-bundle produced `Zed Dev.app`, update `Info.plist` before signing: set `CFBundleName`, `CFBundleDisplayName`, `CFBundleIdentifier` (`dev.zed.Zed-Preview-Beta`), `CFBundleIconFile`, and the URL type display name.
+- Never edit `Info.plist`, copy runtime files, or rename the icon after signing; any such change invalidates the signature.
+
+### Sign, install, and verify
+
+Sign the completed bundle with the repository entitlements, then verify it before replacing the installed app:
+
+```bash
+/usr/bin/codesign --force --deep \
+  --entitlements crates/zed/resources/zed.entitlements \
+  --sign - "$APP_PATH"
+/usr/bin/codesign --verify --deep --strict "$APP_PATH"
+```
+
+Move the existing `/Applications/Zed Preview Beta.app` to `/Applications/Zed Preview Beta.backup.app`, move the verified bundle into `/Applications/Zed Preview Beta.app`, and launch it. Do not delete the backup until the new app starts and the critical Agent, terminal, and editor flows have been smoke-tested.
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+  '/Applications/Zed Preview Beta.app/Contents/Info.plist'
+/usr/bin/codesign --verify --deep --strict \
+  '/Applications/Zed Preview Beta.app'
+open '/Applications/Zed Preview Beta.app'
+```
+
+If cargo-bundle reports `ColorOutOfRange`, rerun with `TERM=xterm-256color`. A successful build is not proof that the installed app is the new bundle: verify the version, commit, architecture, and running executable path after launch.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:

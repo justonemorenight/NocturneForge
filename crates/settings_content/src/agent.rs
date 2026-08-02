@@ -256,6 +256,10 @@ pub struct AgentSettingsContent {
     /// Custom instructions to include in the prompt when generating git commit messages.
     /// Applied in addition to any project rules files (such as `.rules` or `AGENTS.md`).
     pub commit_message_instructions: Option<String>,
+    /// Name of an Agent Skill whose instructions should be applied only when
+    /// generating Git commit messages. Project-local skills take precedence
+    /// over global skills with the same name.
+    pub commit_message_skill: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
     pub thread_summary_model: Option<LanguageModelSelection>,
     /// Model to use for context compaction (`/compact` and auto-compaction).

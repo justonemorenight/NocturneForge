@@ -611,6 +611,10 @@ pub struct ConversationView {
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
     request_elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
+    /// Entry updates produced by streaming are coalesced so a burst of model
+    /// chunks can invalidate the visible chat at most once per frame.
+    pending_entry_updates: HashMap<acp::SessionId, HashSet<usize>>,
+    entry_update_frame_scheduled: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -705,6 +709,26 @@ impl ConversationView {
         };
 
         connected.navigate_to_thread(session_id);
+        let streaming_visibility = self
+            .as_connected()
+            .map(|connected| {
+                connected
+                    .threads
+                    .iter()
+                    .map(|(session_id, view)| {
+                        (
+                            view.read(cx).thread.clone(),
+                            self.is_thread_render_visible(session_id, cx),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (thread, visible) in streaming_visibility {
+            thread.update(cx, |thread, cx| {
+                thread.set_streaming_updates_visible(visible, cx);
+            });
+        }
         if let Some(view) = self.active_thread().cloned() {
             view.update(cx, |view, cx| {
                 view.unseen_entry_count = 0;
@@ -897,6 +921,8 @@ impl ConversationView {
             draft_prompt_persist_task: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
+            pending_entry_updates: HashMap::default(),
+            entry_update_frame_scheduled: false,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
         }
@@ -1627,20 +1653,8 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::EntryUpdated(index) => {
-                if let Some(active) = self.thread_view(&session_id) {
-                    let entry_view_state = active.read(cx).entry_view_state.clone();
-                    let list_state = active.read(cx).list_state.clone();
-                    entry_view_state.update(cx, |view_state, cx| {
-                        view_state.sync_entry(*index, thread, window, cx);
-                    });
-                    list_state.remeasure_items(*index..*index + 1);
-                    active.update(cx, |active, cx| {
-                        active.entry_updated(*index, cx);
-                        active.sync_elicitation_state_for_entry(*index, window, cx);
-                        active.auto_expand_streaming_thought(cx);
-                        active.sync_generating_indicator(cx);
-                    });
-                }
+                self.schedule_entry_update(session_id, *index, window, cx);
+                return;
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -1879,6 +1893,104 @@ impl ConversationView {
             }
         }
         cx.notify();
+    }
+
+    fn is_thread_render_visible(&self, session_id: &acp::SessionId, cx: &App) -> bool {
+        let Some(connected) = self.as_connected() else {
+            return false;
+        };
+        if connected.active_id.as_ref() == Some(session_id) {
+            return true;
+        }
+        if connected.active_id.as_ref() != self.root_session_id.as_ref() {
+            return false;
+        }
+
+        let Some(root_view) = self.root_thread_view() else {
+            return false;
+        };
+        let root_thread = root_view.read(cx).thread.clone();
+        let Some(tool_call_id) = root_thread
+            .read(cx)
+            .tool_call_for_subagent(session_id)
+            .map(|tool_call| tool_call.id.clone())
+        else {
+            return false;
+        };
+
+        root_view
+            .read(cx)
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call_id)
+    }
+
+    fn schedule_entry_update(
+        &mut self,
+        session_id: acp::SessionId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_thread_render_visible(&session_id, cx) {
+            return;
+        }
+
+        self.pending_entry_updates
+            .entry(session_id)
+            .or_default()
+            .insert(index);
+        if self.entry_update_frame_scheduled {
+            return;
+        }
+
+        self.entry_update_frame_scheduled = true;
+        cx.on_next_frame(window, |this, window, cx| {
+            this.flush_pending_entry_updates(window, cx);
+        });
+    }
+
+    fn flush_pending_entry_updates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.entry_update_frame_scheduled = false;
+        let pending = std::mem::take(&mut self.pending_entry_updates);
+        let mut did_update = false;
+
+        for (session_id, indexes) in pending {
+            if !self.is_thread_render_visible(&session_id, cx) {
+                continue;
+            }
+            let Some(thread_view) = self.thread_view(&session_id) else {
+                continue;
+            };
+            let thread = thread_view.read(cx).thread.clone();
+            let entry_view_state = thread_view.read(cx).entry_view_state.clone();
+            let list_state = thread_view.read(cx).list_state.clone();
+            let mut indexes = indexes.into_iter().collect::<Vec<_>>();
+            indexes.sort_unstable();
+
+            entry_view_state.update(cx, |view_state, cx| {
+                for &index in &indexes {
+                    view_state.sync_entry(index, &thread, window, cx);
+                }
+            });
+            for &index in &indexes {
+                list_state.remeasure_items(index..index + 1);
+            }
+            thread_view.update(cx, |thread_view, cx| {
+                for &index in &indexes {
+                    thread_view.entry_updated(index, cx);
+                    thread_view.sync_elicitation_state_for_entry(index, window, cx);
+                }
+                thread_view.auto_expand_streaming_thought(cx);
+                thread_view.sync_generating_indicator(cx);
+                cx.notify();
+            });
+            did_update = true;
+        }
+
+        if did_update {
+            cx.notify();
+        }
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {

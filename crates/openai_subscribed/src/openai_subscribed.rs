@@ -2,51 +2,75 @@ use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
-use gpui::{App, AsyncApp, Context, Entity, SharedString, Task, WeakEntity};
+use futures::{
+    FutureExt, StreamExt,
+    future::{AbortHandle, Abortable, BoxFuture, Shared},
+};
+use gpui::{App, AsyncApp, BackgroundExecutor, Context, Entity, SharedString, Task, WeakEntity};
 use http_client::{
-    AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest,
+    AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
     http::{HeaderName, HeaderValue},
 };
 use language_model::{
-    CompactionResult, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice, RateLimiter,
+    CompactedContext, CompactionResult, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelRequest,
+    LanguageModelToolChoice, RateLimiter,
 };
 use open_ai::{
     ReasoningEffort,
     completion::token_usage_from_response_usage,
     responses::{compact_codex_response, stream_response},
 };
+use parking_lot::Mutex;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 use util::ResultExt as _;
 
-use open_ai::completion::{OpenAiResponseEventMapper, into_open_ai_response};
+use open_ai::completion::{OpenAiResponseEventMapper, into_open_ai_response_with_account_scope};
 
 pub const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openai-subscribed");
 pub const PROVIDER_NAME: LanguageModelProviderName =
     LanguageModelProviderName::new("ChatGPT Subscription");
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-const CREDENTIALS_KEY: &str = "https://chatgpt.com/backend-api/codex";
+const LEGACY_CREDENTIALS_KEY: &str = "https://chatgpt.com/backend-api/codex";
+const ACCOUNT_MANIFEST_KEY: &str = "https://chatgpt.com/backend-api/codex/accounts";
+const ACCOUNT_CREDENTIALS_PREFIX: &str = "https://chatgpt.com/backend-api/codex/account/";
+const MAX_ACCOUNT_SESSIONS: usize = 5;
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const TOKEN_REFRESH_BUFFER_MS: u64 = 5 * 60 * 1000;
+const RESPONSE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const COMPACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const MODEL_CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CodexCredentials {
     access_token: String,
     refresh_token: String,
     expires_at_ms: u64,
+    #[serde(default)]
     account_id: Option<String>,
+    #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    plan_type: Option<String>,
 }
 
 impl CodexCredentials {
@@ -56,15 +80,167 @@ impl CodexCredentials {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct AccountManifest {
+    #[serde(default = "account_manifest_version")]
+    version: u32,
+    #[serde(default)]
+    active_session_id: Option<String>,
+    #[serde(default)]
+    sessions: Vec<AccountSessionMetadata>,
+}
+
+fn account_manifest_version() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AccountSessionMetadata {
+    session_id: String,
+    email: Option<String>,
+    user_id: Option<String>,
+    display_name: Option<String>,
+    image_url: Option<String>,
+    last_used_at_ms: u64,
+    #[serde(default)]
+    token_expires_at_ms: Option<u64>,
+    #[serde(default)]
+    selected_workspace_account_id: Option<String>,
+    #[serde(default)]
+    workspaces: Vec<WorkspaceMetadata>,
+    quota: Option<QuotaSnapshot>,
+    quota_fetched_at_ms: Option<u64>,
+    #[serde(default)]
+    reauthentication_required: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WorkspaceMetadata {
+    account_id: String,
+    name: Option<String>,
+    image_url: Option<String>,
+    kind: Option<String>,
+    plan_type: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuotaWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuotaSnapshot {
+    pub primary: Option<QuotaWindow>,
+    pub secondary: Option<QuotaWindow>,
+    pub credits_has_credits: bool,
+    pub credits_unlimited: bool,
+    pub credits_balance: Option<String>,
+    pub limit_name: Option<String>,
+    pub plan_type: Option<String>,
+    pub captured_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountSummary {
+    pub session_id: SharedString,
+    pub email: Option<SharedString>,
+    pub display_name: Option<SharedString>,
+    pub workspace_name: Option<SharedString>,
+    pub workspace_kind: Option<SharedString>,
+    pub plan_type: Option<SharedString>,
+    pub token_expires_at_ms: Option<u64>,
+    pub quota: Option<QuotaSnapshot>,
+    pub quota_stale: bool,
+    pub reauthentication_required: bool,
+    pub is_active: bool,
+    pub is_busy: bool,
+}
+
+/// Whether the persisted account manifest was read successfully during the
+/// initial load. While `Pending` or `Unavailable`, background code must not
+/// overwrite the manifest on disk: a transient keychain failure or a corrupt
+/// manifest must not silently drop known accounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestLoadState {
+    Pending,
+    Loaded,
+    Unavailable,
+}
+
+/// Tracks the number of in-flight model operations and pokes the `State`
+/// entity when the count transitions between zero and non-zero so busy UI can
+/// re-render without the guard touching GPUI from `Drop`.
+struct BusyNotifier {
+    counter: AtomicUsize,
+    notify_tx: async_channel::Sender<()>,
+    receiver: Mutex<Option<async_channel::Receiver<()>>>,
+}
+impl BusyNotifier {
+    fn new() -> Self {
+        let (notify_tx, receiver) = async_channel::unbounded();
+        Self {
+            counter: AtomicUsize::new(0),
+            notify_tx,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    }
+
+    /// Registers an in-flight operation. The first transition out of idle also
+    /// starts the watcher task that forwards busy notifications to the state.
+    fn enter(&self, state: &WeakEntity<State>, cx: &AsyncApp) {
+        if self.counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            if let Some(receiver) = self.receiver.lock().take() {
+                let state = state.clone();
+                cx.spawn(async move |cx| {
+                    while receiver.recv().await.is_ok() {
+                        state.update(cx, |_, cx| cx.notify()).ok();
+                    }
+                })
+                .detach();
+            }
+            let _ = self.notify_tx.try_send(());
+        }
+    }
+
+    /// Unregisters an in-flight operation. Only called from `Drop`, so it
+    /// never touches GPUI; the watcher task performs the notify instead.
+    fn exit(&self) {
+        if self.counter.fetch_sub(1, Ordering::Relaxed) == 1 {
+            let _ = self.notify_tx.try_send(());
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.counter.load(Ordering::Relaxed) > 0
+    }
+}
+
 pub struct State {
+    manifest: AccountManifest,
     credentials: Option<CodexCredentials>,
-    sign_in_task: Option<Task<Result<()>>>,
+    active_session_id: Option<String>,
+    sign_in_task: Option<Task<()>>,
+    sign_in_abort_handle: Option<AbortHandle>,
+    sign_out_task: Option<Task<()>>,
+    account_mutation_in_progress: bool,
     refresh_task: Option<Shared<Task<Result<CodexCredentials, Arc<anyhow::Error>>>>>,
     load_task: Option<Shared<Task<Result<(), Arc<anyhow::Error>>>>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     auth_generation: u64,
+    /// Monotonic sequence of accepted account mutations. A switch whose
+    /// captured sequence is no longer current discards its result, so the
+    /// account clicked last is the one that stays active.
+    account_mutation_seq: u64,
     last_auth_error: Option<SharedString>,
+    models: Vec<ChatGptModel>,
+    model_fetch_task: Option<Task<()>>,
+    quota_fetch_tasks: Vec<Task<()>>,
+    active_operations: Arc<BusyNotifier>,
+    manifest_load_state: ManifestLoadState,
+    client_version: String,
 }
 
 #[derive(Debug)]
@@ -88,27 +264,173 @@ impl State {
     pub fn new(
         http_client: Arc<dyn HttpClient>,
         credentials_provider: Arc<dyn CredentialsProvider>,
+        client_version: String,
         cx: &mut Context<Self>,
     ) -> Self {
         let load_task = cx
             .spawn({
                 let credentials_provider = credentials_provider.clone();
                 async move |this, cx| {
-                    let result = credentials_provider
-                        .read_credentials(CREDENTIALS_KEY, cx)
-                        .await;
-                    this.update(cx, |state, cx| {
-                        if let Ok(Some((_, bytes))) = result {
-                            match serde_json::from_slice::<CodexCredentials>(&bytes) {
-                                Ok(creds) => state.credentials = Some(creds),
-                                Err(err) => {
-                                    log::warn!(
-                                        "Failed to deserialize ChatGPT subscription credentials: {err}"
+                    let generation = this
+                        .read_with(cx, |state, _| state.auth_generation)
+                        .unwrap_or(0);
+
+                    enum ManifestLoad {
+                        Loaded(AccountManifest),
+                        Missing,
+                        Unavailable,
+                    }
+                    let load = match credentials_provider
+                        .read_credentials(ACCOUNT_MANIFEST_KEY, cx)
+                        .await
+                    {
+                        Ok(Some((_, bytes))) => match serde_json::from_slice(&bytes) {
+                            Ok(manifest) => ManifestLoad::Loaded(manifest),
+                            Err(err) => {
+                                log::error!(
+                                    "ChatGPT subscription account manifest is corrupt: {err}"
+                                );
+                                ManifestLoad::Unavailable
+                            }
+                        },
+                        Ok(None) => ManifestLoad::Missing,
+                        Err(err) => {
+                            log::error!(
+                                "Failed to read ChatGPT subscription account manifest from the \
+                                 credential store: {err:#}"
+                            );
+                            ManifestLoad::Unavailable
+                        }
+                    };
+
+                    // A manifest that could not be read must not fall back to the
+                    // legacy single-account key: that would resurrect accounts the
+                    // user signed out, and a later write could clobber the real
+                    // manifest. Only a manifest that is genuinely missing can be
+                    // migrated.
+                    let migrate_legacy = matches!(&load, ManifestLoad::Missing);
+                    let manifest_load_state = match &load {
+                        ManifestLoad::Loaded(_) => ManifestLoadState::Loaded,
+                        ManifestLoad::Missing => ManifestLoadState::Loaded,
+                        ManifestLoad::Unavailable => ManifestLoadState::Unavailable,
+                    };
+                    let mut manifest = match load {
+                        ManifestLoad::Loaded(manifest) => manifest,
+                        ManifestLoad::Missing | ManifestLoad::Unavailable => {
+                            AccountManifest::default()
+                        }
+                    };
+                    if manifest.version == 0 {
+                        manifest.version = 1;
+                    }
+
+                    let mut active_session_id = manifest.active_session_id.clone().or_else(|| {
+                        manifest
+                            .sessions
+                            .iter()
+                            .max_by_key(|session| session.last_used_at_ms)
+                            .map(|session| session.session_id.clone())
+                    });
+                    manifest.active_session_id = active_session_id.clone();
+                    let mut credentials = None;
+                    let mut credentials_unavailable = false;
+                    if let Some(session_id) = active_session_id.as_deref() {
+                        match credentials_provider
+                            .read_credentials(&account_credentials_key(session_id), cx)
+                            .await
+                        {
+                            Ok(Some((_, bytes))) => {
+                                credentials =
+                                    serde_json::from_slice::<CodexCredentials>(&bytes).ok();
+                                if credentials.is_none() {
+                                    log::error!(
+                                        "ChatGPT subscription account credentials are corrupt"
                                     );
+                                    credentials_unavailable = true;
                                 }
                             }
+                            Ok(None) => {}
+                            Err(err) => {
+                                log::warn!(
+                                    "Failed to read ChatGPT subscription account credentials: \
+                                     {err:#}"
+                                );
+                                credentials_unavailable = true;
+                            }
                         }
+                    }
+
+                    // Migrate the old single-account credential on first load. The
+                    // legacy key is only removed once the account-scoped key and
+                    // the manifest have both persisted successfully; a failed
+                    // persist retries the migration on the next launch.
+                    if migrate_legacy
+                        && !credentials_unavailable
+                        && let Ok(Some((_, bytes))) = credentials_provider
+                            .read_credentials(LEGACY_CREDENTIALS_KEY, cx)
+                            .await
+                    {
+                        match serde_json::from_slice::<CodexCredentials>(&bytes) {
+                            Ok(creds) => {
+                                let session_id = session_id_for_credentials(&creds);
+                                active_session_id = Some(session_id.clone());
+                                credentials = Some(creds.clone());
+                                upsert_manifest_session(&mut manifest, &session_id, &creds);
+                                manifest.active_session_id = Some(session_id.clone());
+                                let persist = async {
+                                    let json = serde_json::to_vec(&creds)?;
+                                    credentials_provider
+                                        .write_credentials(
+                                            &account_credentials_key(&session_id),
+                                            "Bearer",
+                                            &json,
+                                            cx,
+                                        )
+                                        .await?;
+                                    let json = serde_json::to_vec(&manifest)?;
+                                    credentials_provider
+                                        .write_credentials(ACCOUNT_MANIFEST_KEY, "json", &json, cx)
+                                        .await?;
+                                    anyhow::Ok(())
+                                };
+                                match persist.await {
+                                    Ok(()) => {
+                                        credentials_provider
+                                            .delete_credentials(LEGACY_CREDENTIALS_KEY, cx)
+                                            .await
+                                            .log_err();
+                                    }
+                                    Err(err) => {
+                                        log::error!(
+                                            "Failed to migrate legacy ChatGPT subscription \
+                                             credentials: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "Failed to deserialize ChatGPT subscription credentials: \
+                                     {err}"
+                                );
+                            }
+                        }
+                    }
+
+                    this.update(cx, |state, cx| {
+                        // A sign-in/out or switch that happened while loading
+                        // owns the identity now; discard the loaded result.
                         state.load_task = None;
+                        if state.auth_generation != generation {
+                            return;
+                        }
+                        state.manifest = manifest;
+                        state.manifest_load_state = manifest_load_state;
+                        state.active_session_id = active_session_id;
+                        state.credentials = credentials;
+                        if state.credentials.is_some() {
+                            state.restart_model_fetch(cx);
+                        }
                         cx.notify();
                     })?;
                     Ok::<(), Arc<anyhow::Error>>(())
@@ -117,14 +439,29 @@ impl State {
             .shared();
 
         Self {
+            manifest: AccountManifest {
+                version: 1,
+                ..Default::default()
+            },
             credentials: None,
+            active_session_id: None,
             sign_in_task: None,
+            sign_in_abort_handle: None,
+            sign_out_task: None,
+            account_mutation_in_progress: false,
             refresh_task: None,
             load_task: Some(load_task),
             credentials_provider,
             http_client,
             auth_generation: 0,
+            account_mutation_seq: 0,
             last_auth_error: None,
+            models: ChatGptModel::fallback_models(),
+            model_fetch_task: None,
+            quota_fetch_tasks: Vec::new(),
+            active_operations: Arc::new(BusyNotifier::new()),
+            manifest_load_state: ManifestLoadState::Pending,
+            client_version,
         }
     }
 
@@ -136,12 +473,250 @@ impl State {
         self.credentials.as_ref().and_then(|c| c.email.as_deref())
     }
 
+    /// Returns the accounts known to this installation. The active account is
+    /// always first so compact pickers can render it without another sort.
+    pub fn account_summaries(&self) -> Vec<AccountSummary> {
+        let now = now_ms();
+        let stale_after_ms = QUOTA_STALE_AFTER.as_millis() as u64;
+        let mut accounts = self
+            .manifest
+            .sessions
+            .iter()
+            .map(|session| {
+                let workspace = session
+                    .selected_workspace_account_id
+                    .as_deref()
+                    .and_then(|id| {
+                        session
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.account_id == id)
+                    })
+                    .or_else(|| session.workspaces.first());
+                let plan_type = workspace
+                    .and_then(|workspace| workspace.plan_type.clone())
+                    .or_else(|| {
+                        session
+                            .quota
+                            .as_ref()
+                            .and_then(|quota| quota.plan_type.clone())
+                    })
+                    .or_else(|| {
+                        self.credentials_for_session(&session.session_id)
+                            .and_then(|creds| creds.plan_type)
+                    });
+                AccountSummary {
+                    session_id: session.session_id.clone().into(),
+                    email: session.email.clone().map(Into::into),
+                    display_name: session.display_name.clone().map(Into::into),
+                    workspace_name: workspace
+                        .and_then(|workspace| workspace.name.clone())
+                        .map(Into::into),
+                    workspace_kind: workspace
+                        .and_then(|workspace| workspace.kind.clone())
+                        .map(Into::into),
+                    plan_type: plan_type.map(Into::into),
+                    token_expires_at_ms: session.token_expires_at_ms,
+                    quota: session.quota.clone(),
+                    quota_stale: session
+                        .quota_fetched_at_ms
+                        .is_none_or(|fetched_at| now.saturating_sub(fetched_at) > stale_after_ms),
+                    reauthentication_required: session.reauthentication_required,
+                    is_active: self.active_session_id.as_deref()
+                        == Some(session.session_id.as_str()),
+                    is_busy: self.active_operations.is_busy() || self.account_mutation_in_progress,
+                }
+            })
+            .collect::<Vec<_>>();
+        accounts.sort_by_key(|account| !account.is_active);
+        accounts
+    }
+
+    pub fn active_account_id(&self) -> Option<SharedString> {
+        self.active_session_id.clone().map(Into::into)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_operations.is_busy() || self.account_mutation_in_progress
+    }
+
+    fn begin_account_mutation(&mut self) -> Result<()> {
+        if self.is_busy() {
+            return Err(anyhow!(
+                "Cannot change ChatGPT accounts while a request or account operation is active"
+            ));
+        }
+        self.account_mutation_in_progress = true;
+        Ok(())
+    }
+
+    fn begin_account_switch(&mut self) -> Result<()> {
+        self.begin_account_mutation()
+    }
+
+    fn finish_account_mutation(&mut self) {
+        self.account_mutation_in_progress = false;
+    }
+
+    pub fn switch_account(
+        &mut self,
+        session_id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let session_id = session_id.to_string();
+        if self.active_session_id.as_deref() == Some(session_id.as_str())
+            && self.credentials.is_some()
+        {
+            return Task::ready(Ok(()));
+        }
+        if !self
+            .manifest
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Task::ready(Err(anyhow!("Unknown ChatGPT account session")));
+        }
+        if let Err(error) = self.begin_account_switch() {
+            return Task::ready(Err(error));
+        }
+        cx.notify();
+
+        self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        let mutation_seq = self.account_mutation_seq;
+        let provider = self.credentials_provider.clone();
+        let key = account_credentials_key(&session_id);
+        cx.spawn(async move |this, cx| {
+            let operation_result: Result<Option<(AccountManifest, CodexCredentials)>> = async {
+                let (_, bytes) = provider
+                    .read_credentials(&key, cx)
+                    .await?
+                    .ok_or_else(|| anyhow!("ChatGPT account credentials are missing"))?;
+                let credentials = serde_json::from_slice::<CodexCredentials>(&bytes)
+                    .context("Failed to deserialize ChatGPT account credentials")?;
+                let manifest = this.read_with(cx, |state, _| {
+                    if state.account_mutation_seq != mutation_seq
+                        || !state.account_mutation_in_progress
+                    {
+                        return None;
+                    }
+                    Some(state.manifest.clone())
+                })?;
+                let Some(mut manifest) = manifest else {
+                    return Ok(None);
+                };
+                manifest.active_session_id = Some(session_id.clone());
+                if let Some(session) = manifest
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.session_id == session_id)
+                {
+                    session.last_used_at_ms = now_ms();
+                    session.reauthentication_required = false;
+                }
+                write_manifest(&provider, &manifest, cx).await?;
+                Ok(Some((manifest, credentials)))
+            }
+            .await;
+
+            this.update(cx, |state, cx| {
+                let is_current = state.account_mutation_seq == mutation_seq;
+                state.finish_account_mutation();
+                if is_current && let Ok(Some((manifest, credentials))) = &operation_result {
+                    state.auth_generation = state.auth_generation.wrapping_add(1);
+                    state.active_session_id = Some(session_id);
+                    state.manifest = manifest.clone();
+                    state.credentials = Some(credentials.clone());
+                    state.refresh_task = None;
+                    state.refresh_quota(cx);
+                    state.restart_model_fetch(cx);
+                    state.last_auth_error = None;
+                } else if is_current && operation_result.is_err() {
+                    state.last_auth_error =
+                        Some("Failed to switch ChatGPT accounts. Please try again.".into());
+                }
+                cx.notify();
+            })?;
+            operation_result.map(|_| ())
+        })
+    }
+
+    /// Refreshes quota for the active account. The backend response is kept
+    /// local and cached in the account manifest; a stale value remains useful
+    /// when the usage endpoint is unavailable.
+    pub fn refresh_quota(&mut self, cx: &mut Context<Self>) {
+        if self.credentials.is_none() || self.active_session_id.is_none() {
+            return;
+        }
+        if self
+            .active_session_id
+            .as_deref()
+            .and_then(|session_id| {
+                self.manifest
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .and_then(|session| session.quota_fetched_at_ms)
+            })
+            .is_some_and(|fetched_at| {
+                now_ms().saturating_sub(fetched_at) < QUOTA_REFRESH_INTERVAL.as_millis() as u64
+            })
+        {
+            return;
+        }
+        let http_client = self.http_client.clone();
+        let credentials = self.credentials.clone().unwrap();
+        let session_id = self.active_session_id.clone().unwrap();
+        let task = cx.spawn(async move |this, cx| {
+            let result = fetch_quota(http_client.as_ref(), &credentials).await;
+            if let Ok(quota) = result {
+                this.update(cx, |state, cx| {
+                    if state.active_session_id.as_deref() != Some(session_id.as_str()) {
+                        return;
+                    }
+                    if let Some(session) = state
+                        .manifest
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.session_id == session_id)
+                    {
+                        session.quota = Some(quota);
+                        session.quota_fetched_at_ms = Some(now_ms());
+                    }
+                    cx.notify();
+                })
+                .log_err();
+                if let Ok(provider) =
+                    this.read_with(cx, |state, _| state.credentials_provider.clone())
+                {
+                    persist_manifest(&provider, &this, cx).await.log_err();
+                }
+            } else if let Err(error) = result {
+                log::debug!("ChatGPT usage refresh failed: {error:#}");
+            }
+        });
+        self.quota_fetch_tasks.clear();
+        self.quota_fetch_tasks.push(task);
+    }
+
+    fn credentials_for_session(&self, session_id: &str) -> Option<CodexCredentials> {
+        if self.active_session_id.as_deref() == Some(session_id) {
+            self.credentials.clone()
+        } else {
+            None
+        }
+    }
+
     pub fn is_signing_in(&self) -> bool {
         self.sign_in_task.is_some()
     }
 
     pub fn last_auth_error(&self) -> Option<SharedString> {
         self.last_auth_error.clone()
+    }
+
+    pub fn models(&self) -> Vec<ChatGptModel> {
+        self.models.clone()
     }
 
     /// The in-flight task loading persisted credentials, or `None` once the
@@ -152,21 +727,105 @@ impl State {
 
     /// Starts the browser-based OAuth sign-in flow. No-op while a sign-in is
     /// already in progress; observe the entity to react to the outcome.
-    pub fn sign_in(&mut self, cx: &mut Context<Self>) {
+    pub fn sign_in(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         if self.is_signing_in() {
-            return;
+            return Task::ready(Ok(()));
+        }
+        if let Err(error) = self.begin_account_mutation() {
+            return Task::ready(Err(error));
         }
 
         let http_client = self.http_client.clone();
-        let task = cx.spawn(async move |this, cx| {
-            match do_oauth_flow(http_client, cx).await {
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        self.sign_in_abort_handle = Some(abort_handle);
+        let task = cx
+            .spawn(async move |this, cx| {
+                // Let the initial load settle so the new session is persisted
+                // against the manifest that is actually on disk.
+                if let Some(load_task) =
+                    this.read_with(cx, |state, _| state.load_task.clone()).unwrap_or(None)
+                {
+                    load_task.await.log_err();
+                }
+                let generation = this
+                    .read_with(cx, |state, _| state.auth_generation)
+                    .unwrap_or(0);
+                let oauth_result = {
+                    let oauth_flow =
+                        Abortable::new(do_oauth_flow(http_client, cx), abort_registration).fuse();
+                    let timeout = cx
+                        .background_executor()
+                        .timer(OAUTH_FLOW_TIMEOUT)
+                        .fuse();
+                    futures::pin_mut!(oauth_flow, timeout);
+                    futures::select! {
+                        result = oauth_flow => match result {
+                            Ok(result) => Some(result),
+                            Err(_) => None,
+                        },
+                        _ = timeout => Some(Err(anyhow!(
+                            "ChatGPT sign-in timed out after {OAUTH_FLOW_TIMEOUT:?}"
+                        ))),
+                    }
+                };
+                let Some(oauth_result) = oauth_result else {
+                    return Ok::<(), Arc<anyhow::Error>>(());
+                };
+                this.update(cx, |state, cx| {
+                    state.sign_in_abort_handle = None;
+                    cx.notify();
+                })
+                .log_err();
+                match oauth_result {
                 Ok(creds) => {
+                    let session_id = session_id_for_credentials(&creds);
+                    // Discard the result if the user signed out or switched
+                    // while the browser flow was open.
+                    let generation_current = this
+                        .read_with(cx, |state, _| state.auth_generation == generation)
+                        .unwrap_or(false);
+                    if !generation_current {
+                        this.update(cx, |state, cx| {
+                            state.sign_in_task = None;
+                            state.sign_in_abort_handle = None;
+                            state.finish_account_mutation();
+                            cx.notify();
+                        })
+                        .log_err();
+                        return Ok(());
+                    }
                     let persist_result = async {
                         let credentials_provider =
                             this.read_with(cx, |state, _| state.credentials_provider.clone())?;
                         let json = serde_json::to_vec(&creds)?;
+                        let mut manifest = this.read_with(cx, |state, _| state.manifest.clone())?;
+                        if manifest
+                            .sessions
+                            .iter()
+                            .all(|session| session.session_id != session_id)
+                            && manifest.sessions.len() >= MAX_ACCOUNT_SESSIONS
+                        {
+                            return Err(anyhow!(
+                                "ChatGPT supports at most {MAX_ACCOUNT_SESSIONS} saved accounts"
+                            ));
+                        }
                         credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, cx)
+                            .write_credentials(
+                                &account_credentials_key(&session_id),
+                                "Bearer",
+                                &json,
+                                cx,
+                            )
+                            .await?;
+                        upsert_manifest_session(&mut manifest, &session_id, &creds);
+                        manifest.active_session_id = Some(session_id.clone());
+                        credentials_provider
+                            .write_credentials(
+                                ACCOUNT_MANIFEST_KEY,
+                                "json",
+                                &serde_json::to_vec(&manifest)?,
+                                cx,
+                            )
                             .await?;
                         anyhow::Ok(())
                     }
@@ -175,9 +834,29 @@ impl State {
                     match persist_result {
                         Ok(()) => {
                             this.update(cx, |state, cx| {
+                                if state.auth_generation != generation {
+                                    state.sign_in_task = None;
+                                    return;
+                                }
+                                upsert_manifest_session(
+                                    &mut state.manifest,
+                                    &session_id,
+                                    &creds,
+                                );
+                                state.manifest.active_session_id = Some(session_id.clone());
+                                state.active_session_id = Some(session_id);
                                 state.credentials = Some(creds);
+                                state.auth_generation = state.auth_generation.wrapping_add(1);
+                                state.account_mutation_seq =
+                                    state.account_mutation_seq.wrapping_add(1);
+                                state.refresh_task = None;
+                                state.manifest_load_state = ManifestLoadState::Loaded;
                                 state.sign_in_task = None;
+                                state.sign_in_abort_handle = None;
+                                state.finish_account_mutation();
                                 state.last_auth_error = None;
+                                state.refresh_quota(cx);
+                                state.restart_model_fetch(cx);
                                 cx.notify();
                             })
                             .log_err();
@@ -188,6 +867,8 @@ impl State {
                             );
                             this.update(cx, |state, cx| {
                                 state.sign_in_task = None;
+                                state.sign_in_abort_handle = None;
+                                state.finish_account_mutation();
                                 state.last_auth_error =
                                     Some("Failed to save credentials. Please try again.".into());
                                 cx.notify();
@@ -200,146 +881,411 @@ impl State {
                     log::error!("ChatGPT subscription sign-in failed: {err:?}");
                     this.update(cx, |state, cx| {
                         state.sign_in_task = None;
+                        state.sign_in_abort_handle = None;
+                        state.finish_account_mutation();
                         state.last_auth_error = Some("Sign-in failed. Please try again.".into());
                         cx.notify();
                     })
                     .log_err();
                 }
             }
-            anyhow::Ok(())
-        });
+            Ok::<(), Arc<anyhow::Error>>(())
+        })
+        .shared();
 
         self.last_auth_error = None;
-        self.sign_in_task = Some(task);
+        // Keep the task alive after the caller drops their handle and resolve
+        // the returned task once the flow has fully completed.
+        let sign_in_watch = task.clone();
+        self.sign_in_task = Some(cx.spawn(async move |this, cx| {
+            sign_in_watch.await.log_err();
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
         cx.notify();
-    }
-
-    /// Clears credentials and in-flight work immediately (so observers see the
-    /// sign-out right away); the returned task deletes the persisted
-    /// credentials.
-    pub fn sign_out(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        self.auth_generation += 1;
-        self.credentials = None;
-        self.sign_in_task = None;
-        self.refresh_task = None;
-        self.last_auth_error = None;
-        cx.notify();
-
-        let credentials_provider = self.credentials_provider.clone();
-        cx.spawn(async move |_this, cx| {
-            credentials_provider
-                .delete_credentials(CREDENTIALS_KEY, cx)
-                .await
-                .context("Failed to delete ChatGPT subscription credentials from keychain")?;
+        cx.spawn(async move |_this, _cx| {
+            task.await.log_err();
             anyhow::Ok(())
         })
     }
+
+    pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        let Some(abort_handle) = self.sign_in_abort_handle.take() else {
+            return;
+        };
+        abort_handle.abort();
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        self.sign_in_task = None;
+        self.finish_account_mutation();
+        self.last_auth_error = Some("Sign-in cancelled. You can try again.".into());
+        cx.notify();
+    }
+
+    pub fn can_cancel_sign_in(&self) -> bool {
+        self.sign_in_abort_handle.is_some()
+    }
+
+    /// Prevents new model operations immediately, then commits the persisted
+    /// account removal before exposing the next account to observers.
+    pub fn sign_out(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if let Err(error) = self.begin_account_mutation() {
+            return Task::ready(Err(error));
+        }
+        // Even without an active session this invalidates any in-flight load
+        // or sign-in so a sign-out is never reverted by a pending result.
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        let initial_removed_session_id = self.active_session_id.clone();
+        self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        let original_manifest = self.manifest.clone();
+        let original_active_session_id = self.active_session_id.clone();
+        let original_credentials = self.credentials.take();
+        let original_models = self.models.clone();
+        let original_last_auth_error = self.last_auth_error.take();
+        self.refresh_task = None;
+        self.model_fetch_task = None;
+        self.models = ChatGptModel::fallback_models();
+        cx.notify();
+
+        let credentials_provider = self.credentials_provider.clone();
+        let generation = self.auth_generation;
+        let load_task = self.load_task.clone();
+        let task = cx
+            .spawn(async move |this, cx| {
+                let operation_result: Result<(
+                    AccountManifest,
+                    Option<String>,
+                    Option<CodexCredentials>,
+                    Option<String>,
+                )> = async {
+                    if let Some(load_task) = load_task {
+                        load_task.await.map_err(|error| anyhow!("{error}"))?;
+                    }
+                    let still_current = this
+                        .read_with(cx, |state, _| state.auth_generation == generation)
+                        .unwrap_or(false);
+                    if !still_current {
+                        return Err(anyhow!("ChatGPT account changed during sign-out"));
+                    }
+
+                    let mut manifest = match credentials_provider
+                        .read_credentials(ACCOUNT_MANIFEST_KEY, cx)
+                        .await
+                        .context("Failed to read the ChatGPT account manifest")?
+                    {
+                        Some((_, bytes)) => serde_json::from_slice(&bytes)
+                            .context("The ChatGPT account manifest is corrupt")?,
+                        None => original_manifest.clone(),
+                    };
+                    let legacy_credentials = match credentials_provider
+                        .read_credentials(LEGACY_CREDENTIALS_KEY, cx)
+                        .await
+                        .context("Failed to inspect the legacy ChatGPT credential")?
+                    {
+                        Some((_, bytes)) => match serde_json::from_slice::<CodexCredentials>(&bytes)
+                        {
+                            Ok(credentials) => Some(credentials),
+                            Err(error) => {
+                                log::warn!(
+                                    "Failed to deserialize the legacy ChatGPT credential: {error}"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let removed_session_id = initial_removed_session_id
+                        .clone()
+                        .or_else(|| manifest.active_session_id.clone())
+                        .or_else(|| {
+                            legacy_credentials
+                                .as_ref()
+                                .map(session_id_for_credentials)
+                        });
+                    let Some(removed_session_id) = removed_session_id else {
+                        manifest.active_session_id = None;
+                        write_manifest(&credentials_provider, &manifest, cx).await?;
+                        return Ok((manifest, None, None, None));
+                    };
+                    manifest
+                        .sessions
+                        .retain(|session| session.session_id != removed_session_id);
+                    if legacy_credentials.as_ref().is_some_and(|credentials| {
+                        session_id_for_credentials(credentials) == removed_session_id
+                    }) {
+                        credentials_provider
+                            .delete_credentials(LEGACY_CREDENTIALS_KEY, cx)
+                            .await
+                            .context("Failed to delete the legacy ChatGPT credential")?;
+                    }
+
+                    let mut candidates = manifest.sessions.iter().collect::<Vec<_>>();
+                    candidates.sort_by_key(|session| std::cmp::Reverse(session.last_used_at_ms));
+                    let mut next_account = None;
+                    for session in candidates {
+                        let key = account_credentials_key(&session.session_id);
+                        match credentials_provider.read_credentials(&key, cx).await {
+                            Ok(Some((_, bytes))) => {
+                                match serde_json::from_slice::<CodexCredentials>(&bytes) {
+                                    Ok(credentials) => {
+                                        next_account =
+                                            Some((session.session_id.clone(), credentials));
+                                        break;
+                                    }
+                                    Err(error) => log::warn!(
+                                        "Failed to deserialize saved ChatGPT account {}: {error}",
+                                        session.session_id
+                                    ),
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => log::warn!(
+                                "Failed to load saved ChatGPT account {}: {error:#}",
+                                session.session_id
+                            ),
+                        }
+                    }
+                    let (next_session_id, next_credentials) = match next_account {
+                        Some((session_id, credentials)) => {
+                            (Some(session_id), Some(credentials))
+                        }
+                        None => (None, None),
+                    };
+                    manifest.active_session_id = next_session_id.clone();
+                    write_manifest(&credentials_provider, &manifest, cx)
+                        .await
+                        .context("Failed to update the ChatGPT account manifest")?;
+
+                    let cleanup_error = credentials_provider
+                        .delete_credentials(&account_credentials_key(&removed_session_id), cx)
+                        .await
+                        .context("Failed to delete ChatGPT subscription credentials")
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                    Ok((
+                        manifest,
+                        next_session_id,
+                        next_credentials,
+                        cleanup_error,
+                    ))
+                }
+                .await;
+
+                let update_result = this.update(cx, |state, cx| {
+                    state.sign_out_task = None;
+                    state.finish_account_mutation();
+                    match &operation_result {
+                        Ok((manifest, next_session_id, next_credentials, cleanup_error)) => {
+                            state.manifest = manifest.clone();
+                            state.active_session_id = next_session_id.clone();
+                            state.credentials = next_credentials.clone();
+                            state.last_auth_error = cleanup_error.as_ref().map(|_| {
+                                "Signed out, but failed to remove cached credentials. Please try \
+                                 signing out again."
+                                    .into()
+                            });
+                            if state.credentials.is_some() {
+                                state.restart_model_fetch(cx);
+                                state.refresh_quota(cx);
+                            }
+                        }
+                        Err(error) => {
+                            state.manifest = original_manifest;
+                            state.active_session_id = original_active_session_id;
+                            state.credentials = original_credentials;
+                            state.models = original_models;
+                            state.last_auth_error = original_last_auth_error;
+                            log::error!("ChatGPT sign-out failed: {error:#}");
+                        }
+                    }
+                    cx.notify();
+                });
+                update_result.map_err(Arc::new)?;
+                match operation_result {
+                    Ok((_, _, _, Some(cleanup_error))) => Err(Arc::new(anyhow!(cleanup_error))),
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(Arc::new(error)),
+                }
+            })
+            .shared();
+
+        let sign_out_watch = task.clone();
+        self.sign_out_task = Some(cx.spawn(async move |_this, _cx| {
+            sign_out_watch.await.log_err();
+        }));
+        cx.notify();
+        cx.spawn(async move |_this, _cx| task.await.map_err(|error| anyhow!("{error}")))
+    }
+
+    fn restart_model_fetch(&mut self, cx: &mut Context<Self>) {
+        self.model_fetch_task = None;
+
+        let http_client = self.http_client.clone();
+        let client_version = self.client_version.clone();
+        let auth_generation = self.auth_generation;
+        self.model_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let credentials = get_fresh_credentials(&this, &http_client, cx).await?;
+                let fetch = fetch_codex_models(
+                    http_client.as_ref(),
+                    &credentials,
+                    &client_version,
+                )
+                .fuse();
+                let timeout = FutureExt::fuse(
+                    cx.background_executor().timer(MODEL_CATALOG_READ_TIMEOUT),
+                );
+                futures::pin_mut!(fetch, timeout);
+                let models = futures::select! {
+                    result = fetch => result.map_err(LanguageModelCompletionError::Other)?,
+                    _ = timeout => return Err(LanguageModelCompletionError::Other(anyhow!(
+                        "ChatGPT subscription model catalog timed out after {MODEL_CATALOG_READ_TIMEOUT:?}"
+                    ))),
+                };
+                Ok::<_, LanguageModelCompletionError>(models)
+            }
+            .await;
+
+            this.update(cx, |state, cx| {
+                state.model_fetch_task = None;
+                if state.auth_generation != auth_generation || state.credentials.is_none() {
+                    return;
+                }
+
+                match result {
+                    Ok(models) if !models.is_empty() => {
+                        state.install_models(models);
+                        cx.notify();
+                    }
+                    Ok(_) => {
+                        log::warn!("ChatGPT subscription returned an empty model catalog");
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to refresh ChatGPT subscription model catalog: {error:#}"
+                        );
+                    }
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    fn install_models(&mut self, mut models: Vec<ChatGptModel>) {
+        for model in &mut models {
+            if let Some(existing) = self
+                .models
+                .iter()
+                .find(|existing| existing.id() == model.id())
+            {
+                existing
+                    .context_window
+                    .store(model.max_token_count(), Ordering::Relaxed);
+                model.context_window = existing.context_window.clone();
+            }
+        }
+        self.models = models;
+    }
 }
 
 //
-// The ChatGPT Subscription provider routes requests to chatgpt.com/backend-api/codex,
-// which only supports a subset of OpenAI models. This list is maintained separately
-// from the standard OpenAI API model list (open_ai::Model).
-//
-// TODO: The Codex CLI fetches this list dynamically from
-// `GET <codex_base_url>/models?client_version=...` (see
-// codex-rs/codex-api/src/endpoint/models.rs in openai/codex) and falls back to
-// a bundled models.json. Beyond going stale, the static approach also can't
-// model per-account access (e.g. free accounts cannot use gpt-5.4 even though
-// paid accounts can), so the backend still rejects some requests. The bundled
-// list at
-// codex-rs/models-manager/models.json (openai/codex) is the closest
-// approximation; the entries below mirror that file's picker-visible models.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ChatGptModel {
-    Gpt56Sol,
-    Gpt56Terra,
-    Gpt56Luna,
-    Gpt55,
-    Gpt54,
-    Gpt54Mini,
+#[derive(Clone, Debug)]
+pub struct ChatGptModel {
+    id: Arc<str>,
+    display_name: Arc<str>,
+    context_window: Arc<AtomicU64>,
+    default_reasoning_effort: Option<ReasoningEffort>,
+    supported_reasoning_efforts: Arc<[ReasoningEffort]>,
+    supports_images: bool,
+    supports_parallel_tool_calls: bool,
+    supports_priority: bool,
 }
 
 impl ChatGptModel {
-    pub fn all() -> Vec<Self> {
-        vec![
-            Self::Gpt56Sol,
-            Self::Gpt56Terra,
-            Self::Gpt56Luna,
-            Self::Gpt55,
-            Self::Gpt54,
-            Self::Gpt54Mini,
+    fn fallback_context_window(model_id: &str) -> u64 {
+        if model_id.starts_with("gpt-5.6") {
+            299_000
+        } else {
+            272_000
+        }
+    }
+
+    pub fn fallback_models() -> Vec<Self> {
+        [
+            ("gpt-5.6-sol", "GPT-5.6 Sol", ReasoningEffort::Low, true),
+            (
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                ReasoningEffort::Medium,
+                true,
+            ),
+            (
+                "gpt-5.6-luna",
+                "GPT-5.6 Luna",
+                ReasoningEffort::Medium,
+                true,
+            ),
+            ("gpt-5.5", "GPT-5.5", ReasoningEffort::Medium, true),
         ]
+        .into_iter()
+        .map(
+            |(id, display_name, default_reasoning_effort, supports_priority)| Self {
+                id: id.into(),
+                display_name: display_name.into(),
+                context_window: Arc::new(AtomicU64::new(Self::fallback_context_window(id))),
+                default_reasoning_effort: Some(default_reasoning_effort),
+                supported_reasoning_efforts: if id.starts_with("gpt-5.6") {
+                    Arc::from([
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                        ReasoningEffort::XHigh,
+                        ReasoningEffort::Max,
+                    ])
+                } else {
+                    Arc::from([
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::High,
+                        ReasoningEffort::XHigh,
+                    ])
+                },
+                supports_images: true,
+                supports_parallel_tool_calls: true,
+                supports_priority,
+            },
+        )
+        .collect()
     }
 
     pub fn id(&self) -> &str {
-        match self {
-            Self::Gpt56Sol => "gpt-5.6-sol",
-            Self::Gpt56Terra => "gpt-5.6-terra",
-            Self::Gpt56Luna => "gpt-5.6-luna",
-            Self::Gpt55 => "gpt-5.5",
-            Self::Gpt54 => "gpt-5.4",
-            Self::Gpt54Mini => "gpt-5.4-mini",
-        }
+        &self.id
     }
 
     pub fn display_name(&self) -> &str {
-        match self {
-            Self::Gpt56Sol => "GPT-5.6 Sol",
-            Self::Gpt56Terra => "GPT-5.6 Terra",
-            Self::Gpt56Luna => "GPT-5.6 Luna",
-            Self::Gpt55 => "GPT-5.5",
-            Self::Gpt54 => "GPT-5.4",
-            Self::Gpt54Mini => "GPT-5.4 Mini",
-        }
+        &self.display_name
     }
 
     fn max_token_count(&self) -> u64 {
-        match self {
-            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => 372_000,
-            Self::Gpt55 | Self::Gpt54 | Self::Gpt54Mini => 272_000,
-        }
+        self.context_window.load(Ordering::Relaxed)
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
-        // Codex model metadata does not expose a max output token cap for these
-        // models. Source: openai/codex models-manager/models.json.
         None
     }
 
     fn supports_images(&self) -> bool {
-        true
+        self.supports_images
     }
 
     fn default_reasoning_effort(&self) -> Option<ReasoningEffort> {
-        match self {
-            Self::Gpt56Sol => Some(ReasoningEffort::Low),
-            Self::Gpt56Terra | Self::Gpt56Luna | Self::Gpt55 | Self::Gpt54 | Self::Gpt54Mini => {
-                Some(ReasoningEffort::Medium)
-            }
-        }
+        self.default_reasoning_effort
     }
 
-    fn supported_reasoning_efforts(&self) -> &'static [ReasoningEffort] {
-        match self {
-            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna => &[
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-                ReasoningEffort::Max,
-            ],
-            Self::Gpt55 | Self::Gpt54 | Self::Gpt54Mini => &[
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::XHigh,
-            ],
-        }
+    fn supported_reasoning_efforts(&self) -> &[ReasoningEffort] {
+        &self.supported_reasoning_efforts
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
-        true
+        self.supports_parallel_tool_calls
     }
 
     fn supports_prompt_cache_key(&self) -> bool {
@@ -347,10 +1293,120 @@ impl ChatGptModel {
     }
 
     pub fn supports_priority(&self) -> bool {
-        match self {
-            Self::Gpt56Sol | Self::Gpt56Terra | Self::Gpt56Luna | Self::Gpt55 | Self::Gpt54 => true,
-            Self::Gpt54Mini => false,
+        self.supports_priority
+    }
+
+    fn from_catalog(model: CodexModelInfo) -> Option<Self> {
+        if model.visibility != "list" {
+            return None;
         }
+
+        let context_window = model
+            .context_window
+            .or(model.max_context_window)
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| Self::fallback_context_window(&model.slug));
+        let mut supported_reasoning_efforts = model
+            .supported_reasoning_levels
+            .into_iter()
+            .filter_map(|level| reasoning_effort_from_catalog(&level.effort))
+            .collect::<Vec<_>>();
+        supported_reasoning_efforts.dedup();
+        if supported_reasoning_efforts.is_empty() {
+            supported_reasoning_efforts.extend([
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]);
+        }
+
+        let default_reasoning_effort = model
+            .default_reasoning_level
+            .as_deref()
+            .and_then(reasoning_effort_from_catalog)
+            .filter(|effort| supported_reasoning_efforts.contains(effort))
+            .or_else(|| supported_reasoning_efforts.first().copied());
+        let supports_priority = model
+            .additional_speed_tiers
+            .iter()
+            .any(|tier| tier == "priority")
+            || model.service_tiers.iter().any(|tier| tier.id == "priority");
+        let supports_images = model.input_modalities.is_empty()
+            || model
+                .input_modalities
+                .iter()
+                .any(|modality| modality == "image");
+
+        Some(Self {
+            display_name: if model.display_name.trim().is_empty() {
+                model.slug.clone().into()
+            } else {
+                model.display_name.into()
+            },
+            id: model.slug.into(),
+            context_window: Arc::new(AtomicU64::new(context_window)),
+            default_reasoning_effort,
+            supported_reasoning_efforts: supported_reasoning_efforts.into(),
+            supports_images,
+            supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+            supports_priority,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelInfo>,
+}
+
+#[derive(Deserialize)]
+struct CodexModelInfo {
+    slug: String,
+    display_name: String,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default)]
+    visibility: String,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    service_tiers: Vec<CodexServiceTier>,
+    #[serde(default)]
+    supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+#[derive(Deserialize)]
+struct CodexServiceTier {
+    id: String,
+}
+
+fn reasoning_effort_from_catalog(effort: &str) -> Option<ReasoningEffort> {
+    match effort {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::XHigh),
+        "max" | "ultra" => Some(ReasoningEffort::Max),
+        _ => None,
     }
 }
 
@@ -461,52 +1517,95 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         if !self.model.supports_priority() {
             request.speed = None;
         }
-
-        let mut responses_request = match into_open_ai_response(
-            request,
-            self.model.id(),
-            self.model.supports_parallel_tool_calls(),
-            self.model.supports_prompt_cache_key(),
-            /*max_output_tokens*/ None,
-            self.model.default_reasoning_effort(),
-            self.model
-                .supported_reasoning_efforts()
-                .contains(&ReasoningEffort::None),
-            &PROVIDER_ID,
-        ) {
-            Ok(request) => request,
-            Err(error) => return async move { Err(error.into()) }.boxed(),
-        };
-        responses_request.store = Some(false);
-        responses_request.instructions.get_or_insert_default();
-        let compact_request = responses_request.into_codex_compact_request();
-
+        let model_id = self.model.id().to_string();
+        let supports_parallel_tool_calls = self.model.supports_parallel_tool_calls();
+        let supports_prompt_cache_key = self.model.supports_prompt_cache_key();
+        let default_reasoning_effort = self.model.default_reasoning_effort();
+        let supports_none_reasoning_effort = self
+            .model
+            .supported_reasoning_efforts()
+            .contains(&ReasoningEffort::None);
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
         let future = cx.spawn(async move |cx| {
+            // Mark the whole operation busy up front, including credential
+            // refresh and request preparation, so account mutations are
+            // blocked for the full lifetime of the compaction.
+            let active_operations = state
+                .read_with(&*cx, |state, _| {
+                    if state.account_mutation_in_progress {
+                        return Err(anyhow!("A ChatGPT account operation is in progress"));
+                    }
+                    Ok(state.active_operations.clone())
+                })
+                .map_err(LanguageModelCompletionError::Other)?
+                .map_err(LanguageModelCompletionError::Other)?;
+            active_operations.enter(&state, &cx);
+            let operation_guard = ActiveOperationGuard(active_operations);
+            let auth_generation = state
+                .read_with(&*cx, |state, _| state.auth_generation)
+                .map_err(LanguageModelCompletionError::Other)?;
             let creds = get_fresh_credentials(&state, &http_client, cx).await?;
+            let (account_scope, current_generation) = state
+                .read_with(&*cx, |state, _| {
+                    (state.active_session_id.clone(), state.auth_generation)
+                })
+                .map_err(LanguageModelCompletionError::Other)?;
+            if current_generation != auth_generation {
+                return Err(LanguageModelCompletionError::Other(anyhow!(
+                    "ChatGPT account changed while preparing compaction"
+                )));
+            }
+            let mut responses_request = into_open_ai_response_with_account_scope(
+                request,
+                &model_id,
+                supports_parallel_tool_calls,
+                supports_prompt_cache_key,
+                None,
+                default_reasoning_effort,
+                supports_none_reasoning_effort,
+                &PROVIDER_ID,
+                account_scope.as_deref(),
+            )
+            .map_err(LanguageModelCompletionError::Other)?;
+            responses_request.store = Some(false);
+            responses_request.instructions.get_or_insert_default();
+            let compact_request = responses_request.into_codex_compact_request();
             let extra_headers = codex_headers(&creds);
             let access_token = creds.access_token.clone();
+            let timeout = cx
+                .background_executor()
+                .timer(COMPACTION_REQUEST_TIMEOUT);
 
-            request_limiter
+            let result = request_limiter
                 .run(async move {
-                    compact_codex_response(
+                    let provider_name = PROVIDER_NAME;
+                    let compact_request = compact_codex_response(
                         http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
+                        provider_name.0.as_str(),
                         CODEX_BASE_URL,
                         &access_token,
                         compact_request,
                         &extra_headers,
                     )
-                    .await
-                    .map_err(LanguageModelCompletionError::from)
+                    .fuse();
+                    let timeout = FutureExt::fuse(timeout);
+                    futures::pin_mut!(compact_request, timeout);
+                    futures::select! {
+                        result = compact_request => result.map_err(LanguageModelCompletionError::from),
+                        _ = timeout => Err(LanguageModelCompletionError::Other(anyhow!(
+                            "ChatGPT subscription compaction timed out after {COMPACTION_REQUEST_TIMEOUT:?}"
+                        ))),
+                    }
                 })
-                .await
+                .await;
+            drop(operation_guard);
+            result.map(|response| (response, account_scope))
         });
 
         async move {
-            let response = future.await?;
+            let (response, account_scope) = future.await?;
             let usage = response
                 .usage
                 .as_ref()
@@ -515,6 +1614,15 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             let context = response
                 .into_compacted_context(PROVIDER_ID)
                 .map_err(LanguageModelCompletionError::Other)?;
+            let context = match context {
+                CompactedContext::ProviderState(state) => {
+                    CompactedContext::ProviderState(match account_scope.as_deref() {
+                        Some(account_scope) => state.with_account_scope(account_scope),
+                        None => state,
+                    })
+                }
+                other => other,
+            };
             Ok(CompactionResult { context, usage })
         }
         .boxed()
@@ -549,56 +1657,106 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         // The Codex backend rejects `max_output_tokens` (`Unsupported parameter`),
         // unlike the public OpenAI Responses API. Pass `None` so the field is
         // omitted from the serialized request body entirely.
-        let mut responses_request = match into_open_ai_response(
-            request,
-            self.model.id(),
-            self.model.supports_parallel_tool_calls(),
-            self.model.supports_prompt_cache_key(),
-            /*max_output_tokens*/ None,
-            self.model.default_reasoning_effort(),
-            self.model
-                .supported_reasoning_efforts()
-                .contains(&ReasoningEffort::None),
-            &PROVIDER_ID,
-        ) {
-            Ok(request) => request,
-            Err(error) => return async move { Err(error.into()) }.boxed(),
-        };
-        responses_request.store = Some(false);
-
-        // `into_open_ai_response` already hoists system messages into
-        // `instructions`, which is the only form the Codex backend accepts.
-        // Codex has only ever been sent requests with the field present
-        // (possibly empty), so keep sending it even without system messages.
-        responses_request.instructions.get_or_insert_default();
-
+        let model_id = self.model.id().to_string();
+        let supports_parallel_tool_calls = self.model.supports_parallel_tool_calls();
+        let supports_prompt_cache_key = self.model.supports_prompt_cache_key();
+        let default_reasoning_effort = self.model.default_reasoning_effort();
+        let supports_none_reasoning_effort = self
+            .model
+            .supported_reasoning_efforts()
+            .contains(&ReasoningEffort::None);
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
+        let background_executor = cx.background_executor().clone();
 
         let future = cx.spawn(async move |cx| {
+            // Mark the whole operation busy up front, including credential
+            // refresh and request preparation, so account mutations are
+            // blocked for the full lifetime of the stream.
+            let active_operations = state
+                .read_with(&*cx, |state, _| {
+                    if state.account_mutation_in_progress {
+                        return Err(anyhow!("A ChatGPT account operation is in progress"));
+                    }
+                    Ok(state.active_operations.clone())
+                })
+                .map_err(LanguageModelCompletionError::Other)?
+                .map_err(LanguageModelCompletionError::Other)?;
+            active_operations.enter(&state, &cx);
+            let operation_guard = ActiveOperationGuard(active_operations);
+            let auth_generation = state
+                .read_with(&*cx, |state, _| state.auth_generation)
+                .map_err(LanguageModelCompletionError::Other)?;
             let creds = get_fresh_credentials(&state, &http_client, cx).await?;
+            let (account_scope, current_generation) = state
+                .read_with(&*cx, |state, _| {
+                    (state.active_session_id.clone(), state.auth_generation)
+                })
+                .map_err(LanguageModelCompletionError::Other)?;
+            if current_generation != auth_generation {
+                return Err(LanguageModelCompletionError::Other(anyhow!(
+                    "ChatGPT account changed while preparing request"
+                )));
+            }
+            let mut responses_request = into_open_ai_response_with_account_scope(
+                request,
+                &model_id,
+                supports_parallel_tool_calls,
+                supports_prompt_cache_key,
+                None,
+                default_reasoning_effort,
+                supports_none_reasoning_effort,
+                &PROVIDER_ID,
+                account_scope.as_deref(),
+            )
+            .map_err(LanguageModelCompletionError::Other)?;
+            responses_request.store = Some(false);
+
+            // `into_open_ai_response` already hoists system messages into
+            // `instructions`, which is the only form the Codex backend accepts.
+            responses_request.instructions.get_or_insert_default();
+
             let extra_headers = codex_headers(&creds);
             let access_token = creds.access_token.clone();
+            let timeout = cx
+                .background_executor()
+                .timer(RESPONSE_STREAM_IDLE_TIMEOUT);
             request_limiter
                 .stream(async move {
-                    stream_response(
+                    let provider_name = PROVIDER_NAME;
+                    let response = stream_response(
                         http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
+                        provider_name.0.as_str(),
                         CODEX_BASE_URL,
                         &access_token,
                         responses_request,
                         &extra_headers,
                     )
-                    .await
-                    .map_err(LanguageModelCompletionError::from)
+                    .fuse();
+                    let timeout = FutureExt::fuse(timeout);
+                    futures::pin_mut!(response, timeout);
+                    futures::select! {
+                        result = response => result.map_err(LanguageModelCompletionError::from),
+                        _ = timeout => Err(LanguageModelCompletionError::Other(anyhow!(
+                            "ChatGPT subscription response did not start within {RESPONSE_STREAM_IDLE_TIMEOUT:?}"
+                        ))),
+                    }
                 })
                 .await
+                .map(|stream| (stream, account_scope, operation_guard))
         });
 
         async move {
-            let mapper = OpenAiResponseEventMapper::new(PROVIDER_ID);
-            Ok(mapper.map_stream(future.await?.boxed()).boxed())
+            let (stream, account_scope, operation_guard) = future.await?;
+            let mapper =
+                OpenAiResponseEventMapper::new_with_account_scope(PROVIDER_ID, account_scope);
+            let stream = mapper.map_stream(stream.boxed()).boxed();
+            Ok(stream_with_idle_timeout(
+                stream,
+                background_executor,
+                operation_guard,
+            ))
         }
         .boxed()
     }
@@ -622,6 +1780,157 @@ fn codex_headers(creds: &CodexCredentials) -> CustomHeaders {
         header_pairs.push((HeaderName::from_static("chatgpt-account-id"), value));
     }
     CustomHeaders::new(header_pairs)
+}
+
+async fn fetch_codex_models(
+    http_client: &dyn HttpClient,
+    credentials: &CodexCredentials,
+    client_version: &str,
+) -> Result<Vec<ChatGptModel>> {
+    let mut url = url::Url::parse(&format!("{CODEX_BASE_URL}/models"))?;
+    url.query_pairs_mut()
+        .append_pair("client_version", client_version);
+    let headers = codex_headers(credentials);
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(url.as_str())
+        .header(
+            "Authorization",
+            format!("Bearer {}", credentials.access_token.trim()),
+        )
+        .header("Accept", "application/json")
+        .extra_headers(&headers)
+        .body(AsyncBody::empty())?;
+
+    let mut response = http_client.send(request).await?;
+    let status = response.status();
+    let mut body = String::new();
+    smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "ChatGPT subscription model catalog request failed (HTTP {status}): {body}"
+        ));
+    }
+
+    let mut response: CodexModelsResponse =
+        serde_json::from_str(&body).context("Failed to parse ChatGPT model catalog")?;
+    response.models.sort_by_key(|model| model.priority);
+    Ok(response
+        .models
+        .into_iter()
+        .filter_map(ChatGptModel::from_catalog)
+        .collect())
+}
+
+struct ActiveOperationGuard(Arc<BusyNotifier>);
+
+impl Drop for ActiveOperationGuard {
+    fn drop(&mut self) {
+        self.0.exit();
+    }
+}
+
+/// Persists the in-memory manifest, refusing to overwrite a manifest that
+/// could not be loaded and converging on the newest identity if a background
+/// write races a newer account mutation (a stale write must never leave a
+/// different account active on disk).
+async fn persist_manifest(
+    credentials_provider: &Arc<dyn CredentialsProvider>,
+    state: &WeakEntity<State>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    for _ in 0..4 {
+        let Some((manifest, generation, load_ready)) = state
+            .read_with(cx, |s, _| {
+                (
+                    s.manifest.clone(),
+                    s.auth_generation,
+                    s.manifest_load_state == ManifestLoadState::Loaded,
+                )
+            })
+            .ok()
+        else {
+            return Ok(());
+        };
+        if !load_ready {
+            return Ok(());
+        }
+        write_manifest(credentials_provider, &manifest, cx).await?;
+        let still_current = state
+            .read_with(cx, |s, _| s.auth_generation == generation)
+            .unwrap_or(false);
+        if still_current {
+            return Ok(());
+        }
+    }
+    Err(anyhow!(
+        "ChatGPT subscription manifest writes kept racing account mutations"
+    ))
+}
+
+async fn write_manifest(
+    credentials_provider: &Arc<dyn CredentialsProvider>,
+    manifest: &AccountManifest,
+    cx: &AsyncApp,
+) -> Result<()> {
+    if manifest.sessions.is_empty() {
+        credentials_provider
+            .delete_credentials(ACCOUNT_MANIFEST_KEY, cx)
+            .await
+    } else {
+        let json = serde_json::to_vec(manifest)?;
+        credentials_provider
+            .write_credentials(ACCOUNT_MANIFEST_KEY, "json", &json, cx)
+            .await
+    }
+}
+
+fn stream_with_idle_timeout(
+    stream: futures::stream::BoxStream<
+        'static,
+        Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+    >,
+    background_executor: BackgroundExecutor,
+    operation_guard: ActiveOperationGuard,
+) -> futures::stream::BoxStream<
+    'static,
+    Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+> {
+    futures::stream::unfold(
+        (stream, background_executor, false, operation_guard),
+        |(mut stream, background_executor, timed_out, operation_guard)| async move {
+            if timed_out {
+                return None;
+            }
+
+            let outcome = {
+                let next_event = stream.next().fuse();
+                let timeout = FutureExt::fuse(
+                    background_executor.timer(RESPONSE_STREAM_IDLE_TIMEOUT),
+                );
+                futures::pin_mut!(next_event, timeout);
+                futures::select! {
+                    event = next_event => Ok(event),
+                    _ = timeout => Err(()),
+                }
+            };
+
+            match outcome {
+                Ok(Some(event)) => Some((
+                    event,
+                    (stream, background_executor, false, operation_guard),
+                )),
+                Ok(None) => None,
+                Err(()) => Some((
+                    Err(LanguageModelCompletionError::Other(anyhow!(
+                        "ChatGPT subscription response was idle for {RESPONSE_STREAM_IDLE_TIMEOUT:?}"
+                    ))),
+                    (stream, background_executor, true, operation_guard),
+                )),
+            }
+        },
+    )
+    .boxed()
 }
 
 async fn get_fresh_credentials(
@@ -653,25 +1962,47 @@ async fn get_fresh_credentials(
     let state_clone = state.clone();
     let refresh_token_value = creds.refresh_token.clone();
 
-    // Capture the generation so we can detect sign-outs that happened during refresh.
-    let generation = state
-        .read_with(&*cx, |s, _| s.auth_generation)
+    // Capture the identity so the refreshed credential is written back under
+    // the same account, even if the user switches while the refresh runs.
+    let (generation, session_id) = state
+        .read_with(&*cx, |s, _| {
+            (s.auth_generation, s.active_session_id.clone())
+        })
         .map_err(LanguageModelCompletionError::Other)?;
+    let Some(session_id) = session_id else {
+        return Err(LanguageModelCompletionError::NoApiKey {
+            provider: PROVIDER_NAME,
+        });
+    };
+    let account_key = account_credentials_key(&session_id);
 
     let shared_task = cx
         .spawn(async move |cx| {
             let result = refresh_token(&http_client_clone, &refresh_token_value).await;
 
             match result {
-                Ok(refreshed) => {
+                Ok(mut refreshed) => {
+                    // Some refresh responses omit identity claims. Keep the
+                    // account routing metadata from the previous token so a
+                    // refresh never silently drops chatgpt-account-id.
+                    refreshed.account_id = refreshed.account_id.or(creds.account_id.clone());
+                    refreshed.email = refreshed.email.or(creds.email.clone());
+                    refreshed.user_id = refreshed.user_id.or(creds.user_id.clone());
+                    refreshed.plan_type = refreshed.plan_type.or(creds.plan_type.clone());
                     let persist_result: Result<CodexCredentials, Arc<anyhow::Error>> = async {
-                        // Check if auth_generation changed (sign-out during refresh).
-                        let current_generation = state_clone
-                            .read_with(&*cx, |s, _| s.auth_generation)
+                        // Only apply the result if this refresh still belongs
+                        // to the current identity (a sign-in/out or switch
+                        // during the refresh discards it).
+                        let (current_generation, current_session_id) = state_clone
+                            .read_with(&*cx, |s, _| {
+                                (s.auth_generation, s.active_session_id.clone())
+                            })
                             .map_err(|e| Arc::new(e))?;
-                        if current_generation != generation {
+                        if current_generation != generation
+                            || current_session_id.as_deref() != Some(session_id.as_str())
+                        {
                             return Err(Arc::new(anyhow!(
-                                "Sign-out occurred during token refresh"
+                                "ChatGPT account changed during token refresh"
                             )));
                         }
 
@@ -682,17 +2013,47 @@ async fn get_fresh_credentials(
                         let json =
                             serde_json::to_vec(&refreshed).map_err(|e| Arc::new(e.into()))?;
 
+                        // The refreshed credential belongs to the account the
+                        // refresh started for, regardless of what is active now.
                         credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, &*cx)
+                            .write_credentials(&account_key, "Bearer", &json, &*cx)
                             .await
                             .map_err(|e| Arc::new(e))?;
 
-                        state_clone
-                            .update(cx, |s, _| {
-                                s.credentials = Some(refreshed.clone());
-                                s.refresh_task = None;
+                        // Re-check identity after the keychain write so the
+                        // in-memory state can never be clobbered by a stale
+                        // refresh that raced a switch.
+                        let (current_generation, current_session_id) = state_clone
+                            .read_with(&*cx, |s, _| {
+                                (s.auth_generation, s.active_session_id.clone())
                             })
                             .map_err(|e| Arc::new(e))?;
+                        if current_generation != generation
+                            || current_session_id.as_deref() != Some(session_id.as_str())
+                        {
+                            return Err(Arc::new(anyhow!(
+                                "ChatGPT account changed during token refresh"
+                            )));
+                        }
+                        state_clone
+                            .update(cx, |s, cx| {
+                                s.credentials = Some(refreshed.clone());
+                                if let Some(session) = s
+                                    .manifest
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|session| session.session_id == session_id)
+                                {
+                                    session.token_expires_at_ms = Some(refreshed.expires_at_ms);
+                                }
+                                s.refresh_task = None;
+                                cx.notify();
+                            })
+                            .map_err(|e| Arc::new(e))?;
+                        // Persist the refreshed expiry so it survives a restart.
+                        persist_manifest(&credentials_provider, &state_clone, cx)
+                            .await
+                            .log_err();
 
                         Ok(refreshed)
                     }
@@ -711,23 +2072,52 @@ async fn get_fresh_credentials(
                 }
                 Err(RefreshError::Fatal(e)) => {
                     log::error!("ChatGPT subscription token refresh failed fatally: {e:?}");
-                    state_clone
-                        .update(cx, |s, cx| {
-                            s.refresh_task = None;
-                            s.credentials = None;
-                            s.last_auth_error =
-                                Some("Your session has expired. Please sign in again.".into());
-                            cx.notify();
+                    let (current_generation, current_session_id) = state_clone
+                        .read_with(&*cx, |s, _| {
+                            (s.auth_generation, s.active_session_id.clone())
                         })
-                        .ok();
-                    // Also clear the keychain so stale credentials aren't loaded next time.
-                    if let Ok(credentials_provider) =
-                        state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
+                        .unwrap_or((u64::MAX, None));
+                    if current_generation == generation
+                        && current_session_id.as_deref() == Some(session_id.as_str())
                     {
-                        credentials_provider
-                            .delete_credentials(CREDENTIALS_KEY, &*cx)
-                            .await
-                            .log_err();
+                        // Mark the account as needing re-authentication, but
+                        // keep the session metadata and the keychain entry so
+                        // the account remains visible and can be signed back
+                        // into. A different account must never be affected.
+                        state_clone
+                            .update(cx, |s, cx| {
+                                s.refresh_task = None;
+                                s.credentials = None;
+                                if let Some(session) = s
+                                    .manifest
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|session| session.session_id == session_id)
+                                {
+                                    session.reauthentication_required = true;
+                                }
+                                s.last_auth_error =
+                                    Some("Your session has expired. Please sign in again.".into());
+                                cx.notify();
+                            })
+                            .ok();
+                        if let Ok(credentials_provider) =
+                            state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
+                        {
+                            persist_manifest(&credentials_provider, &state_clone, cx)
+                                .await
+                                .log_err();
+                        }
+                    } else {
+                        log::warn!(
+                            "ChatGPT subscription token refresh failed after the account \
+                             changed; leaving the current account untouched"
+                        );
+                        state_clone
+                            .update(cx, |s, _| {
+                                s.refresh_task = None;
+                            })
+                            .ok();
                     }
                     Err(Arc::new(e))
                 }
@@ -858,6 +2248,8 @@ async fn do_oauth_flow(
         expires_at_ms: now_ms() + tokens.expires_in * 1000,
         account_id: claims.account_id,
         email: claims.email.or(tokens.email),
+        user_id: claims.user_id,
+        plan_type: claims.plan_type,
     })
 }
 
@@ -949,12 +2341,16 @@ async fn refresh_token(
         expires_at_ms: now_ms() + tokens.expires_in * 1000,
         account_id: claims.account_id,
         email: claims.email.or(tokens.email),
+        user_id: claims.user_id,
+        plan_type: claims.plan_type,
     })
 }
 
 struct JwtClaims {
     account_id: Option<String>,
     email: Option<String>,
+    user_id: Option<String>,
+    plan_type: Option<String>,
 }
 
 /// Extract claims from a JWT payload (base64url middle segment).
@@ -965,18 +2361,24 @@ fn extract_jwt_claims(jwt: &str) -> JwtClaims {
         return JwtClaims {
             account_id: None,
             email: None,
+            user_id: None,
+            plan_type: None,
         };
     };
     let Ok(payload) = URL_SAFE_NO_PAD.decode(payload_b64) else {
         return JwtClaims {
             account_id: None,
             email: None,
+            user_id: None,
+            plan_type: None,
         };
     };
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload) else {
         return JwtClaims {
             account_id: None,
             email: None,
+            user_id: None,
+            plan_type: None,
         };
     };
 
@@ -1004,7 +2406,204 @@ fn extract_jwt_claims(jwt: &str) -> JwtClaims {
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned());
 
-    JwtClaims { account_id, email }
+    let user_id = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let plan_type = claims
+        .get("chatgpt_plan_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(|v| v.get("chatgpt_plan_type"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_owned);
+
+    JwtClaims {
+        account_id,
+        email,
+        user_id,
+        plan_type,
+    }
+}
+
+fn account_credentials_key(session_id: &str) -> String {
+    format!("{ACCOUNT_CREDENTIALS_PREFIX}{session_id}")
+}
+
+fn session_id_for_credentials(credentials: &CodexCredentials) -> String {
+    let stable_identity = credentials
+        .user_id
+        .as_deref()
+        .or(credentials.account_id.as_deref())
+        .or(credentials.email.as_deref())
+        .unwrap_or(&credentials.refresh_token);
+    let mut hasher = Sha256::new();
+    hasher.update(stable_identity.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn upsert_manifest_session(
+    manifest: &mut AccountManifest,
+    session_id: &str,
+    credentials: &CodexCredentials,
+) {
+    let existing = manifest
+        .sessions
+        .iter_mut()
+        .find(|session| session.session_id == session_id);
+    if let Some(session) = existing {
+        session.email = credentials.email.clone().or(session.email.clone());
+        session.user_id = credentials.user_id.clone().or(session.user_id.clone());
+        session.last_used_at_ms = now_ms();
+        session.token_expires_at_ms = Some(credentials.expires_at_ms);
+        session.reauthentication_required = false;
+        if let Some(account_id) = credentials.account_id.clone() {
+            // The workspace the credential is actually scoped to is the
+            // selected one, even when it differs from a previously selected
+            // workspace for the same OAuth identity.
+            session.selected_workspace_account_id = Some(account_id.clone());
+            if let Some(workspace) = session
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.account_id == account_id)
+            {
+                workspace.plan_type = credentials
+                    .plan_type
+                    .clone()
+                    .or(workspace.plan_type.clone());
+            } else {
+                session.workspaces.push(WorkspaceMetadata {
+                    account_id,
+                    name: None,
+                    image_url: None,
+                    kind: None,
+                    plan_type: credentials.plan_type.clone(),
+                });
+            }
+        }
+        return;
+    }
+
+    let workspaces = credentials
+        .account_id
+        .clone()
+        .map(|account_id| {
+            vec![WorkspaceMetadata {
+                account_id,
+                name: None,
+                image_url: None,
+                kind: None,
+                plan_type: credentials.plan_type.clone(),
+            }]
+        })
+        .unwrap_or_default();
+    manifest.sessions.push(AccountSessionMetadata {
+        session_id: session_id.to_string(),
+        email: credentials.email.clone(),
+        user_id: credentials.user_id.clone(),
+        display_name: None,
+        image_url: None,
+        last_used_at_ms: now_ms(),
+        token_expires_at_ms: Some(credentials.expires_at_ms),
+        selected_workspace_account_id: credentials.account_id.clone(),
+        workspaces,
+        quota: None,
+        quota_fetched_at_ms: None,
+        reauthentication_required: false,
+    });
+}
+
+async fn fetch_quota(
+    http_client: &dyn HttpClient,
+    credentials: &CodexCredentials,
+) -> Result<QuotaSnapshot> {
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(format!("{CHATGPT_BACKEND_BASE_URL}/wham/usage"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", credentials.access_token.trim()),
+        )
+        .header("Accept", "application/json")
+        .extra_headers(&codex_headers(credentials))
+        .body(AsyncBody::empty())?;
+    let mut response = http_client.send(request).await?;
+    let status = response.status();
+    let mut body = String::new();
+    smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "ChatGPT usage request failed (HTTP {status}): {body}"
+        ));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .context("Failed to parse ChatGPT usage response")?;
+    Ok(quota_snapshot_from_value(&value))
+}
+
+fn quota_snapshot_from_value(value: &serde_json::Value) -> QuotaSnapshot {
+    let rate_limit = value.get("rate_limit").unwrap_or(value);
+    let primary = quota_window_from_value(rate_limit.get("primary_window"));
+    let secondary = quota_window_from_value(rate_limit.get("secondary_window"));
+    let credits = rate_limit.get("credits").or_else(|| value.get("credits"));
+    QuotaSnapshot {
+        primary,
+        secondary,
+        credits_has_credits: credits
+            .and_then(|credits| credits.get("has_credits"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        credits_unlimited: credits
+            .and_then(|credits| credits.get("unlimited"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        credits_balance: credits
+            .and_then(|credits| credits.get("balance"))
+            .map(|balance| balance.to_string().trim_matches('"').to_string()),
+        limit_name: rate_limit
+            .get("limit_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        plan_type: value
+            .get("plan_type")
+            .or_else(|| rate_limit.get("plan_type"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        captured_at_ms: now_ms(),
+    }
+}
+
+fn quota_window_from_value(value: Option<&serde_json::Value>) -> Option<QuotaWindow> {
+    let value = value?;
+    let used_percent = value
+        .get("used_percent")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let window_minutes = value
+        .get("limit_window_seconds")
+        .and_then(serde_json::Value::as_i64)
+        .map(|seconds| seconds / 60);
+    let resets_at = value
+        .get("reset_at")
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            value
+                .get("reset_after_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .map(|seconds| (now_ms() / 1000) as i64 + seconds)
+        });
+    Some(QuotaWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -1023,6 +2622,7 @@ mod tests {
     use gpui::{AppContext as _, TestAppContext};
     use http_client::FakeHttpClient;
     use parking_lot::Mutex;
+    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1045,6 +2645,10 @@ mod tests {
 
         let http: Arc<dyn HttpClient> = http_client;
         let state = make_state(http.clone(), Some(make_expired_credentials()), cx);
+        let session_id = session_id_for_credentials(&make_expired_credentials());
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+        });
 
         let weak_state = cx.read(|_cx| state.downgrade());
 
@@ -1137,7 +2741,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_fatal_refresh_clears_auth_state(cx: &mut TestAppContext) {
+    async fn test_fatal_refresh_marks_reauth_and_keeps_account(cx: &mut TestAppContext) {
         let http_client = FakeHttpClient::create(move |_request| async move {
             Ok(http_client::Response::builder()
                 .status(401)
@@ -1145,7 +2749,40 @@ mod tests {
         });
 
         let http: Arc<dyn HttpClient> = http_client;
-        let state = make_state(http.clone(), Some(make_expired_credentials()), cx);
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        let session_id = session_id_for_credentials(&make_expired_credentials());
+        creds_provider.insert(
+            &account_credentials_key(&session_id),
+            "Bearer",
+            serde_json::to_vec(&make_expired_credentials()).unwrap(),
+        );
+        let state = make_state_with_credentials_provider(
+            http.clone(),
+            Some(make_expired_credentials()),
+            creds_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+            state.manifest = AccountManifest {
+                version: 1,
+                active_session_id: Some(session_id.clone()),
+                sessions: vec![AccountSessionMetadata {
+                    session_id: session_id.clone(),
+                    email: None,
+                    user_id: None,
+                    display_name: None,
+                    image_url: None,
+                    last_used_at_ms: now_ms(),
+                    token_expires_at_ms: Some(0),
+                    selected_workspace_account_id: None,
+                    workspaces: Vec::new(),
+                    quota: None,
+                    quota_fetched_at_ms: None,
+                    reauthentication_required: false,
+                }],
+            };
+        });
 
         let weak_state = cx.read(|_cx| state.downgrade());
 
@@ -1168,7 +2805,29 @@ mod tests {
                 s.last_auth_error.is_some(),
                 "last_auth_error should be set on fatal refresh failure"
             );
+            let session = s
+                .manifest
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .expect("the expired account must stay in the manifest");
+            assert!(
+                session.reauthentication_required,
+                "the expired account should be marked as needing re-authentication"
+            );
+            assert_eq!(
+                s.active_session_id.as_deref(),
+                Some(session_id.as_str()),
+                "the expired account stays the active session"
+            );
         });
+        assert!(
+            creds_provider
+                .storage
+                .lock()
+                .contains_key(&account_credentials_key(&session_id)),
+            "the keychain entry must be kept so the account can be signed back into"
+        );
     }
 
     #[gpui::test]
@@ -1181,6 +2840,10 @@ mod tests {
 
         let http: Arc<dyn HttpClient> = http_client;
         let state = make_state(http.clone(), Some(make_expired_credentials()), cx);
+        let session_id = session_id_for_credentials(&make_expired_credentials());
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+        });
 
         let weak_state = cx.read(|_cx| state.downgrade());
 
@@ -1229,6 +2892,10 @@ mod tests {
 
         let http: Arc<dyn HttpClient> = http_client;
         let state = make_state(http.clone(), Some(make_expired_credentials()), cx);
+        let session_id = session_id_for_credentials(&make_expired_credentials());
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+        });
 
         let weak_state = cx.read(|_cx| state.downgrade());
 
@@ -1264,12 +2931,37 @@ mod tests {
 
     #[gpui::test]
     async fn test_sign_out_completes_fully(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let session_id = session_id_for_credentials(&creds);
         let creds_provider = Arc::new(FakeCredentialsProvider::new());
-        // Pre-populate the credential store
-        creds_provider
-            .storage
-            .lock()
-            .replace(("Bearer".to_string(), b"some-creds".to_vec()));
+        creds_provider.insert(
+            &account_credentials_key(&session_id),
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+        creds_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&AccountManifest {
+                version: 1,
+                active_session_id: Some(session_id.clone()),
+                sessions: vec![AccountSessionMetadata {
+                    session_id: session_id.clone(),
+                    email: None,
+                    user_id: None,
+                    display_name: None,
+                    image_url: None,
+                    last_used_at_ms: now_ms(),
+                    token_expires_at_ms: Some(creds.expires_at_ms),
+                    selected_workspace_account_id: None,
+                    workspaces: Vec::new(),
+                    quota: None,
+                    quota_fetched_at_ms: None,
+                    reauthentication_required: false,
+                }],
+            })
+            .unwrap(),
+        );
 
         let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
             Ok(http_client::Response::builder()
@@ -1282,6 +2974,9 @@ mod tests {
             creds_provider.clone(),
             cx,
         );
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+        });
 
         let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
 
@@ -1289,7 +2984,7 @@ mod tests {
         sign_out_task.await.expect("sign-out should succeed");
 
         assert!(
-            creds_provider.storage.lock().is_none(),
+            creds_provider.storage.lock().is_empty(),
             "credential store should be empty after sign-out"
         );
         cx.read(|cx| {
@@ -1301,14 +2996,314 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_sign_out_blocks_new_account_mutations(cx: &mut TestAppContext) {
+        let credentials = make_fresh_credentials();
+        let session_id = session_id_for_credentials(&credentials);
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_id.clone()),
+            sessions: vec![session_metadata(&session_id, now_ms(), None)],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.insert(
+            &account_credentials_key(&session_id),
+            "Bearer",
+            serde_json::to_vec(&credentials).unwrap(),
+        );
+        credentials_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        let gate_tx = credentials_provider.gate_reads_for(ACCOUNT_MANIFEST_KEY);
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state =
+            make_state_with_credentials_provider(http, Some(credentials), credentials_provider, cx);
+        state.update(cx, |state, _| {
+            state.manifest = manifest;
+            state.active_session_id = Some(session_id);
+        });
+
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        cx.run_until_parked();
+        let sign_in_task = state.update(cx, |state, cx| state.sign_in(cx));
+        assert!(
+            sign_in_task.await.is_err(),
+            "sign-in must remain blocked until sign-out persistence completes"
+        );
+
+        gate_tx.send(()).expect("release manifest read");
+        cx.run_until_parked();
+        sign_out_task.await.expect("sign-out should succeed");
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_manifest_read_error_restores_active_account(cx: &mut TestAppContext) {
+        let credentials = make_fresh_credentials();
+        let session_id = session_id_for_credentials(&credentials);
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_id.clone()),
+            sessions: vec![session_metadata(&session_id, now_ms(), None)],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.insert(
+            &account_credentials_key(&session_id),
+            "Bearer",
+            serde_json::to_vec(&credentials).unwrap(),
+        );
+        credentials_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        credentials_provider.fail_reads_for(ACCOUNT_MANIFEST_KEY);
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state_with_credentials_provider(
+            http,
+            Some(credentials),
+            credentials_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.manifest = manifest;
+            state.active_session_id = Some(session_id.clone());
+        });
+
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        cx.run_until_parked();
+        assert!(sign_out_task.await.is_err());
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(state.is_authenticated());
+            assert_eq!(
+                state.active_session_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            assert!(!state.is_busy());
+        });
+        assert!(
+            credentials_provider
+                .storage
+                .lock()
+                .contains_key(&account_credentials_key(&session_id)),
+            "a failed sign-out must not delete the active credential"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_switch_manifest_write_error_keeps_current_account(cx: &mut TestAppContext) {
+        let account_a = make_credentials("a");
+        let account_b = make_credentials("b");
+        let account_a_id = session_id_for_credentials(&account_a);
+        let account_b_id = session_id_for_credentials(&account_b);
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(account_a_id.clone()),
+            sessions: vec![
+                session_metadata(&account_a_id, 2, None),
+                session_metadata(&account_b_id, 1, None),
+            ],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.insert(
+            &account_credentials_key(&account_b_id),
+            "Bearer",
+            serde_json::to_vec(&account_b).unwrap(),
+        );
+        credentials_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        credentials_provider.fail_writes_for(ACCOUNT_MANIFEST_KEY);
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state_with_credentials_provider(
+            http,
+            Some(account_a.clone()),
+            credentials_provider,
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.manifest = manifest;
+            state.active_session_id = Some(account_a_id.clone());
+        });
+
+        let switch_task = state.update(cx, |state, cx| {
+            state.switch_account(account_b_id.into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(switch_task.await.is_err());
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(
+                state.active_session_id.as_deref(),
+                Some(account_a_id.as_str())
+            );
+            assert_eq!(
+                state
+                    .credentials
+                    .as_ref()
+                    .map(|value| value.access_token.as_str()),
+                Some(account_a.access_token.as_str())
+            );
+            assert!(!state.is_busy());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_does_not_activate_account_without_credentials(cx: &mut TestAppContext) {
+        let account_a = make_credentials("a");
+        let account_a_id = session_id_for_credentials(&account_a);
+        let missing_account_id = "missing-account".to_string();
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(account_a_id.clone()),
+            sessions: vec![
+                session_metadata(&account_a_id, 1, None),
+                session_metadata(&missing_account_id, 2, None),
+            ],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.insert(
+            &account_credentials_key(&account_a_id),
+            "Bearer",
+            serde_json::to_vec(&account_a).unwrap(),
+        );
+        credentials_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state =
+            make_state_with_credentials_provider(http, Some(account_a), credentials_provider, cx);
+        state.update(cx, |state, _| {
+            state.manifest = manifest;
+            state.active_session_id = Some(account_a_id);
+        });
+
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        cx.run_until_parked();
+        sign_out_task.await.expect("sign-out should succeed");
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id, None);
+            assert!(state.credentials.is_none());
+        });
+        let retry = state.update(cx, |state, cx| {
+            state.switch_account(missing_account_id.into(), cx)
+        });
+        assert!(
+            retry.await.is_err(),
+            "switch must retry the missing credential"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_surfaces_credential_cleanup_failure(cx: &mut TestAppContext) {
+        let credentials = make_fresh_credentials();
+        let session_id = session_id_for_credentials(&credentials);
+        let credential_key = account_credentials_key(&session_id);
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_id.clone()),
+            sessions: vec![session_metadata(&session_id, now_ms(), None)],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.insert(
+            &credential_key,
+            "Bearer",
+            serde_json::to_vec(&credentials).unwrap(),
+        );
+        credentials_provider.insert(
+            ACCOUNT_MANIFEST_KEY,
+            "json",
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        credentials_provider.fail_deletes_for(&credential_key);
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state_with_credentials_provider(
+            http,
+            Some(credentials),
+            credentials_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.manifest = manifest;
+            state.active_session_id = Some(session_id);
+        });
+
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        cx.run_until_parked();
+        assert!(sign_out_task.await.is_err());
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(!state.is_authenticated());
+            assert!(state.last_auth_error.is_some());
+        });
+        assert!(
+            credentials_provider
+                .storage
+                .lock()
+                .contains_key(&credential_key)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancel_sign_in_releases_account_mutation(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state(http, None, cx);
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        state.update(cx, |state, cx| {
+            state.account_mutation_in_progress = true;
+            state.sign_in_abort_handle = Some(abort_handle);
+            state.sign_in_task = Some(Task::ready(()));
+            state.cancel_sign_in(cx);
+        });
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(!state.is_busy());
+            assert!(!state.is_signing_in());
+            assert!(!state.can_cancel_sign_in());
+        });
+        let aborted = Abortable::new(futures::future::pending::<()>(), abort_registration).await;
+        assert!(aborted.is_err(), "the OAuth future must be aborted");
+    }
+
+    #[gpui::test]
     async fn test_initial_load_restores_persisted_credentials(cx: &mut TestAppContext) {
         let creds = make_fresh_credentials();
         let creds_json = serde_json::to_vec(&creds).unwrap();
         let creds_provider = Arc::new(FakeCredentialsProvider::new());
-        creds_provider
-            .storage
-            .lock()
-            .replace(("Bearer".to_string(), creds_json));
+        // The legacy single-account key triggers the migration path, which
+        // restores the account-scoped key and the manifest.
+        creds_provider.insert(LEGACY_CREDENTIALS_KEY, "Bearer", creds_json);
 
         let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
             Ok(http_client::Response::builder()
@@ -1316,7 +3311,8 @@ mod tests {
                 .body(http_client::AsyncBody::default())?)
         });
 
-        let state = cx.new(|cx| State::new(http, creds_provider, cx));
+        let state =
+            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
 
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
@@ -1332,47 +3328,868 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn test_legacy_migration_deletes_legacy_key_after_success(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        cx.read(|cx| assert!(state.read(cx).is_authenticated()));
+        let storage = creds_provider.storage.lock();
+        let session_id = session_id_for_credentials(&creds);
+        assert!(
+            storage.contains_key(&account_credentials_key(&session_id)),
+            "the account-scoped key should be written"
+        );
+        assert!(
+            storage.contains_key(ACCOUNT_MANIFEST_KEY),
+            "the manifest should be written"
+        );
+        assert!(
+            !storage.contains_key(LEGACY_CREDENTIALS_KEY),
+            "the legacy key should be deleted once the migration persisted"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_legacy_migration_keeps_legacy_when_persist_fails(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+        creds_provider.fail_writes_for(ACCOUNT_MANIFEST_KEY);
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        cx.read(|cx| assert!(state.read(cx).is_authenticated()));
+        assert!(
+            creds_provider
+                .storage
+                .lock()
+                .contains_key(LEGACY_CREDENTIALS_KEY),
+            "the legacy key must survive a failed persist so the migration retries"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_of_migrated_account_does_not_resurrect(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state =
+            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        cx.run_until_parked();
+        sign_out_task.await.expect("sign-out should succeed");
+        assert!(
+            creds_provider.storage.lock().is_empty(),
+            "sign-out should remove the migrated account everywhere, including the legacy key"
+        );
+
+        // A fresh launch must not restore the signed-out account.
+        let state2 = cx.new(|cx| State::new(http, creds_provider, "test".to_string(), cx));
+        let load_task2 = cx
+            .read(|cx| state2.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+        cx.run_until_parked();
+        load_task2.await.expect("load should succeed");
+        cx.read(|cx| {
+            assert!(
+                !state2.read(cx).is_authenticated(),
+                "the signed-out account must not come back after a restart"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fatal_refresh_after_switch_does_not_wipe_new_account(cx: &mut TestAppContext) {
+        let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+        let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+        let gate_rx_clone = gate_rx.clone();
+        let http_client = FakeHttpClient::create(move |_request| {
+            let gate_rx = gate_rx_clone.clone();
+            async move {
+                let rx = gate_rx.lock().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+                Ok(http_client::Response::builder()
+                    .status(401)
+                    .body(http_client::AsyncBody::from(r#"{"error":"invalid_grant"}"#))?)
+            }
+        });
+        let http: Arc<dyn HttpClient> = http_client;
+
+        let a_creds = make_expired_credentials();
+        let b_creds = make_credentials("b");
+        let a_id = session_id_for_credentials(&a_creds);
+        let b_id = session_id_for_credentials(&b_creds);
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            &account_credentials_key(&b_id),
+            "Bearer",
+            serde_json::to_vec(&b_creds).unwrap(),
+        );
+        let state = make_state_with_credentials_provider(
+            http.clone(),
+            Some(a_creds.clone()),
+            creds_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(a_id.clone());
+            state.manifest = AccountManifest {
+                version: 1,
+                active_session_id: Some(a_id.clone()),
+                sessions: vec![
+                    session_metadata(&a_id, 2, Some(0)),
+                    session_metadata(&b_id, 1, None),
+                ],
+            };
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let weak = weak_state.clone();
+        let http_clone = http.clone();
+        let refresh_task =
+            cx.spawn(async move |mut cx| get_fresh_credentials(&weak, &http_clone, &mut cx).await);
+        cx.run_until_parked();
+
+        // Switch to B while A's fatal refresh is in flight.
+        let switch_task = state.update(cx, |state, cx| {
+            state.switch_account(b_id.clone().into(), cx)
+        });
+        cx.run_until_parked();
+        switch_task.await.expect("switch should succeed");
+
+        let _ = gate_tx.send(());
+        cx.run_until_parked();
+        assert!(
+            refresh_task.await.is_err(),
+            "the refresh should fail after the account changed"
+        );
+
+        cx.read(|cx| {
+            let s = state.read(cx);
+            assert_eq!(s.active_session_id.as_deref(), Some(b_id.as_str()));
+            assert_eq!(
+                s.credentials
+                    .as_ref()
+                    .map(|creds| creds.access_token.as_str()),
+                Some("b"),
+                "B's credentials must not be wiped by A's stale refresh"
+            );
+            let a_session = s
+                .manifest
+                .sessions
+                .iter()
+                .find(|session| session.session_id == a_id)
+                .expect("A stays in the manifest");
+            assert!(
+                !a_session.reauthentication_required,
+                "a stale fatal refresh must not mark the account it no longer belongs to"
+            );
+        });
+        assert!(
+            creds_provider
+                .storage
+                .lock()
+                .contains_key(&account_credentials_key(&b_id)),
+            "B's keychain entry must be untouched"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_concurrent_switch_is_rejected(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let b_creds = make_credentials("b");
+        let c_creds = make_credentials("c");
+        let b_id = session_id_for_credentials(&b_creds);
+        let c_id = session_id_for_credentials(&c_creds);
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            &account_credentials_key(&b_id),
+            "Bearer",
+            serde_json::to_vec(&b_creds).unwrap(),
+        );
+        creds_provider.insert(
+            &account_credentials_key(&c_id),
+            "Bearer",
+            serde_json::to_vec(&c_creds).unwrap(),
+        );
+        let state = make_state_with_credentials_provider(http, None, creds_provider.clone(), cx);
+        state.update(cx, |state, _| {
+            state.manifest = AccountManifest {
+                version: 1,
+                active_session_id: None,
+                sessions: vec![
+                    session_metadata(&b_id, 2, None),
+                    session_metadata(&c_id, 1, None),
+                ],
+            };
+        });
+
+        // B's credential read is slow, so another switch must not start until
+        // its manifest transaction has completed.
+        let gate_tx = creds_provider.gate_reads_for(&account_credentials_key(&b_id));
+        let switch_b = state.update(cx, |state, cx| {
+            state.switch_account(b_id.clone().into(), cx)
+        });
+        cx.run_until_parked();
+        let switch_c = state.update(cx, |state, cx| {
+            state.switch_account(c_id.clone().into(), cx)
+        });
+        assert!(
+            switch_c.await.is_err(),
+            "concurrent switch must be rejected"
+        );
+
+        let _ = gate_tx.send(());
+        cx.run_until_parked();
+        switch_b.await.expect("switch to B should complete");
+
+        cx.read(|cx| {
+            let s = state.read(cx);
+            assert_eq!(
+                s.active_session_id.as_deref(),
+                Some(b_id.as_str()),
+                "the serialized switch must stay active"
+            );
+            assert_eq!(
+                s.manifest.active_session_id.as_deref(),
+                Some(b_id.as_str()),
+                "the in-memory manifest must match the active account"
+            );
+        });
+        let storage = creds_provider.storage.lock();
+        let (_, manifest_bytes) = storage
+            .get(ACCOUNT_MANIFEST_KEY)
+            .expect("the manifest should be persisted");
+        let persisted: AccountManifest = serde_json::from_slice(manifest_bytes).unwrap();
+        assert_eq!(
+            persisted.active_session_id.as_deref(),
+            Some(b_id.as_str()),
+            "the persisted manifest must agree with the completed switch"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_busy_blocks_sign_in_and_sign_out(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state(http, Some(make_fresh_credentials()), cx);
+        state.update(cx, |state, _| {
+            state
+                .active_operations
+                .counter
+                .fetch_add(1, Ordering::Relaxed);
+        });
+
+        let sign_in_task = state.update(cx, |state, cx| state.sign_in(cx));
+        assert!(
+            sign_in_task.await.is_err(),
+            "sign-in must be blocked while a request is active"
+        );
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        assert!(
+            sign_out_task.await.is_err(),
+            "sign-out must be blocked while a request is active"
+        );
+
+        state.update(cx, |state, _| {
+            state
+                .active_operations
+                .counter
+                .fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refresh_after_switch_discards_result(cx: &mut TestAppContext) {
+        let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+        let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+        let gate_rx_clone = gate_rx.clone();
+        let http_client = FakeHttpClient::create(move |_request| {
+            let gate_rx = gate_rx_clone.clone();
+            async move {
+                let rx = gate_rx.lock().take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+                let body = fake_token_response();
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(http_client::AsyncBody::from(body))?)
+            }
+        });
+        let http: Arc<dyn HttpClient> = http_client;
+
+        let a_creds = make_expired_credentials();
+        let b_creds = make_credentials("b");
+        let a_id = session_id_for_credentials(&a_creds);
+        let b_id = session_id_for_credentials(&b_creds);
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            &account_credentials_key(&a_id),
+            "Bearer",
+            serde_json::to_vec(&a_creds).unwrap(),
+        );
+        creds_provider.insert(
+            &account_credentials_key(&b_id),
+            "Bearer",
+            serde_json::to_vec(&b_creds).unwrap(),
+        );
+        let state = make_state_with_credentials_provider(
+            http.clone(),
+            Some(a_creds.clone()),
+            creds_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(a_id.clone());
+            state.manifest = AccountManifest {
+                version: 1,
+                active_session_id: Some(a_id.clone()),
+                sessions: vec![
+                    session_metadata(&a_id, 2, Some(0)),
+                    session_metadata(&b_id, 1, None),
+                ],
+            };
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let weak = weak_state.clone();
+        let http_clone = http.clone();
+        let refresh_task =
+            cx.spawn(async move |mut cx| get_fresh_credentials(&weak, &http_clone, &mut cx).await);
+        cx.run_until_parked();
+
+        let switch_task = state.update(cx, |state, cx| {
+            state.switch_account(b_id.clone().into(), cx)
+        });
+        cx.run_until_parked();
+        switch_task.await.expect("switch should succeed");
+
+        let _ = gate_tx.send(());
+        cx.run_until_parked();
+        assert!(
+            refresh_task.await.is_err(),
+            "a refresh superseded by a switch must fail"
+        );
+
+        cx.read(|cx| {
+            let s = state.read(cx);
+            assert_eq!(s.active_session_id.as_deref(), Some(b_id.as_str()));
+            assert_eq!(
+                s.credentials
+                    .as_ref()
+                    .map(|creds| creds.access_token.as_str()),
+                Some("b"),
+                "B's credentials must not be replaced by A's refreshed token"
+            );
+        });
+        let storage = creds_provider.storage.lock();
+        let (_, a_bytes) = storage
+            .get(&account_credentials_key(&a_id))
+            .expect("A's keychain entry");
+        let a_persisted: CodexCredentials = serde_json::from_slice(a_bytes).unwrap();
+        assert_eq!(
+            a_persisted.access_token, "old_access",
+            "the stale refresh must not write A's refreshed token after the switch"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_corrupt_manifest_skips_migration(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(ACCOUNT_MANIFEST_KEY, "json", b"not a manifest".to_vec());
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        cx.read(|cx| {
+            assert!(
+                !state.read(cx).is_authenticated(),
+                "a corrupt manifest must not fall back to the legacy key"
+            );
+        });
+        let storage = creds_provider.storage.lock();
+        assert!(
+            storage.contains_key(LEGACY_CREDENTIALS_KEY),
+            "the legacy key must be left in place"
+        );
+        assert_eq!(
+            storage.get(ACCOUNT_MANIFEST_KEY).unwrap().1,
+            b"not a manifest",
+            "the corrupt manifest must not be overwritten by a default"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_manifest_read_error_skips_migration(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.fail_reads_for(ACCOUNT_MANIFEST_KEY);
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        cx.read(|cx| {
+            assert!(
+                !state.read(cx).is_authenticated(),
+                "a keychain read error must not fall back to the legacy key"
+            );
+        });
+        assert!(
+            creds_provider
+                .storage
+                .lock()
+                .contains_key(LEGACY_CREDENTIALS_KEY),
+            "the legacy key must be left in place"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_refresh_persists_token_expiry(cx: &mut TestAppContext) {
+        let http_client = FakeHttpClient::create(move |_request| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::from(fake_token_response()))?)
+        });
+        let http: Arc<dyn HttpClient> = http_client;
+        let creds = make_expired_credentials();
+        let session_id = session_id_for_credentials(&creds);
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            &account_credentials_key(&session_id),
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+        let state = make_state_with_credentials_provider(
+            http.clone(),
+            Some(creds),
+            creds_provider.clone(),
+            cx,
+        );
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id.clone());
+            state.manifest = AccountManifest {
+                version: 1,
+                active_session_id: Some(session_id.clone()),
+                sessions: vec![session_metadata(&session_id, now_ms(), Some(0))],
+            };
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let weak = weak_state.clone();
+        let http_clone = http.clone();
+        let result = cx
+            .spawn(async move |mut cx| get_fresh_credentials(&weak, &http_clone, &mut cx).await)
+            .await;
+        let refreshed = result.expect("refresh should succeed");
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            let s = state.read(cx);
+            let session = s
+                .manifest
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .expect("session stays in the manifest");
+            assert_eq!(
+                session.token_expires_at_ms,
+                Some(refreshed.expires_at_ms),
+                "the in-memory expiry should be updated"
+            );
+        });
+        let storage = creds_provider.storage.lock();
+        let (_, manifest_bytes) = storage
+            .get(ACCOUNT_MANIFEST_KEY)
+            .expect("the manifest should be persisted");
+        let persisted: AccountManifest = serde_json::from_slice(manifest_bytes).unwrap();
+        let session = persisted
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .expect("session stays in the persisted manifest");
+        assert_eq!(
+            session.token_expires_at_ms,
+            Some(refreshed.expires_at_ms),
+            "the refreshed expiry must survive a restart"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_before_load_completes_does_not_resurrect(cx: &mut TestAppContext) {
+        let creds = make_fresh_credentials();
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        creds_provider.insert(
+            LEGACY_CREDENTIALS_KEY,
+            "Bearer",
+            serde_json::to_vec(&creds).unwrap(),
+        );
+        let gate_tx = creds_provider.gate_reads_for(ACCOUNT_MANIFEST_KEY);
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state =
+            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
+
+        // Let the load start (and capture the identity) before signing out.
+        cx.run_until_parked();
+
+        // Sign out while the initial load is still reading the manifest.
+        let sign_out_task = state.update(cx, |state, cx| state.sign_out(cx));
+        let _ = gate_tx.send(());
+        cx.run_until_parked();
+        assert!(sign_out_task.await.is_ok());
+        cx.read(|cx| {
+            let s = state.read(cx);
+            assert!(
+                !s.is_authenticated(),
+                "a sign-out must not be reverted by the pending load"
+            );
+            assert!(s.load_task().is_none(), "the load should settle");
+        });
+        assert!(
+            creds_provider.storage.lock().is_empty(),
+            "sign-out during initial load must remove migrated credentials"
+        );
+
+        let restarted = cx.new(|cx| State::new(http, creds_provider, "test".to_string(), cx));
+        let restarted_load = cx
+            .read(|cx| restarted.read(cx).load_task())
+            .expect("restart should load credentials");
+        cx.run_until_parked();
+        restarted_load.await.expect("restart load should finish");
+        cx.read(|cx| {
+            assert!(
+                !restarted.read(cx).is_authenticated(),
+                "the account must not return after restart"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_busy_transitions_notify(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state(http, None, cx);
+        let notifies = Arc::new(AtomicUsize::new(0));
+        let notifies_clone = notifies.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe(&state, move |_, _| {
+                notifies_clone.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let weak = cx.read(|_cx| state.downgrade());
+        let async_cx = cx.to_async();
+
+        cx.read(|cx| state.read(cx).active_operations.enter(&weak, &async_cx));
+        cx.run_until_parked();
+        assert_eq!(notifies.load(Ordering::SeqCst), 1, "0→1 must notify");
+        cx.read(|cx| state.read(cx).active_operations.exit());
+        cx.run_until_parked();
+        assert_eq!(notifies.load(Ordering::SeqCst), 2, "1→0 must notify");
+
+        // Nested operations only notify once on the transition out of idle.
+        cx.read(|cx| state.read(cx).active_operations.enter(&weak, &async_cx));
+        cx.read(|cx| state.read(cx).active_operations.enter(&weak, &async_cx));
+        cx.run_until_parked();
+        assert_eq!(notifies.load(Ordering::SeqCst), 3);
+        cx.read(|cx| state.read(cx).active_operations.exit());
+        cx.run_until_parked();
+        assert_eq!(notifies.load(Ordering::SeqCst), 3, "2→1 must not notify");
+        cx.read(|cx| state.read(cx).active_operations.exit());
+        cx.run_until_parked();
+        assert_eq!(notifies.load(Ordering::SeqCst), 4);
+
+        drop(state);
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn test_upsert_manifest_session_updates_selected_workspace() {
+        let session_id = "session";
+        let mut manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_id.to_string()),
+            sessions: vec![AccountSessionMetadata {
+                session_id: session_id.to_string(),
+                email: None,
+                user_id: None,
+                display_name: None,
+                image_url: None,
+                last_used_at_ms: 0,
+                token_expires_at_ms: None,
+                selected_workspace_account_id: Some("ws1".to_string()),
+                workspaces: vec![WorkspaceMetadata {
+                    account_id: "ws1".to_string(),
+                    name: None,
+                    image_url: None,
+                    kind: None,
+                    plan_type: None,
+                }],
+                quota: None,
+                quota_fetched_at_ms: None,
+                reauthentication_required: false,
+            }],
+        };
+        let creds = CodexCredentials {
+            access_token: "token".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            account_id: Some("ws2".to_string()),
+            email: None,
+            user_id: None,
+            plan_type: Some("pro".to_string()),
+        };
+        upsert_manifest_session(&mut manifest, session_id, &creds);
+        let session = manifest
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .expect("session stays");
+        assert_eq!(
+            session.selected_workspace_account_id.as_deref(),
+            Some("ws2"),
+            "the selected workspace must follow the credential's account id"
+        );
+        assert_eq!(session.workspaces.len(), 2);
+        assert!(
+            session
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.account_id == "ws2"
+                    && workspace.plan_type.as_deref() == Some("pro"))
+        );
+    }
+
+    fn make_credentials(access_token: &str) -> CodexCredentials {
+        CodexCredentials {
+            access_token: access_token.to_string(),
+            refresh_token: format!("refresh_{access_token}"),
+            expires_at_ms: now_ms() + 3_600_000,
+            account_id: None,
+            email: None,
+            user_id: None,
+            plan_type: None,
+        }
+    }
+
+    fn session_metadata(
+        session_id: &str,
+        last_used_at_ms: u64,
+        token_expires_at_ms: Option<u64>,
+    ) -> AccountSessionMetadata {
+        AccountSessionMetadata {
+            session_id: session_id.to_string(),
+            email: None,
+            user_id: None,
+            display_name: None,
+            image_url: None,
+            last_used_at_ms,
+            token_expires_at_ms,
+            selected_workspace_account_id: None,
+            workspaces: Vec::new(),
+            quota: None,
+            quota_fetched_at_ms: None,
+            reauthentication_required: false,
+        }
+    }
+
     struct FakeCredentialsProvider {
-        storage: Mutex<Option<(String, Vec<u8>)>>,
+        storage: Mutex<HashMap<String, (String, Vec<u8>)>>,
+        /// Keys whose reads fail with an error, simulating transient keychain
+        /// failures.
+        failing_reads: Mutex<Vec<String>>,
+        /// Keys whose writes fail, simulating persist failures.
+        failing_writes: Mutex<Vec<String>>,
+        /// Keys whose deletes fail, simulating keychain cleanup failures.
+        failing_deletes: Mutex<Vec<String>>,
+        /// Keys whose next read waits on a oneshot so tests can control the
+        /// ordering of concurrent operations.
+        read_gates: Mutex<HashMap<String, futures::channel::oneshot::Receiver<()>>>,
     }
 
     impl FakeCredentialsProvider {
         fn new() -> Self {
             Self {
-                storage: Mutex::new(None),
+                storage: Mutex::new(HashMap::new()),
+                failing_reads: Mutex::new(Vec::new()),
+                failing_writes: Mutex::new(Vec::new()),
+                failing_deletes: Mutex::new(Vec::new()),
+                read_gates: Mutex::new(HashMap::new()),
             }
+        }
+
+        fn insert(&self, key: &str, username: &str, password: Vec<u8>) {
+            self.storage
+                .lock()
+                .insert(key.to_string(), (username.to_string(), password));
+        }
+
+        fn fail_reads_for(&self, key: &str) {
+            self.failing_reads.lock().push(key.to_string());
+        }
+
+        fn fail_writes_for(&self, key: &str) {
+            self.failing_writes.lock().push(key.to_string());
+        }
+
+        fn fail_deletes_for(&self, key: &str) {
+            self.failing_deletes.lock().push(key.to_string());
+        }
+
+        fn gate_reads_for(&self, key: &str) -> futures::channel::oneshot::Sender<()> {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            self.read_gates.lock().insert(key.to_string(), rx);
+            tx
         }
     }
 
     impl CredentialsProvider for FakeCredentialsProvider {
         fn read_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-            Box::pin(async { Ok(self.storage.lock().clone()) })
+            Box::pin(async move {
+                let gate = self.read_gates.lock().remove(url);
+                if let Some(gate) = gate {
+                    let _ = gate.await;
+                }
+                if self.failing_reads.lock().iter().any(|key| key == url) {
+                    return Err(anyhow!("simulated keychain read failure"));
+                }
+                Ok(self.storage.lock().get(url).cloned())
+            })
         }
 
         fn write_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             username: &'a str,
             password: &'a [u8],
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            self.storage
-                .lock()
-                .replace((username.to_string(), password.to_vec()));
-            Box::pin(async { Ok(()) })
+            if self.failing_writes.lock().iter().any(|key| key == url) {
+                return Box::pin(async move { Err(anyhow!("simulated keychain write failure")) });
+            }
+            let username = username.to_string();
+            let password = password.to_vec();
+            Box::pin(async move {
+                self.storage
+                    .lock()
+                    .insert(url.to_string(), (username, password));
+                Ok(())
+            })
         }
 
         fn delete_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            *self.storage.lock() = None;
-            Box::pin(async { Ok(()) })
+            let url = url.to_string();
+            if self.failing_deletes.lock().iter().any(|key| key == &url) {
+                return Box::pin(async move { Err(anyhow!("simulated keychain delete failure")) });
+            }
+            Box::pin(async move {
+                self.storage.lock().remove(&url);
+                Ok(())
+            })
         }
     }
 
@@ -1396,14 +4213,29 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> Entity<State> {
         cx.new(|_cx| State {
+            manifest: AccountManifest {
+                version: 1,
+                ..Default::default()
+            },
             credentials,
+            active_session_id: None,
             sign_in_task: None,
+            sign_in_abort_handle: None,
+            sign_out_task: None,
+            account_mutation_in_progress: false,
             refresh_task: None,
             load_task: None,
             credentials_provider,
             http_client,
             auth_generation: 0,
+            account_mutation_seq: 0,
             last_auth_error: None,
+            models: ChatGptModel::fallback_models(),
+            model_fetch_task: None,
+            quota_fetch_tasks: Vec::new(),
+            active_operations: Arc::new(BusyNotifier::new()),
+            manifest_load_state: ManifestLoadState::Loaded,
+            client_version: "test".to_string(),
         })
     }
 
@@ -1414,6 +4246,8 @@ mod tests {
             expires_at_ms: 0,
             account_id: None,
             email: None,
+            user_id: None,
+            plan_type: None,
         }
     }
 
@@ -1424,6 +4258,8 @@ mod tests {
             expires_at_ms: now_ms() + 3_600_000,
             account_id: None,
             email: None,
+            user_id: None,
+            plan_type: None,
         }
     }
 

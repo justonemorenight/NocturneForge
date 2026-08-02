@@ -30,7 +30,7 @@ pub use tools::*;
 
 use acp_thread::{
     AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId, TokenUsageRatio,
+    AgentSessionListRequest, AgentSessionListResponse, ClientUserMessageId,
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::{
@@ -3348,7 +3348,6 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 enum SubagentPromptResult {
     Completed,
     Cancelled,
-    ContextWindowWarning,
     Error(String),
 }
 
@@ -3391,12 +3390,7 @@ impl SubagentHandle for NativeSubagentHandle {
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
-            let (task, _subscription) = cx.update(|cx| {
-                let ratio_before_prompt = thread
-                    .read(cx)
-                    .latest_token_usage()
-                    .map(|usage| usage.ratio());
-
+            let task = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
@@ -3407,49 +3401,21 @@ impl SubagentHandle for NativeSubagentHandle {
                     acp_thread.send(vec![message.into()], cx)
                 });
 
-                let (token_limit_tx, token_limit_rx) = oneshot::channel::<()>();
-                let mut token_limit_tx = Some(token_limit_tx);
-
-                let subscription = cx.subscribe(
-                    &thread,
-                    move |_thread, event: &TokenUsageUpdated, _cx| {
-                        if let Some(usage) = &event.0 {
-                            let old_ratio = ratio_before_prompt
-                                .clone()
-                                .unwrap_or(TokenUsageRatio::Normal);
-                            let new_ratio = usage.ratio();
-                            if old_ratio == TokenUsageRatio::Normal
-                                && new_ratio == TokenUsageRatio::Warning
-                            {
-                                if let Some(tx) = token_limit_tx.take() {
-                                    tx.send(()).ok();
-                                }
+                cx.background_spawn(async move {
+                    match task.await {
+                        Ok(Some(response)) => {
+                            match response.stop_reason {
+                                acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
+                                acp::StopReason::MaxTokens => SubagentPromptResult::Error("The agent reached the maximum number of tokens.".into()),
+                                acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error("The agent reached the maximum number of allowed requests between user turns. Try prompting again.".into()),
+                                acp::StopReason::Refusal => SubagentPromptResult::Error("The agent refused to process that prompt. Try again.".into()),
+                                acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
                             }
                         }
-                    },
-                );
-
-                let wait_for_prompt = cx
-                    .background_spawn(async move {
-                        futures::select! {
-                            response = task.fuse() => match response {
-                                Ok(Some(response)) => {
-                                    match response.stop_reason {
-                                        acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
-                                        acp::StopReason::MaxTokens => SubagentPromptResult::Error("The agent reached the maximum number of tokens.".into()),
-                                        acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error("The agent reached the maximum number of allowed requests between user turns. Try prompting again.".into()),
-                                        acp::StopReason::Refusal => SubagentPromptResult::Error("The agent refused to process that prompt. Try again.".into()),
-                                        acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
-                                    }
-                                }
-                                Ok(None) => SubagentPromptResult::Error("No response from the agent. You can try messaging again.".into()),
-                                Err(error) => SubagentPromptResult::Error(error.to_string()),
-                            },
-                            _ = token_limit_rx.fuse() => SubagentPromptResult::ContextWindowWarning,
-                        }
-                    });
-
-                (wait_for_prompt, subscription)
+                        Ok(None) => SubagentPromptResult::Error("No response from the agent. You can try messaging again.".into()),
+                        Err(error) => SubagentPromptResult::Error(error.to_string()),
+                    }
+                })
             });
 
             let result = match task.await {
@@ -3475,14 +3441,6 @@ impl SubagentHandle for NativeSubagentHandle {
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
                 SubagentPromptResult::Error(message) => Err(anyhow!("{message}")),
-                SubagentPromptResult::ContextWindowWarning => {
-                    thread.update(cx, |thread, cx| thread.cancel(cx)).await;
-                    Err(anyhow!(
-                        "The agent is nearing the end of its context window and has been \
-                         stopped. You can prompt the thread again to have the agent wrap up \
-                         or hand off its work."
-                    ))
-                }
             };
 
             parent_thread

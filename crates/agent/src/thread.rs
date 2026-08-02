@@ -128,6 +128,9 @@ const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 const COMPACTION_REQUEST_BYTES_PER_TOKEN: u64 = 3;
 const COMPACTION_REQUEST_HEADROOM_PERCENT: u64 = 80;
 const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
+const COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT: usize = 64 * 1024;
+const COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated.";
 const MAX_HIERARCHICAL_COMPACTION_PASSES: usize = 8;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
 const MIN_USER_MESSAGES_BEFORE_RECOMPACTION: usize = 2;
@@ -4738,14 +4741,24 @@ impl Thread {
             .filter(|model| model.supports_explicit_compaction())
             .cloned()
         {
-            let request = self.build_provider_compaction_request(target_ix, &model, cx);
             let fallback_model = self
                 .compaction_model(cx)
                 .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-            return Ok(CompactionOperation::ProviderNative {
-                model,
-                request,
-                fallback_model,
+            let request = self.build_provider_compaction_request(target_ix, &model, cx);
+            if let Some(request) = prepare_provider_compaction_request(request, model.as_ref())? {
+                return Ok(CompactionOperation::ProviderNative {
+                    model,
+                    request,
+                    fallback_model,
+                });
+            }
+
+            log::warn!(
+                "Provider-native compaction input exceeds the model budget after trimming; \
+                 using bounded summary compaction"
+            );
+            return Ok(CompactionOperation::Summary {
+                model: fallback_model,
             });
         }
 
@@ -5295,6 +5308,68 @@ fn compaction_request_byte_budget(model: &dyn LanguageModel) -> usize {
         .saturating_mul(COMPACTION_REQUEST_HEADROOM_PERCENT)
         / 100;
     usize::try_from(byte_budget).unwrap_or(usize::MAX)
+}
+
+fn prepare_provider_compaction_request(
+    mut request: LanguageModelRequest,
+    model: &dyn LanguageModel,
+) -> Result<Option<LanguageModelRequest>> {
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            if let MessageContent::ToolResult(tool_result) = content {
+                tool_result.output = None;
+            }
+        }
+    }
+
+    let byte_budget = compaction_request_byte_budget(model);
+    if serialized_request_len(&request)? <= byte_budget {
+        return Ok(Some(request));
+    }
+
+    let mut truncated_oversized_output = false;
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            let MessageContent::ToolResult(tool_result) = content else {
+                continue;
+            };
+            for part in &mut tool_result.content {
+                if matches!(part, LanguageModelToolResultContent::Text(text) if text.len() > COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT)
+                {
+                    *part = COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE.into();
+                    truncated_oversized_output = true;
+                }
+            }
+        }
+    }
+    if truncated_oversized_output && serialized_request_len(&request)? <= byte_budget {
+        return Ok(Some(request));
+    }
+
+    let mut removed_historical_tool_output = false;
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            let MessageContent::ToolResult(tool_result) = content else {
+                continue;
+            };
+            let replacement = vec![COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE.into()];
+            if tool_result.content != replacement {
+                tool_result.content = replacement;
+                removed_historical_tool_output = true;
+            }
+        }
+    }
+    if removed_historical_tool_output && serialized_request_len(&request)? <= byte_budget {
+        return Ok(Some(request));
+    }
+
+    Ok(None)
+}
+
+fn serialized_request_len(request: &LanguageModelRequest) -> Result<usize> {
+    serde_json::to_vec(request)
+        .map(|request| request.len())
+        .context("failed to size provider-native compaction request")
 }
 
 struct RunningTurn {

@@ -944,13 +944,25 @@ impl BufferSearchBar {
         cx.notify();
         cx.emit(Event::UpdateLocation);
         cx.emit(ToolbarItemEvent::ChangeLocation(
-            if self.needs_expand_collapse_option(cx) {
-                ToolbarItemLocation::PrimaryLeft
-            } else {
-                ToolbarItemLocation::Secondary
-            },
+            self.deployed_toolbar_location(cx),
         ));
         true
+    }
+
+    fn deployed_toolbar_location(&self, cx: &App) -> ToolbarItemLocation {
+        if self.needs_expand_collapse_option(cx) {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Secondary
+        }
+    }
+
+    fn uses_hidden_splittable_editor(&self, cx: &App) -> bool {
+        self.splittable_editor.is_none()
+            && self.active_searchable_item.as_ref().is_some_and(|item| {
+                item.act_as_type(TypeId::of::<SplittableEditor>(), cx)
+                    .is_some()
+            })
     }
 
     fn supported_options(&self, cx: &mut Context<Self>) -> workspace::searchable::SearchOptions {
@@ -963,20 +975,11 @@ impl BufferSearchBar {
     // We provide an expand/collapse button if we are in a multibuffer
     // and not doing a project search.
     fn needs_expand_collapse_option(&self, cx: &App) -> bool {
-        if let Some(item) = &self.active_searchable_item {
-            let buffer_kind = item.buffer_kind(cx);
-
-            if buffer_kind == ItemBufferKind::Singleton {
-                return false;
-            }
-
-            let workspace::searchable::SearchOptions {
-                find_in_results, ..
-            } = item.supported_options(cx);
-            !find_in_results
-        } else {
-            false
-        }
+        !self.uses_hidden_splittable_editor(cx)
+            && self.active_searchable_item.as_ref().is_some_and(|item| {
+                item.buffer_kind(cx) == ItemBufferKind::Multibuffer
+                    && !item.supported_options(cx).find_in_results
+            })
     }
 
     fn toggle_fold_all(&mut self, _: &ToggleFoldAll, window: &mut Window, cx: &mut Context<Self>) {

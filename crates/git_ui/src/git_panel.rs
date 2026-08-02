@@ -16,7 +16,8 @@ use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
 use agent_settings::{AgentSettings, UserAgentsMd};
-use anyhow::Context as _;
+use agent_skills::{Skill, SkillIndex, SkillSource};
+use anyhow::{Context as _, anyhow};
 use askpass::AskPassDelegate;
 use client::zed_urls;
 use collections::{BTreeMap, HashMap, HashSet};
@@ -44,15 +45,17 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
-    DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton,
-    MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt,
-    TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred, uniform_list,
+    DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, FutureExt as _, KeyContext,
+    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task,
+    TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
+    uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
 use language_model::{
-    CompletionIntent, ConfiguredModel, Event as LanguageModelEvent, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, Role,
+    CompletionIntent, ConfiguredModel, Event as LanguageModelEvent, LanguageModelId,
+    LanguageModelProviderId, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, Role, SelectedModel,
 };
 use menu;
 use multi_buffer::ExcerptBoundaryInfo;
@@ -60,7 +63,7 @@ use notifications::status_toast::StatusToast;
 use panel::PanelHeader;
 use project::git_store::GitAccess;
 use project::{
-    Fs, Project, ProjectPath,
+    Fs, Project, ProjectPath, WorktreeId,
     git_store::{
         CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
     },
@@ -70,8 +73,8 @@ use prompt_store::RULES_FILE_NAMES;
 use proto::RpcError;
 use serde::{Deserialize, Serialize};
 use settings::{
-    GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore, StatusStyle,
-    update_settings_file,
+    GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, LanguageModelSelection, Settings,
+    SettingsLocation, SettingsStore, StatusStyle, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -79,7 +82,11 @@ use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
-use std::{sync::Arc, time::Duration, usize};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+    usize,
+};
 use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
@@ -102,6 +109,9 @@ use zed_actions::{
 
 const GIT_PANEL_KEY: &str = "GitPanel";
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
+const COMMIT_MESSAGE_HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMIT_MESSAGE_GENERATION_TIMEOUT: Duration = Duration::from_secs(90);
+const COMMIT_MESSAGE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
@@ -838,16 +848,126 @@ struct TruncatedPatch {
     hunks_to_keep: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CommitMessageHistory {
+    repository: Vec<String>,
+    author: Vec<String>,
+    attempted: usize,
+    resolved: usize,
+    failed: usize,
+    timed_out: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommitMessageContext {
+    repository_name: String,
+    branch_name: String,
+    current_message: String,
+    commit_template: Option<String>,
+    history: CommitMessageHistory,
+    skill_name: Option<String>,
+    skill_instructions: Option<String>,
+    user_agents_md: Option<String>,
+    project_rules: Option<String>,
+    explicit_instructions: Option<String>,
+    changed_files: Vec<String>,
+    diff_text: String,
+    diff_was_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CommitMessageContextSummary {
+    repository_name: String,
+    branch_name: String,
+    history: CommitMessageHistory,
+    skill_name: Option<String>,
+    skill_loaded: bool,
+    project_rules_loaded: bool,
+    changed_files: usize,
+    diff_bytes: usize,
+    diff_was_truncated: bool,
+    model_name: String,
+    provider_id: String,
+    model_id: String,
+}
+
+impl CommitMessageContextSummary {
+    fn has_warning(&self) -> bool {
+        self.history.failed > 0
+            || self.history.timed_out > 0
+            || self.skill_name.is_some() && !self.skill_loaded
+    }
+
+    fn compact_label(&self) -> String {
+        let history_label = if self.history.attempted == 0 {
+            "History none".to_string()
+        } else if self.history.repository.is_empty() && self.history.timed_out > 0 {
+            "History timeout".to_string()
+        } else if self.history.failed > 0 || self.history.timed_out > 0 {
+            format!("History {} · partial", self.history.resolved)
+        } else {
+            format!("History {}", self.history.resolved)
+        };
+        let skill_label = match (&self.skill_name, self.skill_loaded) {
+            (Some(name), true) => format!("Skill {name}"),
+            (Some(_), false) => "Skill unavailable".to_string(),
+            (None, _) => "No skill".to_string(),
+        };
+        format!("{history_label} · {skill_label}")
+    }
+
+    fn tooltip(&self) -> String {
+        let skill = match (&self.skill_name, self.skill_loaded) {
+            (Some(name), true) => format!("{name} (loaded)"),
+            (Some(name), false) => format!("{name} (not loaded)"),
+            (None, _) => "None".to_string(),
+        };
+        let diff = if self.diff_was_truncated {
+            format!("{} bytes (compressed)", self.diff_bytes)
+        } else {
+            format!("{} bytes", self.diff_bytes)
+        };
+
+        format!(
+            "Last commit generation context\nRepository: {}\nBranch: {}\nModel: {} · {}/{}\nHistory commits: {}/{} resolved\nHistory subjects in prompt: {}\nCurrent-author subjects: {}\nHistory failures: {} · timeouts: {}\nSkill: {}\nProject rules: {}\nChanged files: {}\nDiff context: {}",
+            self.repository_name,
+            self.branch_name,
+            self.model_name,
+            self.provider_id,
+            self.model_id,
+            self.history.resolved,
+            self.history.attempted,
+            self.history.repository.len(),
+            self.history.author.len(),
+            self.history.failed,
+            self.history.timed_out,
+            skill,
+            if self.project_rules_loaded {
+                "loaded"
+            } else {
+                "none"
+            },
+            self.changed_files,
+            diff,
+        )
+    }
+}
+
 impl TruncatedPatch {
     fn from_unified_diff(patch_str: &str) -> Option<Self> {
         let lines: Vec<&str> = patch_str.lines().collect();
-        if lines.len() < 2 {
+        if lines.is_empty() {
             return None;
         }
-        let header = format!("{}\n{}\n", lines[0], lines[1]);
+        let first_hunk = lines
+            .iter()
+            .position(|line| line.starts_with("@@"))
+            .unwrap_or(lines.len());
+        let mut header = lines[..first_hunk].join("\n");
+        header.push('\n');
         let mut hunks = Vec::new();
         let mut current_hunk = String::new();
-        for line in &lines[2..] {
+        for line in &lines[first_hunk..] {
             if line.starts_with("@@") {
                 if !current_hunk.is_empty() {
                     hunks.push(current_hunk);
@@ -861,24 +981,12 @@ impl TruncatedPatch {
         if !current_hunk.is_empty() {
             hunks.push(current_hunk);
         }
-        if hunks.is_empty() {
-            return None;
-        }
         let hunks_to_keep = hunks.len();
         Some(TruncatedPatch {
             header,
             hunks,
             hunks_to_keep,
         })
-    }
-    fn calculate_size(&self) -> usize {
-        let mut size = self.header.len();
-        for (i, hunk) in self.hunks.iter().enumerate() {
-            if i < self.hunks_to_keep {
-                size += hunk.len();
-            }
-        }
-        size
     }
     fn to_string(&self) -> String {
         let mut out = self.header.clone();
@@ -904,6 +1012,8 @@ pub struct GitPanel {
     conflicted_staged_count: usize,
     add_coauthors: bool,
     generate_commit_message_task: Option<Task<Option<()>>>,
+    commit_message_context_summary: Option<CommitMessageContextSummary>,
+    commit_message_context_loading: bool,
     entries: Vec<GitListEntry>,
     view_mode: GitPanelViewMode,
     tree_expanded_dirs: HashMap<TreeKey, bool>,
@@ -1203,6 +1313,8 @@ impl GitPanel {
                 conflicted_staged_count: 0,
                 add_coauthors: true,
                 generate_commit_message_task: None,
+                commit_message_context_summary: None,
+                commit_message_context_loading: false,
                 entries: Vec::new(),
                 view_mode: GitPanelViewMode::from_settings(cx),
                 tree_expanded_dirs: HashMap::default(),
@@ -3124,6 +3236,23 @@ impl GitPanel {
     }
 
     fn split_patch(patch: &str) -> Vec<String> {
+        if patch.lines().any(|line| line.starts_with("diff --git ")) {
+            let mut result = Vec::new();
+            let mut current_patch = String::new();
+            for line in patch.lines() {
+                if line.starts_with("diff --git ") && !current_patch.is_empty() {
+                    result.push(current_patch.trim_end_matches('\n').into());
+                    current_patch.clear();
+                }
+                current_patch.push_str(line);
+                current_patch.push('\n');
+            }
+            if !current_patch.is_empty() {
+                result.push(current_patch.trim_end_matches('\n').into());
+            }
+            return result;
+        }
+
         let mut result = Vec::new();
         let mut current_patch = String::new();
 
@@ -3143,8 +3272,7 @@ impl GitPanel {
         result
     }
     fn truncate_iteratively(patch: &str, max_bytes: usize) -> String {
-        let mut current_size = patch.len();
-        if current_size <= max_bytes {
+        if patch.len() <= max_bytes {
             return patch.to_string();
         }
         let file_patches = Self::split_patch(patch);
@@ -3154,37 +3282,57 @@ impl GitPanel {
             .collect();
 
         if file_infos.is_empty() {
-            return patch.to_string();
+            return Self::truncate_utf8(patch, max_bytes);
         }
 
-        current_size = file_infos.iter().map(|f| f.calculate_size()).sum::<usize>();
-        while current_size > max_bytes {
-            let file_idx = file_infos
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.hunks_to_keep > 1)
-                .max_by_key(|(_, f)| f.hunks_to_keep)
-                .map(|(idx, _)| idx);
-            match file_idx {
-                Some(idx) => {
-                    let file = &mut file_infos[idx];
-                    let size_before = file.calculate_size();
-                    file.hunks_to_keep -= 1;
-                    let size_after = file.calculate_size();
-                    let saved = size_before.saturating_sub(size_after);
-                    current_size = current_size.saturating_sub(saved);
-                }
-                None => {
-                    break;
+        for file in &mut file_infos {
+            file.hunks_to_keep = 0;
+        }
+
+        let mut current_size = file_infos
+            .iter()
+            .map(|file| file.header.len())
+            .sum::<usize>();
+        let max_hunks = file_infos
+            .iter()
+            .map(|file| file.hunks.len())
+            .max()
+            .unwrap_or_default();
+        for hunk_index in 0..max_hunks {
+            for file in &mut file_infos {
+                let Some(hunk) = file.hunks.get(hunk_index) else {
+                    continue;
+                };
+                if current_size.saturating_add(hunk.len()) <= max_bytes {
+                    file.hunks_to_keep += 1;
+                    current_size += hunk.len();
                 }
             }
         }
 
-        file_infos
+        let compressed = file_infos
             .iter()
             .map(|info| info.to_string())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        Self::truncate_utf8(&compressed, max_bytes)
+    }
+
+    fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            return text.to_string();
+        }
+        if max_bytes == 0 {
+            return String::new();
+        }
+        let marker = "\n[...diff truncated...]";
+        if max_bytes <= marker.len() {
+            return marker[..marker.floor_char_boundary(max_bytes)].to_string();
+        }
+        let keep = text.floor_char_boundary(max_bytes - marker.len());
+        let mut output = text[..keep].trim_end().to_string();
+        output.push_str(marker);
+        output
     }
 
     pub fn compress_commit_diff(diff_text: &str, max_bytes: usize) -> String {
@@ -3192,11 +3340,18 @@ impl GitPanel {
             return diff_text.to_string();
         }
 
+        let long_line_limit = 256.min((max_bytes / 16).max(4));
         let mut compressed = diff_text
             .lines()
             .map(|line| {
-                if line.len() > 256 {
-                    format!("{}...[truncated]\n", &line[..line.floor_char_boundary(256)])
+                let is_diff_content = line.starts_with(' ')
+                    || (line.starts_with('+') && !line.starts_with("+++"))
+                    || (line.starts_with('-') && !line.starts_with("---"));
+                if is_diff_content && line.len() > 256 {
+                    format!(
+                        "{}...[truncated]\n",
+                        &line[..line.floor_char_boundary(long_line_limit)]
+                    )
                 } else {
                     format!("{}\n", line)
                 }
@@ -3259,47 +3414,293 @@ impl GitPanel {
         }
     }
 
-    fn build_commit_message_prompt(
-        prompt: &str,
-        user_agents_md: Option<&str>,
-        rules_content: Option<&str>,
-        instructions: Option<&str>,
-        subject: &str,
-        diff_text: &str,
-    ) -> String {
-        let user_agents_md_section = match user_agents_md {
-            Some(user_agents_md) => format!(
-                "\n\nThe user has provided the following rules that you should follow when writing the commit message. Project-specific rules may override these instructions when they conflict:\n\
-                <rules>\n{user_agents_md}\n</rules>\n"
-            ),
-            None => String::new(),
+    async fn load_commit_skill_body(
+        project: &Entity<Project>,
+        fs: &Arc<dyn Fs>,
+        skill: Skill,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<String> {
+        let body = match skill.source.clone() {
+            SkillSource::ProjectLocal { worktree_id, .. } => {
+                let worktree_id = WorktreeId::from_usize(worktree_id.0);
+                let worktree = project
+                    .update(cx, |project, cx| project.worktree_for_id(worktree_id, cx))
+                    .context("commit-message skill belongs to a closed worktree")?;
+                let relative_path = worktree.update(cx, |worktree, _cx| {
+                    worktree
+                        .path_style()
+                        .strip_prefix(&skill.skill_file_path, &worktree.abs_path())
+                        .map(Arc::from)
+                        .context("commit-message skill is outside its worktree")
+                })?;
+                let buffer = project
+                    .update(cx, |project, cx| {
+                        project.open_buffer((worktree_id, relative_path), cx)
+                    })
+                    .await?;
+                let content = buffer.read_with(cx, |buffer, _| buffer.text());
+                agent_skills::read_skill_body_from_content(&skill.skill_file_path, &content)?
+            }
+            SkillSource::BuiltIn => skill
+                .embedded_body
+                .context("built-in commit-message skill has no embedded body")?
+                .trim()
+                .to_string(),
+            SkillSource::Global => {
+                agent_skills::read_skill_body(fs.as_ref(), &skill.skill_file_path).await?
+            }
         };
 
-        let rules_section = match rules_content {
-            Some(rules) => format!(
-                "\n\nThe user has provided the following rules specific to this project that you should follow when writing the commit message:\n\
-                <project_rules>\n{rules}\n</project_rules>\n"
-            ),
-            None => String::new(),
-        };
+        anyhow::ensure!(
+            !body.trim().is_empty(),
+            "commit-message skill body is empty"
+        );
+        anyhow::ensure!(
+            body.len() <= 32 * 1024,
+            "commit-message skill body exceeds the 32 KiB prompt limit"
+        );
+        Ok(body)
+    }
 
-        let instructions_section = match instructions {
-            Some(instructions) if !instructions.trim().is_empty() => format!(
-                "\n\nThe user has provided the following instructions for writing commit messages that you should follow:\n\
-                <commit_message_instructions>\n{instructions}\n</commit_message_instructions>\n"
-            ),
-            _ => String::new(),
+    async fn load_commit_message_history(
+        history_tasks: Vec<futures::channel::oneshot::Receiver<anyhow::Result<CommitDetails>>>,
+        cx: &AsyncApp,
+    ) -> CommitMessageHistory {
+        if history_tasks.is_empty() {
+            return CommitMessageHistory::default();
+        }
+        let executor = cx.background_executor().clone();
+        let attempted = history_tasks.len();
+        let history_results = futures::future::join_all(history_tasks.into_iter().map(|task| {
+            let executor = executor.clone();
+            async move {
+                task.with_timeout(COMMIT_MESSAGE_HISTORY_TIMEOUT, &executor)
+                    .await
+            }
+        }))
+        .await;
+        let mut commits = Vec::with_capacity(attempted);
+        let mut failed = 0;
+        let mut timed_out = 0;
+        for result in history_results {
+            match result {
+                Ok(Ok(Ok(commit))) => commits.push(commit),
+                Ok(Ok(Err(error))) => {
+                    failed += 1;
+                    log::debug!("failed to load commit-message history entry: {error:#}");
+                }
+                Ok(Err(error)) => {
+                    failed += 1;
+                    log::debug!("commit-message history request was canceled: {error}");
+                }
+                Err(_) => timed_out += 1,
+            }
+        }
+        if timed_out > 0 {
+            log::warn!(
+                "{timed_out}/{attempted} commit-message history requests timed out after {:?}; using the entries that completed",
+                COMMIT_MESSAGE_HISTORY_TIMEOUT
+            );
+        }
+        let resolved = commits.len();
+        let committer = match get_git_committer(cx)
+            .with_timeout(COMMIT_MESSAGE_HISTORY_TIMEOUT, &executor)
+            .await
+        {
+            Ok(committer) => committer,
+            Err(_) => {
+                log::debug!(
+                    "Git committer lookup timed out; omitting author-specific commit history"
+                );
+                GitCommitter {
+                    name: None,
+                    email: None,
+                }
+            }
         };
+        let mut repository = Vec::with_capacity(5);
+        let mut author = Vec::with_capacity(5);
+        let mut seen_repository = HashSet::default();
+        let mut seen_author = HashSet::default();
 
-        let subject_section = if subject.trim().is_empty() {
-            String::new()
+        for commit in commits {
+            let subject = commit.message.lines().next().unwrap_or_default().trim();
+            if subject.is_empty() {
+                continue;
+            }
+            if repository.len() < 5 && seen_repository.insert(subject.to_string()) {
+                repository.push(subject.to_string());
+            }
+
+            let is_current_author = committer
+                .email
+                .as_deref()
+                .is_some_and(|email| commit.author_email.eq_ignore_ascii_case(email))
+                || committer
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| commit.author_name.eq_ignore_ascii_case(name));
+            if is_current_author && author.len() < 5 && seen_author.insert(subject.to_string()) {
+                author.push(subject.to_string());
+            }
+        }
+
+        CommitMessageHistory {
+            repository,
+            author,
+            attempted,
+            resolved,
+            failed,
+            timed_out,
+        }
+    }
+
+    fn build_commit_message_prompt(prompt: &str, context: &CommitMessageContext) -> String {
+        let mut output = String::with_capacity(prompt.len() + context.diff_text.len() + 2048);
+        output.push_str(prompt.trim());
+        output.push_str("\n\n<context>\n");
+        output.push_str(&format!(
+            "Repository: {}\nBranch: {}\n",
+            context.repository_name, context.branch_name
+        ));
+
+        if !context.history.repository.is_empty() {
+            output.push_str(
+                "\nRecent repository commit subjects (infer naming, scope, casing, and tone from these examples):\n",
+            );
+            for subject in &context.history.repository {
+                output.push_str("- ");
+                output.push_str(subject);
+                output.push('\n');
+            }
+        }
+        if !context.history.author.is_empty() {
+            output.push_str("\nRecent commit subjects by the current author (learn the author's phrasing when it is consistent with repository conventions):\n");
+            for subject in &context.history.author {
+                output.push_str("- ");
+                output.push_str(subject);
+                output.push('\n');
+            }
+        }
+        if let Some(rules) = context.user_agents_md.as_deref() {
+            output.push_str("\n<user_rules>\n");
+            output.push_str(rules);
+            output.push_str("\n</user_rules>\n");
+        }
+        if let Some(rules) = context.project_rules.as_deref() {
+            output.push_str("\n<project_rules>\n");
+            output.push_str(rules);
+            output.push_str("\n</project_rules>\n");
+        }
+        if let Some(skill) = context.skill_instructions.as_deref() {
+            output.push_str("\n<commit_message_skill");
+            if let Some(name) = context.skill_name.as_deref() {
+                output.push_str(" name=\"");
+                output.push_str(name);
+                output.push('"');
+            }
+            output.push_str(">\n");
+            output.push_str(skill);
+            output.push_str("\n</commit_message_skill>\n");
+        }
+        if let Some(instructions) = context.explicit_instructions.as_deref() {
+            if !instructions.trim().is_empty() {
+                output.push_str("\n<commit_message_instructions>\n");
+                output.push_str(instructions);
+                output.push_str("\n</commit_message_instructions>\n");
+            }
+        }
+        if let Some(template) = context.commit_template.as_deref() {
+            if !template.trim().is_empty() {
+                output.push_str("\n<commit_template>\n");
+                output.push_str(template);
+                output.push_str("\n</commit_template>\n");
+            }
+        }
+        if !context.current_message.trim().is_empty() {
+            output.push_str("\n<current_draft>\n");
+            output.push_str(&context.current_message);
+            output.push_str("\n</current_draft>\n");
+        }
+        output.push_str("\nChanged files:\n");
+        for file in &context.changed_files {
+            output.push_str("- ");
+            output.push_str(file);
+            output.push('\n');
+        }
+        if context.diff_was_truncated {
+            output.push_str(
+                "\nThe diff below was compressed. The changed-file list above is complete.\n",
+            );
+        }
+        output.push_str("\n<diff>\n");
+        output.push_str(&context.diff_text);
+        output.push_str("\n</diff>\n</context>\n");
+        output.push_str(
+            "\nReturn only the final commit message. Do not use Markdown fences, commentary, XML tags, or echo the diff.",
+        );
+        output
+    }
+
+    fn sanitize_generated_commit_message(text: &str) -> Option<String> {
+        let mut output = text.replace("\r\n", "\n").replace('\r', "\n");
+        while let Some(start) = output.find("<think>") {
+            let Some(relative_end) = output[start + 7..].find("</think>") else {
+                output.truncate(start);
+                break;
+            };
+            let end = start + 7 + relative_end + 8;
+            output.replace_range(start..end, "");
+        }
+
+        let trimmed = output.trim();
+        if trimmed.starts_with("```") && trimmed.ends_with("```") {
+            let without_opening = trimmed.split_once('\n').map_or("", |(_, rest)| rest);
+            output = without_opening
+                .strip_suffix("```")
+                .unwrap_or(without_opening)
+                .trim()
+                .to_string();
         } else {
-            format!("\nHere is the user's subject line:\n{subject}")
-        };
+            output = trimmed.to_string();
+        }
 
-        format!(
-            "{prompt}{user_agents_md_section}{rules_section}{instructions_section}{subject_section}\nHere are the changes in this commit:\n{diff_text}"
-        )
+        if let Some(diff_start) = output
+            .find("\ndiff --git ")
+            .or_else(|| output.starts_with("diff --git ").then_some(0))
+        {
+            output.truncate(diff_start);
+        }
+
+        let trimmed = output.trim();
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            if matches!(
+                (bytes[0], bytes[bytes.len() - 1]),
+                (b'"', b'"') | (b'\'', b'\'')
+            ) {
+                output = trimmed[1..trimmed.len() - 1].trim().to_string();
+            }
+        }
+
+        let mut normalized = String::with_capacity(output.len());
+        let mut blank_lines = 0;
+        for line in output.lines() {
+            if line.trim().is_empty() {
+                blank_lines += 1;
+                if blank_lines > 1 {
+                    continue;
+                }
+            } else {
+                blank_lines = 0;
+            }
+            if !normalized.is_empty() {
+                normalized.push('\n');
+            }
+            normalized.push_str(line.trim_end());
+        }
+        let normalized = normalized.trim().to_string();
+        (!normalized.is_empty()).then_some(normalized)
     }
 
     /// Generates a commit message using an LLM.
@@ -3314,14 +3715,15 @@ impl GitPanel {
             return;
         };
 
-        let Some(repo) = self.active_repository.as_ref() else {
+        let Some(repo) = self.active_repository.clone() else {
             return;
         };
 
         telemetry::event!("Git Commit Message Generated");
 
+        let staged_only = self.has_staged_changes();
         let diff = repo.update(cx, |repo, cx| {
-            if self.has_staged_changes() {
+            if staged_only {
                 repo.diff(DiffType::HeadToIndex, cx)
             } else {
                 repo.diff(DiffType::HeadToWorktree, cx)
@@ -3330,20 +3732,111 @@ impl GitPanel {
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
 
-        let include_project_rules =
-            AgentSettings::get_global(cx).commit_message_include_project_rules;
-
-        let instructions = AgentSettings::get_global(cx)
-            .commit_message_instructions
-            .clone();
         let project = self.project.clone();
         let repo_work_dir = repo.read(cx).work_directory_abs_path.clone();
+        let project_path = project
+            .read(cx)
+            .project_path_for_absolute_path(&repo_work_dir, cx);
+        let settings_location = project_path.as_ref().map(|project_path| SettingsLocation {
+            worktree_id: project_path.worktree_id,
+            path: project_path.path.as_ref(),
+        });
+        let agent_settings = AgentSettings::get(settings_location, cx);
+        let include_project_rules = agent_settings.commit_message_include_project_rules;
+        let instructions = agent_settings.commit_message_instructions.clone();
+        let configured_skill_name = agent_settings
+            .commit_message_skill
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
+        let active_worktree_id = project_path.map(|path| path.worktree_id.to_usize());
+        let selected_skill = configured_skill_name.as_deref().and_then(|name| {
+            cx.try_global::<SkillIndex>()
+                .and_then(|skill_index| {
+                    active_worktree_id
+                        .and_then(|worktree_id| {
+                            skill_index
+                                .project_skills
+                                .iter()
+                                .find(|group| group.worktree_id.0 == worktree_id)
+                                .and_then(|group| {
+                                    group.skills.iter().find(|skill| skill.name == name)
+                                })
+                        })
+                        .or_else(|| {
+                            skill_index
+                                .global_skills
+                                .iter()
+                                .filter(|skill| skill.name == name)
+                                .max_by_key(|skill| skill.source.precedence())
+                        })
+                        .cloned()
+                })
+                .or_else(|| {
+                    agent_skills::builtin_skills()
+                        .into_iter()
+                        .find(|skill| skill.name == name)
+                })
+        });
+        // Fetch only a bounded first-parent window. `recent_commit_data` starts
+        // Git Graph hydration, which can scan a large repository even when the
+        // caller only needs a handful of subjects. Individual `show` requests
+        // also preserve the local/remote repository abstraction.
+        let has_head_commit = repo.read(cx).head_commit.is_some();
+        let history_tasks = if has_head_commit {
+            (0..10)
+                .map(|offset| {
+                    let revision = if offset == 0 {
+                        "HEAD".to_string()
+                    } else {
+                        format!("HEAD~{offset}")
+                    };
+                    repo.update(cx, |repo, _cx| repo.show(revision))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let repository_name = repo_work_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo_work_dir.to_string_lossy().into_owned());
+        let branch_name = repo
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string())
+            .unwrap_or_else(|| "detached HEAD".to_string());
+        let current_message = self.commit_editor.read(cx).text(cx);
+        let commit_template = self
+            .commit_template
+            .as_ref()
+            .map(|template| template.template.clone());
+        let changed_files = self
+            .entries
+            .iter()
+            .filter_map(GitListEntry::status_entry)
+            .filter(|entry| !staged_only || entry.staging.has_staged())
+            .map(|entry| entry.repo_path.display(PathStyle::Unix).to_string())
+            .unique()
+            .collect::<Vec<_>>();
+        let repository_id = repo.entity_id();
+        let fs = self.fs.clone();
+        let model_name = model.name().0.to_string();
+        let provider_id = provider.id().0.to_string();
+        let model_id = model.id().0.to_string();
 
+        self.commit_message_context_loading = true;
+        cx.notify();
         self.generate_commit_message_task = Some(cx.spawn(async move |this, mut cx| {
             async move {
-                let _defer = cx.on_drop(&this, |this, _cx| {
+                let _defer = cx.on_drop(&this, |this, cx| {
                     this.generate_commit_message_task.take();
+                    this.commit_message_context_loading = false;
+                    cx.notify();
                 });
+                let executor = cx.background_executor().clone();
 
                 if let Some(task) = cx.update(|cx| {
                     if !provider.is_authenticated(cx) {
@@ -3352,127 +3845,273 @@ impl GitPanel {
                         None
                     }
                 }) {
-                    task.await.log_err();
+                    match task
+                        .with_timeout(COMMIT_MESSAGE_GENERATION_TIMEOUT, &executor)
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                        Err(_) => {
+                            let error = anyhow!(
+                                "provider authentication timed out after {} seconds",
+                                COMMIT_MESSAGE_GENERATION_TIMEOUT.as_secs()
+                            );
+                            log::warn!("commit-message {error}");
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                    }
                 }
 
-                let mut diff_text = match diff.await {
-                    Ok(result) => match result {
-                        Ok(text) => text,
+                let generation_started = Instant::now();
+                let generation = async {
+                    log::debug!("commit-message generation: collecting context");
+
+                    let raw_diff = match diff.await {
+                        Ok(result) => match result {
+                            Ok(text) => text,
+                            Err(e) => {
+                                Self::show_commit_message_error(&this, &e, cx);
+                                return anyhow::Ok(());
+                            }
+                        },
                         Err(e) => {
                             Self::show_commit_message_error(&this, &e, cx);
                             return anyhow::Ok(());
                         }
-                    },
-                    Err(e) => {
-                        Self::show_commit_message_error(&this, &e, cx);
-                        return anyhow::Ok(());
-                    }
-                };
+                    };
 
-                const MAX_DIFF_BYTES: usize = 20_000;
-                diff_text = Self::compress_commit_diff(&diff_text, MAX_DIFF_BYTES);
+                    const MAX_DIFF_BYTES: usize = 20_000;
+                    let diff_was_truncated = raw_diff.len() > MAX_DIFF_BYTES;
+                    let diff_text = Self::compress_commit_diff(&raw_diff, MAX_DIFF_BYTES);
 
-                let rules_content = if include_project_rules {
-                    Self::load_project_rules(&project, &repo_work_dir, &mut cx).await
-                } else {
-                    None
-                };
-                let user_agents_md = if include_project_rules {
-                    cx.update(|cx| {
-                        UserAgentsMd::global(cx)
-                            .and_then(|user_agents_md| user_agents_md.content().cloned())
-                    })
-                } else {
-                    None
-                };
+                    let history = Self::load_commit_message_history(history_tasks, &cx).await;
 
-                let prompt = include_str!("../src/commit_message_prompt.txt");
-
-                let subject = this.update(cx, |this, cx| {
-                    this.commit_editor
-                        .read(cx)
-                        .text(cx)
-                        .lines()
-                        .next()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_default()
-                })?;
-
-                let text_empty = subject.trim().is_empty();
-
-                let content = Self::build_commit_message_prompt(
-                    &prompt,
-                    user_agents_md.as_deref(),
-                    rules_content.as_deref(),
-                    instructions.as_deref(),
-                    &subject,
-                    &diff_text,
-                );
-
-                let request = LanguageModelRequest {
-                    thread_id: None,
-                    prompt_id: None,
-                    intent: Some(CompletionIntent::GenerateGitCommitMessage),
-                    messages: vec![LanguageModelRequestMessage {
-                        role: Role::User,
-                        content: vec![content.into()],
-                        cache: false,
-                        reasoning_details: None,
-                    }],
-                    tools: Vec::new(),
-                    tool_choice: None,
-                    stop: Vec::new(),
-                    temperature,
-                    thinking_allowed: false,
-                    thinking_effort: None,
-                    speed: None,
-                    compact_at_tokens: None,
-                };
-
-                let stream = model.stream_completion_text(request, cx);
-                match stream.await {
-                    Ok(mut messages) => {
-                        if !text_empty {
-                            this.update(cx, |this, cx| {
-                                this.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                                    let insert_position = buffer.anchor_before(buffer.len());
-                                    buffer.edit(
-                                        [(insert_position..insert_position, "\n")],
-                                        None,
-                                        cx,
-                                    )
-                                });
-                            })?;
+                    let rules_content = if include_project_rules {
+                        Self::load_project_rules(&project, &repo_work_dir, &mut cx).await
+                    } else {
+                        None
+                    };
+                    let user_agents_md = if include_project_rules {
+                        cx.update(|cx| {
+                            UserAgentsMd::global(cx)
+                                .and_then(|user_agents_md| user_agents_md.content().cloned())
+                                .map(|content| content.to_string())
+                        })
+                    } else {
+                        None
+                    };
+                    let skill_result: anyhow::Result<Option<String>> =
+                        match (configured_skill_name.as_ref(), selected_skill) {
+                            (Some(name), None) => Err(anyhow!(
+                                "configured commit-message skill `{name}` was not found"
+                            )),
+                            (_, Some(skill)) => {
+                                Self::load_commit_skill_body(&project, &fs, skill, &mut cx)
+                                    .await
+                                    .map(Some)
+                            }
+                            (None, None) => Ok(None),
+                        };
+                    let skill_loaded = matches!(&skill_result, Ok(Some(_)));
+                    let project_rules_loaded = rules_content.is_some() || user_agents_md.is_some();
+                    let context_summary = CommitMessageContextSummary {
+                        repository_name: repository_name.clone(),
+                        branch_name: branch_name.clone(),
+                        history: history.clone(),
+                        skill_name: configured_skill_name.clone(),
+                        skill_loaded,
+                        project_rules_loaded,
+                        changed_files: changed_files.len(),
+                        diff_bytes: diff_text.len(),
+                        diff_was_truncated,
+                        model_name: model_name.clone(),
+                        provider_id: provider_id.clone(),
+                        model_id: model_id.clone(),
+                    };
+                    this.update(cx, |this, cx| {
+                        let repository_unchanged = this
+                            .active_repository
+                            .as_ref()
+                            .is_some_and(|repository| repository.entity_id() == repository_id);
+                        if repository_unchanged {
+                            this.commit_message_context_summary = Some(context_summary.clone());
+                            cx.notify();
                         }
+                    })
+                    .ok();
+                    log::info!(
+                        "commit-message context: model={}/{} ({}) history_subjects={} author_subjects={} history_resolved={}/{} history_failed={} history_timed_out={} skill={} skill_loaded={} project_rules_loaded={} changed_files={} diff_bytes={} diff_truncated={}",
+                        provider_id,
+                        model_id,
+                        model_name,
+                        history.repository.len(),
+                        history.author.len(),
+                        history.resolved,
+                        history.attempted,
+                        history.failed,
+                        history.timed_out,
+                        configured_skill_name.as_deref().unwrap_or("none"),
+                        skill_loaded,
+                        project_rules_loaded,
+                        changed_files.len(),
+                        diff_text.len(),
+                        diff_was_truncated,
+                    );
+                    let skill_instructions = match skill_result {
+                        Ok(instructions) => instructions,
+                        Err(error) => {
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                    };
 
-                        while let Some(message) = messages.stream.next().await {
-                            match message {
-                                Ok(text) => {
-                                    this.update(cx, |this, cx| {
-                                        this.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                                            let insert_position =
-                                                buffer.anchor_before(buffer.len());
-                                            buffer.edit(
-                                                [(insert_position..insert_position, text)],
-                                                None,
-                                                cx,
-                                            );
-                                        });
-                                    })?;
+                    let prompt = include_str!("../src/commit_message_prompt.txt");
+                    let content = Self::build_commit_message_prompt(
+                        prompt,
+                        &CommitMessageContext {
+                            repository_name,
+                            branch_name,
+                            current_message: current_message.clone(),
+                            commit_template,
+                            history,
+                            skill_name: configured_skill_name,
+                            skill_instructions,
+                            user_agents_md,
+                            project_rules: rules_content,
+                            explicit_instructions: instructions,
+                            changed_files,
+                            diff_text,
+                            diff_was_truncated,
+                        },
+                    );
+
+                    let request = LanguageModelRequest {
+                        thread_id: None,
+                        prompt_id: None,
+                        intent: Some(CompletionIntent::GenerateGitCommitMessage),
+                        messages: vec![LanguageModelRequestMessage {
+                            role: Role::User,
+                            content: vec![content.into()],
+                            cache: false,
+                            reasoning_details: None,
+                        }],
+                        tools: Vec::new(),
+                        tool_choice: None,
+                        stop: Vec::new(),
+                        temperature,
+                        thinking_allowed: false,
+                        thinking_effort: None,
+                        speed: None,
+                        compact_at_tokens: None,
+                    };
+
+                    log::debug!(
+                        "commit-message generation: requesting model after {:?}",
+                        generation_started.elapsed()
+                    );
+                    let mut messages = match model
+                        .stream_completion_text(request, cx)
+                        .with_timeout(COMMIT_MESSAGE_FIRST_RESPONSE_TIMEOUT, &executor)
+                        .await
+                    {
+                        Ok(Ok(messages)) => messages,
+                        Ok(Err(error)) => {
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                        Err(_) => {
+                            let error = anyhow!(
+                                "model did not start responding within {} seconds",
+                                COMMIT_MESSAGE_FIRST_RESPONSE_TIMEOUT.as_secs()
+                            );
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                    };
+                    let mut generated = String::new();
+                    while let Some(message) = messages.stream.next().await {
+                        match message {
+                            Ok(text) => {
+                                generated.push_str(&text);
+                                if generated.len() > 64 * 1024 {
+                                    let error =
+                                        anyhow!("model response exceeded the 64 KiB safety limit");
+                                    Self::show_commit_message_error(&this, &error, cx);
+                                    return anyhow::Ok(());
                                 }
-                                Err(e) => {
-                                    Self::show_commit_message_error(&this, &e, cx);
-                                    break;
-                                }
+                            }
+                            Err(error) => {
+                                Self::show_commit_message_error(&this, &error, cx);
+                                return anyhow::Ok(());
                             }
                         }
                     }
-                    Err(e) => {
-                        Self::show_commit_message_error(&this, &e, cx);
+
+                    let Some(generated) = Self::sanitize_generated_commit_message(&generated)
+                    else {
+                        let error = anyhow!("model returned an empty commit message");
+                        Self::show_commit_message_error(&this, &error, cx);
+                        return anyhow::Ok(());
+                    };
+
+                    let apply_result = this.update(cx, |this, cx| {
+                        let repository_unchanged = this
+                            .active_repository
+                            .as_ref()
+                            .is_some_and(|repository| repository.entity_id() == repository_id);
+                        let buffer = this.commit_message_buffer(cx);
+                        let draft_unchanged = buffer.read(cx).text() == current_message;
+                        if !repository_unchanged || !draft_unchanged {
+                            anyhow::bail!(
+                                "commit draft or active repository changed while generation was running"
+                            );
+                        }
+                        buffer.update(cx, |buffer, cx| {
+                            let start = buffer.anchor_before(0);
+                            let end = buffer.anchor_after(buffer.len());
+                            buffer.edit([(start..end, generated)], None, cx);
+                        });
+                        Ok(())
+                    });
+                    match apply_result {
+                        Ok(Ok(())) => {
+                            log::info!(
+                                "commit-message generation completed in {:?}",
+                                generation_started.elapsed()
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                        Err(error) => {
+                            Self::show_commit_message_error(&this, &error, cx);
+                            return anyhow::Ok(());
+                        }
+                    }
+
+                    anyhow::Ok(())
+                };
+
+                match generation
+                    .with_timeout(COMMIT_MESSAGE_GENERATION_TIMEOUT, &executor)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let error = anyhow!(
+                            "generation timed out after {} seconds",
+                            COMMIT_MESSAGE_GENERATION_TIMEOUT.as_secs()
+                        );
+                        log::warn!("commit-message {error}");
+                        Self::show_commit_message_error(&this, &error, cx);
+                        anyhow::Ok(())
                     }
                 }
-
-                anyhow::Ok(())
             }
             .log_err()
             .await
@@ -4343,6 +4982,8 @@ impl GitPanel {
                 self.set_amend_pending(false, cx);
             }
             self.git_access = None;
+            self.commit_message_context_summary = None;
+            self.commit_message_context_loading = false;
             self._repo_subscriptions.clear();
             if self.active_tab == GitPanelTab::History {
                 self.set_commit_history(CommitHistory::Loading, cx);
@@ -5218,6 +5859,91 @@ impl GitPanel {
             .anchor(Anchor::TopRight)
     }
 
+    fn configured_commit_message_skill(&self, cx: &Context<Self>) -> Option<String> {
+        let repo_work_dir = self
+            .active_repository
+            .as_ref()
+            .map(|repository| repository.read(cx).work_directory_abs_path.clone());
+        let project_path = repo_work_dir.as_ref().and_then(|path| {
+            self.project
+                .read(cx)
+                .project_path_for_absolute_path(path, cx)
+        });
+        let settings_location = project_path.as_ref().map(|project_path| SettingsLocation {
+            worktree_id: project_path.worktree_id,
+            path: project_path.path.as_ref(),
+        });
+        AgentSettings::get(settings_location, cx)
+            .commit_message_skill
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn render_commit_message_context_chip(&self, cx: &Context<Self>) -> AnyElement {
+        if self.commit_message_context_loading {
+            let configured_skill = self
+                .configured_commit_message_skill(cx)
+                .as_deref()
+                .unwrap_or("none")
+                .to_string();
+            return Chip::new("Loading context…")
+                .icon(IconName::Info)
+                .icon_color(Color::Muted)
+                .label_color(Color::Muted)
+                .truncate()
+                .tooltip(move |_window, cx| {
+                    Tooltip::simple(
+                        format!(
+                            "Loading Git history, commit skill, project rules, and diff context\nConfigured skill: {configured_skill}"
+                        ),
+                        cx,
+                    )
+                })
+                .into_any_element();
+        }
+
+        if let Some(summary) = self.commit_message_context_summary.as_ref() {
+            let tooltip = summary.tooltip();
+            let (icon, color) = if summary.has_warning() {
+                (IconName::Warning, Color::Warning)
+            } else {
+                (IconName::Check, Color::Success)
+            };
+            return Chip::new(summary.compact_label())
+                .icon(icon)
+                .icon_color(color)
+                .label_color(color)
+                .truncate()
+                .tooltip(move |_window, cx| Tooltip::simple(tooltip.clone(), cx))
+                .into_any_element();
+        }
+
+        let configured_skill = self.configured_commit_message_skill(cx);
+        let (label, tooltip) = if let Some(skill) = configured_skill {
+            (
+                format!("History pending · Skill {skill}"),
+                format!(
+                    "Git history and commit skill status will be shown after generation\nConfigured skill: {skill}"
+                ),
+            )
+        } else {
+            (
+                "History pending · No skill".to_string(),
+                "Git history status will be shown after generation\nNo commit skill is configured"
+                    .to_string(),
+            )
+        };
+        Chip::new(label)
+            .icon(IconName::Info)
+            .icon_color(Color::Muted)
+            .label_color(Color::Muted)
+            .truncate()
+            .tooltip(move |_window, cx| Tooltip::simple(tooltip.clone(), cx))
+            .into_any_element()
+    }
+
     pub(crate) fn render_generate_commit_message_button(
         &self,
         cx: &Context<Self>,
@@ -5229,6 +5955,7 @@ impl GitPanel {
         if self.generate_commit_message_task.is_some() {
             return Some(
                 h_flex()
+                    .min_w_0()
                     .gap_1()
                     .child(
                         IconButton::new("cancel-generate-commit-message", IconName::Stop)
@@ -5246,6 +5973,7 @@ impl GitPanel {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
+                    .child(self.render_commit_message_context_chip(cx))
                     .into_any_element(),
             );
         }
@@ -5257,14 +5985,44 @@ impl GitPanel {
         let can_commit = self.can_commit();
 
         let editor_focus_handle = self.commit_editor.focus_handle(cx);
+        let configured_selection = AgentSettings::get_global(cx).commit_message_model.clone();
+        let effective_model = model_registry.commit_message_model(cx);
+        let effective_model_name = effective_model
+            .as_ref()
+            .map(|configured| configured.model.name().0.to_string())
+            .unwrap_or_else(|| "Select model".to_string());
+        let effective_model_label = if effective_model_name.chars().count() > 24 {
+            format!(
+                "{}…",
+                effective_model_name.chars().take(23).collect::<String>()
+            )
+        } else {
+            effective_model_name.clone()
+        };
+        let effective_model_tooltip = effective_model.as_ref().map(|configured| {
+            format!(
+                "{} · {}/{}",
+                effective_model_name,
+                configured.provider.id().0,
+                configured.model.id().0
+            )
+        });
 
-        let button = IconButton::new("generate-commit-message", IconName::AiEdit)
-            .shape(ui::IconButtonShape::Square)
-            .icon_color(if has_commit_model_configuration_error {
-                Color::Disabled
-            } else {
-                Color::Muted
-            })
+        let button = ButtonLike::new_rounded_left("generate-commit-message")
+            .layer(ElevationIndex::ModalSurface)
+            .size(ButtonSize::Compact)
+            .child(Icon::new(IconName::AiEdit).size(IconSize::Small).color(
+                if has_commit_model_configuration_error {
+                    Color::Disabled
+                } else {
+                    Color::Muted
+                },
+            ))
+            .child(
+                Label::new(effective_model_label)
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
             .disabled(!can_commit || has_commit_model_configuration_error)
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 this.generate_commit_message(cx);
@@ -5278,6 +6036,8 @@ impl GitPanel {
             button.tooltip(move |_window, cx| {
                 if !can_commit {
                     Tooltip::simple("No Changes to Commit", cx)
+                } else if let Some(model) = effective_model_tooltip.as_deref() {
+                    Tooltip::simple(format!("Generate Commit Message\n{model}"), cx)
                 } else {
                     Tooltip::for_action_in(
                         "Generate Commit Message",
@@ -5289,7 +6049,98 @@ impl GitPanel {
             })
         };
 
-        Some(button.into_any_element())
+        let models = model_registry
+            .available_models(cx)
+            .map(|model| {
+                (
+                    format!("{} · {}", model.name().0, model.provider_name().0),
+                    model.provider_id().0.to_string(),
+                    model.id().0.to_string(),
+                )
+            })
+            .sorted_by(|left, right| left.0.cmp(&right.0))
+            .collect::<Vec<_>>();
+        let fs = self.fs.clone();
+        let model_menu = PopoverMenu::new("commit-message-model-menu")
+            .trigger(crate::render_split_button_chevron_trigger(
+                "commit-message-model-menu-trigger",
+                false,
+            ))
+            .menu(move |window, cx| {
+                let configured_selection = configured_selection.clone();
+                let models = models.clone();
+                let fs = fs.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let fs_for_automatic = fs.clone();
+                    let mut menu = menu.header("Commit Message Model").toggleable_entry(
+                        "Automatic (fast/default model)",
+                        configured_selection.is_none(),
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
+                            update_settings_file(fs_for_automatic.clone(), cx, |settings, _| {
+                                settings.agent.get_or_insert_default().commit_message_model = None;
+                            });
+                            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                                registry.select_commit_message_model(None, cx);
+                            });
+                        },
+                    );
+
+                    for (label, provider, model) in models {
+                        let is_selected = configured_selection.as_ref().is_some_and(|selection| {
+                            selection.provider.0 == provider && selection.model.as_str() == model
+                        });
+                        let fs = fs.clone();
+                        menu = menu.toggleable_entry(
+                            label,
+                            is_selected,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                let selected_model = SelectedModel {
+                                    provider: LanguageModelProviderId(provider.clone().into()),
+                                    model: LanguageModelId(model.clone().into()),
+                                };
+                                update_settings_file(fs.clone(), cx, {
+                                    let provider = provider.clone();
+                                    let model = model.clone();
+                                    move |settings, _| {
+                                        settings
+                                            .agent
+                                            .get_or_insert_default()
+                                            .commit_message_model = Some(LanguageModelSelection {
+                                            provider: provider.into(),
+                                            model,
+                                            enable_thinking: false,
+                                            effort: None,
+                                            speed: None,
+                                        });
+                                    }
+                                });
+                                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                                    registry.select_commit_message_model(Some(&selected_model), cx);
+                                });
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+            .anchor(Anchor::TopLeft)
+            .offset(Point {
+                x: px(0.),
+                y: px(2.),
+            });
+
+        Some(
+            h_flex()
+                .min_w_0()
+                .gap_1()
+                .child(SplitButton::new(button, model_menu.into_any_element()))
+                .child(self.render_commit_message_context_chip(cx))
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn render_co_authors(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -11765,11 +12616,14 @@ mod tests {
     fn test_commit_message_prompt_includes_user_agents_md_before_project_rules() {
         let prompt = GitPanel::build_commit_message_prompt(
             "Write a commit message.",
-            Some("Use terse commit messages."),
-            Some("Use the git_ui prefix."),
-            Some("Follow the configured commit message format."),
-            "Update generated message",
-            "diff --git a/file b/file",
+            &CommitMessageContext {
+                user_agents_md: Some("Use terse commit messages.".into()),
+                project_rules: Some("Use the git_ui prefix.".into()),
+                explicit_instructions: Some("Follow the configured commit message format.".into()),
+                current_message: "Update generated message".into(),
+                diff_text: "diff --git a/file b/file".into(),
+                ..Default::default()
+            },
         );
 
         assert!(prompt.contains("Use terse commit messages."));
@@ -11778,7 +12632,7 @@ mod tests {
         assert!(prompt.contains("Update generated message"));
         assert!(prompt.contains("diff --git a/file b/file"));
 
-        let user_agents_md_index = prompt.find("<rules>").unwrap();
+        let user_agents_md_index = prompt.find("<user_rules>").unwrap();
         let project_rules_index = prompt.find("<project_rules>").unwrap();
         let instructions_index = prompt.find("<commit_message_instructions>").unwrap();
         assert!(user_agents_md_index < project_rules_index);
@@ -11789,11 +12643,11 @@ mod tests {
     fn test_commit_message_prompt_omits_blank_instructions() {
         let prompt = GitPanel::build_commit_message_prompt(
             "Write a commit message.",
-            None,
-            None,
-            Some("   \n  "),
-            "",
-            "diff --git a/file b/file",
+            &CommitMessageContext {
+                explicit_instructions: Some("   \n  ".into()),
+                diff_text: "diff --git a/file b/file".into(),
+                ..Default::default()
+            },
         );
 
         assert!(!prompt.contains("<commit_message_instructions>"));

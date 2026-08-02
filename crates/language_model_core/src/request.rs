@@ -289,6 +289,8 @@ pub struct ProviderCompactionState {
     provider_id: LanguageModelProviderId,
     format: SharedString,
     payload: Arc<str>,
+    #[serde(default)]
+    account_scope: Option<SharedString>,
 }
 
 impl ProviderCompactionState {
@@ -301,7 +303,13 @@ impl ProviderCompactionState {
             provider_id,
             format: format.into(),
             payload: payload.into(),
+            account_scope: None,
         }
+    }
+
+    pub fn with_account_scope(mut self, account_scope: impl Into<SharedString>) -> Self {
+        self.account_scope = Some(account_scope.into());
+        self
     }
 
     pub fn provider_id(&self) -> &LanguageModelProviderId {
@@ -314,6 +322,10 @@ impl ProviderCompactionState {
 
     pub fn payload(&self) -> &str {
         &self.payload
+    }
+
+    pub fn account_scope(&self) -> Option<&str> {
+        self.account_scope.as_deref()
     }
 }
 

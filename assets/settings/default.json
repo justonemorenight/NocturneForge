@@ -1055,6 +1055,9 @@
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)
     // in the prompt when generating git commit messages.
     "commit_message_include_project_rules": true,
+    // Name of an Agent Skill to use only for Git commit message generation.
+    // Project-local skills take precedence over global skills with the same name.
+    "commit_message_skill": "commit-message",
     // Whether the agent is enabled.
     "enabled": true,
     // Whether to show the agent panel button in the status bar.
@@ -1249,8 +1252,8 @@
     "expand_edit_card": true,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
-    // Default: true
-    "expand_terminal_card": true,
+    // Default: false
+    "expand_terminal_card": false,
     // Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).

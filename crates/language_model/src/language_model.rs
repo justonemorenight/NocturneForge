@@ -35,6 +35,21 @@ impl DisabledReason {
     }
 }
 
+/// A provider-owned signed-in account exposed to compact account pickers.
+/// Providers that do not support multiple sessions return an empty list.
+#[derive(Clone, Debug)]
+pub struct ProviderAccountSummary {
+    pub id: SharedString,
+    pub label: SharedString,
+    pub detail: Option<SharedString>,
+    pub quota: Option<SharedString>,
+    pub is_active: bool,
+    pub is_busy: bool,
+    /// The account's access token is invalid and the user must sign in again
+    /// before the account can be used.
+    pub reauthentication_required: bool,
+}
+
 /// The outcome of an explicit [`LanguageModel::compact`] request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionResult {
@@ -351,6 +366,28 @@ pub trait LanguageModelProvider: 'static {
     fn is_authenticated(&self, cx: &App) -> bool;
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>>;
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView>;
+
+    fn account_summaries(&self, _cx: &App) -> Vec<ProviderAccountSummary> {
+        Vec::new()
+    }
+
+    fn switch_account(&self, _account_id: SharedString, _cx: &mut App) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "This language model provider does not support account switching"
+        )))
+    }
+
+    fn add_account(&self, _cx: &mut App) -> Task<Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "This language model provider does not support adding accounts"
+        )))
+    }
+
+    fn can_cancel_account_sign_in(&self, _cx: &App) -> bool {
+        false
+    }
+
+    fn cancel_account_sign_in(&self, _cx: &mut App) {}
 
     fn set_api_key(&self, _key: Option<String>, _cx: &mut App) -> Task<Result<()>> {
         Task::ready(Ok(()))

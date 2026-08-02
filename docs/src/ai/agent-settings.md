@@ -41,6 +41,7 @@ Some Zed AI features have their own model or prompt settings in `settings.json`,
 - `agent.compaction_model`
 - `agent.subagent_model`
 - `agent.commit_message_instructions`
+- `agent.commit_message_skill`
 - `agent.inline_alternatives`
 
 Use `agent.commit_message_instructions` for instructions that apply only to generated Git commit messages:
@@ -52,6 +53,8 @@ Use `agent.commit_message_instructions` for instructions that apply only to gene
   }
 }
 ```
+
+Use `agent.commit_message_skill` to apply a reusable Agent Skill only to commit-message generation. Project-local skills override global skills with the same name.
 
 For feature-specific model examples, see [Feature-specific Models](#feature-specific-models).
 

@@ -162,12 +162,24 @@ pub fn provider_compaction_state_from_items(
     owner: LanguageModelProviderId,
     items: Vec<Value>,
 ) -> Result<ProviderCompactionState> {
+    provider_compaction_state_from_items_with_scope(owner, items, None)
+}
+
+pub fn provider_compaction_state_from_items_with_scope(
+    owner: LanguageModelProviderId,
+    items: Vec<Value>,
+    account_scope: Option<&str>,
+) -> Result<ProviderCompactionState> {
     validate_compaction_items(&items)?;
-    Ok(ProviderCompactionState::new(
+    let state = ProviderCompactionState::new(
         owner,
         SharedString::new_static(COMPACTION_STATE_FORMAT),
         serde_json::to_string(&items)?,
-    ))
+    );
+    Ok(match account_scope {
+        Some(account_scope) => state.with_account_scope(account_scope),
+        None => state,
+    })
 }
 
 /// Recovers the canonical replacement window from `state` if it is owned by
@@ -177,7 +189,25 @@ pub fn provider_compaction_items(
     state: &ProviderCompactionState,
     owner: &LanguageModelProviderId,
 ) -> Result<Option<Vec<Value>>> {
+    provider_compaction_items_with_scope(state, owner, None)
+}
+
+/// Recovers provider-native compaction items only when the opaque state was
+/// produced for the same account scope. Legacy state without a scope is
+/// intentionally rejected once a scoped request is being built; the caller
+/// then replays the transcript instead of sending another account's encrypted
+/// context.
+pub fn provider_compaction_items_with_scope(
+    state: &ProviderCompactionState,
+    owner: &LanguageModelProviderId,
+    account_scope: Option<&str>,
+) -> Result<Option<Vec<Value>>> {
     if state.provider_id() != owner {
+        return Ok(None);
+    }
+    if let Some(account_scope) = account_scope
+        && state.account_scope() != Some(account_scope)
+    {
         return Ok(None);
     }
     if state.format() != COMPACTION_STATE_FORMAT {
@@ -196,15 +226,6 @@ pub fn provider_compaction_items(
 fn validate_compaction_items(items: &[Value]) -> Result<()> {
     if items.is_empty() {
         return Err(anyhow!("OpenAI returned an empty compaction output"));
-    }
-    if !items.iter().any(|item| {
-        item.get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|item_type| item_type == "compaction")
-    }) {
-        return Err(anyhow!(
-            "OpenAI compaction output did not contain a compaction item"
-        ));
     }
     Ok(())
 }
@@ -1223,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn compacted_response_rejects_output_without_compaction_item() {
+    fn compacted_response_accepts_canonical_replacement_without_compaction_item() {
         let response: CompactedResponse = serde_json::from_value(json!({
             "id": "resp_compact",
             "created_at": 1_700_000_000,
@@ -1243,12 +1264,19 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(
-            response
-                .into_compacted_context(OPEN_AI_PROVIDER_ID)
-                .unwrap_err()
-                .to_string()
-                .contains("compaction item")
+        let CompactedContext::ProviderState(state) = response
+            .into_compacted_context(OPEN_AI_PROVIDER_ID)
+            .unwrap()
+        else {
+            panic!("expected provider state");
+        };
+        assert_eq!(
+            provider_compaction_items(&state, &OPEN_AI_PROVIDER_ID).unwrap(),
+            Some(vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": "Retained user context."
+            })])
         );
     }
 

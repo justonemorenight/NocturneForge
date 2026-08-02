@@ -187,7 +187,6 @@ impl CommitModal {
             let buffer = git_panel.commit_message_buffer(cx);
             let panel_editor = git_panel.commit_editor.clone();
             let project = git_panel.project.clone();
-
             cx.new(|cx| {
                 let mut editor =
                     commit_message_editor(buffer, None, project.clone(), false, window, cx);

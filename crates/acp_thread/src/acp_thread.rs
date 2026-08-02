@@ -2118,6 +2118,10 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    /// Whether streaming Markdown is currently visible to the user. Hidden
+    /// threads update in coarse batches instead of driving the UI cadence used
+    /// by the active thread.
+    streaming_updates_visible: bool,
 }
 
 struct StreamingTextBuffer {
@@ -2129,6 +2133,9 @@ struct StreamingTextBuffer {
     bytes_to_reveal_per_tick: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
+    /// Entry containing `target`, used to invalidate only the affected list row
+    /// after text has actually been appended.
+    entry_index: usize,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
 }
@@ -2143,6 +2150,9 @@ impl StreamingTextBuffer {
     /// The number of milliseconds between each timer tick, controlling how quickly
     /// text is revealed.
     const TASK_UPDATE_MS: u64 = 16;
+    /// Hidden threads batch Markdown updates at a low cadence so their model
+    /// state remains current without driving continuous layout work.
+    const HIDDEN_TASK_UPDATE_MS: u64 = 250;
     /// The time in milliseconds to reveal the entire pending text.
     const REVEAL_TARGET: f32 = 200.0;
 }
@@ -2304,6 +2314,8 @@ impl AcpThread {
             }
         });
 
+        let streaming_updates_visible = parent_session_id.is_none();
+
         Self {
             parent_session_id,
             work_dirs,
@@ -2335,11 +2347,26 @@ impl AcpThread {
             active_draft_prompt_snapshot_provider: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            streaming_updates_visible,
         }
     }
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    /// Controls whether smooth streaming work should update Markdown for this
+    /// thread. Making a thread visible flushes any text accumulated while it was
+    /// hidden so navigation never shows stale content.
+    pub fn set_streaming_updates_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.streaming_updates_visible == visible {
+            return;
+        }
+
+        self.streaming_updates_visible = visible;
+        if visible {
+            Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        }
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -2829,8 +2856,12 @@ impl AcpThread {
                 self.streaming_markdown_target(message_id.as_ref(), is_thought, indented)
             {
                 let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
-                self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
+                self.buffer_streaming_text(
+                    &markdown,
+                    entries_len - 1,
+                    text_content.text.clone(),
+                    cx,
+                );
                 return;
             }
         }
@@ -2955,6 +2986,7 @@ impl AcpThread {
     fn buffer_streaming_text(
         &mut self,
         markdown: &Entity<Markdown>,
+        entry_index: usize,
         text: String,
         cx: &mut Context<Self>,
     ) {
@@ -2983,6 +3015,7 @@ impl AcpThread {
             revealed_bytes: 0,
             bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
+            entry_index,
             _reveal_task,
         });
     }
@@ -2997,6 +3030,7 @@ impl AcpThread {
                 buffer.target.update(cx, |markdown, cx| {
                     markdown.append(&buffer.pending[buffer.revealed_bytes..], cx)
                 });
+                cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
             }
         }
     }
@@ -3007,8 +3041,17 @@ impl AcpThread {
     fn start_streaming_reveal(&self, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
+                let update_ms = this
+                    .read_with(cx, |this, _cx| {
+                        if this.streaming_updates_visible {
+                            StreamingTextBuffer::TASK_UPDATE_MS
+                        } else {
+                            StreamingTextBuffer::HIDDEN_TASK_UPDATE_MS
+                        }
+                    })
+                    .unwrap_or(StreamingTextBuffer::HIDDEN_TASK_UPDATE_MS);
                 cx.background_executor()
-                    .timer(Duration::from_millis(StreamingTextBuffer::TASK_UPDATE_MS))
+                    .timer(Duration::from_millis(update_ms))
                     .await;
 
                 let should_continue = this
@@ -3025,9 +3068,13 @@ impl AcpThread {
 
                         let remaining = &buffer.pending[buffer.revealed_bytes..];
 
-                        let byte_count = remaining
-                            .ceil_char_boundary(buffer.bytes_to_reveal_per_tick)
-                            .min(remaining.len());
+                        let byte_count = if this.streaming_updates_visible {
+                            remaining
+                                .ceil_char_boundary(buffer.bytes_to_reveal_per_tick)
+                                .min(remaining.len())
+                        } else {
+                            remaining.len()
+                        };
                         let byte_boundary = buffer.revealed_bytes + byte_count;
 
                         buffer.target.update(cx, |markdown: &mut Markdown, cx| {
@@ -3035,6 +3082,7 @@ impl AcpThread {
                                 .append(&buffer.pending[buffer.revealed_bytes..byte_boundary], cx);
                         });
                         buffer.revealed_bytes = byte_boundary;
+                        cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
 
                         true
                     })
@@ -4492,8 +4540,7 @@ impl AcpThread {
         };
         let env = cx.spawn(async move |_, _| {
             let mut env = env.await.unwrap_or_default();
-            // Disables paging for `git` and hopefully other commands
-            env.insert("PAGER".into(), "".into());
+            disable_pagers_through_env(&mut env);
             for var in extra_env {
                 env.insert(var.name, var.value);
             }

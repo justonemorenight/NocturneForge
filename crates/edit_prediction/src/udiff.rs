@@ -22,6 +22,8 @@ pub use zeta_prompt::udiff::{
     strip_diff_metadata, strip_diff_path_prefix,
 };
 
+const INLINE_CURSOR_SENTINEL: &str = "\u{fdd0}";
+
 #[derive(Clone, Debug)]
 pub struct OpenedBuffers(HashMap<String, Entity<Buffer>>);
 
@@ -54,7 +56,11 @@ pub async fn prediction_edits_for_single_file_diff(
 
     while let Some(event) = diff.next()? {
         match event {
-            DiffEvent::Hunk { path, hunk, status } => {
+            DiffEvent::Hunk {
+                path,
+                mut hunk,
+                status,
+            } => {
                 anyhow::ensure!(
                     status == FileStatus::Modified,
                     "V4 edit predictions only support modifying existing files"
@@ -81,85 +87,37 @@ pub async fn prediction_edits_for_single_file_diff(
                 }
 
                 let (_, _, snapshot) = target_file.as_ref().context("missing target file")?;
-                let mut pending_marker: Option<(Range<Anchor>, String, usize)> = None;
+                for edit in &mut hunk.edits {
+                    while let Some(marker_offset) = edit.text.find(INLINE_CURSOR_MARKER) {
+                        edit.text.replace_range(
+                            marker_offset..marker_offset + INLINE_CURSOR_MARKER.len(),
+                            INLINE_CURSOR_SENTINEL,
+                        );
+                    }
+                }
+
                 for (range, text) in resolve_hunk_edits_in_buffer(
                     hunk,
                     snapshot,
                     &[Anchor::min_max_range_for_buffer(snapshot.remote_id())],
                     status,
                 )? {
-                    let mut remaining = text.as_ref();
-                    let mut output = String::new();
-
-                    if let Some((pending_range, mut pending_text, pending_offset)) =
-                        pending_marker.take()
-                    {
-                        let matched_len = INLINE_CURSOR_MARKER[pending_text.len()..]
-                            .bytes()
-                            .zip(remaining.bytes())
-                            .take_while(|(left, right)| left == right)
-                            .count();
-
-                        if matched_len == 0 {
-                            edits.push((pending_range, pending_text.into()));
-                        } else {
-                            let marker_len = pending_text.len() + matched_len;
-                            if marker_len == INLINE_CURSOR_MARKER.len() {
-                                cursor_position.get_or_insert_with(|| {
-                                    PredictedCursorPosition::new(
-                                        pending_range.start,
-                                        pending_offset,
-                                    )
-                                });
-                                remaining = &remaining[matched_len..];
-                            } else if matched_len == remaining.len() {
-                                pending_text.push_str(
-                                    &INLINE_CURSOR_MARKER[pending_text.len()..marker_len],
-                                );
-                                pending_marker =
-                                    Some((pending_range, pending_text, pending_offset));
-                                continue;
-                            } else {
-                                pending_text.push_str(&remaining[..matched_len]);
-                                edits.push((pending_range, pending_text.into()));
-                                remaining = &remaining[matched_len..];
-                            }
-                        }
-                    }
-
-                    while let Some(marker_offset) = remaining.find(INLINE_CURSOR_MARKER) {
-                        output.push_str(&remaining[..marker_offset]);
+                    if let Some(marker_offset) = text.find(INLINE_CURSOR_SENTINEL) {
                         cursor_position.get_or_insert_with(|| {
-                            PredictedCursorPosition::new(range.start, output.len())
+                            PredictedCursorPosition::new(
+                                snapshot.anchor_before(range.start.to_offset(snapshot)),
+                                marker_offset,
+                            )
                         });
-                        remaining = &remaining[marker_offset + INLINE_CURSOR_MARKER.len()..];
-                    }
-
-                    let marker_prefix_len = (1..=INLINE_CURSOR_MARKER.len().min(remaining.len()))
-                        .rev()
-                        .find(|prefix_len| {
-                            remaining.ends_with(&INLINE_CURSOR_MARKER[..*prefix_len])
-                        });
-                    if let Some(marker_prefix_len) = marker_prefix_len {
-                        let marker_start = remaining.len() - marker_prefix_len;
-                        output.push_str(&remaining[..marker_start]);
-                        pending_marker = Some((
-                            range.clone(),
-                            remaining[marker_start..].to_string(),
-                            output.len(),
-                        ));
+                        let text = text.replace(INLINE_CURSOR_SENTINEL, "");
+                        if range.start.to_offset(snapshot) != range.end.to_offset(snapshot)
+                            || !text.is_empty()
+                        {
+                            edits.push((range, text.into()));
+                        }
                     } else {
-                        output.push_str(remaining);
+                        edits.push((range, text));
                     }
-
-                    if range.start.to_offset(snapshot) != range.end.to_offset(snapshot)
-                        || !output.is_empty()
-                    {
-                        edits.push((range, output.into()));
-                    }
-                }
-                if let Some((range, text, _)) = pending_marker {
-                    edits.push((range, text.into()));
                 }
             }
             DiffEvent::FileEnd { renamed_to } => {

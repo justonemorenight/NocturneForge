@@ -6414,6 +6414,75 @@ impl Repository {
         }
     }
 
+    pub fn recent_commit_data(
+        &mut self,
+        log_source: LogSource,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<Arc<CommitData>>>> {
+        let log_order = LogOrder::DateOrder;
+        self.graph_data(log_source.clone(), log_order, 0..0, cx);
+
+        let Some(graph_data) = self.initial_graph_data.get_mut(&(log_source, log_order)) else {
+            return Task::ready(Err(anyhow!(
+                "failed to initialize Git history for commit-message context"
+            )));
+        };
+        let mut initial_commits = graph_data
+            .commit_data
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let graph_data_updates =
+            if initial_commits.len() < limit && !graph_data.fetch_task.is_ready() {
+                let (sender, receiver) = async_channel::unbounded();
+                graph_data.subscribers.push(sender);
+                Some(receiver)
+            } else {
+                None
+            };
+
+        cx.spawn(async move |repository, cx| {
+            if let Some(graph_data_updates) = graph_data_updates {
+                while initial_commits.len() < limit {
+                    let Ok(Ok(batch)) = graph_data_updates.recv().await else {
+                        break;
+                    };
+                    initial_commits.extend(batch);
+                }
+            }
+            initial_commits.truncate(limit);
+            initial_commits.retain(|commit| commit.parents.len() <= 1);
+
+            let mut commits = Vec::with_capacity(initial_commits.len());
+            for batch in initial_commits.chunks(8) {
+                let mut states = Vec::with_capacity(batch.len());
+                for initial_commit in batch {
+                    let state = repository.update(cx, |repository, cx| {
+                        repository
+                            .fetch_commit_data(initial_commit.sha, true, cx)
+                            .clone()
+                    })?;
+                    states.push(state);
+                }
+
+                let loaded = future::join_all(states.into_iter().map(|state| async move {
+                    match state {
+                        CommitDataState::Loaded(data) => Some(data),
+                        CommitDataState::Loading(Some(receiver)) => receiver.await.ok(),
+                        CommitDataState::Loading(None) => None,
+                    }
+                }))
+                .await;
+                for data in loaded.into_iter().flatten() {
+                    commits.push(data);
+                }
+            }
+            Ok(commits)
+        })
+    }
+
     async fn append_initial_graph_commits(
         this: &WeakEntity<Self>,
         graph_data_key: &(LogSource, LogOrder),

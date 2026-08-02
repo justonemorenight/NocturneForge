@@ -7,12 +7,14 @@ use language_model_core::{
     LanguageModelProviderId, LanguageModelRequest, LanguageModelRequestMessage,
     LanguageModelRequestToolInput, LanguageModelToolChoice, LanguageModelToolResultContent,
     LanguageModelToolUse, LanguageModelToolUseId, LanguageModelToolUseInput, MessageContent, Role,
-    StopReason, TokenUsage,
+    SharedString, StopReason, TokenUsage,
     util::{fix_streamed_json, is_context_window_exceeded_message, parse_tool_arguments},
 };
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::responses::provider_compaction_state_from_items;
 use crate::responses::{
     ContextManagement, Request as ResponseRequest, ResponseCustomToolCallItem,
     ResponseCustomToolCallOutputItem, ResponseError, ResponseFunctionCallItem,
@@ -21,7 +23,7 @@ use crate::responses::{
     ResponseOutputMessage, ResponseReasoningInputItem, ResponseReasoningItem,
     ResponseReasoningSummaryPart, ResponseSummary as ResponsesSummary,
     ResponseUsage as ResponsesUsage, StreamEvent as ResponsesStreamEvent,
-    provider_compaction_items, provider_compaction_state_from_items,
+    provider_compaction_items_with_scope, provider_compaction_state_from_items_with_scope,
 };
 use crate::{
     FunctionContent, FunctionDefinition, ImageUrl, MessagePart, ReasoningEffort,
@@ -243,6 +245,30 @@ pub fn into_open_ai_response(
     supports_none_reasoning_effort: bool,
     compaction_state_owner: &LanguageModelProviderId,
 ) -> Result<ResponseRequest> {
+    into_open_ai_response_with_account_scope(
+        request,
+        model_id,
+        supports_parallel_tool_calls,
+        supports_prompt_cache_key,
+        max_output_tokens,
+        default_reasoning_effort,
+        supports_none_reasoning_effort,
+        compaction_state_owner,
+        None,
+    )
+}
+
+pub fn into_open_ai_response_with_account_scope(
+    request: LanguageModelRequest,
+    model_id: &str,
+    supports_parallel_tool_calls: bool,
+    supports_prompt_cache_key: bool,
+    max_output_tokens: Option<u64>,
+    default_reasoning_effort: Option<ReasoningEffort>,
+    supports_none_reasoning_effort: bool,
+    compaction_state_owner: &LanguageModelProviderId,
+    account_scope: Option<&str>,
+) -> Result<ResponseRequest> {
     let stream = !model_id.starts_with("o1-");
 
     let LanguageModelRequest {
@@ -289,6 +315,7 @@ pub fn into_open_ai_response(
             message,
             index,
             compaction_state_owner,
+            account_scope,
             &mut replayed_reasoning_item_indexes,
             &mut tool_use_kinds_by_id,
             &mut provider_items,
@@ -397,6 +424,7 @@ fn append_message_to_response_items(
     message: LanguageModelRequestMessage,
     index: usize,
     compaction_state_owner: &LanguageModelProviderId,
+    account_scope: Option<&str>,
     replayed_reasoning_item_indexes: &mut HashMap<String, usize>,
     tool_use_kinds_by_id: &mut HashMap<LanguageModelToolUseId, ReplayToolKind>,
     provider_items: &mut Vec<serde_json::Value>,
@@ -440,7 +468,11 @@ fn append_message_to_response_items(
                 // the previous one, so the last compaction wins. State owned
                 // by another backend yields `None`, in which case we fall
                 // back to replaying the full transcript.
-                if let Some(items) = provider_compaction_items(&state, compaction_state_owner)? {
+                if let Some(items) = provider_compaction_items_with_scope(
+                    &state,
+                    compaction_state_owner,
+                    account_scope,
+                )? {
                     content_parts.clear();
                     input_items.clear();
                     replayed_reasoning_item_indexes.clear();
@@ -872,6 +904,7 @@ pub struct OpenAiResponseEventMapper {
     /// The backend whose infrastructure produced this stream; stamped on any
     /// compaction state it emits so replay is limited to the same backend.
     compaction_state_owner: LanguageModelProviderId,
+    account_scope: Option<SharedString>,
     function_calls_by_item: HashMap<String, PendingResponseFunctionCall>,
     custom_tool_calls_by_item: HashMap<String, PendingResponseCustomToolCall>,
     reasoning_items: Vec<ResponseReasoningInputItem>,
@@ -895,8 +928,16 @@ struct PendingResponseCustomToolCall {
 
 impl OpenAiResponseEventMapper {
     pub fn new(compaction_state_owner: LanguageModelProviderId) -> Self {
+        Self::new_with_account_scope(compaction_state_owner, None::<SharedString>)
+    }
+
+    pub fn new_with_account_scope(
+        compaction_state_owner: LanguageModelProviderId,
+        account_scope: Option<impl Into<SharedString>>,
+    ) -> Self {
         Self {
             compaction_state_owner,
+            account_scope: account_scope.map(Into::into),
             function_calls_by_item: HashMap::default(),
             custom_tool_calls_by_item: HashMap::default(),
             reasoning_items: Vec::new(),
@@ -1159,9 +1200,10 @@ impl OpenAiResponseEventMapper {
                     match serde_json::to_value(ResponseInputItem::Compaction(compaction))
                         .map_err(anyhow::Error::from)
                         .and_then(|item| {
-                            provider_compaction_state_from_items(
+                            provider_compaction_state_from_items_with_scope(
                                 self.compaction_state_owner.clone(),
                                 vec![item],
+                                self.account_scope.as_deref(),
                             )
                         }) {
                         Ok(state) => vec![Ok(LanguageModelCompletionEvent::Compaction(

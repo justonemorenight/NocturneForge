@@ -17,6 +17,7 @@ test-support = ["multi_buffer/test-support", "remote_connection/test-support"]
 call = ["dep:call"]
 
 [dependencies]
+agent_skills.workspace = true
 agent_settings.workspace = true
 anyhow.workspace = true
 askpass.workspace = true

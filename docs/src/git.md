@@ -279,7 +279,8 @@ You can ask AI to generate a commit message by focusing on the message editor wi
 > Note that you need to have an LLM provider configured either via your own API keys or through Zed's hosted AI models.
 > Visit [AI Quick Start](./ai/quick-start.md) to learn how to configure AI.
 
-You can specify your preferred model for this task by adding a `commit_message_model` field to your agent settings.
+You can choose the model from the split button next to **Generate Commit Message**, or add a `commit_message_model` field to your agent settings.
+The split button always displays the model that will actually be used, including the automatic fast/default-model fallback.
 See [Feature-specific models](./ai/agent-settings.md#feature-specific-models) for more information.
 
 ```json [settings]
@@ -306,6 +307,24 @@ To add custom instructions that apply only to commit message generation, use the
 ```
 
 These instructions are sent to the model in addition to any instruction files, such as `.rules` or `AGENTS.md`. To add instructions that apply to both commit messages and the agent more broadly, use the global `AGENTS.md` file located at `~/.config/zed/AGENTS.md` on macOS and Linux, `%APPDATA%\Zed\AGENTS.md` on Windows.
+
+For a reusable workflow, set `commit_message_skill` to the name of an installed Agent Skill:
+
+```json [settings]
+{
+  "agent": {
+    "commit_message_skill": "commit-message"
+  }
+}
+```
+
+The bundled `commit-message` skill is enabled by default and provides a conservative workflow based on the supplied diff, repository history, current draft, and commit template. You can override it with a global or project-local skill of the same name, or set `commit_message_skill` to an empty string to disable the skill layer.
+
+A project-local skill takes precedence over a global skill with the same name. If the configured skill is missing, invalid, empty, or larger than the commit prompt safety limit, generation stops with an error instead of silently ignoring it.
+
+Generation uses the staged diff when changes are staged, otherwise the working-tree diff. It also uses the repository and branch name, the current draft and commit template, changed-file names, and a small sample of recent repository/current-author commit subjects. History is used only as a style reference. The generated response is applied atomically after the request finishes, so cancellation or a failed request does not leave a partial draft.
+
+When the commit subject is non-empty, Zed may offer a short inline continuation after a brief pause. This completion uses only an in-memory changed-file snapshot and never runs a Git diff for each keystroke.
 
 > Before Zed v1.4.0, this was done through the Rules Library, which has been removed.
 > See [Migrating from Rules](./ai/instructions.md#migrating-from-rules) for more information.

@@ -626,6 +626,7 @@ pub struct ThreadView {
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pub chatgpt_account_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub project: WeakEntity<Project>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Cloned from the parent `ConversationView` so the cache is shared and the
@@ -1117,6 +1118,7 @@ impl ThreadView {
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
             fast_mode_menu_handle: PopoverMenuHandle::default(),
+            chatgpt_account_menu_handle: PopoverMenuHandle::default(),
             project,
             code_span_resolver,
             show_external_source_prompt_warning,
@@ -4527,6 +4529,7 @@ impl ThreadView {
                                     .gap_1()
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
+                                    .children(self.render_chatgpt_account_picker(cx))
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
@@ -5206,6 +5209,103 @@ impl ThreadView {
             return None;
         }
         Some((provider_id, model_id, confirmation))
+    }
+
+    fn render_chatgpt_account_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let native_thread = self.as_native_thread(cx)?;
+        if native_thread.read(cx).model().is_none_or(|model| {
+            model.provider_id() != LanguageModelProviderId::new("openai-subscribed")
+        }) {
+            return None;
+        }
+        let provider = LanguageModelRegistry::read_global(cx)
+            .provider(&LanguageModelProviderId::new("openai-subscribed"))?;
+        let accounts = provider.account_summaries(cx);
+        if accounts.is_empty() {
+            return None;
+        }
+        let active = accounts.iter().find(|account| account.is_active)?;
+        let active_label = if active.reauthentication_required {
+            format!("{} · sign in required", active.label).into()
+        } else {
+            active.label.clone()
+        };
+        let busy = accounts.iter().any(|account| account.is_busy);
+        let can_cancel_sign_in = provider.can_cancel_account_sign_in(cx);
+        let menu_accounts = accounts.clone();
+        let menu_provider = provider.clone();
+        let trigger = ButtonLike::new("chatgpt-account-picker")
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::AiOpenAiGptSub).size(IconSize::XSmall))
+                    .child(Label::new(active_label).size(LabelSize::Small))
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .disabled(busy && !can_cancel_sign_in)
+            .tooltip(Tooltip::text("Switch ChatGPT account"));
+        Some(
+            PopoverMenu::new("chatgpt-account-picker")
+                .with_handle(self.chatgpt_account_menu_handle.clone())
+                .trigger(trigger)
+                .menu(move |window, cx| {
+                    let accounts = menu_accounts.clone();
+                    let provider = menu_provider.clone();
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |mut menu, _window, _cx| {
+                            menu = menu.header("ChatGPT accounts");
+                            for account in accounts.iter().cloned() {
+                                let mut label = account.label.to_string();
+                                if account.reauthentication_required {
+                                    label.push_str(" · sign in required");
+                                }
+                                if let Some(detail) = account.detail.as_ref() {
+                                    label.push_str(" · ");
+                                    label.push_str(detail);
+                                }
+                                if let Some(quota) = account.quota.as_ref() {
+                                    label.push_str(" · ");
+                                    label.push_str(quota);
+                                }
+                                let provider = provider.clone();
+                                let account_id = account.id.clone();
+                                menu.push_item(
+                                    ContextMenuEntry::new(label)
+                                        .toggleable(IconPosition::End, account.is_active)
+                                        .disabled(account.is_active || account.is_busy)
+                                        .handler(move |_window, cx| {
+                                            provider
+                                                .switch_account(account_id.clone(), cx)
+                                                .detach_and_log_err(cx);
+                                        }),
+                                );
+                            }
+                            let account_action_label = if can_cancel_sign_in {
+                                "Cancel ChatGPT sign-in"
+                            } else {
+                                "Add ChatGPT account"
+                            };
+                            menu.separator().item(
+                                ContextMenuEntry::new(account_action_label)
+                                    .disabled(busy && !can_cancel_sign_in)
+                                    .handler({
+                                        let provider = provider.clone();
+                                        move |_window, cx| {
+                                            if can_cancel_sign_in {
+                                                provider.cancel_account_sign_in(cx);
+                                            } else {
+                                                provider.add_account(cx).detach_and_log_err(cx);
+                                            }
+                                        }
+                                    }),
+                            )
+                        },
+                    ))
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -10868,6 +10968,7 @@ impl ThreadView {
         };
 
         let error_message = self.subagent_error_message(&tool_call.status, tool_call, cx);
+        let streaming_thread = thread.clone();
 
         v_flex()
             .w_full()
@@ -10955,12 +11056,20 @@ impl ThreadView {
                                     )
                                     .on_click(cx.listener({
                                         let tool_call_id = tool_call.id.clone();
+                                        let streaming_thread = streaming_thread.clone();
                                         move |this, _, window, cx| {
                                             let expanded =
                                                 this.entry_view_state.update(cx, |state, _cx| {
                                                     state.toggle_tool_call_expansion(&tool_call_id);
                                                     state.is_tool_call_expanded(&tool_call_id)
                                                 });
+                                            if let Some(streaming_thread) = &streaming_thread {
+                                                streaming_thread.update(cx, |thread, cx| {
+                                                    thread.set_streaming_updates_visible(
+                                                        expanded, cx,
+                                                    );
+                                                });
+                                            }
                                             this.refresh_thread_search(window, cx);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();
