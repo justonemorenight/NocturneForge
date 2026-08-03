@@ -14,7 +14,10 @@ use std::{
     cmp,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use text::{Edit, Patch, Rope};
 use util::{RangeExt, ResultExt as _};
@@ -64,6 +67,7 @@ pub struct ActionLog {
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
     last_reported_large_diff_state: Cell<Option<bool>>,
+    lsp_lease_counters: Arc<AgentLspLeaseCounters>,
 }
 
 impl ActionLog {
@@ -76,6 +80,7 @@ impl ActionLog {
             last_reject_undo: None,
             file_read_times: HashMap::default(),
             last_reported_large_diff_state: Cell::new(None),
+            lsp_lease_counters: Arc::default(),
         }
     }
 
@@ -158,6 +163,11 @@ impl ActionLog {
                 let open_lsp_handle = self.project.update(cx, |project, cx| {
                     project.register_buffer_with_language_servers(&buffer, cx)
                 });
+                let lsp_lease = AgentLspLease::new(
+                    open_lsp_handle,
+                    AgentLspLeaseOwnership::Legacy,
+                    self.lsp_lease_counters.clone(),
+                );
 
                 let text_snapshot = buffer.read(cx).text_snapshot();
                 let language = buffer.read(cx).language().cloned();
@@ -191,7 +201,7 @@ impl ActionLog {
                     diff_generation: 0,
                     review_state_changed_before_recompute: false,
                     diff_complexity: DiffComplexity::default(),
-                    _open_lsp_handle: open_lsp_handle,
+                    _lsp_lease: lsp_lease,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
                         async move |this, cx| {
@@ -1147,6 +1157,22 @@ impl ActionLog {
         load
     }
 
+    pub fn lsp_lease_debug_counters(&self) -> AgentLspLeaseDebugCounters {
+        AgentLspLeaseDebugCounters {
+            tracked_buffers: self.tracked_buffers.len(),
+            read_leases: self.lsp_lease_counters.read_leases.load(Ordering::Relaxed),
+            edit_leases: self.lsp_lease_counters.edit_leases.load(Ordering::Relaxed),
+            diagnostic_leases: self
+                .lsp_lease_counters
+                .diagnostic_leases
+                .load(Ordering::Relaxed),
+            queued_acquisitions: self
+                .lsp_lease_counters
+                .queued_acquisitions
+                .load(Ordering::Relaxed),
+        }
+    }
+
     pub fn buffer_diff_load(&self, buffer: &Entity<Buffer>, cx: &App) -> AgentDiffLoad {
         self.tracked_buffers
             .get(buffer)
@@ -1532,6 +1558,76 @@ struct PendingDiffUpdate {
     snapshot: text::BufferSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentLspLeaseOwnership {
+    Legacy,
+    Edit,
+    Diagnostic,
+}
+
+#[derive(Default)]
+struct AgentLspLeaseCounters {
+    read_leases: AtomicUsize,
+    edit_leases: AtomicUsize,
+    diagnostic_leases: AtomicUsize,
+    queued_acquisitions: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentLspLeaseDebugCounters {
+    pub tracked_buffers: usize,
+    pub read_leases: usize,
+    pub edit_leases: usize,
+    pub diagnostic_leases: usize,
+    pub queued_acquisitions: usize,
+}
+
+pub struct AgentLspLease {
+    _handle: OpenLspBufferHandle,
+    ownership: AgentLspLeaseOwnership,
+    counters: Arc<AgentLspLeaseCounters>,
+}
+
+impl AgentLspLease {
+    fn new(
+        handle: OpenLspBufferHandle,
+        ownership: AgentLspLeaseOwnership,
+        counters: Arc<AgentLspLeaseCounters>,
+    ) -> Self {
+        counters.increment(ownership);
+        Self {
+            _handle: handle,
+            ownership,
+            counters,
+        }
+    }
+}
+
+impl Drop for AgentLspLease {
+    fn drop(&mut self) {
+        self.counters.decrement(self.ownership);
+    }
+}
+
+impl AgentLspLeaseCounters {
+    fn counter(&self, ownership: AgentLspLeaseOwnership) -> &AtomicUsize {
+        match ownership {
+            AgentLspLeaseOwnership::Legacy => &self.read_leases,
+            AgentLspLeaseOwnership::Edit => &self.edit_leases,
+            AgentLspLeaseOwnership::Diagnostic => &self.diagnostic_leases,
+        }
+    }
+
+    fn increment(&self, ownership: AgentLspLeaseOwnership) {
+        self.counter(ownership).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement(&self, ownership: AgentLspLeaseOwnership) {
+        let previous = self.counter(ownership).fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "Agent LSP lease counter underflow");
+    }
+}
+
 #[derive(Debug)]
 enum TrackedBufferStatus {
     Created { existing_file_content: Option<Rope> },
@@ -1553,7 +1649,7 @@ pub struct TrackedBuffer {
     diff_generation: u64,
     review_state_changed_before_recompute: bool,
     diff_complexity: DiffComplexity,
-    _open_lsp_handle: OpenLspBufferHandle,
+    _lsp_lease: AgentLspLease,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
 }
@@ -1617,6 +1713,38 @@ mod tests {
     use language::Point;
     use project::{FakeFs, Fs, Project, RemoveOptions};
     use rand::prelude::*;
+
+    #[gpui::test]
+    async fn test_legacy_lsp_lease_matches_tracked_buffer_lifetime(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| log.lsp_lease_debug_counters()),
+            AgentLspLeaseDebugCounters {
+                tracked_buffers: 1,
+                read_leases: 1,
+                edit_leases: 0,
+                diagnostic_leases: 0,
+                queued_acquisitions: 0,
+            }
+        );
+    }
     use serde_json::json;
     use settings::SettingsStore;
     use std::env;
