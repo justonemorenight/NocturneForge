@@ -1319,8 +1319,15 @@ struct WorkspaceThread {
     _thread_subscriptions: (Subscription, Subscription),
     singleton_editors: HashMap<WeakEntity<Buffer>, HashMap<WeakEntity<Editor>, Subscription>>,
     contextual_review_editors: HashSet<WeakEntity<Editor>>,
+    pending_review_navigation: HashMap<WeakEntity<Editor>, ReviewNavigationTarget>,
     _settings_subscription: Subscription,
     _workspace_subscription: Option<Subscription>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReviewNavigationTarget {
+    FirstHunk,
+    CurrentSelection,
 }
 
 struct AgentDiffGlobal(Entity<AgentDiff>);
@@ -1354,6 +1361,7 @@ impl AgentDiff {
         workspace: &WeakEntity<Workspace>,
         thread: Entity<AcpThread>,
         editor: Entity<Editor>,
+        navigation_target: ReviewNavigationTarget,
         window: &mut Window,
         cx: &mut App,
     ) -> bool {
@@ -1365,7 +1373,13 @@ impl AgentDiff {
             if !active_thread_matches {
                 this.register_active_thread_impl(workspace, thread, window, cx);
             }
-            this.review_editor_from_thread_navigation_impl(workspace, editor, window, cx)
+            this.review_editor_from_thread_navigation_impl(
+                workspace,
+                editor,
+                navigation_target,
+                window,
+                cx,
+            )
         })
     }
 
@@ -1407,6 +1421,7 @@ impl AgentDiff {
             workspace_thread._thread_subscriptions = (action_log_subscription, thread_subscription);
             if active_thread_changed {
                 workspace_thread.contextual_review_editors.clear();
+                workspace_thread.pending_review_navigation.clear();
             }
             self.update_reviewing_editors(workspace, window, cx);
             return;
@@ -1435,6 +1450,7 @@ impl AgentDiff {
                 _thread_subscriptions: (action_log_subscription, thread_subscription),
                 singleton_editors: HashMap::default(),
                 contextual_review_editors: HashSet::default(),
+                pending_review_navigation: HashMap::default(),
                 _settings_subscription: settings_subscription,
                 _workspace_subscription: workspace_subscription,
             },
@@ -1482,6 +1498,7 @@ impl AgentDiff {
         &mut self,
         workspace: &WeakEntity<Workspace>,
         editor: Entity<Editor>,
+        navigation_target: ReviewNavigationTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -1514,6 +1531,9 @@ impl AgentDiff {
         workspace_thread
             .contextual_review_editors
             .insert(editor.downgrade());
+        workspace_thread
+            .pending_review_navigation
+            .insert(editor.downgrade(), navigation_target);
         self.update_reviewing_editors(workspace, window, cx);
         true
     }
@@ -1655,6 +1675,7 @@ impl AgentDiff {
                     };
 
                     active_thread.contextual_review_editors.remove(&weak_editor);
+                    active_thread.pending_review_navigation.remove(&weak_editor);
 
                     if let Entry::Occupied(mut entry) =
                         active_thread.singleton_editors.entry(buffer)
@@ -1686,7 +1707,7 @@ impl AgentDiff {
             return;
         };
 
-        let action_log = thread.read(cx).action_log();
+        let action_log = thread.read(cx).action_log().clone();
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let review_all_editors = AgentSettings::get_global(cx).single_file_review;
         let contextual_review_editors = workspace_thread.contextual_review_editors.clone();
@@ -1713,6 +1734,7 @@ impl AgentDiff {
                 };
 
                 let multibuffer = editor.read(cx).buffer().clone();
+                let is_large = action_log.read(cx).buffer_diff_load(&buffer, cx).is_large();
                 multibuffer.update(cx, |multibuffer, cx| {
                     multibuffer.add_diff(diff_handle.clone(), cx);
                 });
@@ -1729,32 +1751,32 @@ impl AgentDiff {
                             Some(agent_diff_delegate(&thread, workspace.clone())),
                             cx,
                         );
-                        editor.set_expand_all_diff_hunks(cx);
+                        if !is_large {
+                            editor.set_expand_all_diff_hunks(cx);
+                        }
                         editor.register_addon(EditorAgentDiffAddon);
                     });
                 } else {
                     unaffected.remove(weak_editor);
                 }
 
-                if reviewing_state == EditorState::Reviewing
-                    && previous_state != Some(reviewing_state)
-                {
-                    // Jump to first hunk when we enter review mode
-                    editor.update(cx, |editor, cx| {
-                        let snapshot = multibuffer.read(cx).snapshot(cx);
-                        if let Some(first_hunk) = snapshot.diff_hunks().next() {
-                            let first_hunk_start = first_hunk.multi_buffer_range.start;
-
-                            editor.change_selections(
-                                SelectionEffects::scroll(Autoscroll::center()),
-                                window,
-                                cx,
-                                |selections| {
-                                    selections.select_ranges([first_hunk_start..first_hunk_start])
-                                },
-                            );
-                        }
+                let navigation_target = workspace_thread
+                    .pending_review_navigation
+                    .remove(weak_editor)
+                    .or_else(|| {
+                        (reviewing_state == EditorState::Reviewing
+                            && previous_state != Some(reviewing_state))
+                        .then_some(ReviewNavigationTarget::FirstHunk)
                     });
+                if let Some(navigation_target) = navigation_target {
+                    Self::navigate_review_editor(
+                        &editor,
+                        &multibuffer,
+                        navigation_target,
+                        is_large,
+                        window,
+                        cx,
+                    );
                 }
             }
         }
@@ -1784,6 +1806,48 @@ impl AgentDiff {
         }
 
         cx.notify();
+    }
+
+    fn navigate_review_editor(
+        editor: &Entity<Editor>,
+        multibuffer: &Entity<MultiBuffer>,
+        target: ReviewNavigationTarget,
+        expand_only_target_hunk: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        editor.update(cx, |editor, cx| {
+            let snapshot = multibuffer.read(cx).snapshot(cx);
+            let target_hunk = match target {
+                ReviewNavigationTarget::FirstHunk => snapshot.diff_hunks().next(),
+                ReviewNavigationTarget::CurrentSelection => {
+                    let cursor = editor.selections.newest_anchor().head();
+                    editor
+                        .diff_hunks_in_ranges(&[cursor..editor::Anchor::Max], &snapshot)
+                        .next()
+                }
+            };
+            let Some(target_hunk) = target_hunk else {
+                return;
+            };
+
+            let hunk_start = target_hunk.multi_buffer_range.start;
+            if expand_only_target_hunk {
+                multibuffer.update(cx, |multibuffer, cx| {
+                    multibuffer
+                        .expand_diff_hunks(vec![hunk_start..target_hunk.multi_buffer_range.end], cx)
+                });
+            }
+
+            if matches!(target, ReviewNavigationTarget::FirstHunk) {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([hunk_start..hunk_start]),
+                );
+            }
+        });
     }
 
     fn clear_reviewing_editors_for_workspace(
@@ -1991,6 +2055,7 @@ impl AgentDiff {
                                 &workspace_handle,
                                 thread.clone(),
                                 editor,
+                                ReviewNavigationTarget::FirstHunk,
                                 window,
                                 cx,
                             );

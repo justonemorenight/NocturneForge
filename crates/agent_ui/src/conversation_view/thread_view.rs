@@ -1532,15 +1532,6 @@ impl ThreadView {
                 let Some(editor) = item.downcast::<Editor>() else {
                     return anyhow::Ok(());
                 };
-                cx.update(|window, cx| {
-                    AgentDiff::review_editor_from_thread_navigation(
-                        &workspace,
-                        thread,
-                        editor.clone(),
-                        window,
-                        cx,
-                    );
-                })?;
                 editor.update_in(cx, |editor, window, cx| {
                     editor.change_selections(
                         SelectionEffects::scroll(Autoscroll::center()),
@@ -1549,6 +1540,16 @@ impl ThreadView {
                         |selections| {
                             selections.select_ranges([position..position]);
                         },
+                    );
+                })?;
+                cx.update(|window, cx| {
+                    AgentDiff::review_editor_from_thread_navigation(
+                        &workspace,
+                        thread,
+                        editor,
+                        ReviewNavigationTarget::CurrentSelection,
+                        window,
+                        cx,
                     );
                 })?;
                 anyhow::Ok(())
@@ -3044,7 +3045,12 @@ impl ThreadView {
                 };
                 cx.update(|window, cx| {
                     AgentDiff::review_editor_from_thread_navigation(
-                        &workspace, thread, editor, window, cx,
+                        &workspace,
+                        thread,
+                        editor,
+                        ReviewNavigationTarget::FirstHunk,
+                        window,
+                        cx,
                     );
                 })?;
                 anyhow::Ok(())
@@ -10435,16 +10441,6 @@ impl ThreadView {
                     return anyhow::Ok(());
                 };
 
-                cx.update(|window, cx| {
-                    AgentDiff::review_editor_from_thread_navigation(
-                        &workspace,
-                        thread,
-                        active_editor.clone(),
-                        window,
-                        cx,
-                    );
-                })?;
-
                 active_editor.update_in(cx, |editor, window, cx| {
                     let snapshot = editor.buffer().read(cx).snapshot(cx);
                     if snapshot.as_singleton().is_some()
@@ -10459,6 +10455,17 @@ impl ThreadView {
                             selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
                         })
                     }
+                })?;
+
+                cx.update(|window, cx| {
+                    AgentDiff::review_editor_from_thread_navigation(
+                        &workspace,
+                        thread,
+                        active_editor,
+                        ReviewNavigationTarget::CurrentSelection,
+                        window,
+                        cx,
+                    );
                 })?;
 
                 anyhow::Ok(())

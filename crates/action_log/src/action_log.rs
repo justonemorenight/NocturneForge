@@ -1060,6 +1060,16 @@ impl ActionLog {
         load
     }
 
+    pub fn buffer_diff_load(&self, buffer: &Entity<Buffer>, cx: &App) -> AgentDiffLoad {
+        self.tracked_buffers
+            .get(buffer)
+            .filter(|tracked_buffer| tracked_buffer.has_edits(cx))
+            .map_or_else(
+                || AgentDiffLoad::new(0, DiffComplexity::default()),
+                |tracked_buffer| AgentDiffLoad::new(1, tracked_buffer.diff_complexity),
+            )
+    }
+
     /// Iterate over buffers changed since last read or edited by the model
     pub fn stale_buffers<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a Entity<Buffer>> {
         self.tracked_buffers

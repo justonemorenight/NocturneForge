@@ -81,7 +81,7 @@ use crate::ModelSelectorPopover;
 use crate::agent_connection_store::{
     AgentConnectedState, AgentConnectionEntryEvent, AgentConnectionStore,
 };
-use crate::agent_diff::AgentDiff;
+use crate::agent_diff::{AgentDiff, ReviewNavigationTarget};
 use crate::completion_provider::{AgentContextSelection, AvailableSkill};
 use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
