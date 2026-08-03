@@ -601,6 +601,8 @@ pub struct ThreadView {
     acknowledged_confusable_warnings: HashSet<acp::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
+    large_diff_review_prompt: bool,
+    full_diff_review_opted_in: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
@@ -1095,6 +1097,8 @@ impl ThreadView {
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
+            large_diff_review_prompt: false,
+            full_diff_review_opted_in: false,
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
@@ -3188,6 +3192,7 @@ impl ThreadView {
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
+        let diff_load = action_log.read(cx).diff_load(cx);
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
 
@@ -3276,6 +3281,13 @@ impl ThreadView {
                                     cx,
                                 ))
                             })
+                            .when(
+                                self.large_diff_review_prompt && diff_load.is_large(),
+                                |parent| {
+                                    parent
+                                        .child(self.render_large_diff_review_prompt(&diff_load, cx))
+                                },
+                            )
                         },
                     )
                     .when(!queue_is_empty, |this| {
@@ -3436,6 +3448,120 @@ impl ThreadView {
                 )),
             )
             .into_any_element()
+    }
+
+    fn render_large_diff_review_prompt(
+        &self,
+        diff_load: &AgentDiffLoad,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let AgentDiffLoad::Large {
+            file_count,
+            complexity,
+            reasons,
+        } = diff_load
+        else {
+            return Empty.into_any_element();
+        };
+
+        let reason_text = reasons
+            .iter()
+            .map(|reason| match reason {
+                LargeDiffReason::FileCount => "many files",
+                LargeDiffReason::ChangedRows => "many changed lines",
+                LargeDiffReason::ChangedBytes => "large changed text",
+                LargeDiffReason::HunkCount => "many diff hunks",
+                LargeDiffReason::LongestChangedLine => "a very long changed line",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        v_flex()
+            .m_1p5()
+            .mt_0()
+            .p_2()
+            .gap_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                Label::new("Large change set")
+                    .size(LabelSize::Small),
+            )
+            .child(
+                Label::new(format!(
+                    "{file_count} files, {} changed lines, {} across {} hunks. Full review is deferred because of {reason_text}.",
+                    complexity.changed_rows,
+                    format_file_size(complexity.changed_bytes, true),
+                    complexity.hunk_count,
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(
+                        Button::new("review-large-diff-file-by-file", "Review Files Individually")
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.large_diff_review_prompt = false;
+                                this.open_first_edited_buffer(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("load-full-large-diff-review", "Load Full Review")
+                            .style(ButtonStyle::Filled)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.full_diff_review_opted_in = true;
+                                this.large_diff_review_prompt = false;
+                                AgentDiffPane::deploy(
+                                    this.thread.clone(),
+                                    this.workspace.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .log_err();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn open_first_edited_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let action_log = self.thread.read(cx).action_log().clone();
+        let first_buffer = action_log
+            .read(cx)
+            .changed_buffers(cx)
+            .map(|(buffer, _)| buffer)
+            .min_by_key(|buffer| buffer.read(cx).file().map(|file| file.path().clone()));
+
+        if let Some(buffer) = first_buffer {
+            self.open_edited_buffer(&buffer, window, cx);
+        }
+    }
+
+    pub(crate) fn should_defer_full_diff_review(&self, cx: &App) -> bool {
+        !self.full_diff_review_opted_in
+            && self
+                .thread
+                .read(cx)
+                .action_log()
+                .read(cx)
+                .diff_load(cx)
+                .is_large()
+    }
+
+    pub(crate) fn show_large_diff_review_prompt(&mut self, cx: &mut Context<Self>) {
+        self.large_diff_review_prompt = true;
+        self.edits_expanded = true;
+        cx.notify();
     }
 
     fn render_edited_files_buttons(

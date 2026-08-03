@@ -6,7 +6,7 @@ use acp_thread::{
     ToolCallContent, ToolCallStatus,
 };
 use acp_thread::{AgentConnection, Plan};
-use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
+use action_log::{ActionLog, ActionLogTelemetry, AgentDiffLoad, DiffStats, LargeDiffReason};
 use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 #[cfg(test)]
@@ -81,7 +81,7 @@ use crate::ModelSelectorPopover;
 use crate::agent_connection_store::{
     AgentConnectedState, AgentConnectionEntryEvent, AgentConnectionStore,
 };
-use crate::agent_diff::{AgentDiff, ReviewNavigationTarget};
+use crate::agent_diff::{AgentDiff, AgentDiffPane, ReviewNavigationTarget};
 use crate::completion_provider::{AgentContextSelection, AvailableSkill};
 use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};

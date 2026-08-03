@@ -447,17 +447,20 @@ pub fn init(cx: &mut App) {
                     workspace.follow(CollaboratorId::Agent, window, cx);
                 })
                 .register_action(|workspace, _: &OpenAgentDiff, window, cx| {
-                    let thread = workspace
+                    let thread_view = workspace
                         .panel::<AgentPanel>(cx)
                         .and_then(|panel| panel.read(cx).active_conversation_view().cloned())
-                        .and_then(|conversation| {
-                            conversation
-                                .read(cx)
-                                .root_thread_view()
-                                .map(|r| r.read(cx).thread.clone())
-                        });
+                        .and_then(|conversation| conversation.read(cx).root_thread_view());
 
-                    if let Some(thread) = thread {
+                    if let Some(thread_view) = thread_view {
+                        if thread_view.read(cx).should_defer_full_diff_review(cx) {
+                            thread_view.update(cx, |thread_view, cx| {
+                                thread_view.show_large_diff_review_prompt(cx);
+                            });
+                            return;
+                        }
+
+                        let thread = thread_view.read(cx).thread.clone();
                         AgentDiffPane::deploy_in_workspace(thread, workspace, window, cx);
                     }
                 })
