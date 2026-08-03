@@ -358,6 +358,7 @@ pub(crate) struct EditSession {
     pipeline: Pipeline,
     context: Arc<EditSessionContext>,
     _finalize_diff_guard: Deferred<Box<dyn FnOnce()>>,
+    _finish_lsp_lease_guard: Deferred<Box<dyn FnOnce()>>,
 }
 
 /// The destination of an edit session, identified by its absolute path on
@@ -756,7 +757,19 @@ impl EditSession {
         });
         context
             .action_log
-            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
+            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx))
+            .await
+            .map_err(|error| format!("Failed to acquire edit language-server lease: {error:#}"))?;
+        let finish_lsp_lease_guard = util::defer(Box::new({
+            let action_log = context.action_log.downgrade();
+            let buffer = buffer.clone();
+            let mut cx = cx.clone();
+            move || {
+                action_log
+                    .update(&mut cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx))
+                    .ok();
+            }
+        }) as Box<dyn FnOnce()>);
 
         let old_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
         let old_text = cx
@@ -776,6 +789,7 @@ impl EditSession {
             pipeline: Pipeline::new(mode, file_changed_since_last_read),
             context,
             _finalize_diff_guard: finalize_diff_guard,
+            _finish_lsp_lease_guard: finish_lsp_lease_guard,
         })
     }
 

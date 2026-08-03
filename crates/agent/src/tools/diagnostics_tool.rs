@@ -8,7 +8,7 @@ use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::{fmt::Write, sync::Arc};
+use std::{fmt::Write, sync::Arc, time::Duration};
 use ui::SharedString;
 use util::markdown::MarkdownInlineCode;
 
@@ -81,11 +81,45 @@ async fn with_cancellation<T>(f: impl Future<Output = T>, s: &ToolCallEventStrea
     }
 }
 
-fn freshness_message(refreshed: bool) -> &'static str {
-    if refreshed {
-        "Diagnostics successfully refreshed."
-    } else {
-        "Failed to refresh diagnostics. Diagnostics may be stale."
+fn freshness_message(refreshed: DiagnosticsRefresh) -> &'static str {
+    match refreshed {
+        DiagnosticsRefresh::Refreshed => "Diagnostics successfully refreshed.",
+        DiagnosticsRefresh::Failed => "Failed to refresh diagnostics. Diagnostics may be stale.",
+        DiagnosticsRefresh::TimedOut => {
+            "Diagnostics refresh timed out after 5 seconds. Diagnostics may be stale."
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticsRefresh {
+    Refreshed,
+    Failed,
+    TimedOut,
+}
+
+async fn pull_diagnostics_with_timeout(
+    project: &Entity<Project>,
+    action_log: &Entity<ActionLog>,
+    path: Option<&Path>,
+    event_stream: &ToolCallEventStream,
+    cx: &mut AsyncApp,
+) -> Result<DiagnosticsRefresh> {
+    let timeout = cx.background_executor().timer(Duration::from_secs(5));
+    let pull = pull_diagnostics(project, action_log, path, event_stream, cx);
+    futures::select! {
+        result = pull.fuse() => result,
+        _ = timeout.fuse() => {
+            if let Some(path) = path {
+                log::warn!("Timed out refreshing diagnostics for {}", path.display());
+            } else {
+                log::warn!("Timed out refreshing workspace diagnostics");
+            }
+            Ok(DiagnosticsRefresh::TimedOut)
+        },
+        _ = event_stream.cancelled_by_user().fuse() => {
+            Err("Diagnostics cancelled by user".to_string())
+        }
     }
 }
 
@@ -100,7 +134,7 @@ async fn pull_diagnostics(
     path: Option<&Path>,
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
-) -> Result<bool, String> {
+) -> Result<DiagnosticsRefresh, String> {
     match path {
         Some(path) => {
             let open_buffer_task = project.update(cx, |project, cx| {
@@ -113,29 +147,36 @@ async fn pull_diagnostics(
             let buffer = with_cancellation(open_buffer_task, event_stream)
                 .await?
                 .map_err(|e| e.to_string())?;
-            let _diagnostic_lease =
-                action_log.update(cx, |log, cx| log.acquire_diagnostic_lsp_lease(&buffer, cx));
+            let lease_task = action_log.update(cx, |log, cx| {
+                log.acquire_diagnostic_lsp_lease(buffer.clone(), cx)
+            });
+            let lease_result = lease_task.await;
+            let _diagnostic_lease = lease_result.map_err(|error| error.to_string())?;
 
             let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
             let pull_task = lsp_store.update(cx, |lsp_store, cx| {
                 lsp_store.pull_diagnostics_for_buffer(buffer, cx)
             });
-            let pull_result = with_cancellation(pull_task, event_stream).await?;
-            if let Err(error) = &pull_result {
+            let pull_result = pull_task.await;
+            if let Err(error) = pull_result {
                 log::warn!("Failed to pull diagnostics, using cached: {error:#}");
+                Ok(DiagnosticsRefresh::Failed)
+            } else {
+                Ok(DiagnosticsRefresh::Refreshed)
             }
-            Ok(pull_result.is_ok())
         }
         None => {
             let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
             let pull_task = lsp_store.update(cx, |lsp_store, cx| {
                 lsp_store.pull_workspace_diagnostics_once(cx)
             });
-            let succeeded = with_cancellation(pull_task, event_stream).await?;
+            let succeeded = pull_task.await;
             if !succeeded {
                 log::warn!("Failed to pull workspace diagnostics, using cached");
+                Ok(DiagnosticsRefresh::Failed)
+            } else {
+                Ok(DiagnosticsRefresh::Refreshed)
             }
-            Ok(succeeded)
         }
     }
 }
@@ -178,7 +219,7 @@ impl AgentTool for DiagnosticsTool {
 
             match input.path {
                 Some(ref path) if !path.is_empty() => {
-                    let refreshed = pull_diagnostics(
+                    let refreshed = pull_diagnostics_with_timeout(
                         &project,
                         &action_log,
                         Some(Path::new(path)),
@@ -230,8 +271,14 @@ impl AgentTool for DiagnosticsTool {
                     }
                 }
                 _ => {
-                    let refreshed =
-                        pull_diagnostics(&project, &action_log, None, &event_stream, cx).await?;
+                    let refreshed = pull_diagnostics_with_timeout(
+                        &project,
+                        &action_log,
+                        None,
+                        &event_stream,
+                        cx,
+                    )
+                    .await?;
 
                     let (output, has_diagnostics) = project.read_with(cx, |project, cx| {
                         let mut output = String::new();

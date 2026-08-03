@@ -4,22 +4,25 @@ use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use clock;
 use collections::{BTreeMap, HashMap};
 use fs::MTime;
-use futures::FutureExt;
+use futures::{FutureExt, channel::oneshot};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity,
+    App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
+    WeakEntity,
 };
 use language::{Anchor, Buffer, BufferEvent, Point, ToOffset, ToPoint};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
-use settings::Settings as _;
+use settings::{Settings as _, SettingsStore};
 use std::{
     cell::Cell,
     cmp,
+    collections::VecDeque,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock, Weak as SyncWeak,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 use text::{Edit, Patch, Rope};
 use util::{RangeExt, ResultExt as _};
@@ -70,11 +73,14 @@ pub struct ActionLog {
     file_read_times: HashMap<PathBuf, MTime>,
     last_reported_large_diff_state: Cell<Option<bool>>,
     lsp_lease_counters: Arc<AgentLspLeaseCounters>,
+    lsp_lease_limiter: Arc<AgentLspLeaseLimiter>,
+    settings_subscription: Option<Subscription>,
 }
 
 impl ActionLog {
     /// Creates a new, empty action log associated with the given project.
     pub fn new(project: Entity<Project>) -> Self {
+        let lsp_lease_limiter = project_lsp_lease_limiter(project.entity_id());
         Self {
             tracked_buffers: BTreeMap::default(),
             project,
@@ -83,6 +89,8 @@ impl ActionLog {
             file_read_times: HashMap::default(),
             last_reported_large_diff_state: Cell::new(None),
             lsp_lease_counters: Arc::default(),
+            lsp_lease_limiter,
+            settings_subscription: None,
         }
     }
 
@@ -127,6 +135,10 @@ impl ActionLog {
         is_created: bool,
         cx: &mut Context<Self>,
     ) -> &mut TrackedBuffer {
+        if self.settings_subscription.is_none() {
+            self.settings_subscription =
+                Some(cx.observe_global::<SettingsStore>(|this, cx| this.sync_lsp_lease_mode(cx)));
+        }
         let status = if is_created {
             if let Some(tracked) = self.tracked_buffers.remove(&buffer) {
                 match tracked.status {
@@ -173,8 +185,18 @@ impl ActionLog {
                     handle,
                     AgentLspLeaseOwnership::Legacy,
                     self.lsp_lease_counters.clone(),
+                    None,
                 ));
             }
+        } else if experimental_lsp_leases
+            && let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer)
+            && tracked_buffer.active_edit_sessions == 0
+            && tracked_buffer
+                .lsp_lease
+                .as_ref()
+                .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Legacy)
+        {
+            tracked_buffer.lsp_lease.take();
         }
 
         let tracked_buffer = self
@@ -191,6 +213,7 @@ impl ActionLog {
                         open_lsp_handle,
                         AgentLspLeaseOwnership::Legacy,
                         self.lsp_lease_counters.clone(),
+                        None,
                     ))
                 };
 
@@ -227,6 +250,9 @@ impl ActionLog {
                     review_state_changed_before_recompute: false,
                     diff_complexity: DiffComplexity::default(),
                     lsp_lease,
+                    lsp_lease_generation: 0,
+                    active_edit_sessions: 0,
+                    lsp_release_task: None,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
                         async move |this, cx| {
@@ -240,6 +266,36 @@ impl ActionLog {
             });
         tracked_buffer.version = buffer.read(cx).version();
         tracked_buffer
+    }
+
+    fn sync_lsp_lease_mode(&mut self, cx: &mut Context<Self>) {
+        if AgentSettings::get_global(cx).experimental_lsp_leases {
+            for tracked in self.tracked_buffers.values_mut() {
+                if tracked.active_edit_sessions == 0
+                    && tracked
+                        .lsp_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Legacy)
+                {
+                    tracked.lsp_lease.take();
+                }
+            }
+        } else {
+            let buffers = self
+                .tracked_buffers
+                .iter()
+                .filter_map(|(buffer, tracked)| {
+                    (!tracked
+                        .lsp_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Legacy))
+                    .then(|| buffer.clone())
+                })
+                .collect::<Vec<_>>();
+            for buffer in buffers {
+                self.ensure_legacy_lsp_lease(&buffer, cx);
+            }
+        }
     }
 
     fn handle_buffer_event(
@@ -698,61 +754,150 @@ impl ActionLog {
         self.buffer_edited_impl(buffer, true, cx);
     }
 
-    pub fn acquire_edit_lsp_lease(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+    pub fn acquire_edit_lsp_lease(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         if let Some(linked_action_log) = &self.linked_action_log {
-            linked_action_log.update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
-            return;
+            return linked_action_log
+                .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
         }
 
         let experimental = AgentSettings::get_global(cx).experimental_lsp_leases;
         self.track_buffer_internal(buffer.clone(), false, cx);
+        if !experimental {
+            self.ensure_legacy_lsp_lease(&buffer, cx);
+            if let Some(tracked) = self.tracked_buffers.get_mut(&buffer) {
+                tracked.active_edit_sessions = tracked.active_edit_sessions.saturating_add(1);
+            }
+            return Task::ready(Ok(()));
+        }
+
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
-            return;
+            return Task::ready(Ok(()));
         };
-        let desired_ownership = if experimental {
-            AgentLspLeaseOwnership::Edit
-        } else {
-            AgentLspLeaseOwnership::Legacy
-        };
+        tracked_buffer.lsp_release_task.take();
+        tracked_buffer.lsp_lease_generation = tracked_buffer.lsp_lease_generation.saturating_add(1);
         if tracked_buffer
             .lsp_lease
             .as_ref()
-            .is_some_and(|lease| lease.ownership == desired_ownership)
+            .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Edit)
         {
-            return;
+            tracked_buffer.active_edit_sessions =
+                tracked_buffer.active_edit_sessions.saturating_add(1);
+            return Task::ready(Ok(()));
         }
 
-        let handle = self.project.update(cx, |project, cx| {
-            project.register_buffer_with_language_servers(&buffer, cx)
-        });
-        tracked_buffer.lsp_lease = Some(AgentLspLease::new(
-            handle,
-            desired_ownership,
-            self.lsp_lease_counters.clone(),
-        ));
+        let limiter = self.lsp_lease_limiter.clone();
+        let counters = self.lsp_lease_counters.clone();
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            let permit = limiter
+                .acquire(AgentLspLeaseOwnership::Edit, &counters)
+                .await;
+            let should_register = this.update(cx, |_this, cx| {
+                AgentSettings::get_global(cx).experimental_lsp_leases
+            })?;
+            if !should_register {
+                this.update(cx, |this, cx| {
+                    if !AgentSettings::get_global(cx).experimental_lsp_leases {
+                        this.ensure_legacy_lsp_lease(&buffer, cx);
+                    }
+                })?;
+                return Ok(());
+            }
+
+            let handle = project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&buffer, cx)
+            });
+            let mut lease = Some(AgentLspLease::new(
+                handle,
+                AgentLspLeaseOwnership::Edit,
+                counters,
+                Some(permit),
+            ));
+            this.update(cx, |this, cx| {
+                let experimental = AgentSettings::get_global(cx).experimental_lsp_leases;
+                let Some(tracked) = this.tracked_buffers.get_mut(&buffer) else {
+                    return;
+                };
+                if experimental {
+                    tracked.active_edit_sessions = tracked.active_edit_sessions.saturating_add(1);
+                    if !tracked
+                        .lsp_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Edit)
+                    {
+                        tracked.lsp_lease = lease.take();
+                    }
+                    return;
+                }
+                if !experimental {
+                    this.ensure_legacy_lsp_lease(&buffer, cx);
+                }
+            })?;
+            Ok(())
+        })
     }
 
     pub fn acquire_diagnostic_lsp_lease(
         &mut self,
-        buffer: &Entity<Buffer>,
+        buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
-    ) -> Option<AgentLspLease> {
+    ) -> Task<Result<Option<AgentLspLease>>> {
         if let Some(linked_action_log) = &self.linked_action_log {
             return linked_action_log
                 .update(cx, |log, cx| log.acquire_diagnostic_lsp_lease(buffer, cx));
         }
         if !AgentSettings::get_global(cx).experimental_lsp_leases {
-            return None;
+            return Task::ready(Ok(None));
         }
 
+        let limiter = self.lsp_lease_limiter.clone();
+        let counters = self.lsp_lease_counters.clone();
+        let project = self.project.clone();
+        cx.spawn(async move |_this, cx| {
+            let permit = limiter
+                .acquire(AgentLspLeaseOwnership::Diagnostic, &counters)
+                .await;
+            if !cx.update(|cx| AgentSettings::get_global(cx).experimental_lsp_leases) {
+                return Ok(None);
+            }
+            let handle = project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&buffer, cx)
+            });
+            Ok(Some(AgentLspLease::new(
+                handle,
+                AgentLspLeaseOwnership::Diagnostic,
+                counters,
+                Some(permit),
+            )))
+        })
+    }
+
+    fn ensure_legacy_lsp_lease(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let needs_legacy = self.tracked_buffers.get_mut(buffer).is_some_and(|tracked| {
+            tracked.lsp_release_task.take();
+            !tracked
+                .lsp_lease
+                .as_ref()
+                .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Legacy)
+        });
+        if !needs_legacy {
+            return;
+        }
         let handle = self.project.update(cx, |project, cx| {
             project.register_buffer_with_language_servers(buffer, cx)
         });
-        Some(AgentLspLease::new(
-            handle,
-            AgentLspLeaseOwnership::Diagnostic,
-            self.lsp_lease_counters.clone(),
-        ))
+        if let Some(tracked) = self.tracked_buffers.get_mut(buffer) {
+            tracked.lsp_lease = Some(AgentLspLease::new(
+                handle,
+                AgentLspLeaseOwnership::Legacy,
+                self.lsp_lease_counters.clone(),
+                None,
+            ));
+        }
     }
 
     fn buffer_edited_impl(
@@ -771,13 +916,78 @@ impl ActionLog {
             self.update_file_read_time(&buffer, cx);
         }
         let new_version = buffer.read(cx).version();
-        let tracked_buffer = self.track_buffer_internal(buffer, false, cx);
+        let tracked_buffer = self.track_buffer_internal(buffer.clone(), false, cx);
         if let TrackedBufferStatus::Deleted = tracked_buffer.status {
             tracked_buffer.status = TrackedBufferStatus::Modified;
         }
 
         tracked_buffer.version = new_version;
         tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+    }
+
+    pub fn finish_edit_lsp_lease(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(buffer, cx));
+            return;
+        }
+        let experimental = AgentSettings::get_global(cx).experimental_lsp_leases;
+        let Some(tracked) = self.tracked_buffers.get_mut(buffer) else {
+            return;
+        };
+        if tracked.active_edit_sessions > 0 {
+            tracked.active_edit_sessions -= 1;
+        }
+        if tracked.active_edit_sessions > 0 {
+            return;
+        }
+        if !experimental {
+            self.ensure_legacy_lsp_lease(buffer, cx);
+            return;
+        }
+        if tracked
+            .lsp_lease
+            .as_ref()
+            .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Legacy)
+        {
+            tracked.lsp_lease.take();
+            return;
+        }
+        if !tracked
+            .lsp_lease
+            .as_ref()
+            .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Edit)
+        {
+            return;
+        }
+
+        tracked.lsp_lease_generation = tracked.lsp_lease_generation.saturating_add(1);
+        let generation = tracked.lsp_lease_generation;
+        let buffer = buffer.clone();
+        let timer = cx
+            .background_executor()
+            .timer(AGENT_EDIT_LSP_LEASE_IDLE_TTL);
+        tracked.lsp_release_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if !AgentSettings::get_global(cx).experimental_lsp_leases {
+                    this.ensure_legacy_lsp_lease(&buffer, cx);
+                    return;
+                }
+                let Some(tracked) = this.tracked_buffers.get_mut(&buffer) else {
+                    return;
+                };
+                if tracked.lsp_lease_generation == generation
+                    && tracked
+                        .lsp_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.ownership == AgentLspLeaseOwnership::Edit)
+                {
+                    tracked.lsp_lease.take();
+                    tracked.lsp_release_task.take();
+                }
+            })
+            .ok();
+        }));
     }
 
     pub fn will_delete_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -1655,6 +1865,122 @@ struct AgentLspLeaseCounters {
     queued_acquisitions: AtomicUsize,
 }
 
+const MAX_AGENT_LSP_LEASES_PER_PROJECT: usize = 4;
+const AGENT_EDIT_LSP_LEASE_IDLE_TTL: Duration = Duration::from_secs(20);
+
+#[derive(Default)]
+struct AgentLspLeaseLimiter {
+    state: Mutex<AgentLspLeaseLimiterState>,
+}
+
+#[derive(Default)]
+struct AgentLspLeaseLimiterState {
+    active: usize,
+    diagnostic_queue: VecDeque<oneshot::Sender<()>>,
+    edit_queue: VecDeque<oneshot::Sender<()>>,
+}
+
+struct AgentLspPermit {
+    limiter: Arc<AgentLspLeaseLimiter>,
+}
+
+impl AgentLspLeaseLimiter {
+    async fn acquire(
+        self: &Arc<Self>,
+        ownership: AgentLspLeaseOwnership,
+        counters: &Arc<AgentLspLeaseCounters>,
+    ) -> AgentLspPermit {
+        let receiver = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.active < MAX_AGENT_LSP_LEASES_PER_PROJECT {
+                state.active += 1;
+                None
+            } else {
+                let (sender, receiver) = oneshot::channel();
+                match ownership {
+                    AgentLspLeaseOwnership::Diagnostic => state.diagnostic_queue.push_back(sender),
+                    AgentLspLeaseOwnership::Edit | AgentLspLeaseOwnership::Legacy => {
+                        state.edit_queue.push_back(sender)
+                    }
+                }
+                counters.queued_acquisitions.fetch_add(1, Ordering::Relaxed);
+                Some(receiver)
+            }
+        };
+
+        if let Some(receiver) = receiver {
+            let _queued = QueuedAgentLspAcquisition {
+                counters: counters.clone(),
+            };
+            // The limiter owns the corresponding sender until this request is
+            // granted. If the future is cancelled, release() skips the closed
+            // sender and transfers the permit to the next waiter.
+            receiver.await.ok();
+        }
+
+        AgentLspPermit {
+            limiter: self.clone(),
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            let next = state
+                .diagnostic_queue
+                .pop_front()
+                .or_else(|| state.edit_queue.pop_front());
+            let Some(next) = next else {
+                state.active = state.active.saturating_sub(1);
+                return;
+            };
+            if next.send(()).is_ok() {
+                // The active slot transfers directly to the awakened waiter.
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for AgentLspPermit {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+struct QueuedAgentLspAcquisition {
+    counters: Arc<AgentLspLeaseCounters>,
+}
+
+impl Drop for QueuedAgentLspAcquisition {
+    fn drop(&mut self) {
+        let previous = self
+            .counters
+            .queued_acquisitions
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(
+            previous > 0,
+            "Agent LSP acquisition queue counter underflow"
+        );
+    }
+}
+
+fn project_lsp_lease_limiter(project_id: EntityId) -> Arc<AgentLspLeaseLimiter> {
+    static LIMITERS: OnceLock<Mutex<HashMap<EntityId, SyncWeak<AgentLspLeaseLimiter>>>> =
+        OnceLock::new();
+    let mut limiters = LIMITERS
+        .get_or_init(|| Mutex::new(HashMap::default()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(limiter) = limiters.get(&project_id).and_then(SyncWeak::upgrade) {
+        return limiter;
+    }
+
+    let limiter = Arc::new(AgentLspLeaseLimiter::default());
+    limiters.insert(project_id, Arc::downgrade(&limiter));
+    limiter
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AgentLspLeaseDebugCounters {
     pub tracked_buffers: usize,
@@ -1666,6 +1992,7 @@ pub struct AgentLspLeaseDebugCounters {
 
 pub struct AgentLspLease {
     _handle: OpenLspBufferHandle,
+    _permit: Option<AgentLspPermit>,
     ownership: AgentLspLeaseOwnership,
     counters: Arc<AgentLspLeaseCounters>,
 }
@@ -1675,10 +2002,12 @@ impl AgentLspLease {
         handle: OpenLspBufferHandle,
         ownership: AgentLspLeaseOwnership,
         counters: Arc<AgentLspLeaseCounters>,
+        permit: Option<AgentLspPermit>,
     ) -> Self {
         counters.increment(ownership);
         Self {
             _handle: handle,
+            _permit: permit,
             ownership,
             counters,
         }
@@ -1732,6 +2061,9 @@ pub struct TrackedBuffer {
     review_state_changed_before_recompute: bool,
     diff_complexity: DiffComplexity,
     lsp_lease: Option<AgentLspLease>,
+    lsp_lease_generation: u64,
+    active_edit_sessions: usize,
+    lsp_release_task: Option<Task<()>>,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
 }
@@ -1790,7 +2122,7 @@ pub struct ChangedBuffer {
 mod tests {
     use super::*;
     use buffer_diff::DiffHunkStatusKind;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal};
     use indoc::indoc;
     use language::Point;
     use project::{FakeFs, Fs, Project, RemoveOptions};
@@ -1825,6 +2157,282 @@ mod tests {
                 diagnostic_leases: 0,
                 queued_acquisitions: 0,
             }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_experimental_lsp_lease_skips_reads_and_acquires_for_edits(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .experimental_lsp_leases = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| log.lsp_lease_debug_counters()),
+            AgentLspLeaseDebugCounters {
+                tracked_buffers: 1,
+                ..Default::default()
+            }
+        );
+
+        action_log
+            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx))
+            .await
+            .unwrap();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| log.lsp_lease_debug_counters()),
+            AgentLspLeaseDebugCounters {
+                tracked_buffers: 1,
+                edit_leases: 1,
+                ..Default::default()
+            }
+        );
+
+        action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx));
+        cx.executor().advance_clock(Duration::from_secs(19));
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            1
+        );
+
+        action_log
+            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx))
+            .await
+            .unwrap();
+        action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            1,
+            "the superseded release timer must not drop a reacquired lease"
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(19));
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            0
+        );
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .experimental_lsp_leases = Some(false);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| log.lsp_lease_debug_counters()),
+            AgentLspLeaseDebugCounters {
+                tracked_buffers: 1,
+                read_leases: 1,
+                ..Default::default()
+            },
+            "disabling the experiment must restore the legacy lease immediately"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_lsp_lease_limiter_prioritizes_diagnostics(cx: &mut TestAppContext) {
+        let limiter = Arc::new(AgentLspLeaseLimiter::default());
+        let counters = Arc::new(AgentLspLeaseCounters::default());
+        let mut active = Vec::new();
+        for _ in 0..MAX_AGENT_LSP_LEASES_PER_PROJECT {
+            active.push(
+                limiter
+                    .acquire(AgentLspLeaseOwnership::Edit, &counters)
+                    .await,
+            );
+        }
+
+        let edit_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let edit_task = cx.executor().spawn({
+            let limiter = limiter.clone();
+            let counters = counters.clone();
+            let edit_acquired = edit_acquired.clone();
+            async move {
+                let permit = limiter
+                    .acquire(AgentLspLeaseOwnership::Edit, &counters)
+                    .await;
+                edit_acquired.store(true, Ordering::Relaxed);
+                permit
+            }
+        });
+        cx.run_until_parked();
+
+        let diagnostic_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let diagnostic_task = cx.executor().spawn({
+            let limiter = limiter.clone();
+            let counters = counters.clone();
+            let diagnostic_acquired = diagnostic_acquired.clone();
+            async move {
+                let permit = limiter
+                    .acquire(AgentLspLeaseOwnership::Diagnostic, &counters)
+                    .await;
+                diagnostic_acquired.store(true, Ordering::Relaxed);
+                permit
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(counters.queued_acquisitions.load(Ordering::Relaxed), 2);
+
+        active.pop();
+        cx.run_until_parked();
+        assert!(diagnostic_acquired.load(Ordering::Relaxed));
+        assert!(!edit_acquired.load(Ordering::Relaxed));
+
+        let diagnostic_permit = diagnostic_task.await;
+        drop(diagnostic_permit);
+        cx.run_until_parked();
+        assert!(edit_acquired.load(Ordering::Relaxed));
+        drop(edit_task.await);
+        assert_eq!(counters.queued_acquisitions.load(Ordering::Relaxed), 0);
+    }
+
+    #[gpui::test]
+    async fn test_concurrent_edit_sessions_share_buffer_lease(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .experimental_lsp_leases = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        let first = action_log.update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
+        let second =
+            action_log.update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
+        futures::future::try_join(first, second).await.unwrap();
+
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            1,
+            "concurrent sessions for one buffer must share one registration"
+        );
+        action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx));
+        cx.executor().advance_clock(AGENT_EDIT_LSP_LEASE_IDLE_TTL);
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            1,
+            "the first session must not release the shared lease"
+        );
+
+        action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx));
+        cx.executor().advance_clock(AGENT_EDIT_LSP_LEASE_IDLE_TTL);
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().edit_leases
+            }),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn test_enabling_experimental_leases_does_not_interrupt_active_legacy_edit(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        action_log
+            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx))
+            .await
+            .unwrap();
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .agent
+                        .get_or_insert_default()
+                        .experimental_lsp_leases = Some(true);
+                });
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().read_leases
+            }),
+            1,
+            "enabling the experiment must not close LSP during an active legacy edit"
+        );
+
+        action_log.update(cx, |log, cx| log.finish_edit_lsp_lease(&buffer, cx));
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| {
+                log.lsp_lease_debug_counters().read_leases
+            }),
+            0,
+            "the retained legacy lease should be released when that edit finishes"
         );
     }
     use serde_json::json;
