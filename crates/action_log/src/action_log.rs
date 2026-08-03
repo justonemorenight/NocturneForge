@@ -187,6 +187,9 @@ impl ActionLog {
                     diff,
                     diff_update: diff_update_tx,
                     pending_diff_update: None,
+                    in_flight_diff_update: None,
+                    diff_generation: 0,
+                    review_state_changed_before_recompute: false,
                     diff_complexity: DiffComplexity::default(),
                     _open_lsp_handle: open_lsp_handle,
                     _maintain_diff: cx.spawn({
@@ -297,24 +300,65 @@ impl ActionLog {
             None
         };
 
+        let mut retry_git_diff = false;
         loop {
+            if retry_git_diff {
+                let has_pending_buffer_update = this.read_with(cx, |this, _cx| {
+                    this.tracked_buffers
+                        .get(&buffer)
+                        .is_some_and(|tracked_buffer| tracked_buffer.pending_diff_update.is_some())
+                })?;
+                if !has_pending_buffer_update {
+                    if let Some(git_diff) = git_diff.as_ref() {
+                        retry_git_diff =
+                            !Self::keep_committed_edits(&this, &buffer, git_diff, cx).await?;
+                    } else {
+                        retry_git_diff = false;
+                    }
+                    continue;
+                }
+            }
+
             futures::select_biased! {
                 buffer_update = buffer_updates.changed().fuse() => {
                     if buffer_update.is_err() {
                         break;
                     }
                     let buffer_update = this.update(cx, |this, _cx| {
-                        this.tracked_buffers
-                            .get_mut(&buffer)
-                            .and_then(|tracked_buffer| tracked_buffer.pending_diff_update.take())
+                        let tracked_buffer = this.tracked_buffers.get_mut(&buffer)?;
+                        let pending = tracked_buffer.pending_diff_update.take()?;
+                        tracked_buffer.in_flight_diff_update = Some((pending.generation, pending.author));
+                        Some(pending)
                     })?;
-                    if let Some((author, buffer_snapshot)) = buffer_update {
-                        Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
+                    if let Some(pending) = buffer_update {
+                        let result = Self::track_edits(
+                            &this,
+                            &buffer,
+                            pending.generation,
+                            pending.author,
+                            pending.snapshot,
+                            cx,
+                        )
+                        .await;
+                        this.update(cx, |this, _cx| {
+                            if let Some(tracked_buffer) = this.tracked_buffers.get_mut(&buffer)
+                                && tracked_buffer
+                                    .in_flight_diff_update
+                                    .is_some_and(|(generation, _)| generation == pending.generation)
+                            {
+                                tracked_buffer.in_flight_diff_update = None;
+                            }
+                        })?;
+                        result?;
                     }
                 }
                 _ = git_diff_updates_rx.changed().fuse() => {
                     if let Some(git_diff) = git_diff.as_ref() {
-                        Self::keep_committed_edits(&this, &buffer, git_diff, cx).await?;
+                        if !Self::keep_committed_edits(&this, &buffer, git_diff, cx).await? {
+                            // A buffer update superseded this reconciliation while it was
+                            // running. Retry it after that buffer snapshot is canonical.
+                            retry_git_diff = true;
+                        }
                     }
                 }
             }
@@ -326,6 +370,7 @@ impl ActionLog {
     async fn track_edits(
         this: &WeakEntity<ActionLog>,
         buffer: &Entity<Buffer>,
+        generation: u64,
         author: ChangeAuthor,
         buffer_snapshot: text::BufferSnapshot,
         cx: &mut AsyncApp,
@@ -360,15 +405,21 @@ impl ActionLog {
         })??;
         let (new_base_text, new_diff_base) = rebase.await;
 
+        if !Self::is_diff_generation_current(this, buffer, generation, cx)? {
+            return Ok(());
+        }
+
         Self::update_diff(
             this,
             buffer,
+            generation,
             buffer_snapshot,
             new_base_text,
             new_diff_base,
             cx,
         )
         .await
+        .map(|_| ())
     }
 
     async fn keep_committed_edits(
@@ -376,13 +427,16 @@ impl ActionLog {
         buffer: &Entity<Buffer>,
         git_diff: &Entity<BufferDiff>,
         cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let buffer_snapshot = this.read_with(cx, |this, _cx| {
+    ) -> Result<bool> {
+        let (generation, buffer_snapshot) = this.read_with(cx, |this, _cx| {
             let tracked_buffer = this
                 .tracked_buffers
                 .get(buffer)
                 .context("buffer not tracked")?;
-            anyhow::Ok(tracked_buffer.snapshot.clone())
+            anyhow::Ok((
+                tracked_buffer.diff_generation,
+                tracked_buffer.snapshot.clone(),
+            ))
         })??;
         let (new_base_text, new_diff_base) = this
             .read_with(cx, |this, cx| {
@@ -457,6 +511,7 @@ impl ActionLog {
         Self::update_diff(
             this,
             buffer,
+            generation,
             buffer_snapshot,
             new_base_text,
             new_diff_base,
@@ -468,11 +523,15 @@ impl ActionLog {
     async fn update_diff(
         this: &WeakEntity<ActionLog>,
         buffer: &Entity<Buffer>,
+        generation: u64,
         buffer_snapshot: text::BufferSnapshot,
         new_base_text: Arc<str>,
         new_diff_base: Rope,
         cx: &mut AsyncApp,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if !Self::is_diff_generation_current(this, buffer, generation, cx)? {
+            return Ok(false);
+        }
         let diff = this.read_with(cx, |this, _cx| {
             let tracked_buffer = this
                 .tracked_buffers
@@ -521,12 +580,35 @@ impl ActionLog {
                 .tracked_buffers
                 .get_mut(buffer)
                 .context("buffer not tracked")?;
+            if tracked_buffer.diff_generation != generation {
+                return Ok(false);
+            }
+            let should_notify = tracked_buffer.review_state_changed_before_recompute
+                || tracked_buffer.unreviewed_edits != unreviewed_edits
+                || tracked_buffer.diff_complexity != diff_complexity;
             tracked_buffer.diff_base = new_diff_base;
             tracked_buffer.snapshot = buffer_snapshot;
             tracked_buffer.unreviewed_edits = unreviewed_edits;
             tracked_buffer.diff_complexity = diff_complexity;
-            cx.notify();
-            anyhow::Ok(())
+            tracked_buffer.review_state_changed_before_recompute = false;
+            if should_notify {
+                cx.notify();
+            }
+            anyhow::Ok(true)
+        })?
+    }
+
+    fn is_diff_generation_current(
+        this: &WeakEntity<ActionLog>,
+        buffer: &Entity<Buffer>,
+        generation: u64,
+        cx: &AsyncApp,
+    ) -> Result<bool> {
+        this.read_with(cx, |this, _cx| {
+            this.tracked_buffers
+                .get(buffer)
+                .map(|tracked_buffer| tracked_buffer.diff_generation == generation)
+                .context("buffer not tracked")
         })?
     }
 
@@ -662,6 +744,7 @@ impl ActionLog {
                 let buffer_range =
                     buffer_range.start.to_point(buffer)..buffer_range.end.to_point(buffer);
                 let mut delta = 0i32;
+                let previous_unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
                 tracked_buffer.unreviewed_edits.retain_mut(|edit| {
                     edit.old.start = (edit.old.start as i32 + delta) as u32;
                     edit.old.end = (edit.old.end as i32 + delta) as u32;
@@ -702,6 +785,8 @@ impl ActionLog {
                 {
                     tracked_buffer.status = TrackedBufferStatus::Modified;
                 }
+                tracked_buffer.review_state_changed_before_recompute |=
+                    tracked_buffer.unreviewed_edits != previous_unreviewed_edits;
                 tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
             }
         }
@@ -911,6 +996,8 @@ impl ActionLog {
                     if let TrackedBufferStatus::Created { .. } = &mut tracked_buffer.status {
                         tracked_buffer.status = TrackedBufferStatus::Modified;
                     }
+                    tracked_buffer.review_state_changed_before_recompute |=
+                        !tracked_buffer.unreviewed_edits.is_empty();
                     tracked_buffer.unreviewed_edits.clear();
                     tracked_buffer.diff_base = tracked_buffer.snapshot.as_rope().clone();
                     tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
@@ -1423,10 +1510,26 @@ fn point_to_row_edit(edit: Edit<Point>, old_text: &Rope, new_text: &Rope) -> Edi
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ChangeAuthor {
     User,
     Agent,
+}
+
+impl ChangeAuthor {
+    fn coalesce(self, other: Self) -> Self {
+        if matches!(self, Self::Agent) || matches!(other, Self::Agent) {
+            Self::Agent
+        } else {
+            Self::User
+        }
+    }
+}
+
+struct PendingDiffUpdate {
+    generation: u64,
+    author: ChangeAuthor,
+    snapshot: text::BufferSnapshot,
 }
 
 #[derive(Debug)]
@@ -1445,7 +1548,10 @@ pub struct TrackedBuffer {
     diff: Entity<BufferDiff>,
     snapshot: text::BufferSnapshot,
     diff_update: watch::Sender<()>,
-    pending_diff_update: Option<(ChangeAuthor, text::BufferSnapshot)>,
+    pending_diff_update: Option<PendingDiffUpdate>,
+    in_flight_diff_update: Option<(u64, ChangeAuthor)>,
+    diff_generation: u64,
+    review_state_changed_before_recompute: bool,
     diff_complexity: DiffComplexity,
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
@@ -1474,17 +1580,25 @@ impl TrackedBuffer {
 
     fn schedule_diff_update(&mut self, author: ChangeAuthor, cx: &App) {
         let snapshot = self.buffer.read(cx).text_snapshot();
-        if let Some((pending_author, pending_snapshot)) = &mut self.pending_diff_update {
-            // If agent and user changes arrive while a prior diff is still being
-            // computed, treating the combined delta as agent-authored is the safe
-            // fallback: it may show a user change for review, but it can never
-            // silently accept an agent edit into the diff base.
-            if matches!(author, ChangeAuthor::Agent) {
-                *pending_author = ChangeAuthor::Agent;
-            }
-            *pending_snapshot = snapshot;
+        self.diff_generation = self.diff_generation.saturating_add(1);
+        let author = self
+            .in_flight_diff_update
+            .map(|(_, in_flight_author)| author.coalesce(in_flight_author))
+            .unwrap_or(author);
+
+        if let Some(pending) = &mut self.pending_diff_update {
+            // Treat a coalesced Agent + User delta as Agent-authored. This may
+            // conservatively show a user edit for review, but cannot silently
+            // accept an Agent edit into the diff base.
+            pending.generation = self.diff_generation;
+            pending.author = pending.author.coalesce(author);
+            pending.snapshot = snapshot;
         } else {
-            self.pending_diff_update = Some((author, snapshot));
+            self.pending_diff_update = Some(PendingDiffUpdate {
+                generation: self.diff_generation,
+                author,
+                snapshot,
+            });
         }
         self.diff_update.send(()).ok();
     }
