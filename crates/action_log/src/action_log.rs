@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
+use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use clock;
 use collections::{BTreeMap, HashMap};
 use fs::MTime;
@@ -10,6 +10,7 @@ use gpui::{
 use language::{Anchor, Buffer, BufferEvent, Point, ToOffset, ToPoint};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
 use std::{
+    cell::Cell,
     cmp,
     ops::Range,
     path::{Path, PathBuf},
@@ -62,6 +63,7 @@ pub struct ActionLog {
     last_reject_undo: Option<LastRejectUndo>,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
+    last_reported_large_diff_state: Cell<Option<bool>>,
 }
 
 impl ActionLog {
@@ -73,6 +75,7 @@ impl ActionLog {
             linked_action_log: None,
             last_reject_undo: None,
             file_read_times: HashMap::default(),
+            last_reported_large_diff_state: Cell::new(None),
         }
     }
 
@@ -184,6 +187,7 @@ impl ActionLog {
                     diff,
                     diff_update: diff_update_tx,
                     pending_diff_update: None,
+                    diff_complexity: DiffComplexity::default(),
                     _open_lsp_handle: open_lsp_handle,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
@@ -482,7 +486,7 @@ impl ActionLog {
         .await;
         let diff_snapshot = diff.update(cx, |diff, cx| diff.snapshot(cx));
 
-        let unreviewed_edits = cx
+        let (unreviewed_edits, diff_complexity) = cx
             .background_spawn({
                 let buffer_snapshot = buffer_snapshot.clone();
                 let new_diff_base = new_diff_base.clone();
@@ -506,7 +510,9 @@ impl ActionLog {
                             buffer_snapshot.as_rope(),
                         ));
                     }
-                    unreviewed_edits
+                    let diff_complexity =
+                        DiffComplexity::from_diff(&diff_snapshot, &buffer_snapshot, &new_diff_base);
+                    (unreviewed_edits, diff_complexity)
                 }
             })
             .await;
@@ -518,6 +524,7 @@ impl ActionLog {
             tracked_buffer.diff_base = new_diff_base;
             tracked_buffer.snapshot = buffer_snapshot;
             tracked_buffer.unreviewed_edits = unreviewed_edits;
+            tracked_buffer.diff_complexity = diff_complexity;
             cx.notify();
             anyhow::Ok(())
         })?
@@ -1032,6 +1039,27 @@ impl ActionLog {
         DiffStats::all_files(self.changed_buffers(cx), cx)
     }
 
+    pub fn diff_load(&self, cx: &App) -> AgentDiffLoad {
+        let mut file_count = 0usize;
+        let mut complexity = DiffComplexity::default();
+        for tracked_buffer in self.tracked_buffers.values() {
+            if tracked_buffer.has_edits(cx) {
+                file_count += 1;
+                complexity += tracked_buffer.diff_complexity;
+            }
+        }
+
+        let load = AgentDiffLoad::new(file_count, complexity);
+        let is_large = load.is_large();
+        if self.last_reported_large_diff_state.get() != Some(is_large) {
+            self.last_reported_large_diff_state.set(Some(is_large));
+            log::debug!(
+                "agent diff load changed: large={is_large}, files={file_count}, complexity={complexity:?}"
+            );
+        }
+        load
+    }
+
     /// Iterate over buffers changed since last read or edited by the model
     pub fn stale_buffers<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a Entity<Buffer>> {
         self.tracked_buffers
@@ -1052,6 +1080,144 @@ impl ActionLog {
 pub struct DiffStats {
     pub lines_added: u32,
     pub lines_removed: u32,
+}
+
+const LARGE_DIFF_FILE_COUNT: usize = 50;
+const LARGE_DIFF_CHANGED_ROWS: u64 = 20_000;
+const LARGE_DIFF_CHANGED_BYTES: u64 = 4 * 1024 * 1024;
+const LARGE_DIFF_HUNK_COUNT: u64 = 2_000;
+const LARGE_DIFF_LONGEST_CHANGED_LINE_BYTES: u32 = 256 * 1024;
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffComplexity {
+    pub changed_rows: u64,
+    pub changed_bytes: u64,
+    pub hunk_count: u64,
+    pub longest_changed_line_bytes: u32,
+}
+
+impl DiffComplexity {
+    fn from_diff(
+        diff: &BufferDiffSnapshot,
+        buffer: &text::BufferSnapshot,
+        diff_base: &Rope,
+    ) -> Self {
+        let (lines_added, lines_removed) = diff.changed_row_counts();
+        let mut complexity = Self {
+            changed_rows: u64::from(lines_added) + u64::from(lines_removed),
+            ..Self::default()
+        };
+
+        for hunk in diff.hunks(buffer) {
+            complexity.hunk_count = complexity.hunk_count.saturating_add(1);
+            let buffer_byte_range =
+                hunk.buffer_range.start.to_offset(buffer)..hunk.buffer_range.end.to_offset(buffer);
+            complexity.changed_bytes = complexity
+                .changed_bytes
+                .saturating_add(buffer_byte_range.len() as u64)
+                .saturating_add(hunk.diff_base_byte_range.len() as u64);
+
+            let buffer_range = hunk.range;
+            for row in buffer_range.start.row..=buffer_range.end.row.min(buffer.max_point().row) {
+                complexity.longest_changed_line_bytes = complexity
+                    .longest_changed_line_bytes
+                    .max(buffer.line_len(row));
+            }
+
+            let base_start = diff_base.offset_to_point(hunk.diff_base_byte_range.start);
+            let base_end = diff_base.offset_to_point(hunk.diff_base_byte_range.end);
+            for row in base_start.row..=base_end.row.min(diff_base.max_point().row) {
+                complexity.longest_changed_line_bytes = complexity
+                    .longest_changed_line_bytes
+                    .max(diff_base.line_len(row));
+            }
+        }
+
+        complexity
+    }
+}
+
+impl std::ops::AddAssign for DiffComplexity {
+    fn add_assign(&mut self, other: Self) {
+        self.changed_rows = self.changed_rows.saturating_add(other.changed_rows);
+        self.changed_bytes = self.changed_bytes.saturating_add(other.changed_bytes);
+        self.hunk_count = self.hunk_count.saturating_add(other.hunk_count);
+        self.longest_changed_line_bytes = self
+            .longest_changed_line_bytes
+            .max(other.longest_changed_line_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LargeDiffReason {
+    FileCount,
+    ChangedRows,
+    ChangedBytes,
+    HunkCount,
+    LongestChangedLine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDiffLoad {
+    Normal {
+        file_count: usize,
+        complexity: DiffComplexity,
+    },
+    Large {
+        file_count: usize,
+        complexity: DiffComplexity,
+        reasons: Vec<LargeDiffReason>,
+    },
+}
+
+impl AgentDiffLoad {
+    fn new(file_count: usize, complexity: DiffComplexity) -> Self {
+        let mut reasons = Vec::new();
+        if file_count > LARGE_DIFF_FILE_COUNT {
+            reasons.push(LargeDiffReason::FileCount);
+        }
+        if complexity.changed_rows > LARGE_DIFF_CHANGED_ROWS {
+            reasons.push(LargeDiffReason::ChangedRows);
+        }
+        if complexity.changed_bytes > LARGE_DIFF_CHANGED_BYTES {
+            reasons.push(LargeDiffReason::ChangedBytes);
+        }
+        if complexity.hunk_count > LARGE_DIFF_HUNK_COUNT {
+            reasons.push(LargeDiffReason::HunkCount);
+        }
+        if complexity.longest_changed_line_bytes > LARGE_DIFF_LONGEST_CHANGED_LINE_BYTES {
+            reasons.push(LargeDiffReason::LongestChangedLine);
+        }
+
+        if reasons.is_empty() {
+            Self::Normal {
+                file_count,
+                complexity,
+            }
+        } else {
+            Self::Large {
+                file_count,
+                complexity,
+                reasons,
+            }
+        }
+    }
+
+    pub fn is_large(&self) -> bool {
+        matches!(self, Self::Large { .. })
+    }
+
+    pub fn file_count(&self) -> usize {
+        match self {
+            Self::Normal { file_count, .. } | Self::Large { file_count, .. } => *file_count,
+        }
+    }
+
+    pub fn complexity(&self) -> DiffComplexity {
+        match self {
+            Self::Normal { complexity, .. } | Self::Large { complexity, .. } => *complexity,
+        }
+    }
 }
 
 impl DiffStats {
@@ -1270,6 +1436,7 @@ pub struct TrackedBuffer {
     snapshot: text::BufferSnapshot,
     diff_update: watch::Sender<()>,
     pending_diff_update: Option<(ChangeAuthor, text::BufferSnapshot)>,
+    diff_complexity: DiffComplexity,
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
@@ -1330,6 +1497,54 @@ mod tests {
     use settings::SettingsStore;
     use std::env;
     use util::{RandomCharIter, path};
+
+    #[test]
+    fn test_agent_diff_load_thresholds() {
+        assert!(!AgentDiffLoad::new(1, DiffComplexity::default()).is_large());
+        assert!(
+            AgentDiffLoad::new(LARGE_DIFF_FILE_COUNT + 1, DiffComplexity::default()).is_large()
+        );
+        assert!(
+            AgentDiffLoad::new(
+                1,
+                DiffComplexity {
+                    changed_rows: LARGE_DIFF_CHANGED_ROWS + 1,
+                    ..DiffComplexity::default()
+                }
+            )
+            .is_large()
+        );
+        assert!(
+            AgentDiffLoad::new(
+                1,
+                DiffComplexity {
+                    changed_bytes: LARGE_DIFF_CHANGED_BYTES + 1,
+                    ..DiffComplexity::default()
+                }
+            )
+            .is_large()
+        );
+        assert!(
+            AgentDiffLoad::new(
+                1,
+                DiffComplexity {
+                    hunk_count: LARGE_DIFF_HUNK_COUNT + 1,
+                    ..DiffComplexity::default()
+                }
+            )
+            .is_large()
+        );
+        assert!(
+            AgentDiffLoad::new(
+                1,
+                DiffComplexity {
+                    longest_changed_line_bytes: LARGE_DIFF_LONGEST_CHANGED_LINE_BYTES + 1,
+                    ..DiffComplexity::default()
+                }
+            )
+            .is_large()
+        );
+    }
 
     #[ctor::ctor(unsafe)]
     fn init_logger() {
