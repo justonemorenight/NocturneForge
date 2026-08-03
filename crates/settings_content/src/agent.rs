@@ -287,6 +287,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub single_file_review: Option<bool>,
+    /// Whether Agent-owned LSP registrations use scoped edit and diagnostic leases.
+    /// Read-only Agent file tracking does not open language servers when enabled.
+    ///
+    /// This is experimental and can be disabled to restore the legacy lifetime.
+    ///
+    /// Default: false
+    pub experimental_lsp_leases: Option<bool>,
     /// Additional parameters for language model requests. When making a request
     /// to a model, parameters will be taken from the last entry in this list
     /// that matches the model's provider and name. In each entry, both provider

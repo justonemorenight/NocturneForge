@@ -1,3 +1,4 @@
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use clock;
@@ -9,6 +10,7 @@ use gpui::{
 };
 use language::{Anchor, Buffer, BufferEvent, Point, ToOffset, ToPoint};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
+use settings::Settings as _;
 use std::{
     cell::Cell,
     cmp,
@@ -156,18 +158,41 @@ impl ActionLog {
             TrackedBufferStatus::Modified
         };
 
+        let experimental_lsp_leases = AgentSettings::get_global(cx).experimental_lsp_leases;
+        let needs_legacy_lease = !experimental_lsp_leases
+            && self
+                .tracked_buffers
+                .get(&buffer)
+                .is_some_and(|tracked_buffer| tracked_buffer.lsp_lease.is_none());
+        if needs_legacy_lease {
+            let handle = self.project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&buffer, cx)
+            });
+            if let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) {
+                tracked_buffer.lsp_lease = Some(AgentLspLease::new(
+                    handle,
+                    AgentLspLeaseOwnership::Legacy,
+                    self.lsp_lease_counters.clone(),
+                ));
+            }
+        }
+
         let tracked_buffer = self
             .tracked_buffers
             .entry(buffer.clone())
             .or_insert_with(|| {
-                let open_lsp_handle = self.project.update(cx, |project, cx| {
-                    project.register_buffer_with_language_servers(&buffer, cx)
-                });
-                let lsp_lease = AgentLspLease::new(
-                    open_lsp_handle,
-                    AgentLspLeaseOwnership::Legacy,
-                    self.lsp_lease_counters.clone(),
-                );
+                let lsp_lease = if experimental_lsp_leases {
+                    None
+                } else {
+                    let open_lsp_handle = self.project.update(cx, |project, cx| {
+                        project.register_buffer_with_language_servers(&buffer, cx)
+                    });
+                    Some(AgentLspLease::new(
+                        open_lsp_handle,
+                        AgentLspLeaseOwnership::Legacy,
+                        self.lsp_lease_counters.clone(),
+                    ))
+                };
 
                 let text_snapshot = buffer.read(cx).text_snapshot();
                 let language = buffer.read(cx).language().cloned();
@@ -201,7 +226,7 @@ impl ActionLog {
                     diff_generation: 0,
                     review_state_changed_before_recompute: false,
                     diff_complexity: DiffComplexity::default(),
-                    _lsp_lease: lsp_lease,
+                    lsp_lease,
                     _maintain_diff: cx.spawn({
                         let buffer = buffer.clone();
                         async move |this, cx| {
@@ -671,6 +696,63 @@ impl ActionLog {
     /// Mark a buffer as edited by agent, so we can refresh it in the context
     pub fn buffer_edited(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
         self.buffer_edited_impl(buffer, true, cx);
+    }
+
+    pub fn acquire_edit_lsp_lease(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
+            return;
+        }
+
+        let experimental = AgentSettings::get_global(cx).experimental_lsp_leases;
+        self.track_buffer_internal(buffer.clone(), false, cx);
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
+            return;
+        };
+        let desired_ownership = if experimental {
+            AgentLspLeaseOwnership::Edit
+        } else {
+            AgentLspLeaseOwnership::Legacy
+        };
+        if tracked_buffer
+            .lsp_lease
+            .as_ref()
+            .is_some_and(|lease| lease.ownership == desired_ownership)
+        {
+            return;
+        }
+
+        let handle = self.project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(&buffer, cx)
+        });
+        tracked_buffer.lsp_lease = Some(AgentLspLease::new(
+            handle,
+            desired_ownership,
+            self.lsp_lease_counters.clone(),
+        ));
+    }
+
+    pub fn acquire_diagnostic_lsp_lease(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Option<AgentLspLease> {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            return linked_action_log
+                .update(cx, |log, cx| log.acquire_diagnostic_lsp_lease(buffer, cx));
+        }
+        if !AgentSettings::get_global(cx).experimental_lsp_leases {
+            return None;
+        }
+
+        let handle = self.project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(buffer, cx)
+        });
+        Some(AgentLspLease::new(
+            handle,
+            AgentLspLeaseOwnership::Diagnostic,
+            self.lsp_lease_counters.clone(),
+        ))
     }
 
     fn buffer_edited_impl(
@@ -1649,7 +1731,7 @@ pub struct TrackedBuffer {
     diff_generation: u64,
     review_state_changed_before_recompute: bool,
     diff_complexity: DiffComplexity,
-    _lsp_lease: AgentLspLease,
+    lsp_lease: Option<AgentLspLease>,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
 }

@@ -754,6 +754,9 @@ impl EditSession {
             EditSessionMode::Write => log.buffer_created(buffer.clone(), cx),
             EditSessionMode::Edit => log.buffer_read(buffer.clone(), cx),
         });
+        context
+            .action_log
+            .update(cx, |log, cx| log.acquire_edit_lsp_lease(buffer.clone(), cx));
 
         let old_snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
         let old_text = cx

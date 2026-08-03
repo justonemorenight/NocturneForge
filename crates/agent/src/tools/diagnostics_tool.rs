@@ -1,4 +1,5 @@
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
 use futures::{Future, FutureExt as _};
 use gpui::{App, AsyncApp, Entity, Task};
@@ -59,11 +60,15 @@ pub struct DiagnosticsToolInput {
 
 pub struct DiagnosticsTool {
     project: Entity<Project>,
+    action_log: Entity<ActionLog>,
 }
 
 impl DiagnosticsTool {
-    pub fn new(project: Entity<Project>) -> Self {
-        Self { project }
+    pub fn new(project: Entity<Project>, action_log: Entity<ActionLog>) -> Self {
+        Self {
+            project,
+            action_log,
+        }
     }
 }
 
@@ -91,6 +96,7 @@ fn freshness_message(refreshed: bool) -> &'static str {
 /// read cached diagnostics), or `Err` if cancelled by the user.
 async fn pull_diagnostics(
     project: &Entity<Project>,
+    action_log: &Entity<ActionLog>,
     path: Option<&Path>,
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
@@ -107,6 +113,8 @@ async fn pull_diagnostics(
             let buffer = with_cancellation(open_buffer_task, event_stream)
                 .await?
                 .map_err(|e| e.to_string())?;
+            let _diagnostic_lease =
+                action_log.update(cx, |log, cx| log.acquire_diagnostic_lsp_lease(&buffer, cx));
 
             let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
             let pull_task = lsp_store.update(cx, |lsp_store, cx| {
@@ -164,14 +172,20 @@ impl AgentTool for DiagnosticsTool {
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
+        let action_log = self.action_log.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
 
             match input.path {
                 Some(ref path) if !path.is_empty() => {
-                    let refreshed =
-                        pull_diagnostics(&project, Some(Path::new(path)), &event_stream, cx)
-                            .await?;
+                    let refreshed = pull_diagnostics(
+                        &project,
+                        &action_log,
+                        Some(Path::new(path)),
+                        &event_stream,
+                        cx,
+                    )
+                    .await?;
 
                     let open_buffer_task = project.update(cx, |project, cx| {
                         let Some(project_path) = project.find_project_path(path, cx) else {
@@ -216,7 +230,8 @@ impl AgentTool for DiagnosticsTool {
                     }
                 }
                 _ => {
-                    let refreshed = pull_diagnostics(&project, None, &event_stream, cx).await?;
+                    let refreshed =
+                        pull_diagnostics(&project, &action_log, None, &event_stream, cx).await?;
 
                     let (output, has_diagnostics) = project.read_with(cx, |project, cx| {
                         let mut output = String::new();

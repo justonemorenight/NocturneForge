@@ -1155,6 +1155,9 @@
     },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
+    // Experimental: scope Agent-owned LSP registrations to active edits and
+    // diagnostics instead of every file read by the Agent.
+    "experimental_lsp_leases": false,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.

@@ -2166,7 +2166,10 @@ impl Thread {
         ));
         self.add_tool(WebSearchTool);
 
-        self.add_tool(DiagnosticsTool::new(self.project.clone()));
+        self.add_tool(DiagnosticsTool::new(
+            self.project.clone(),
+            self.action_log.clone(),
+        ));
 
         let code_action_store: CodeActionStore = cx.new(|_cx| None);
         self.add_tool(FindReferencesTool::new(self.project.clone()));
