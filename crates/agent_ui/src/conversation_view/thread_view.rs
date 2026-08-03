@@ -7,7 +7,7 @@ use crate::{
     thread_transcript_search::ThreadSearchNavigation,
 };
 use agent_client_protocol::schema::v1 as acp;
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
@@ -565,6 +565,12 @@ impl PermissionSelection {
     }
 }
 
+#[derive(Default)]
+struct EditedBufferOrder {
+    membership: HashSet<(EntityId, EntityId)>,
+    buffers: Arc<[(Entity<Buffer>, Entity<BufferDiff>)]>,
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp::SessionId,
@@ -621,7 +627,8 @@ pub struct ThreadView {
     _draft_resolve_task: Option<Task<()>>,
     draft_revision: u64,
     _sandbox_status_refresh_task: Option<Task<()>>,
-    pub hovered_edited_file_buttons: Option<usize>,
+    pub hovered_edited_file_buttons: Option<EntityId>,
+    edited_buffer_order: RefCell<EditedBufferOrder>,
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
@@ -1117,6 +1124,7 @@ impl ThreadView {
             draft_revision: 0,
             _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
+            edited_buffer_order: RefCell::new(EditedBufferOrder::default()),
             in_flight_prompt: None,
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
@@ -3312,142 +3320,163 @@ impl ThreadView {
         pending_edits: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let editor_bg_color = cx.theme().colors().editor_background;
+        let buffers = self.ordered_edited_buffers(changed_buffers, cx);
+        let item_count = buffers.len();
+        let action_log = action_log.clone();
 
-        // Sort edited files alphabetically for consistency with Git diff view
-        let mut sorted_buffers: Vec<_> = changed_buffers.iter().collect();
-        sorted_buffers.sort_by(|(buffer_a, _), (buffer_b, _)| {
-            let path_a = buffer_a.read(cx).file().map(|f| f.path().clone());
-            let path_b = buffer_b.read(cx).file().map(|f| f.path().clone());
-            path_a.cmp(&path_b)
-        });
-
-        v_flex()
-            .id("edited_files_list")
-            .max_h_40()
-            .overflow_y_scroll()
-            .child(
-                v_flex().children(sorted_buffers.into_iter().enumerate().flat_map(
-                    |(index, (buffer, diff))| {
-                        let file = buffer.read(cx).file()?;
-                        let path = file.path();
-                        let path_style = file.path_style(cx);
-                        let separator = file.path_style(cx).primary_separator();
-
-                        let fallback_full_path =
-                            full_path_for_empty_project_path(file.as_ref(), cx);
-
-                        let file_path = path.parent().and_then(|parent| {
-                            if parent.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    Label::new(format!(
-                                        "{}{separator}",
-                                        parent.display(path_style)
-                                    ))
-                                    .color(Color::Muted)
-                                    .size(LabelSize::XSmall)
-                                    .buffer_font(cx),
-                                )
-                            }
-                        });
-
-                        let file_name = path
-                            .file_name()
-                            .map(|name| {
-                                Label::new(name.to_string())
-                                    .size(LabelSize::XSmall)
-                                    .buffer_font(cx)
-                                    .ml_1()
-                            })
-                            .or_else(|| {
-                                fallback_full_path.as_ref().map(|path| {
-                                    Label::new(path.clone())
-                                        .size(LabelSize::XSmall)
-                                        .buffer_font(cx)
-                                        .ml_1()
-                                })
-                            });
-
-                        let full_path = fallback_full_path
-                            .unwrap_or_else(|| path.display(path_style).to_string());
-
-                        let file_icon = FileIcons::get_icon(path.as_std_path(), cx)
-                            .map(Icon::from_path)
-                            .map(|icon| icon.color(Color::Muted).size(IconSize::Small))
-                            .unwrap_or_else(|| {
-                                Icon::new(IconName::File)
-                                    .color(Color::Muted)
-                                    .size(IconSize::Small)
-                            });
-
-                        let file_stats = DiffStats::single_file(diff.read(cx));
-
-                        let buttons = self.render_edited_files_buttons(
-                            index,
+        uniform_list(
+            "edited_files_list",
+            item_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                range
+                    .filter_map(|index| {
+                        let (buffer, diff) = buffers.get(index)?;
+                        this.render_edited_file_row(
                             buffer,
-                            action_log,
+                            diff,
+                            index + 1 == item_count,
+                            &action_log,
                             &telemetry,
                             pending_edits,
                             cx,
-                        );
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .w_full()
+        .max_h_40()
+        .into_any_element()
+    }
 
-                        let element = h_flex()
-                            .group("edited-code")
-                            .id(("file-container", index))
-                            .relative()
-                            .min_w_0()
-                            .p_1p5()
-                            .gap_2()
-                            .justify_between()
-                            .bg(editor_bg_color)
-                            .when(index < changed_buffers.len() - 1, |parent| {
-                                parent.border_color(cx.theme().colors().border).border_b_1()
-                            })
-                            .child(
-                                h_flex()
-                                    .id(("file-name-path", index))
-                                    .cursor_pointer()
-                                    .pr_0p5()
-                                    .gap_0p5()
-                                    .rounded_xs()
-                                    .child(file_icon)
-                                    .children(file_name)
-                                    .children(file_path)
-                                    .child(
-                                        DiffStat::new(
-                                            "file",
-                                            file_stats.lines_added as usize,
-                                            file_stats.lines_removed as usize,
-                                        )
-                                        .label_size(LabelSize::XSmall),
-                                    )
-                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                    .tooltip({
-                                        move |_, cx| {
-                                            Tooltip::with_meta(
-                                                "Go to File",
-                                                None,
-                                                full_path.clone(),
-                                                cx,
-                                            )
-                                        }
-                                    })
-                                    .on_click({
-                                        let buffer = buffer.clone();
-                                        cx.listener(move |this, _, window, cx| {
-                                            this.open_edited_buffer(&buffer, window, cx);
-                                        })
-                                    }),
+    fn ordered_edited_buffers(
+        &self,
+        changed_buffers: &[(Entity<Buffer>, Entity<BufferDiff>)],
+        cx: &App,
+    ) -> Arc<[(Entity<Buffer>, Entity<BufferDiff>)]> {
+        let membership = changed_buffers
+            .iter()
+            .map(|(buffer, diff)| (buffer.entity_id(), diff.entity_id()))
+            .collect::<HashSet<_>>();
+        let mut cached = self.edited_buffer_order.borrow_mut();
+
+        if cached.membership != membership {
+            let mut buffers = changed_buffers.to_vec();
+            buffers.sort_by(|(buffer_a, _), (buffer_b, _)| {
+                let path_a = buffer_a.read(cx).file().map(|file| file.path().clone());
+                let path_b = buffer_b.read(cx).file().map(|file| file.path().clone());
+                path_a.cmp(&path_b)
+            });
+            cached.membership = membership;
+            cached.buffers = buffers.into();
+        }
+
+        cached.buffers.clone()
+    }
+
+    fn render_edited_file_row(
+        &self,
+        buffer: &Entity<Buffer>,
+        diff: &Entity<BufferDiff>,
+        is_last: bool,
+        action_log: &Entity<ActionLog>,
+        telemetry: &ActionLogTelemetry,
+        pending_edits: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let file = buffer.read(cx).file()?;
+        let path = file.path();
+        let path_style = file.path_style(cx);
+        let separator = path_style.primary_separator();
+        let buffer_id = buffer.entity_id();
+        let fallback_full_path = full_path_for_empty_project_path(file.as_ref(), cx);
+
+        let file_path = path.parent().and_then(|parent| {
+            if parent.is_empty() {
+                None
+            } else {
+                Some(
+                    Label::new(format!("{}{separator}", parent.display(path_style)))
+                        .color(Color::Muted)
+                        .size(LabelSize::XSmall)
+                        .buffer_font(cx),
+                )
+            }
+        });
+        let file_name = path
+            .file_name()
+            .map(|name| {
+                Label::new(name.to_string())
+                    .size(LabelSize::XSmall)
+                    .buffer_font(cx)
+                    .ml_1()
+            })
+            .or_else(|| {
+                fallback_full_path.as_ref().map(|path| {
+                    Label::new(path.clone())
+                        .size(LabelSize::XSmall)
+                        .buffer_font(cx)
+                        .ml_1()
+                })
+            });
+        let full_path = fallback_full_path.unwrap_or_else(|| path.display(path_style).to_string());
+        let file_icon = FileIcons::get_icon(path.as_std_path(), cx)
+            .map(Icon::from_path)
+            .map(|icon| icon.color(Color::Muted).size(IconSize::Small))
+            .unwrap_or_else(|| {
+                Icon::new(IconName::File)
+                    .color(Color::Muted)
+                    .size(IconSize::Small)
+            });
+        let file_stats = DiffStats::single_file(diff.read(cx));
+        let buttons =
+            self.render_edited_files_buttons(buffer, action_log, telemetry, pending_edits, cx);
+
+        Some(
+            h_flex()
+                .group("edited-code")
+                .id(("file-container", buffer_id))
+                .relative()
+                .min_w_0()
+                .p_1p5()
+                .gap_2()
+                .justify_between()
+                .bg(cx.theme().colors().editor_background)
+                .when(!is_last, |parent| {
+                    parent.border_color(cx.theme().colors().border).border_b_1()
+                })
+                .child(
+                    h_flex()
+                        .id(("file-name-path", buffer_id))
+                        .cursor_pointer()
+                        .pr_0p5()
+                        .gap_0p5()
+                        .rounded_xs()
+                        .child(file_icon)
+                        .children(file_name)
+                        .children(file_path)
+                        .child(
+                            DiffStat::new(
+                                ("file", buffer_id),
+                                file_stats.lines_added as usize,
+                                file_stats.lines_removed as usize,
                             )
-                            .child(buttons);
-
-                        Some(element)
-                    },
-                )),
-            )
-            .into_any_element()
+                            .label_size(LabelSize::XSmall),
+                        )
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta("Go to File", None, full_path.clone(), cx)
+                        })
+                        .on_click({
+                            let buffer = buffer.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.open_edited_buffer(&buffer, window, cx);
+                            })
+                        }),
+                )
+                .child(buttons)
+                .into_any_element(),
+        )
     }
 
     fn render_large_diff_review_prompt(
@@ -3566,20 +3595,20 @@ impl ThreadView {
 
     fn render_edited_files_buttons(
         &self,
-        index: usize,
         buffer: &Entity<Buffer>,
         action_log: &Entity<ActionLog>,
         telemetry: &ActionLogTelemetry,
         pending_edits: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let buffer_id = buffer.entity_id();
         let controls_background = Hsla {
             a: 1.,
             ..cx.theme().colors().elevated_surface_background
         };
 
         h_flex()
-            .id("edited-buttons-container")
+            .id(("edited-buttons-container", buffer_id))
             .visible_on_hover("edited-code")
             .absolute()
             .right_0()
@@ -3590,14 +3619,14 @@ impl ThreadView {
             .bg(controls_background)
             .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
                 if *is_hovered {
-                    this.hovered_edited_file_buttons = Some(index);
-                } else if this.hovered_edited_file_buttons == Some(index) {
+                    this.hovered_edited_file_buttons = Some(buffer_id);
+                } else if this.hovered_edited_file_buttons == Some(buffer_id) {
                     this.hovered_edited_file_buttons = None;
                 }
                 cx.notify();
             }))
             .child(
-                Button::new("review", "Review")
+                Button::new(("review", buffer_id), "Review")
                     .style(ButtonStyle::Outlined)
                     .label_size(LabelSize::Small)
                     .on_click({
@@ -3608,7 +3637,7 @@ impl ThreadView {
                     }),
             )
             .child(
-                Button::new(("reject-file", index), "Reject")
+                Button::new(("reject-file", buffer_id), "Reject")
                     .style(ButtonStyle::Tinted(TintColor::Error))
                     .label_size(LabelSize::Small)
                     .disabled(pending_edits)
@@ -3634,7 +3663,7 @@ impl ThreadView {
                     }),
             )
             .child(
-                Button::new(("keep-file", index), "Keep")
+                Button::new(("keep-file", buffer_id), "Keep")
                     .style(ButtonStyle::Tinted(TintColor::Success))
                     .label_size(LabelSize::Small)
                     .disabled(pending_edits)

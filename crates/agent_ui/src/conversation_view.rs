@@ -26,10 +26,10 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, App, ClickEvent, ClipboardItem, CursorStyle, ElementId, Empty,
-    Entity, EventEmitter, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, Hsla, ListOffset, ListState, ObjectFit,
     PlatformDisplay, ScrollHandle, SharedString, StyledText, Subscription, Task, TextRun,
     TextStyle, WeakEntity, Window, WindowHandle, div, ease_in_out, img, linear_color_stop,
-    linear_gradient, list, pulsating_between,
+    linear_gradient, list, pulsating_between, uniform_list,
 };
 use language::{Buffer, Language, Rope};
 use language_model::LanguageModelCompletionError;
