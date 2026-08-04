@@ -11292,11 +11292,15 @@ impl ThreadView {
                     .tooltip(Tooltip::text("Make Subagent Full Screen"))
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         telemetry::event!("Subagent Maximized");
-                        this.server_view
-                            .update(cx, |this, cx| {
-                                this.navigate_to_thread(nav_session_id.clone(), window, cx);
-                            })
-                            .ok();
+                        let server_view = this.server_view.clone();
+                        let nav_session_id = nav_session_id.clone();
+                        window.defer(cx, move |window, cx| {
+                            server_view
+                                .update(cx, |this, cx| {
+                                    this.navigate_to_thread(nav_session_id, window, cx);
+                                })
+                                .ok();
+                        });
                     }));
 
                 if is_running && let Some((_, subagent_tool_call_id, _)) = pending_tool_call {
@@ -12729,11 +12733,14 @@ impl Render for ThreadView {
             )
             .on_action(cx.listener(|this, _: &workspace::GoBack, window, cx| {
                 if let Some(parent_session_id) = this.thread.read(cx).parent_session_id().cloned() {
-                    this.server_view
-                        .update(cx, |view, cx| {
-                            view.navigate_to_thread(parent_session_id, window, cx);
-                        })
-                        .ok();
+                    let server_view = this.server_view.clone();
+                    window.defer(cx, move |window, cx| {
+                        server_view
+                            .update(cx, |view, cx| {
+                                view.navigate_to_thread(parent_session_id, window, cx);
+                            })
+                            .ok();
+                    });
                 }
             }))
             .on_action(cx.listener(Self::keep_all))
