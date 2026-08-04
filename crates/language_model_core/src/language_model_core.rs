@@ -106,6 +106,12 @@ impl LanguageModelCompletionEvent {
 pub enum LanguageModelCompletionError {
     #[error("prompt too large for context window")]
     PromptTooLarge { tokens: Option<u64> },
+    /// The request body exceeded a provider or gateway size limit (HTTP 413).
+    /// This is distinct from a context-window overflow: trimming text or
+    /// switching to a larger model cannot fix an oversized payload such as a
+    /// request containing many images.
+    #[error("request body exceeded the provider's size limit: {message}")]
+    RequestPayloadTooLarge { message: String },
     /// The model requires the user to consent to the upstream provider
     /// retaining inference logs (see `LanguageModel::requires_data_retention`)
     /// and that consent has not been given.
@@ -268,8 +274,13 @@ impl LanguageModelCompletionError {
             StatusCode::UNAUTHORIZED => Self::AuthenticationError { provider, message },
             StatusCode::FORBIDDEN => Self::PermissionError { provider, message },
             StatusCode::NOT_FOUND => Self::ApiEndpointNotFound { provider },
-            StatusCode::PAYLOAD_TOO_LARGE => Self::PromptTooLarge {
-                tokens: parse_prompt_too_long(&message),
+            StatusCode::PAYLOAD_TOO_LARGE => match parse_prompt_too_long(&message) {
+                // Some providers report token overflow using HTTP 413. Keep
+                // those responses on the context-overflow path.
+                Some(tokens) => Self::PromptTooLarge {
+                    tokens: Some(tokens),
+                },
+                None => Self::RequestPayloadTooLarge { message },
             },
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimitExceeded {
                 provider,
