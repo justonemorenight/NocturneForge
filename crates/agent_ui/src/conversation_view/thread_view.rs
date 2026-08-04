@@ -3344,6 +3344,7 @@ impl ThreadView {
                     .collect::<Vec<_>>()
             }),
         )
+        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
         .w_full()
         .max_h_40()
         .into_any_element()
