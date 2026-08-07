@@ -634,6 +634,13 @@ impl ListState {
         }
     }
 
+    /// Temporarily suspends active tail following while preserving the current
+    /// scroll position. Tail following may re-engage when the list is laid out
+    /// at the end again.
+    pub fn pause_following_tail(&self) {
+        self.0.borrow_mut().follow_state.stop_following();
+    }
+
     /// Returns whether the list is currently actively following the
     /// tail (snapping to the end on each layout).
     pub fn is_following_tail(&self) -> bool {

@@ -3098,6 +3098,7 @@ impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
+        requested_role: Option<SubagentRole>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
@@ -3114,8 +3115,19 @@ impl NativeThreadEnvironment {
             ));
         }
 
+        let is_chatgpt_subscription = parent_thread
+            .model()
+            .is_some_and(|model| model.provider_id().0.as_ref() == "openai-subscribed");
+        let role = resolve_subagent_role_policy(
+            is_chatgpt_subscription,
+            agent_settings::AgentSettings::get_global(cx)
+                .chatgpt_subagent_roles
+                .enabled,
+            requested_role,
+        )?;
+
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
+            let mut thread = Thread::new_subagent(&parent_thread_entity, role, cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -3297,8 +3309,13 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, cx)
+    fn create_subagent(
+        &self,
+        label: String,
+        role: Option<SubagentRole>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread(label, role, cx)
     }
 
     fn resume_subagent(
@@ -5034,7 +5051,8 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, cx)));
+        let subagent_thread =
+            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.

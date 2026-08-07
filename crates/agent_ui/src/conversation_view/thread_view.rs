@@ -568,6 +568,7 @@ impl PermissionSelection {
 #[derive(Default)]
 struct EditedBufferOrder {
     membership: HashSet<(EntityId, EntityId)>,
+    file_backed_membership: HashSet<EntityId>,
     buffers: Arc<[(Entity<Buffer>, Entity<BufferDiff>)]>,
 }
 
@@ -3324,13 +3325,13 @@ impl ThreadView {
         let item_count = buffers.len();
         let action_log = action_log.clone();
 
-        uniform_list(
+        let list = uniform_list(
             "edited_files_list",
             item_count,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
                 range
-                    .filter_map(|index| {
-                        let (buffer, diff) = buffers.get(index)?;
+                    .map(|index| {
+                        let (buffer, diff) = &buffers[index];
                         this.render_edited_file_row(
                             buffer,
                             diff,
@@ -3340,14 +3341,24 @@ impl ThreadView {
                             pending_edits,
                             cx,
                         )
+                        .unwrap_or_else(|| Empty.into_any_element())
                     })
                     .collect::<Vec<_>>()
             }),
         )
-        .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-        .w_full()
-        .max_h_40()
-        .into_any_element()
+        .w_full();
+
+        // `Infer` measures the full virtual list. Combining that inferred height with a
+        // max-height leaves the parent with the unbounded intrinsic height while the list only
+        // paints its visible rows, producing an increasingly large blank area after five files.
+        // Small lists should hug their contents; larger lists need an explicit viewport so the
+        // uniform list owns scrolling and virtualization against the same bounds.
+        if item_count <= 5 {
+            list.with_sizing_behavior(gpui::ListSizingBehavior::Infer)
+                .into_any_element()
+        } else {
+            list.h_40().into_any_element()
+        }
     }
 
     fn ordered_edited_buffers(
@@ -3359,16 +3370,34 @@ impl ThreadView {
             .iter()
             .map(|(buffer, diff)| (buffer.entity_id(), diff.entity_id()))
             .collect::<HashSet<_>>();
+        let file_backed_membership = changed_buffers
+            .iter()
+            .filter_map(|(buffer, _)| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .is_some()
+                    .then_some(buffer.entity_id())
+            })
+            .collect::<HashSet<_>>();
         let mut cached = self.edited_buffer_order.borrow_mut();
 
-        if cached.membership != membership {
+        if cached.membership != membership
+            || cached.file_backed_membership != file_backed_membership
+        {
             let mut buffers = changed_buffers.to_vec();
+            // A uniform list requires the renderer to return exactly one element for every
+            // requested index. File-less buffers cannot produce an edited-file row, so exclude
+            // them before calculating the list's item count rather than filtering them inside
+            // the renderer and leaving empty item slots behind.
+            buffers.retain(|(buffer, _)| file_backed_membership.contains(&buffer.entity_id()));
             buffers.sort_by(|(buffer_a, _), (buffer_b, _)| {
                 let path_a = buffer_a.read(cx).file().map(|file| file.path().clone());
                 let path_b = buffer_b.read(cx).file().map(|file| file.path().clone());
                 path_a.cmp(&path_b)
             });
             cached.membership = membership;
+            cached.file_backed_membership = file_backed_membership;
             cached.buffers = buffers.into();
         }
 
@@ -3400,6 +3429,8 @@ impl ThreadView {
                     Label::new(format!("{}{separator}", parent.display(path_style)))
                         .color(Color::Muted)
                         .size(LabelSize::XSmall)
+                        .truncate()
+                        .flex_1()
                         .buffer_font(cx),
                 )
             }
@@ -3409,6 +3440,8 @@ impl ThreadView {
             .map(|name| {
                 Label::new(name.to_string())
                     .size(LabelSize::XSmall)
+                    .truncate()
+                    .flex_shrink()
                     .buffer_font(cx)
                     .ml_1()
             })
@@ -3416,6 +3449,8 @@ impl ThreadView {
                 fallback_full_path.as_ref().map(|path| {
                     Label::new(path.clone())
                         .size(LabelSize::XSmall)
+                        .truncate()
+                        .flex_shrink()
                         .buffer_font(cx)
                         .ml_1()
                 })
@@ -3438,10 +3473,10 @@ impl ThreadView {
                 .group("edited-code")
                 .id(("file-container", buffer_id))
                 .relative()
+                .w_full()
                 .min_w_0()
                 .p_1p5()
                 .gap_2()
-                .justify_between()
                 .bg(cx.theme().colors().editor_background)
                 .when(!is_last, |parent| {
                     parent.border_color(cx.theme().colors().border).border_b_1()
@@ -3449,20 +3484,25 @@ impl ThreadView {
                 .child(
                     h_flex()
                         .id(("file-name-path", buffer_id))
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
                         .cursor_pointer()
                         .pr_0p5()
                         .gap_0p5()
                         .rounded_xs()
-                        .child(file_icon)
+                        .child(div().flex_none().child(file_icon))
                         .children(file_name)
                         .children(file_path)
                         .child(
-                            DiffStat::new(
-                                ("file", buffer_id),
-                                file_stats.lines_added as usize,
-                                file_stats.lines_removed as usize,
-                            )
-                            .label_size(LabelSize::XSmall),
+                            div().flex_none().child(
+                                DiffStat::new(
+                                    ("file", buffer_id),
+                                    file_stats.lines_added as usize,
+                                    file_stats.lines_removed as usize,
+                                )
+                                .label_size(LabelSize::XSmall),
+                            ),
                         )
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                         .tooltip(move |_, cx| {
@@ -3611,8 +3651,7 @@ impl ThreadView {
         h_flex()
             .id(("edited-buttons-container", buffer_id))
             .visible_on_hover("edited-code")
-            .absolute()
-            .right_0()
+            .flex_none()
             .px_1()
             .gap_1()
             .border_l_1()
@@ -3626,17 +3665,6 @@ impl ThreadView {
                 }
                 cx.notify();
             }))
-            .child(
-                Button::new(("review", buffer_id), "Review")
-                    .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small)
-                    .on_click({
-                        let buffer = buffer.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            this.open_edited_buffer(&buffer, window, cx);
-                        })
-                    }),
-            )
             .child(
                 Button::new(("reject-file", buffer_id), "Reject")
                     .style(ButtonStyle::Tinted(TintColor::Error))
@@ -4316,9 +4344,19 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.list_state.is_following_tail()
+            && !self
+                .entry_view_state
+                .read(cx)
+                .is_compaction_expanded(entry_ix)
+        {
+            self.list_state.pause_following_tail();
+        }
+
         self.entry_view_state.update(cx, |state, _cx| {
             state.toggle_compaction_expansion(entry_ix);
         });
+        self.list_state.remeasure_items(entry_ix..entry_ix + 1);
         self.refresh_thread_search(window, cx);
         cx.notify();
     }

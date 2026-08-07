@@ -19,7 +19,8 @@ use crate::sandboxing::{
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
     AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
-    SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
+    ChatGptSubagentRolesSettings, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT,
+    builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -75,6 +76,109 @@ const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+const CHATGPT_SUBSCRIPTION_PROVIDER_ID: &str = "openai-subscribed";
+
+/// A role used by native ChatGPT Subscription subagents.
+/// Other providers keep their existing subagent behavior and ignore this value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubagentRole {
+    Explorer,
+    FlowReader,
+    CodingWorker,
+}
+
+pub(crate) fn resolve_subagent_role_policy(
+    is_chatgpt_subscription: bool,
+    enabled: bool,
+    requested_role: Option<SubagentRole>,
+) -> Result<Option<SubagentRole>> {
+    if !is_chatgpt_subscription || !enabled {
+        return Ok(None);
+    }
+
+    requested_role
+        .context(
+            "ChatGPT Subscription subagents require agent_type: explorer, flow-reader, or coding-worker",
+        )
+        .map(Some)
+}
+
+impl SubagentRole {
+    fn model_selection(self, roles: &ChatGptSubagentRolesSettings) -> LanguageModelSelection {
+        let configured = match self {
+            Self::Explorer => &roles.explorer,
+            Self::FlowReader => &roles.flow_reader,
+            Self::CodingWorker => &roles.coding_worker,
+        };
+
+        LanguageModelSelection {
+            provider: settings::LanguageModelProviderSetting(
+                CHATGPT_SUBSCRIPTION_PROVIDER_ID.to_string(),
+            ),
+            model: configured.model.clone(),
+            enable_thinking: true,
+            effort: Some(configured.effort.clone()),
+            speed: None,
+        }
+    }
+
+    fn is_read_only(self) -> bool {
+        matches!(self, Self::Explorer | Self::FlowReader)
+    }
+
+    fn profile_id(self) -> AgentProfileId {
+        AgentProfileId(
+            match self {
+                Self::Explorer | Self::FlowReader => builtin_profiles::ASK,
+                Self::CodingWorker => builtin_profiles::WRITE,
+            }
+            .into(),
+        )
+    }
+
+    fn allows_tool(self, tool_name: &str) -> bool {
+        if matches!(
+            tool_name,
+            CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME
+        ) {
+            return false;
+        }
+
+        if !self.is_read_only() {
+            return true;
+        }
+
+        matches!(
+            tool_name,
+            DiagnosticsTool::NAME
+                | FetchTool::NAME
+                | FindPathTool::NAME
+                | FindReferencesTool::NAME
+                | GetCodeActionsTool::NAME
+                | GoToDefinitionTool::NAME
+                | GrepTool::NAME
+                | ListDirectoryTool::NAME
+                | ReadFileTool::NAME
+                | crate::SkillTool::NAME
+                | WebSearchTool::NAME
+        )
+    }
+
+    fn system_instruction(self) -> &'static str {
+        match self {
+            Self::Explorer => {
+                "You are an explorer subagent. Locate files, symbols, and dependencies. Stay read-only, do not modify project state, and do not create more agents or threads. Return concise findings with paths and evidence."
+            }
+            Self::FlowReader => {
+                "You are a flow-reader subagent. Trace execution flow, architecture, and logs. Stay read-only, do not modify project state, and do not create more agents or threads. Return evidence-backed findings and likely root causes."
+            }
+            Self::CodingWorker => {
+                "You are a coding-worker subagent. Implement only the bounded task and write scope stated by the parent. Do not create more agents or threads. Preserve unrelated changes, verify your work, and report changed files and proof."
+            }
+        }
+    }
+}
 
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
@@ -131,7 +235,6 @@ const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
 const COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT: usize = 64 * 1024;
 const COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE: &str =
     "Output exceeded the available model context and was truncated.";
-const MAX_HIERARCHICAL_COMPACTION_PASSES: usize = 8;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
 const MIN_USER_MESSAGES_BEFORE_RECOMPACTION: usize = 2;
 
@@ -155,6 +258,11 @@ pub struct SubagentContext {
 
     /// Current depth level (0 = root agent, 1 = first-level subagent, etc.)
     pub depth: u8,
+
+    /// Native ChatGPT Subscription role policy, when this subagent was created
+    /// through the role-aware spawn flow.
+    #[serde(default)]
+    pub role: Option<SubagentRole>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -782,7 +890,12 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+    fn create_subagent(
+        &self,
+        label: String,
+        role: Option<SubagentRole>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>>;
 
     fn resume_subagent(
         &self,
@@ -1314,7 +1427,11 @@ impl Thread {
             .embedded_context(true)
     }
 
-    pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
+    pub fn new_subagent(
+        parent_thread: &Entity<Thread>,
+        role: Option<SubagentRole>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
@@ -1335,9 +1452,18 @@ impl Thread {
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
+            role,
         });
         thread.inherit_parent_settings(parent_thread, cx);
-        if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
+        if let Some(role) = role {
+            thread.profile_id = role.profile_id();
+            thread.profile_downgraded_for_restricted_workspace = false;
+            thread.inherits_parent_model_settings = false;
+            thread.apply_model_selection(
+                &role.model_selection(&AgentSettings::get_global(cx).chatgpt_subagent_roles),
+                cx,
+            );
+        } else if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
         }
@@ -1737,6 +1863,11 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = AgentSettings::get_global(cx);
+        let inherits_parent_model_settings = db_thread
+            .subagent_context
+            .as_ref()
+            .and_then(|context| context.role)
+            .is_none();
         let profile_id = db_thread
             .profile
             .unwrap_or_else(|| settings.default_profile.clone());
@@ -1816,7 +1947,7 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
-            inherits_parent_model_settings: true,
+            inherits_parent_model_settings,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
@@ -2266,7 +2397,11 @@ impl Thread {
 
         for subagent in &self.running_subagents {
             subagent
-                .update(cx, |thread, cx| thread.set_profile(profile_id.clone(), cx))
+                .update(cx, |thread, cx| {
+                    if thread.subagent_role().is_none() {
+                        thread.set_profile(profile_id.clone(), cx);
+                    }
+                })
                 .ok();
         }
     }
@@ -3192,30 +3327,39 @@ impl Thread {
                 request,
                 fallback_model,
             } => {
+                let is_chatgpt_subscription =
+                    model.provider_id().0.as_ref() == CHATGPT_SUBSCRIPTION_PROVIDER_ID;
                 match Self::run_native_compaction(this, cancellation_rx.clone(), model, request, cx)
                     .await
                 {
                     Ok(result) => Ok(result),
                     Err(native_error) => {
-                        log::warn!(
-                            "Provider-native compaction failed; falling back to summary: \
-                             {native_error:#}"
-                        );
-                        Self::run_atomic_summary_compaction(
-                            this,
-                            event_stream,
-                            &compaction_id,
-                            cancellation_rx.clone(),
-                            fallback_model,
-                            &target,
-                            cx,
-                        )
-                        .await
-                        .map_err(|fallback_error| {
-                            fallback_error.context(format!(
-                                "Provider-native compaction also failed: {native_error:#}"
-                            ))
-                        })
+                        if is_chatgpt_subscription {
+                            log::warn!(
+                                "Provider-native compaction failed; summary fallback suppressed provider=chatgpt-subscription error_class=native_failure"
+                            );
+                            Err(native_error)
+                        } else {
+                            log::warn!(
+                                "Provider-native compaction failed; falling back to summary: \
+                                 {native_error:#}"
+                            );
+                            Self::run_atomic_summary_compaction(
+                                this,
+                                event_stream,
+                                &compaction_id,
+                                cancellation_rx.clone(),
+                                fallback_model,
+                                &target,
+                                cx,
+                            )
+                            .await
+                            .map_err(|fallback_error| {
+                                fallback_error.context(format!(
+                                    "Provider-native compaction also failed: {native_error:#}"
+                                ))
+                            })
+                        }
                     }
                 }
             }
@@ -3317,7 +3461,6 @@ impl Thread {
             let target_ix = target.resolve(&this.messages)?;
             anyhow::Ok(this.messages[..target_ix].to_vec())
         })??;
-        let mut completed_passes = 0;
         let mut learned_retained_user_byte_budget = None;
 
         loop {
@@ -3365,7 +3508,6 @@ impl Thread {
                 {
                     Ok(None) => return Ok(None),
                     Ok(Some(summary)) => {
-                        completed_passes += 1;
                         if plan.reaches_target {
                             return Ok(Some(CompactionInfo::Summary(summary.into())));
                         }
@@ -3385,11 +3527,6 @@ impl Thread {
                         }
 
                         learned_retained_user_byte_budget = Some(plan.retained_user_byte_budget);
-                        if completed_passes >= MAX_HIERARCHICAL_COMPACTION_PASSES {
-                            return Err(anyhow!(
-                                "Compaction required more than {MAX_HIERARCHICAL_COMPACTION_PASSES} passes"
-                            ));
-                        }
                         break;
                     }
                     Err(error)
@@ -4353,6 +4490,9 @@ impl Thread {
 
                 if tool.supports_provider(&model.provider_id())
                     && profile.is_tool_enabled(profile_tool_name)
+                    && self
+                        .subagent_role()
+                        .is_none_or(|role| role.allows_tool(profile_tool_name))
                 {
                     match (tool_name.as_ref(), use_sandboxed_terminal) {
                         (TerminalTool::NAME, false) | (SandboxedTerminalTool::NAME, true) => {
@@ -4375,6 +4515,9 @@ impl Thread {
         let mut seen_tools = tools.keys().cloned().collect::<HashSet<_>>();
         let mut duplicate_tool_names = HashSet::default();
         for (server_id, server_tools) in self.context_server_registry.read(cx).servers() {
+            if self.subagent_role().is_some_and(SubagentRole::is_read_only) {
+                break;
+            }
             for (tool_name, tool) in server_tools {
                 if profile.is_context_server_tool_enabled(&server_id.0, &tool_name) {
                     let tool_name: SharedString =
@@ -4461,6 +4604,12 @@ impl Thread {
         self.subagent_context.is_some()
     }
 
+    pub fn subagent_role(&self) -> Option<SubagentRole> {
+        self.subagent_context
+            .as_ref()
+            .and_then(|context| context.role)
+    }
+
     pub fn parent_thread_id(&self) -> Option<acp::SessionId> {
         self.subagent_context
             .as_ref()
@@ -4537,7 +4686,7 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4553,6 +4702,10 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if let Some(role) = self.subagent_role() {
+            system_prompt.push_str("\n\n## Subagent role\n");
+            system_prompt.push_str(role.system_instruction());
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -7315,6 +7468,85 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    #[test]
+    fn test_chatgpt_subscription_subagent_role_policies() {
+        assert_eq!(
+            serde_json::to_value(SubagentRole::FlowReader).unwrap(),
+            json!("flow-reader")
+        );
+
+        let roles = ChatGptSubagentRolesSettings {
+            enabled: true,
+            explorer: agent_settings::ChatGptSubagentRoleSettings {
+                model: "explorer-model".to_string(),
+                effort: "low".to_string(),
+            },
+            flow_reader: agent_settings::ChatGptSubagentRoleSettings {
+                model: "flow-model".to_string(),
+                effort: "medium".to_string(),
+            },
+            coding_worker: agent_settings::ChatGptSubagentRoleSettings {
+                model: "worker-model".to_string(),
+                effort: "xhigh".to_string(),
+            },
+        };
+        let cases = [
+            (
+                SubagentRole::Explorer,
+                "explorer-model",
+                "low",
+                builtin_profiles::ASK,
+            ),
+            (
+                SubagentRole::FlowReader,
+                "flow-model",
+                "medium",
+                builtin_profiles::ASK,
+            ),
+            (
+                SubagentRole::CodingWorker,
+                "worker-model",
+                "xhigh",
+                builtin_profiles::WRITE,
+            ),
+        ];
+
+        for (role, model, effort, profile) in cases {
+            let selection = role.model_selection(&roles);
+            assert_eq!(selection.provider.0, CHATGPT_SUBSCRIPTION_PROVIDER_ID);
+            assert_eq!(selection.model, model);
+            assert_eq!(selection.effort.as_deref(), Some(effort));
+            assert_eq!(role.profile_id().as_str(), profile);
+            assert!(!role.allows_tool(CreateThreadTool::NAME));
+            assert!(!role.allows_tool(ListAgentsAndModelsTool::NAME));
+        }
+
+        for role in [SubagentRole::Explorer, SubagentRole::FlowReader] {
+            assert!(role.allows_tool(ReadFileTool::NAME));
+            assert!(role.allows_tool(GrepTool::NAME));
+            assert!(!role.allows_tool(EditFileTool::NAME));
+            assert!(!role.allows_tool(WriteFileTool::NAME));
+            assert!(!role.allows_tool(TerminalTool::NAME));
+        }
+
+        assert!(SubagentRole::CodingWorker.allows_tool(EditFileTool::NAME));
+        assert!(SubagentRole::CodingWorker.allows_tool(TerminalTool::NAME));
+
+        assert_eq!(
+            resolve_subagent_role_policy(true, true, Some(SubagentRole::Explorer)).unwrap(),
+            Some(SubagentRole::Explorer)
+        );
+        assert!(resolve_subagent_role_policy(true, true, None).is_err());
+        assert_eq!(
+            resolve_subagent_role_policy(true, false, Some(SubagentRole::Explorer)).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_subagent_role_policy(false, true, Some(SubagentRole::Explorer)).unwrap(),
+            None
+        );
+    }
+
     async fn setup_thread_for_test(cx: &mut TestAppContext) -> (Entity<Thread>, ThreadEventStream) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -8482,7 +8714,7 @@ mod tests {
         cx.update(|cx| {
             let mut subagents = Vec::new();
             for _ in 0..count {
-                let subagent = cx.new(|cx| Thread::new_subagent(parent, cx));
+                let subagent = cx.new(|cx| Thread::new_subagent(parent, None, cx));
                 parent.update(cx, |thread, _cx| {
                     thread.register_running_subagent(subagent.downgrade());
                 });

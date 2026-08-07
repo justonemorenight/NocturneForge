@@ -99,8 +99,14 @@ impl ShellBuilder {
             });
             if self.redirect_stdin {
                 match self.kind {
-                    ShellKind::Fish | ShellKind::Posix => {
-                        combined_command.insert_str(0, "exec </dev/null; ");
+                    ShellKind::Posix => {
+                        // Activate stdin redirection before the command so a syntax error
+                        // cannot make an interactive shell wait at its prompt.
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
+                    ShellKind::Fish => {
+                        combined_command.insert_str(0, "begin; ");
+                        combined_command.push_str("; end </dev/null");
                     }
                     ShellKind::Nushell
                     | ShellKind::Csh
@@ -143,8 +149,12 @@ impl ShellBuilder {
             });
             if self.redirect_stdin {
                 match self.kind {
-                    ShellKind::Fish | ShellKind::Posix => {
-                        combined_command.insert_str(0, "exec </dev/null; ");
+                    ShellKind::Posix => {
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
+                    ShellKind::Fish => {
+                        combined_command.insert_str(0, "begin; ");
+                        combined_command.push_str("; end </dev/null");
                     }
                     ShellKind::Nushell
                     | ShellKind::Csh
@@ -282,7 +292,7 @@ mod test {
             .build(Some("echo".into()), &["test".to_string()]);
 
         assert_eq!(program, "fish");
-        assert_eq!(args, vec!["-i", "-c", "exec </dev/null; echo test"]);
+        assert_eq!(args, vec!["-i", "-c", "begin; echo test; end </dev/null"]);
     }
 
     #[test]
@@ -298,7 +308,7 @@ mod test {
         assert_eq!(program, "sh");
         assert_eq!(
             args,
-            vec!["-i", "-c", "exec </dev/null; cat <<EOF\nhello\nEOF"]
+            vec!["-i", "-c", "exec </dev/null\ncat <<EOF\nhello\nEOF"]
         );
     }
 

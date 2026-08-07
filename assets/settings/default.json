@@ -1090,6 +1090,24 @@
       // Whether thinking is enabled.
       "enable_thinking": false,
     },
+    // Native role routing for subagents created by ChatGPT Subscription.
+    // Set enabled to false to restore Zed's standard subagent_model/parent
+    // inheritance behavior. While enabled, tool permissions remain fixed by role.
+    "chatgpt_subagent_roles": {
+      "enabled": true,
+      "explorer": {
+        "model": "gpt-5.6-luna",
+        "effort": "low",
+      },
+      "flow_reader": {
+        "model": "gpt-5.6-luna",
+        "effort": "medium",
+      },
+      "coding_worker": {
+        "model": "gpt-5.6-luna",
+        "effort": "xhigh",
+      },
+    },
     // Additional parameters for language model requests. When making a request to a model, parameters will be taken
     // from the last entry in this list that matches the model's provider and name. In each entry, both provider
     // and model are optional, so that you can specify parameters for either one.
@@ -1155,6 +1173,10 @@
     },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
+    // Where to display review controls in single-file editors. The island is
+    // revealed at the bottom-right of the diff hunk while hovering it.
+    // One of: "toolbar", "island".
+    "review_control_location": "island",
     // Experimental: scope Agent-owned LSP registrations to active edits and
     // diagnostics instead of every file read by the Agent.
     "experimental_lsp_leases": false,

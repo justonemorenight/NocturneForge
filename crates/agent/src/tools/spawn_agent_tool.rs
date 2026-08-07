@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, SubagentRole, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
@@ -41,6 +41,11 @@ pub struct SpawnAgentToolInput {
     pub label: String,
     /// The prompt for the agent. For new sessions, include full context needed for the task. For follow-ups (with session_id), you can rely on the agent already having the previous message.
     pub message: String,
+    /// Agent type for a new native ChatGPT Subscription subagent. Use explorer for
+    /// file/symbol lookup, flow-reader for flow/log analysis, and coding-worker
+    /// for bounded implementation. Required for new ChatGPT Subscription
+    /// sessions and ignored when continuing an existing session.
+    pub agent_type: Option<SubagentRole>,
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
     pub session_id: Option<acp::SessionId>,
@@ -165,7 +170,8 @@ impl AgentTool for SpawnAgentTool {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment.create_subagent(input.label, cx)
+                    self.environment
+                        .create_subagent(input.label, input.agent_type, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,

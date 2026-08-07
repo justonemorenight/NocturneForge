@@ -19,6 +19,14 @@ pub struct ResolvedDiffHunks {
     pub hunks: Vec<ResolvedDiffHunk>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffHunkControlsPosition {
+    #[default]
+    Hunk,
+    HunkHoverBottomRight,
+    Hidden,
+}
+
 pub trait DiffHunkDelegate {
     fn toggle(
         &self,
@@ -78,6 +86,14 @@ pub trait DiffHunkDelegate {
 
     fn render_hunk_as_staged(&self, status: &DiffHunkStatus, _cx: &App) -> bool {
         !status.has_secondary_hunk()
+    }
+
+    fn hunk_controls_position(
+        &self,
+        _editor: &Entity<Editor>,
+        _cx: &App,
+    ) -> DiffHunkControlsPosition {
+        DiffHunkControlsPosition::Hunk
     }
 }
 

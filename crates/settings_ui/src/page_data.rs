@@ -8245,6 +8245,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Review Control Location",
+                description: "Choose whether Agent review controls appear in the editor toolbar or beside the diff hunk while hovering it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.review_control_location"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .review_control_location
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .review_control_location = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Enable Feedback",
                 description: "Show voting thumbs up/down icon buttons for feedback on agent edits.",
                 field: Box::new(SettingField {

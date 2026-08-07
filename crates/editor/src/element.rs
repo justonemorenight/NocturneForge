@@ -9,12 +9,12 @@ pub(crate) use header::{header_jump_data, render_buffer_header};
 use crate::{
     BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
     ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
-    ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
-    EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
-    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    ContextMenuPlacement, CursorShape, CustomBlockId, DiffHunkControlsPosition, DisplayDiffHunk,
+    DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings,
+    EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown,
+    HalfPageUp, HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight,
+    LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt,
+    Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     display_map::{
@@ -4634,6 +4634,7 @@ impl EditorElement {
         newest_cursor_row: Option<DisplayRow>,
         line_height: Pixels,
         right_margin: Pixels,
+        bottom_margin: Pixels,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         sticky_header_height: Pixels,
         display_hunks: &[(DisplayDiffHunk, Option<Hitbox>)],
@@ -4643,13 +4644,20 @@ impl EditorElement {
         cx: &mut App,
     ) -> (Vec<AnyElement>, Vec<(DisplayRow, Bounds<Pixels>)>) {
         let diff_hunk_delegate = editor.read(cx).diff_hunk_delegate();
+        let controls_position = diff_hunk_delegate.hunk_controls_position(&editor, cx);
+        if controls_position == DiffHunkControlsPosition::Hidden {
+            return (Vec::new(), Vec::new());
+        }
         let hovered_diff_hunk_row = editor.read(cx).hovered_diff_hunk_row;
         let sticky_top = text_hitbox.bounds.top() + sticky_header_height;
 
         let mut controls = vec![];
         let mut control_bounds = vec![];
 
-        let active_rows = [hovered_diff_hunk_row, newest_cursor_row];
+        let active_rows = match controls_position {
+            DiffHunkControlsPosition::HunkHoverBottomRight => [hovered_diff_hunk_row, None],
+            _ => [hovered_diff_hunk_row, newest_cursor_row],
+        };
 
         for (hunk, _) in display_hunks {
             if let DisplayDiffHunk::Unfolded {
@@ -4661,16 +4669,14 @@ impl EditorElement {
             } = &hunk
             {
                 if display_row_range.start >= row_range.end {
-                    // hunk is fully below the viewport
                     continue;
                 }
                 if display_row_range.end <= row_range.start {
-                    // hunk is fully above the viewport
                     continue;
                 }
-                let row_ix = display_row_range.start.0.saturating_sub(row_range.start.0);
+                let row_index = display_row_range.start.0.saturating_sub(row_range.start.0);
                 if row_infos
-                    .get(row_ix as usize)
+                    .get(row_index as usize)
                     .and_then(|row_info| row_info.diff_status)
                     .is_none()
                 {
@@ -4703,17 +4709,6 @@ impl EditorElement {
                         - scroll_pixel_position.y)
                         .into();
 
-                    let y: Pixels = if hunk_start_y >= sticky_top {
-                        hunk_start_y
-                    } else {
-                        let hunk_end_y: Pixels = hunk_start_y
-                            + (display_row_range.len() as f64
-                                * ScrollPixelOffset::from(line_height))
-                            .into();
-                        let max_y = hunk_end_y - line_height;
-                        sticky_top.min(max_y)
-                    };
-
                     let mut element = diff_hunk_delegate.render_hunk_controls(
                         display_row_range.start.0,
                         status,
@@ -4724,8 +4719,26 @@ impl EditorElement {
                         window,
                         cx,
                     );
-                    let size =
-                        element.layout_as_root(size(px(100.0), line_height).into(), window, cx);
+                    let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
+
+                    let hunk_end_y: Pixels = hunk_start_y
+                        + (display_row_range.len() as f64 * ScrollPixelOffset::from(line_height))
+                            .into();
+                    let viewport_bottom = text_hitbox.bounds.bottom() - bottom_margin;
+                    let y = if controls_position == DiffHunkControlsPosition::HunkHoverBottomRight {
+                        (hunk_end_y - size.height)
+                            .min(viewport_bottom - size.height)
+                            .max(sticky_top)
+                    } else if hunk_start_y >= sticky_top {
+                        hunk_start_y
+                    } else {
+                        let max_y = hunk_end_y - size.height;
+                        sticky_top.min(max_y)
+                    };
+
+                    if y + size.height > viewport_bottom || y < sticky_top {
+                        continue;
+                    }
 
                     let x = text_hitbox.bounds.right() - right_margin - px(10.) - size.width;
 
@@ -8026,9 +8039,9 @@ impl Element for EditorElement {
                         .unwrap_or_default();
 
                     let right_margin = minimap_width + vertical_scrollbar_width;
-
                     let extended_right = 2 * em_width + right_margin;
-                    let editor_width = text_width - gutter_dimensions.margin - extended_right;
+                    let editor_width =
+                        (text_width - gutter_dimensions.margin - extended_right).max(Pixels::ZERO);
                     let editor_margins = EditorMargins {
                         gutter: gutter_dimensions,
                         right: right_margin,
@@ -9039,6 +9052,13 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    let diff_hunk_controls_bottom_margin = scrollbars_layout
+                        .as_ref()
+                        .filter(|scrollbars| scrollbars.visible)
+                        .and_then(|scrollbars| scrollbars.horizontal.as_ref())
+                        .map_or(Pixels::ZERO, |scrollbar| {
+                            scrollbar.hitbox.bounds.size.height
+                        });
 
                     let gutter_settings = EditorSettings::get_global(cx).gutter;
 
@@ -9349,6 +9369,7 @@ impl Element for EditorElement {
                                 current_selection_head,
                                 line_height,
                                 right_margin,
+                                diff_hunk_controls_bottom_margin,
                                 scroll_pixel_position,
                                 sticky_header_height,
                                 &display_hunks,

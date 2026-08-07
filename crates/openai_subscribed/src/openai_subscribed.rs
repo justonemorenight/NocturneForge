@@ -20,7 +20,7 @@ use language_model::{
 use open_ai::{
     ReasoningEffort,
     completion::token_usage_from_response_usage,
-    responses::{compact_codex_response, stream_response},
+    responses::{compact_codex_response_with_body, stream_response},
 };
 use parking_lot::Mutex;
 use rand::RngCore as _;
@@ -30,7 +30,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 use util::ResultExt as _;
 
@@ -54,7 +54,11 @@ const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const TOKEN_REFRESH_BUFFER_MS: u64 = 5 * 60 * 1000;
 const RESPONSE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const COMPACTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const COMPACTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(100);
+const COMPACTION_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const COMPACTION_MAX_ATTEMPTS: usize = 3;
+const COMPACTION_RETRY_DELAYS: [Duration; COMPACTION_MAX_ATTEMPTS - 1] =
+    [Duration::from_millis(500), Duration::from_secs(1)];
 const MODEL_CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const OAUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -237,7 +241,10 @@ pub struct State {
     last_auth_error: Option<SharedString>,
     models: Vec<ChatGptModel>,
     model_fetch_task: Option<Task<()>>,
-    quota_fetch_tasks: Vec<Task<()>>,
+    /// A single serialized monitor owns both the immediate refresh and the
+    /// periodic refreshes. Keeping one task prevents overlapping quota scans
+    /// when switching accounts or re-authenticating while a cycle is running.
+    quota_refresh_task: Option<Task<()>>,
     active_operations: Arc<BusyNotifier>,
     manifest_load_state: ManifestLoadState,
     client_version: String,
@@ -431,6 +438,7 @@ impl State {
                         if state.credentials.is_some() {
                             state.restart_model_fetch(cx);
                         }
+                        state.start_quota_monitor(cx);
                         cx.notify();
                     })?;
                     Ok::<(), Arc<anyhow::Error>>(())
@@ -458,7 +466,7 @@ impl State {
             last_auth_error: None,
             models: ChatGptModel::fallback_models(),
             model_fetch_task: None,
-            quota_fetch_tasks: Vec::new(),
+            quota_refresh_task: None,
             active_operations: Arc::new(BusyNotifier::new()),
             manifest_load_state: ManifestLoadState::Pending,
             client_version,
@@ -628,7 +636,6 @@ impl State {
                     state.manifest = manifest.clone();
                     state.credentials = Some(credentials.clone());
                     state.refresh_task = None;
-                    state.refresh_quota(cx);
                     state.restart_model_fetch(cx);
                     state.last_auth_error = None;
                 } else if is_current && operation_result.is_err() {
@@ -641,62 +648,32 @@ impl State {
         })
     }
 
-    /// Refreshes quota for the active account. The backend response is kept
-    /// local and cached in the account manifest; a stale value remains useful
-    /// when the usage endpoint is unavailable.
-    pub fn refresh_quota(&mut self, cx: &mut Context<Self>) {
-        if self.credentials.is_none() || self.active_session_id.is_none() {
-            return;
-        }
-        if self
-            .active_session_id
-            .as_deref()
-            .and_then(|session_id| {
-                self.manifest
-                    .sessions
-                    .iter()
-                    .find(|session| session.session_id == session_id)
-                    .and_then(|session| session.quota_fetched_at_ms)
-            })
-            .is_some_and(|fetched_at| {
-                now_ms().saturating_sub(fetched_at) < QUOTA_REFRESH_INTERVAL.as_millis() as u64
-            })
+    /// Starts the all-account monitor. The first scan runs immediately after
+    /// the manifest is loaded, then repeats every minute without requiring an
+    /// account switch.
+    fn start_quota_monitor(&mut self, cx: &mut Context<Self>) {
+        if self.quota_refresh_task.is_some()
+            || self.manifest_load_state != ManifestLoadState::Loaded
         {
             return;
         }
-        let http_client = self.http_client.clone();
-        let credentials = self.credentials.clone().unwrap();
-        let session_id = self.active_session_id.clone().unwrap();
-        let task = cx.spawn(async move |this, cx| {
-            let result = fetch_quota(http_client.as_ref(), &credentials).await;
-            if let Ok(quota) = result {
-                this.update(cx, |state, cx| {
-                    if state.active_session_id.as_deref() != Some(session_id.as_str()) {
-                        return;
-                    }
-                    if let Some(session) = state
-                        .manifest
-                        .sessions
-                        .iter_mut()
-                        .find(|session| session.session_id == session_id)
-                    {
-                        session.quota = Some(quota);
-                        session.quota_fetched_at_ms = Some(now_ms());
-                    }
-                    cx.notify();
-                })
-                .log_err();
-                if let Ok(provider) =
-                    this.read_with(cx, |state, _| state.credentials_provider.clone())
-                {
-                    persist_manifest(&provider, &this, cx).await.log_err();
+        self.quota_refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                if let Err(error) = refresh_all_account_quotas(&this, cx).await {
+                    // A transient keychain, network, or persistence error must not disable the
+                    // monitor for the rest of the app lifetime.
+                    log::warn!("ChatGPT all-account quota cycle failed: {error:#}");
                 }
-            } else if let Err(error) = result {
-                log::debug!("ChatGPT usage refresh failed: {error:#}");
+                cx.background_executor().timer(QUOTA_REFRESH_INTERVAL).await;
             }
-        });
-        self.quota_fetch_tasks.clear();
-        self.quota_fetch_tasks.push(task);
+        }));
+    }
+
+    /// Requests an immediate all-account scan. The monitor remains serialized,
+    /// so restarting it cancels any sleeping cycle before beginning a new one.
+    pub fn refresh_quota(&mut self, cx: &mut Context<Self>) {
+        self.quota_refresh_task.take();
+        self.start_quota_monitor(cx);
     }
 
     fn credentials_for_session(&self, session_id: &str) -> Option<CodexCredentials> {
@@ -1084,7 +1061,6 @@ impl State {
                             });
                             if state.credentials.is_some() {
                                 state.restart_model_fetch(cx);
-                                state.refresh_quota(cx);
                             }
                         }
                         Err(error) => {
@@ -1572,34 +1548,98 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             responses_request.store = Some(false);
             responses_request.instructions.get_or_insert_default();
             let compact_request = responses_request.into_codex_compact_request();
+            let compact_body = serde_json::to_string(&compact_request)
+                .map_err(|error| LanguageModelCompletionError::Other(error.into()))?;
             let extra_headers = codex_headers(&creds);
             let access_token = creds.access_token.clone();
-            let timeout = cx
-                .background_executor()
-                .timer(COMPACTION_REQUEST_TIMEOUT);
+            let provider_name = PROVIDER_NAME.0.to_string();
+            let background_executor = cx.background_executor().clone();
 
-            let result = request_limiter
-                .run(async move {
-                    let provider_name = PROVIDER_NAME;
-                    let compact_request = compact_codex_response(
-                        http_client.as_ref(),
-                        provider_name.0.as_str(),
-                        CODEX_BASE_URL,
-                        &access_token,
-                        compact_request,
-                        &extra_headers,
-                    )
-                    .fuse();
-                    let timeout = FutureExt::fuse(timeout);
-                    futures::pin_mut!(compact_request, timeout);
-                    futures::select! {
-                        result = compact_request => result.map_err(LanguageModelCompletionError::from),
-                        _ = timeout => Err(LanguageModelCompletionError::Other(anyhow!(
-                            "ChatGPT subscription compaction timed out after {COMPACTION_REQUEST_TIMEOUT:?}"
-                        ))),
+            let result = async {
+                let operation_started_at = Instant::now();
+                for attempt in 1..=COMPACTION_MAX_ATTEMPTS {
+                    let remaining_operation_time = COMPACTION_OPERATION_TIMEOUT
+                        .saturating_sub(operation_started_at.elapsed());
+                    if remaining_operation_time.is_zero() {
+                        return Err(LanguageModelCompletionError::Other(anyhow!(
+                            "ChatGPT subscription compaction timed out after {COMPACTION_OPERATION_TIMEOUT:?}"
+                        )));
                     }
-                })
-                .await;
+                    let started_at = Instant::now();
+                    let attempt_body = compact_body.clone();
+                    let attempt_headers = extra_headers.clone();
+                    let attempt_access_token = access_token.clone();
+                    let attempt_http_client = http_client.clone();
+                    let attempt_provider_name = provider_name.clone();
+                    let attempt_background_executor = background_executor.clone();
+                    let attempt_request = request_limiter
+                        .run(async move {
+                            compact_codex_response_with_body(
+                                attempt_http_client.as_ref(),
+                                attempt_provider_name.as_str(),
+                                CODEX_BASE_URL,
+                                &attempt_access_token,
+                                attempt_body,
+                                &attempt_headers,
+                            )
+                            .await
+                            .map_err(LanguageModelCompletionError::from)
+                        })
+                        .fuse();
+                    let attempt_timeout = COMPACTION_ATTEMPT_TIMEOUT.min(remaining_operation_time);
+                    let timeout = attempt_background_executor.timer(attempt_timeout).fuse();
+                    futures::pin_mut!(attempt_request, timeout);
+                    let attempt_result = futures::select! {
+                        result = attempt_request => result,
+                        _ = timeout => Err(LanguageModelCompletionError::Other(anyhow!(
+                            "ChatGPT subscription compaction attempt timed out after {attempt_timeout:?}"
+                        ))),
+                    };
+                    let elapsed_ms = started_at.elapsed().as_millis();
+
+                    match attempt_result {
+                        Ok(response) => {
+                            log::info!(
+                                "ChatGPT subscription compaction attempt={} elapsed_ms={} result_class=success",
+                                attempt,
+                                elapsed_ms,
+                            );
+                            return Ok(response);
+                        }
+                        Err(error) => {
+                            let result_class = compaction_error_class(&error);
+                            let retryable = is_retryable_compaction_error(&error);
+                            log::warn!(
+                                "ChatGPT subscription compaction attempt={} elapsed_ms={} result_class={} retryable={}",
+                                attempt,
+                                elapsed_ms,
+                                result_class,
+                                retryable,
+                            );
+                            if !retryable || attempt == COMPACTION_MAX_ATTEMPTS {
+                                return Err(error);
+                            }
+                            let delay = compaction_retry_delay(&error, attempt);
+                            log::debug!(
+                                "ChatGPT subscription compaction retrying attempt={} delay_ms={}",
+                                attempt + 1,
+                                delay.as_millis(),
+                            );
+                            if COMPACTION_OPERATION_TIMEOUT
+                                .saturating_sub(operation_started_at.elapsed())
+                                <= delay
+                            {
+                                return Err(error);
+                            }
+                            background_executor.timer(delay).await;
+                        }
+                    }
+                }
+                Err(LanguageModelCompletionError::Other(anyhow!(
+                    "ChatGPT subscription compaction ended without a result"
+                )))
+            }
+            .await;
             drop(operation_guard);
             result.map(|response| (response, account_scope))
         });
@@ -1830,6 +1870,299 @@ impl Drop for ActiveOperationGuard {
     }
 }
 
+/// Fetches usage for every persisted account in one serialized cycle. Quota is
+/// account-scoped, so it must not depend on which account happens to be active
+/// in the UI. Credentials are read from the secure store for each session and
+/// the whole result is discarded if an account mutation races the cycle.
+async fn refresh_all_account_quotas(state: &WeakEntity<State>, cx: &mut AsyncApp) -> Result<()> {
+    let Some((provider, http_client, session_ids, generation)) = state
+        .read_with(cx, |state, _| {
+            if state.manifest_load_state != ManifestLoadState::Loaded {
+                return None;
+            }
+            Some((
+                state.credentials_provider.clone(),
+                state.http_client.clone(),
+                state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect::<Vec<_>>(),
+                state.auth_generation,
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+
+    let mut updates = Vec::new();
+    let mut credential_updates = Vec::new();
+    let mut reauthentication_required = Vec::new();
+    for session_id in session_ids {
+        let mut credentials = match provider
+            .read_credentials(&account_credentials_key(&session_id), cx)
+            .await
+        {
+            Ok(Some((_, bytes))) => match serde_json::from_slice::<CodexCredentials>(&bytes) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    log::warn!(
+                        "ChatGPT quota check skipped account {session_id}: invalid credentials: {error}"
+                    );
+                    continue;
+                }
+            },
+            Ok(None) => {
+                log::warn!("ChatGPT quota check skipped account {session_id}: credentials missing");
+                continue;
+            }
+            Err(error) => {
+                log::warn!(
+                    "ChatGPT quota check skipped account {session_id}: keychain read failed: {error:#}"
+                );
+                continue;
+            }
+        };
+
+        // The usage endpoint is account-scoped and requires a current access token. Refresh an
+        // expired credential before querying so a background account receives the same accurate
+        // quota as the active one.
+        if credentials.is_expired() {
+            match refresh_quota_credentials(
+                state,
+                generation,
+                &provider,
+                &http_client,
+                &session_id,
+                &credentials,
+                cx,
+            )
+            .await
+            {
+                Ok(refreshed) => {
+                    credential_updates.push((
+                        session_id.clone(),
+                        credentials.refresh_token.clone(),
+                        refreshed.clone(),
+                    ));
+                    credentials = refreshed;
+                }
+                Err(RefreshError::Fatal(error)) => {
+                    log::warn!(
+                        "ChatGPT quota check requires sign-in again for account {session_id}: {error:#}"
+                    );
+                    reauthentication_required.push(session_id);
+                    continue;
+                }
+                Err(RefreshError::Transient(error)) => {
+                    log::debug!(
+                        "ChatGPT quota token refresh failed transiently for account {session_id}: {error:#}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let mut result = fetch_quota(http_client.as_ref(), &credentials).await;
+        // ChatGPT can invalidate an access token before its JWT expiry. Match Cockpit's recovery
+        // behavior: force exactly one refresh-token exchange on 401, persist rotated tokens, then
+        // retry the official usage endpoint once.
+        if matches!(result, Err(QuotaFetchError::Unauthorized(_))) {
+            match refresh_quota_credentials(
+                state,
+                generation,
+                &provider,
+                &http_client,
+                &session_id,
+                &credentials,
+                cx,
+            )
+            .await
+            {
+                Ok(refreshed) => {
+                    credential_updates.push((
+                        session_id.clone(),
+                        credentials.refresh_token.clone(),
+                        refreshed.clone(),
+                    ));
+                    credentials = refreshed;
+                    result = fetch_quota(http_client.as_ref(), &credentials).await;
+                }
+                Err(RefreshError::Fatal(error)) => {
+                    log::warn!(
+                        "ChatGPT quota check requires sign-in again for account {session_id}: {error:#}"
+                    );
+                    reauthentication_required.push(session_id);
+                    continue;
+                }
+                Err(RefreshError::Transient(error)) => {
+                    log::debug!(
+                        "ChatGPT quota token recovery failed transiently for account {session_id}: {error:#}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        match result {
+            Ok(quota) => updates.push((session_id, quota)),
+            Err(error) => {
+                log::debug!("ChatGPT quota check failed for account {session_id}: {error}")
+            }
+        }
+    }
+
+    if updates.is_empty() && credential_updates.is_empty() && reauthentication_required.is_empty() {
+        return Ok(());
+    }
+    let updated = state.update(cx, |state, cx| {
+        if state.auth_generation != generation
+            || state.manifest_load_state != ManifestLoadState::Loaded
+        {
+            return false;
+        }
+        let fetched_at = now_ms();
+        for (session_id, quota) in updates {
+            if let Some(session) = state
+                .manifest
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                session.quota = Some(quota);
+                session.quota_fetched_at_ms = Some(fetched_at);
+                session.reauthentication_required = false;
+            }
+        }
+        for (session_id, old_refresh_token, credentials) in credential_updates {
+            if state.active_session_id.as_deref() == Some(session_id.as_str())
+                && state
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|current| current.refresh_token == old_refresh_token)
+            {
+                state.credentials = Some(credentials.clone());
+            }
+            if let Some(session) = state
+                .manifest
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                session.token_expires_at_ms = Some(credentials.expires_at_ms);
+            }
+        }
+        for session_id in reauthentication_required {
+            if let Some(session) = state
+                .manifest
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                session.reauthentication_required = true;
+            }
+        }
+        cx.notify();
+        true
+    })?;
+    if updated {
+        persist_manifest(&provider, state, cx).await?;
+    } else {
+        log::debug!("Discarded stale ChatGPT quota cycle after account mutation");
+    }
+    Ok(())
+}
+
+async fn refresh_quota_credentials(
+    state: &WeakEntity<State>,
+    generation: u64,
+    provider: &Arc<dyn CredentialsProvider>,
+    http_client: &Arc<dyn HttpClient>,
+    session_id: &str,
+    credentials: &CodexCredentials,
+    cx: &AsyncApp,
+) -> Result<CodexCredentials, RefreshError> {
+    let mut refreshed = refresh_token(http_client, &credentials.refresh_token).await?;
+    refreshed.account_id = refreshed.account_id.or(credentials.account_id.clone());
+    refreshed.email = refreshed.email.or(credentials.email.clone());
+    refreshed.user_id = refreshed.user_id.or(credentials.user_id.clone());
+    refreshed.plan_type = refreshed.plan_type.or(credentials.plan_type.clone());
+
+    let key = account_credentials_key(session_id);
+    let session_is_current = state
+        .read_with(cx, |state, _| {
+            state.auth_generation == generation
+                && state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+        })
+        .unwrap_or(false);
+    if !session_is_current {
+        return Err(RefreshError::Transient(anyhow!(
+            "ChatGPT account changed during quota token refresh"
+        )));
+    }
+
+    // A foreground request may have rotated this credential while the quota request was in
+    // flight. Never overwrite that newer token; use it for the quota retry instead.
+    if let Some((_, bytes)) = provider
+        .read_credentials(&key, cx)
+        .await
+        .map_err(RefreshError::Transient)?
+    {
+        let current = serde_json::from_slice::<CodexCredentials>(&bytes)
+            .map_err(|error| RefreshError::Transient(error.into()))?;
+        if current.refresh_token != credentials.refresh_token
+            || current.access_token != credentials.access_token
+        {
+            return Ok(current);
+        }
+    }
+
+    let json =
+        serde_json::to_vec(&refreshed).map_err(|error| RefreshError::Transient(error.into()))?;
+    provider
+        .write_credentials(&key, "Bearer", &json, cx)
+        .await
+        .map_err(RefreshError::Transient)?;
+
+    // Sign-out can race the keychain write after the guard above. If the account was removed,
+    // delete only the stale scoped credential so a background refresh cannot resurrect it.
+    let session_still_current = state
+        .read_with(cx, |state, _| {
+            state.auth_generation == generation
+                && state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+        })
+        .unwrap_or(false);
+    if !session_still_current {
+        let account_was_removed = state
+            .read_with(cx, |state, _| {
+                !state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+            })
+            .unwrap_or(true);
+        if account_was_removed {
+            provider.delete_credentials(&key, cx).await.log_err();
+        }
+        return Err(RefreshError::Transient(anyhow!(
+            "ChatGPT account changed during quota credential persistence"
+        )));
+    }
+    Ok(refreshed)
+}
+
 /// Persists the in-memory manifest, refusing to overwrite a manifest that
 /// could not be loaded and converging on the newest identity if a background
 /// write races a newer account mutation (a stale write must never leave a
@@ -1931,6 +2264,84 @@ fn stream_with_idle_timeout(
         },
     )
     .boxed()
+}
+
+fn compaction_error_class(error: &LanguageModelCompletionError) -> &'static str {
+    match error {
+        LanguageModelCompletionError::RateLimitExceeded { .. } => "rate_limit",
+        LanguageModelCompletionError::ServerOverloaded { .. }
+        | LanguageModelCompletionError::ApiInternalServerError { .. } => "server_error",
+        LanguageModelCompletionError::AuthenticationError { .. } => "auth",
+        LanguageModelCompletionError::HttpResponseError { status_code, .. }
+            if *status_code == http_client::StatusCode::REQUEST_TIMEOUT =>
+        {
+            "timeout"
+        }
+        LanguageModelCompletionError::HttpResponseError { status_code, .. }
+            if status_code.is_server_error() =>
+        {
+            "server_error"
+        }
+        LanguageModelCompletionError::ApiReadResponseError { .. }
+        | LanguageModelCompletionError::HttpSend { .. } => "transport",
+        LanguageModelCompletionError::Other(error) if is_transport_error(error) => "transport",
+        LanguageModelCompletionError::Other(error) if is_timeout_error(error) => "timeout",
+        LanguageModelCompletionError::PromptTooLarge { .. }
+        | LanguageModelCompletionError::RequestPayloadTooLarge { .. } => "prompt_too_large",
+        LanguageModelCompletionError::BadRequestFormat { .. } => "bad_request",
+        _ => "non_retryable",
+    }
+}
+
+fn is_retryable_compaction_error(error: &LanguageModelCompletionError) -> bool {
+    matches!(
+        compaction_error_class(error),
+        "rate_limit" | "server_error" | "transport" | "timeout"
+    )
+}
+
+fn compaction_retry_delay(
+    error: &LanguageModelCompletionError,
+    completed_attempt: usize,
+) -> Duration {
+    let provider_delay = match error {
+        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }
+        | LanguageModelCompletionError::ServerOverloaded { retry_after, .. }
+        | LanguageModelCompletionError::UpstreamProviderError { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+
+    provider_delay.unwrap_or_else(|| {
+        COMPACTION_RETRY_DELAYS
+            .get(completed_attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or(Duration::from_secs(1))
+    })
+}
+
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
+}
+
+fn is_transport_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "connection",
+        "disconnect",
+        "broken pipe",
+        "reset by peer",
+        "network",
+        "unexpected eof",
+        "end of file",
+        "failed to fill whole buffer",
+        "incomplete message",
+        "connection closed",
+        "stream closed",
+        "socket closed",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 async fn get_fresh_credentials(
@@ -2520,10 +2931,24 @@ fn upsert_manifest_session(
     });
 }
 
+#[derive(Debug)]
+enum QuotaFetchError {
+    Unauthorized(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for QuotaFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(error) | Self::Other(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
 async fn fetch_quota(
     http_client: &dyn HttpClient,
     credentials: &CodexCredentials,
-) -> Result<QuotaSnapshot> {
+) -> Result<QuotaSnapshot, QuotaFetchError> {
     let request = HttpRequest::builder()
         .method(Method::GET)
         .uri(format!("{CHATGPT_BACKEND_BASE_URL}/wham/usage"))
@@ -2533,27 +2958,41 @@ async fn fetch_quota(
         )
         .header("Accept", "application/json")
         .extra_headers(&codex_headers(credentials))
-        .body(AsyncBody::empty())?;
-    let mut response = http_client.send(request).await?;
+        .body(AsyncBody::empty())
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
+    let mut response = http_client
+        .send(request)
+        .await
+        .map_err(QuotaFetchError::Other)?;
     let status = response.status();
     let mut body = String::new();
-    smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body).await?;
+    smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body)
+        .await
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
     if !status.is_success() {
-        return Err(anyhow!(
-            "ChatGPT usage request failed (HTTP {status}): {body}"
-        ));
+        let error = anyhow!("ChatGPT usage request failed (HTTP {status}): {body}");
+        if status == http_client::StatusCode::UNAUTHORIZED {
+            return Err(QuotaFetchError::Unauthorized(error));
+        }
+        return Err(QuotaFetchError::Other(error));
     }
     let value = serde_json::from_str::<serde_json::Value>(&body)
-        .context("Failed to parse ChatGPT usage response")?;
-    Ok(quota_snapshot_from_value(&value))
+        .context("Failed to parse ChatGPT usage response")
+        .map_err(QuotaFetchError::Other)?;
+    quota_snapshot_from_value(&value).map_err(QuotaFetchError::Other)
 }
 
-fn quota_snapshot_from_value(value: &serde_json::Value) -> QuotaSnapshot {
+fn quota_snapshot_from_value(value: &serde_json::Value) -> Result<QuotaSnapshot> {
     let rate_limit = value.get("rate_limit").unwrap_or(value);
     let primary = quota_window_from_value(rate_limit.get("primary_window"));
     let secondary = quota_window_from_value(rate_limit.get("secondary_window"));
     let credits = rate_limit.get("credits").or_else(|| value.get("credits"));
-    QuotaSnapshot {
+    if primary.is_none() && secondary.is_none() && credits.is_none() {
+        return Err(anyhow!(
+            "ChatGPT usage response did not contain rate-limit or credit data"
+        ));
+    }
+    Ok(QuotaSnapshot {
         primary,
         secondary,
         credits_has_credits: credits
@@ -2577,15 +3016,17 @@ fn quota_snapshot_from_value(value: &serde_json::Value) -> QuotaSnapshot {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         captured_at_ms: now_ms(),
-    }
+    })
 }
 
 fn quota_window_from_value(value: Option<&serde_json::Value>) -> Option<QuotaWindow> {
     let value = value?;
     let used_percent = value
         .get("used_percent")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
+        .and_then(serde_json::Value::as_f64)?;
+    if !used_percent.is_finite() {
+        return None;
+    }
     let window_minutes = value
         .get("limit_window_seconds")
         .and_then(serde_json::Value::as_i64)
@@ -2600,7 +3041,7 @@ fn quota_window_from_value(value: Option<&serde_json::Value>) -> Option<QuotaWin
                 .map(|seconds| (now_ms() / 1000) as i64 + seconds)
         });
     Some(QuotaWindow {
-        used_percent,
+        used_percent: used_percent.clamp(0.0, 100.0),
         window_minutes,
         resets_at,
     })
@@ -2626,6 +3067,43 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_compaction_retry_policy() {
+        let rate_limit = LanguageModelCompletionError::RateLimitExceeded {
+            provider: PROVIDER_NAME,
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert!(is_retryable_compaction_error(&rate_limit));
+        assert_eq!(
+            compaction_retry_delay(&rate_limit, 1),
+            Duration::from_secs(7)
+        );
+
+        let server_error = LanguageModelCompletionError::HttpResponseError {
+            provider: PROVIDER_NAME,
+            status_code: http_client::StatusCode::BAD_GATEWAY,
+            message: "bad gateway".to_string(),
+        };
+        assert!(is_retryable_compaction_error(&server_error));
+        assert_eq!(
+            compaction_retry_delay(&server_error, 1),
+            Duration::from_millis(500)
+        );
+
+        assert!(is_retryable_compaction_error(
+            &LanguageModelCompletionError::Other(anyhow!("connection reset by peer"))
+        ));
+        assert!(!is_retryable_compaction_error(
+            &LanguageModelCompletionError::PromptTooLarge { tokens: None }
+        ));
+        assert!(!is_retryable_compaction_error(
+            &LanguageModelCompletionError::AuthenticationError {
+                provider: PROVIDER_NAME,
+                message: "expired".to_string(),
+            }
+        ));
+    }
 
     #[gpui::test]
     async fn test_concurrent_refresh_deduplicates(cx: &mut TestAppContext) {
@@ -4232,7 +4710,7 @@ mod tests {
             last_auth_error: None,
             models: ChatGptModel::fallback_models(),
             model_fetch_task: None,
-            quota_fetch_tasks: Vec::new(),
+            quota_refresh_task: None,
             active_operations: Arc::new(BusyNotifier::new()),
             manifest_load_state: ManifestLoadState::Loaded,
             client_version: "test".to_string(),

@@ -8,6 +8,7 @@ use language::{Buffer, BufferSnapshot, CharKind};
 use smol::future::yield_now;
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     io::{BufRead, BufReader, Read},
     ops::Range,
     sync::{Arc, LazyLock},
@@ -251,6 +252,9 @@ impl SearchQuery {
 
         let regex = RegexBuilder::new(&pattern)
             .case_insensitive(!case_sensitive)
+            // Assertions such as `$` must see line boundaries even when the query
+            // itself does not contain a newline.
+            .multi_line(true)
             .crlf(true)
             .build()?;
         Ok(Self::Regex {
@@ -431,33 +435,17 @@ impl SearchQuery {
                     Ok(None)
                 }
             }
-            Self::Regex {
-                regex, multiline, ..
-            } => {
+            Self::Regex { regex, .. } => {
                 let mut text = String::new();
-                if *multiline {
-                    reader.read_to_string(&mut text)?;
-                    text::LineEnding::normalize(&mut text);
-                    if regex.is_match(&text)? {
-                        Ok(Some(LineHint::default()))
-                    } else {
-                        Ok(None)
-                    }
+                reader.read_to_string(&mut text)?;
+                text::LineEnding::normalize(&mut text);
+                if let Some(mat) = regex.find(&text)? {
+                    let line = text[..mat.start()]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count();
+                    Ok(Some(LineHint::try_from(line).unwrap_or(u32::MAX)))
                 } else {
-                    let mut bytes_read = 0;
-                    let mut line_number: LineHint = LineHint::default();
-                    while reader.read_line(&mut text)? > 0 {
-                        if regex.is_match(&text)? {
-                            return Ok(Some(line_number));
-                        }
-                        bytes_read += text.len();
-                        if bytes_read >= YIELD_THRESHOLD {
-                            bytes_read = 0;
-                            smol::future::yield_now().await;
-                        }
-                        text.clear();
-                        line_number += 1;
-                    }
                     Ok(None)
                 }
             }
@@ -562,42 +550,29 @@ impl SearchQuery {
             }
 
             Self::Regex {
-                regex, multiline, ..
+                regex,
+                one_match_per_line,
+                ..
             } => {
-                if *multiline {
-                    let text = rope.to_string();
-                    for (ix, mat) in regex.find_iter(&text).enumerate() {
-                        if (ix + 1) % YIELD_INTERVAL == 0 {
-                            yield_now().await;
-                        }
-
-                        if let std::result::Result::Ok(mat) = mat {
-                            matches.push(mat.start()..mat.end());
-                        }
+                // Search the complete rope so look-around assertions can see
+                // neighboring lines. The old line-by-line path silently
+                // dropped matches such as `foo(?=\\nbar)`.
+                let text = rope.to_string();
+                let mut seen_lines = BTreeSet::new();
+                for (ix, mat) in regex.find_iter(&text).enumerate() {
+                    if (ix + 1) % YIELD_INTERVAL == 0 {
+                        yield_now().await;
                     }
-                } else {
-                    let mut line = String::new();
-                    let mut line_offset = 0;
-                    for (chunk_ix, chunk) in rope.chunks().chain(["\n"]).enumerate() {
-                        if (chunk_ix + 1) % YIELD_INTERVAL == 0 {
-                            yield_now().await;
-                        }
 
-                        for (newline_ix, text) in chunk.split('\n').enumerate() {
-                            if newline_ix > 0 {
-                                for mat in regex.find_iter(&line).flatten() {
-                                    let start = line_offset + mat.start();
-                                    let end = line_offset + mat.end();
-                                    matches.push(start..end);
-                                    if self.one_match_per_line() == Some(true) {
-                                        break;
-                                    }
-                                }
-
-                                line_offset += line.len() + 1;
-                                line.clear();
-                            }
-                            line.push_str(text);
+                    if let std::result::Result::Ok(mat) = mat {
+                        let should_push = if *one_match_per_line {
+                            seen_lines
+                                .insert(buffer.offset_to_point(range_offset + mat.start()).row)
+                        } else {
+                            true
+                        };
+                        if should_push {
+                            matches.push(mat.start()..mat.end());
                         }
                     }
                 }
@@ -738,30 +713,28 @@ impl SearchQuery {
             }
             Self::Regex {
                 regex,
-                multiline,
                 one_match_per_line,
                 ..
             } => {
-                if *multiline {
-                    for mat in regex.find_iter(text).flatten() {
+                let mut seen_lines = BTreeSet::new();
+                let mut line_cursor = 0;
+                let mut line_number = 0;
+                for mat in regex.find_iter(text).flatten() {
+                    let should_push = if *one_match_per_line {
+                        line_number += text[line_cursor..mat.start()]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count();
+                        line_cursor = mat.start();
+                        seen_lines.insert(line_number)
+                    } else {
+                        true
+                    };
+                    if should_push {
                         matches.push(mat.start()..mat.end());
-                        if matches.len() == limit {
-                            break;
-                        }
                     }
-                } else {
-                    let mut line_offset = 0;
-                    for line in text.split('\n') {
-                        for mat in regex.find_iter(line).flatten() {
-                            matches.push((line_offset + mat.start())..(line_offset + mat.end()));
-                            if *one_match_per_line || matches.len() == limit {
-                                break;
-                            }
-                        }
-                        if matches.len() == limit {
-                            break;
-                        }
-                        line_offset += line.len() + 1;
+                    if matches.len() == limit {
+                        break;
                     }
                 }
             }

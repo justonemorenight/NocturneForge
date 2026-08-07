@@ -1935,10 +1935,9 @@ impl MultiWorkspace {
     /// Removes one or more workspaces from this multi-workspace.
     ///
     /// If the active workspace is among those being removed,
-    /// `fallback_workspace` is called **synchronously before the removal
-    /// begins** to produce a `Task` that resolves to the workspace that
-    /// should become active. The fallback must not be one of the
-    /// workspaces being removed.
+    /// `fallback_workspace` is called after close prompts settle to produce a
+    /// `Task` that resolves to the workspace that should become active. The
+    /// fallback must not be one of the workspaces being removed.
     ///
     /// Returns `true` if any workspaces were actually removed.
     pub fn remove(
@@ -1948,7 +1947,8 @@ impl MultiWorkspace {
             &mut Self,
             &mut Window,
             &mut Context<Self>,
-        ) -> Task<Result<Entity<Workspace>>>,
+        ) -> Task<Result<Entity<Workspace>>>
+        + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
@@ -1961,7 +1961,12 @@ impl MultiWorkspace {
         let removing_active = workspaces.iter().any(|ws| ws == self.workspace());
         let original_active = self.workspace().clone();
 
-        let fallback_task = removing_active.then(|| fallback_workspace(self, window, cx));
+        // Delay constructing the fallback until all close prompts have
+        // settled. A prompt may switch the displayed workspace, and creating
+        // the fallback before that transition can reopen the workspace that
+        // is about to be removed (or select the wrong project while a window
+        // is closing).
+        let fallback_workspace = removing_active.then_some(fallback_workspace);
 
         cx.spawn_in(window, async move |this, cx| {
             // Run the standard workspace close lifecycle for every workspace
@@ -1979,19 +1984,49 @@ impl MultiWorkspace {
                 }
             }
 
-            // If we're removing the active workspace, await the
-            // fallback and switch to it before tearing anything down.
+            // If we're removing the active workspace, choose the fallback
+            // from the post-prompt state and switch to it before tearing
+            // anything down.
             // Otherwise restore the original active workspace in case
             // prompting switched away from it.
-            if let Some(fallback_task) = fallback_task {
+            if let Some(fallback_workspace) = fallback_workspace {
+                let fallback_task =
+                    this.update_in(cx, |this, window, cx| fallback_workspace(this, window, cx))?;
                 let new_active = fallback_task.await?;
 
                 this.update_in(cx, |this, window, cx| {
-                    assert!(
-                        !workspaces.contains(&new_active),
-                        "fallback workspace must not be one of the workspaces being removed"
-                    );
-                    this.activate(new_active, None, window, cx);
+                    if !workspaces.contains(&new_active) {
+                        this.activate(new_active, None, window, cx);
+                        return;
+                    }
+
+                    // A concurrent archive/close may have invalidated the
+                    // caller's candidate while the close prompt was shown.
+                    // Never activate a workspace that is in this removal
+                    // batch; choose a surviving retained workspace instead.
+                    if let Some(surviving_workspace) = this
+                        .retained_workspaces
+                        .iter()
+                        .find(|candidate| !workspaces.contains(candidate))
+                        .cloned()
+                    {
+                        this.activate(surviving_workspace, None, window, cx);
+                    } else {
+                        let app_state = this.workspace().read(cx).app_state().clone();
+                        let project = Project::local(
+                            app_state.client.clone(),
+                            app_state.node_runtime.clone(),
+                            app_state.user_store.clone(),
+                            app_state.languages.clone(),
+                            app_state.fs.clone(),
+                            None,
+                            project::LocalProjectFlags::default(),
+                            cx,
+                        );
+                        let empty_workspace =
+                            cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                        this.activate(empty_workspace, None, window, cx);
+                    }
                 })?;
             } else {
                 this.update_in(cx, |this, window, cx| {

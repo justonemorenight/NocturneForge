@@ -10729,6 +10729,82 @@ async fn test_split_selection_into_lines_interacting_with_creases(cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_add_selection_below_with_tab_aligned_columns(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.hard_tabs = Some(true);
+        settings.defaults.tab_size = Some(4.try_into().unwrap());
+    });
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    // Both `=` render at column 48 despite using a different number of tabs.
+    cx.set_state(
+        "\t\t\t\t\t\tcurrent.rgb.r\t\t\tˇ= p[0] >> 8;\n\t\t\t\t\t\tresiduals[run].rgb.r\t= p[0] & 0xff;\n",
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        editor.add_selection_below(
+            &AddSelectionBelow {
+                skip_soft_wrap: true,
+            },
+            window,
+            cx,
+        );
+    });
+
+    cx.assert_editor_state(
+        "\t\t\t\t\t\tcurrent.rgb.r\t\t\tˇ= p[0] >> 8;\n\t\t\t\t\t\tresiduals[run].rgb.r\tˇ= p[0] & 0xff;\n",
+    );
+}
+
+#[gpui::test]
+async fn test_add_selection_above_below_with_fold(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state(indoc!(
+        r#"fn foo() {
+            aaaa
+            bbbb
+        }
+        one
+        twoˇ"#
+    ));
+
+    cx.update_editor(|editor, window, cx| {
+        editor.fold_creases(
+            vec![Crease::simple(
+                Point::new(0, 10)..Point::new(3, 0),
+                FoldPlaceholder::test(),
+            )],
+            true,
+            window,
+            cx,
+        );
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.add_selection_above(
+            &AddSelectionAbove {
+                skip_soft_wrap: true,
+            },
+            window,
+            cx,
+        );
+    });
+
+    cx.assert_editor_state(indoc!(
+        r#"fn foo() {
+            aaaa
+            bbbb
+        }
+        oneˇ
+        twoˇ"#
+    ));
+}
+
+#[gpui::test]
 async fn test_add_selection_above_below(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -34267,7 +34343,10 @@ async fn test_indent_after_input_for_bash(cx: &mut TestAppContext) {
 
     let mut cx = EditorTestContext::new(cx).await;
     let language = languages::language("bash", tree_sitter_bash::LANGUAGE.into());
-    cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+    cx.update_buffer(|buffer, cx| {
+        buffer.set_language(Some(language), cx);
+        buffer.set_sync_parse_timeout(None);
+    });
 
     // test indents on comment insert
     cx.set_state(indoc! {"

@@ -71,6 +71,30 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// Where to display controls for reviewing Agent edits in a single-file editor.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewControlLocation {
+    /// Display review controls in the editor toolbar.
+    Toolbar,
+    /// Display review controls beside the hovered diff hunk.
+    #[default]
+    Island,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -190,6 +214,25 @@ pub struct AutoCompactSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct ChatGptSubagentRoleContent {
+    /// ChatGPT Subscription model ID used for this role.
+    pub model: Option<String>,
+    /// Reasoning effort used for this role.
+    pub effort: Option<String>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct ChatGptSubagentRolesContent {
+    /// Whether native ChatGPT Subscription role routing is enabled.
+    pub enabled: Option<bool>,
+    pub explorer: Option<ChatGptSubagentRoleContent>,
+    pub flow_reader: Option<ChatGptSubagentRoleContent>,
+    pub coding_worker: Option<ChatGptSubagentRoleContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
     /// Whether the Agent is enabled.
     ///
@@ -237,6 +280,9 @@ pub struct AgentSettingsContent {
     pub default_model: Option<LanguageModelSelection>,
     /// The model to use for subagents spawned via the `spawn_agent` tool. Defaults to the parent agent's model when not specified.
     pub subagent_model: Option<LanguageModelSelection>,
+    /// Native role routing for subagents spawned by ChatGPT Subscription.
+    /// When disabled, `subagent_model` and parent-model inheritance behave as before.
+    pub chatgpt_subagent_roles: Option<ChatGptSubagentRolesContent>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -287,6 +333,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub single_file_review: Option<bool>,
+    /// Where to display controls when reviewing Agent edits in a single-file editor.
+    ///
+    /// Default: toolbar
+    pub review_control_location: Option<ReviewControlLocation>,
     /// Whether Agent-owned LSP registrations use scoped edit and diagnostic leases.
     /// Read-only Agent file tracking does not open language servers when enabled.
     ///

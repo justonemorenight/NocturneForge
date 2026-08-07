@@ -16,8 +16,9 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    DockPosition, DockSide, LanguageModelParameters, LanguageModelSelection,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
+    ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition, DockSide,
+    LanguageModelParameters, LanguageModelSelection, NotifyWhenAgentWaiting,
+    PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
     update_settings_file, update_settings_file_with_completion,
 };
@@ -30,6 +31,55 @@ pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
+
+#[derive(Clone, Debug)]
+pub struct ChatGptSubagentRoleSettings {
+    pub model: String,
+    pub effort: String,
+}
+
+impl From<ChatGptSubagentRoleContent> for ChatGptSubagentRoleSettings {
+    fn from(content: ChatGptSubagentRoleContent) -> Self {
+        Self {
+            model: content.model.unwrap(),
+            effort: content.effort.unwrap(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatGptSubagentRolesSettings {
+    pub enabled: bool,
+    pub explorer: ChatGptSubagentRoleSettings,
+    pub flow_reader: ChatGptSubagentRoleSettings,
+    pub coding_worker: ChatGptSubagentRoleSettings,
+}
+
+impl Default for ChatGptSubagentRolesSettings {
+    fn default() -> Self {
+        let role = |effort: &str| ChatGptSubagentRoleSettings {
+            model: "gpt-5.6-luna".to_string(),
+            effort: effort.to_string(),
+        };
+        Self {
+            enabled: true,
+            explorer: role("low"),
+            flow_reader: role("medium"),
+            coding_worker: role("xhigh"),
+        }
+    }
+}
+
+impl From<ChatGptSubagentRolesContent> for ChatGptSubagentRolesSettings {
+    fn from(content: ChatGptSubagentRolesContent) -> Self {
+        Self {
+            enabled: content.enabled.unwrap(),
+            explorer: content.explorer.unwrap().into(),
+            flow_reader: content.flow_reader.unwrap().into(),
+            coding_worker: content.coding_worker.unwrap().into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelLayout {
@@ -213,6 +263,7 @@ pub struct AgentSettings {
     pub max_content_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
+    pub chatgpt_subagent_roles: ChatGptSubagentRolesSettings,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -229,6 +280,7 @@ pub struct AgentSettings {
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
     pub single_file_review: bool,
+    pub review_control_location: ReviewControlLocation,
     pub experimental_lsp_leases: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
     pub auto_compact: AutoCompactSettings,
@@ -763,6 +815,7 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
+            chatgpt_subagent_roles: agent.chatgpt_subagent_roles.unwrap().into(),
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
@@ -788,6 +841,7 @@ impl Settings for AgentSettings {
             notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),
             single_file_review: agent.single_file_review.unwrap(),
+            review_control_location: agent.review_control_location.unwrap(),
             experimental_lsp_leases: agent.experimental_lsp_leases.unwrap_or(false),
             model_parameters: agent.model_parameters,
             auto_compact: {
@@ -1066,6 +1120,41 @@ mod tests {
                 .terminal_init_command
                 .is_none()
         );
+    }
+
+    #[gpui::test]
+    fn test_chatgpt_subagent_roles_settings_merge_with_defaults(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(
+                    r#"{
+                        "agent": {
+                            "chatgpt_subagent_roles": {
+                                "enabled": false,
+                                "explorer": {
+                                    "model": "custom-luna",
+                                    "effort": "high"
+                                }
+                            }
+                        }
+                    }"#,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        let roles = &AgentSettings::get_global(cx).chatgpt_subagent_roles;
+        assert!(!roles.enabled);
+        assert_eq!(roles.explorer.model, "custom-luna");
+        assert_eq!(roles.explorer.effort, "high");
+        assert_eq!(roles.flow_reader.model, "gpt-5.6-luna");
+        assert_eq!(roles.flow_reader.effort, "medium");
+        assert_eq!(roles.coding_worker.effort, "xhigh");
     }
 
     #[test]

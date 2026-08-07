@@ -6,8 +6,9 @@ use anyhow::Result;
 use buffer_diff::DiffHunkStatus;
 use collections::{HashMap, HashSet};
 use editor::{
-    DiffHunkDelegate, Direction, Editor, EditorEvent, EditorSettings, MultiBuffer,
-    MultiBufferSnapshot, ResolvedDiffHunks, SelectionEffects, SplittableEditor, ToPoint,
+    DiffHunkControlsPosition, DiffHunkDelegate, Direction, Editor, EditorEvent, EditorSettings,
+    MultiBuffer, MultiBufferSnapshot, ResolvedDiffHunks, SelectionEffects, SplittableEditor,
+    ToPoint,
     actions::{GoToHunk, GoToPreviousHunk},
     multibuffer_context_lines,
     scroll::Autoscroll,
@@ -21,7 +22,7 @@ use gpui::{
 use language::{Buffer, Capability, OffsetRangeExt, Point};
 use multi_buffer::PathKey;
 use project::{Project, ProjectItem, ProjectPath};
-use settings::{Settings, SettingsStore};
+use settings::{ReviewControlLocation, Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     collections::hash_map::Entry,
@@ -29,7 +30,8 @@ use std::{
     sync::Arc,
 };
 use ui::{
-    CommonAnimationExt, Divider, IconButtonShape, KeyBinding, TintColor, Tooltip, prelude::*,
+    CommonAnimationExt, ContextMenu, Divider, IconButtonShape, KeyBinding, PopoverMenu, TintColor,
+    Tooltip, prelude::*,
 };
 use util::{ResultExt, truncate_and_trailoff};
 use workspace::{
@@ -798,6 +800,53 @@ impl DiffHunkDelegate for AgentDiffDelegate {
     fn render_hunk_as_staged(&self, _status: &DiffHunkStatus, _cx: &App) -> bool {
         false
     }
+
+    fn hunk_controls_position(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &App,
+    ) -> DiffHunkControlsPosition {
+        if !editor.read(cx).buffer().read(cx).is_singleton() {
+            return DiffHunkControlsPosition::Hunk;
+        }
+        if !EditorSettings::get_global(cx).toolbar.agent_review {
+            return DiffHunkControlsPosition::Hidden;
+        }
+        match AgentSettings::get_global(cx).review_control_location {
+            ReviewControlLocation::Toolbar => DiffHunkControlsPosition::Hidden,
+            ReviewControlLocation::Island => DiffHunkControlsPosition::HunkHoverBottomRight,
+        }
+    }
+}
+
+fn render_all_review_actions_menu(id: &'static str, focus_handle: FocusHandle) -> AnyElement {
+    let menu_focus_handle = focus_handle.clone();
+
+    PopoverMenu::new(id)
+        .trigger_with_tooltip(
+            IconButton::new(id, IconName::Ellipsis)
+                .shape(IconButtonShape::Square)
+                .icon_size(IconSize::Small),
+            Tooltip::text("File Review Actions"),
+        )
+        .anchor(gpui::Anchor::TopRight)
+        .menu(move |window, cx| {
+            let reject_focus_handle = menu_focus_handle.clone();
+            let keep_focus_handle = menu_focus_handle.clone();
+            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                menu.entry(
+                    "Reject All Changes",
+                    Some(RejectAll.boxed_clone()),
+                    move |window, cx| reject_focus_handle.dispatch_action(&RejectAll, window, cx),
+                )
+                .entry(
+                    "Keep All Changes",
+                    Some(KeepAll.boxed_clone()),
+                    move |window, cx| keep_focus_handle.dispatch_action(&KeepAll, window, cx),
+                )
+            }))
+        })
+        .into_any_element()
 }
 
 fn render_diff_hunk_controls(
@@ -827,10 +876,9 @@ fn render_diff_hunk_controls(
         .gap_1()
         .px_0p5()
         .pb_1()
-        .border_x_1()
-        .border_b_1()
+        .border_1()
         .border_color(cx.theme().colors().border)
-        .rounded_b_md()
+        .rounded_md()
         .bg(controls_background)
         .gap_1()
         .block_mouse_except_scroll()
@@ -1044,7 +1092,13 @@ impl AgentDiffToolbar {
             None => ToolbarItemLocation::Hidden,
             Some(AgentDiffToolbarItem::Pane(_)) => ToolbarItemLocation::PrimaryRight,
             Some(AgentDiffToolbarItem::Editor { state, .. }) => match state {
-                EditorState::Reviewing => ToolbarItemLocation::PrimaryRight,
+                EditorState::Reviewing
+                    if AgentSettings::get_global(cx).review_control_location
+                        == ReviewControlLocation::Toolbar =>
+                {
+                    ToolbarItemLocation::PrimaryRight
+                }
+                EditorState::Reviewing => ToolbarItemLocation::Hidden,
                 EditorState::Idle => ToolbarItemLocation::Hidden,
             },
         }
@@ -1176,35 +1230,31 @@ impl Render for AgentDiffToolbar {
                         h_flex()
                             .gap_0p5()
                             .child(
-                                Button::new("reject-all", "Reject All")
+                                Button::new("reject", "Reject")
                                     .style(ButtonStyle::Tinted(TintColor::Error))
                                     .key_binding({
-                                        KeyBinding::for_action_in(
-                                            &RejectAll,
-                                            &editor_focus_handle,
-                                            cx,
-                                        )
-                                        .map(|kb| kb.size(rems_from_px(12.)))
+                                        KeyBinding::for_action_in(&Reject, &editor_focus_handle, cx)
+                                            .map(|kb| kb.size(rems_from_px(12.)))
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.dispatch_action(&RejectAll, window, cx)
+                                        this.dispatch_action(&Reject, window, cx)
                                     })),
                             )
                             .child(
-                                Button::new("keep-all", "Keep All")
+                                Button::new("keep", "Keep")
                                     .style(ButtonStyle::Tinted(TintColor::Success))
                                     .key_binding({
-                                        KeyBinding::for_action_in(
-                                            &KeepAll,
-                                            &editor_focus_handle,
-                                            cx,
-                                        )
-                                        .map(|kb| kb.size(rems_from_px(12.)))
+                                        KeyBinding::for_action_in(&Keep, &editor_focus_handle, cx)
+                                            .map(|kb| kb.size(rems_from_px(12.)))
                                     })
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.dispatch_action(&KeepAll, window, cx)
+                                        this.dispatch_action(&Keep, window, cx)
                                     })),
                             )
+                            .child(render_all_review_actions_menu(
+                                "agent-review-toolbar-all-actions",
+                                editor_focus_handle.clone(),
+                            ))
                             .into_any_element(),
                     ],
                 };
@@ -1316,6 +1366,7 @@ pub enum EditorState {
 
 struct WorkspaceThread {
     thread: WeakEntity<AcpThread>,
+    has_pending_edit_tool_calls: bool,
     _thread_subscriptions: (Subscription, Subscription),
     singleton_editors: HashMap<WeakEntity<Buffer>, HashMap<WeakEntity<Editor>, Subscription>>,
     contextual_review_editors: HashSet<WeakEntity<Editor>>,
@@ -1418,6 +1469,8 @@ impl AgentDiff {
         if let Some(workspace_thread) = self.workspace_threads.get_mut(workspace) {
             // replace thread and action log subscription, but keep editors
             workspace_thread.thread = thread.downgrade();
+            workspace_thread.has_pending_edit_tool_calls =
+                thread.read(cx).has_pending_edit_tool_calls();
             workspace_thread._thread_subscriptions = (action_log_subscription, thread_subscription);
             if active_thread_changed {
                 workspace_thread.contextual_review_editors.clear();
@@ -1429,13 +1482,28 @@ impl AgentDiff {
 
         let settings_subscription = cx.observe_global_in::<SettingsStore>(window, {
             let workspace = workspace.clone();
-            let mut was_active = AgentSettings::get_global(cx).single_file_review;
+            let settings = AgentSettings::get_global(cx);
+            let mut previous_settings = (
+                settings.single_file_review,
+                settings.review_control_location,
+                EditorSettings::get_global(cx).toolbar.agent_review,
+            );
             move |this, window, cx| {
-                let is_active = AgentSettings::get_global(cx).single_file_review;
-                if was_active != is_active {
-                    was_active = is_active;
+                let settings = AgentSettings::get_global(cx);
+                let current_settings = (
+                    settings.single_file_review,
+                    settings.review_control_location,
+                    EditorSettings::get_global(cx).toolbar.agent_review,
+                );
+                if previous_settings.0 != current_settings.0 {
                     this.update_reviewing_editors(&workspace, window, cx);
                 }
+                if previous_settings.1 != current_settings.1
+                    || previous_settings.2 != current_settings.2
+                {
+                    this.notify_reviewing_editors_for_workspace(&workspace, cx);
+                }
+                previous_settings = current_settings;
             }
         });
 
@@ -1447,6 +1515,7 @@ impl AgentDiff {
             workspace.clone(),
             WorkspaceThread {
                 thread: thread.downgrade(),
+                has_pending_edit_tool_calls: thread.read(cx).has_pending_edit_tool_calls(),
                 _thread_subscriptions: (action_log_subscription, thread_subscription),
                 singleton_editors: HashMap::default(),
                 contextual_review_editors: HashSet::default(),
@@ -1573,6 +1642,22 @@ impl AgentDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let has_pending_edit_tool_calls = thread.read(cx).has_pending_edit_tool_calls();
+        let pending_state_changed =
+            self.workspace_threads
+                .get_mut(workspace)
+                .is_some_and(|workspace_thread| {
+                    if workspace_thread.has_pending_edit_tool_calls == has_pending_edit_tool_calls {
+                        false
+                    } else {
+                        workspace_thread.has_pending_edit_tool_calls = has_pending_edit_tool_calls;
+                        true
+                    }
+                });
+        if pending_state_changed {
+            self.notify_reviewing_editors_for_workspace(workspace, cx);
+        }
+
         match event {
             AcpThreadEvent::NewEntry => {
                 if thread
@@ -1878,6 +1963,25 @@ impl AgentDiff {
                 })
                 .ok();
             self.reviewing_editors.remove(&editor);
+        }
+    }
+
+    fn notify_reviewing_editors_for_workspace(
+        &self,
+        workspace: &WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_thread) = self.workspace_threads.get(workspace) else {
+            return;
+        };
+        for editor in workspace_thread
+            .singleton_editors
+            .values()
+            .flat_map(|editors| editors.keys())
+        {
+            if self.reviewing_editors.contains_key(editor) {
+                editor.update(cx, |_editor, cx| cx.notify()).log_err();
+            }
         }
     }
 
@@ -2429,10 +2533,10 @@ mod tests {
             Point::new(1, 0)..Point::new(1, 0)
         );
 
-        // The toolbar is displayed in the right state
+        // Hover controls are the default for singleton review editors.
         assert_eq!(
             diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
-            ToolbarItemLocation::PrimaryRight
+            ToolbarItemLocation::Hidden
         );
         assert!(diff_toolbar.read_with(cx, |toolbar, _cx| matches!(
             toolbar.active_item,
@@ -2441,6 +2545,18 @@ mod tests {
                 ..
             })
         )));
+        assert_eq!(
+            editor1.read_with(cx, |editor, cx| editor
+                .diff_hunk_delegate()
+                .hunk_controls_position(&editor1, cx)),
+            DiffHunkControlsPosition::HunkHoverBottomRight
+        );
+
+        override_review_control_location(ReviewControlLocation::Toolbar, cx);
+        assert_eq!(
+            diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
+            ToolbarItemLocation::PrimaryRight
+        );
 
         // The toolbar respects its setting
         override_toolbar_agent_review_setting(false, cx);
@@ -2449,6 +2565,32 @@ mod tests {
             ToolbarItemLocation::Hidden
         );
         override_toolbar_agent_review_setting(true, cx);
+        assert_eq!(
+            diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
+            ToolbarItemLocation::PrimaryRight
+        );
+
+        override_review_control_location(ReviewControlLocation::Island, cx);
+        assert_eq!(
+            diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
+            ToolbarItemLocation::Hidden
+        );
+        assert_eq!(
+            editor1.read_with(cx, |editor, cx| editor
+                .diff_hunk_delegate()
+                .hunk_controls_position(&editor1, cx)),
+            DiffHunkControlsPosition::HunkHoverBottomRight
+        );
+
+        override_toolbar_agent_review_setting(false, cx);
+        assert_eq!(
+            editor1.read_with(cx, |editor, cx| editor
+                .diff_hunk_delegate()
+                .hunk_controls_position(&editor1, cx)),
+            DiffHunkControlsPosition::Hidden
+        );
+        override_toolbar_agent_review_setting(true, cx);
+        override_review_control_location(ReviewControlLocation::Toolbar, cx);
         assert_eq!(
             diff_toolbar.read_with(cx, |toolbar, cx| toolbar.location(cx)),
             ToolbarItemLocation::PrimaryRight
@@ -2582,6 +2724,20 @@ mod tests {
                 let mut editor_settings = store.get::<EditorSettings>(None).clone();
                 editor_settings.toolbar.agent_review = active;
                 store.override_global(editor_settings);
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn override_review_control_location(
+        location: ReviewControlLocation,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, _cx| {
+                let mut agent_settings = store.get::<AgentSettings>(None).clone();
+                agent_settings.review_control_location = location;
+                store.override_global(agent_settings);
             })
         });
         cx.run_until_parked();

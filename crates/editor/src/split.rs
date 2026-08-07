@@ -37,8 +37,8 @@ use workspace::{
 };
 
 use crate::{
-    Autoscroll, DiffHunkDelegate, Editor, EditorEvent, EditorSettings, ResolvedDiffHunks,
-    ToggleSoftWrap, UncommittedDiffHunkDelegate,
+    Autoscroll, DiffHunkControlsPosition, DiffHunkDelegate, Editor, EditorEvent, EditorSettings,
+    ResolvedDiffHunks, ToggleSoftWrap, UncommittedDiffHunkDelegate,
     actions::{DisableBreakpoint, EditLogBreakpoint, EnableBreakpoint, ToggleBreakpoint},
     display_map::Companion,
 };
@@ -241,6 +241,22 @@ impl DiffHunkDelegate for SplitLhsDiffHunkDelegate {
         };
         let delegate = splittable.read(cx).rhs_editor.read(cx).diff_hunk_delegate();
         delegate.render_hunk_as_staged(status, cx)
+    }
+
+    fn hunk_controls_position(
+        &self,
+        editor: &Entity<Editor>,
+        cx: &App,
+    ) -> DiffHunkControlsPosition {
+        let Some(splittable) = self.splittable.upgrade() else {
+            return DiffHunkControlsPosition::Hidden;
+        };
+        splittable
+            .read(cx)
+            .rhs_editor
+            .read(cx)
+            .diff_hunk_delegate()
+            .hunk_controls_position(editor, cx)
     }
 }
 

@@ -17,6 +17,10 @@ use ui::{ConfiguredApiCard, prelude::*};
 const SUBSCRIPTION_DESCRIPTION: &str =
     "Sign in with your ChatGPT Plus or Pro subscription to use OpenAI models in Zed's agent.";
 
+fn remaining_percent(used_percent: f64) -> f64 {
+    100.0 - used_percent.clamp(0.0, 100.0)
+}
+
 pub struct OpenAiSubscribedProvider {
     state: Entity<State>,
 }
@@ -125,7 +129,12 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
                 let quota = account.quota.as_ref().and_then(|quota| {
                     quota.primary.as_ref().map(|window| {
                         let stale = if account.quota_stale { " · stale" } else { "" };
-                        format!("{:.0}% used{}", window.used_percent, stale).into()
+                        format!(
+                            "{:.0}% remaining{}",
+                            remaining_percent(window.used_percent),
+                            stale
+                        )
+                        .into()
                     })
                 });
                 ProviderAccountSummary {
@@ -268,7 +277,11 @@ impl Render for ConfigurationView {
                     .as_ref()
                     .and_then(|quota| quota.primary.as_ref())
                 {
-                    label = format!("{label} · {:.0}% used", quota.used_percent).into();
+                    label = format!(
+                        "{label} · {:.0}% remaining",
+                        remaining_percent(quota.used_percent)
+                    )
+                    .into();
                 }
                 if account.reauthentication_required {
                     label = format!("{label} · sign in required").into();

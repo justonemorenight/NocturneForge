@@ -567,6 +567,10 @@ impl EditorElement {
                             }
 
                             if scroll_position != current_scroll_position {
+                                // The hovered hunk was resolved against the pre-scroll position
+                                // map. Hide its controls until the next pointer movement rather
+                                // than letting the overlay follow stale screen coordinates.
+                                editor.hovered_diff_hunk_row = None;
                                 editor.scroll(scroll_position, axis, window, cx);
                                 cx.stop_propagation();
                             } else if y < 0. && !forbid_vertical_scroll {

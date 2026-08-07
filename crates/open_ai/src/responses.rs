@@ -806,15 +806,23 @@ pub async fn compact_codex_response(
     request: CodexCompactRequest,
     extra_headers: &CustomHeaders,
 ) -> Result<CodexCompactedResponse, RequestError> {
-    compact_response_with_request(
-        client,
-        provider_name,
-        api_url,
-        api_key,
-        request,
-        extra_headers,
-    )
-    .await
+    let body =
+        serde_json::to_string(&request).map_err(|error| RequestError::Other(error.into()))?;
+    compact_response_with_body(client, provider_name, api_url, api_key, body, extra_headers).await
+}
+
+/// Sends a previously serialized Codex compaction request. Providers that
+/// retry a bounded number of times can reuse the exact same payload without
+/// cloning the request's non-Clone input item tree.
+pub async fn compact_codex_response_with_body(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    body: String,
+    extra_headers: &CustomHeaders,
+) -> Result<CodexCompactedResponse, RequestError> {
+    compact_response_with_body(client, provider_name, api_url, api_key, body, extra_headers).await
 }
 
 async fn compact_response_with_request<Response: DeserializeOwned>(
@@ -825,15 +833,26 @@ async fn compact_response_with_request<Response: DeserializeOwned>(
     request: impl Serialize,
     extra_headers: &CustomHeaders,
 ) -> Result<Response, RequestError> {
+    let body =
+        serde_json::to_string(&request).map_err(|error| RequestError::Other(error.into()))?;
+    compact_response_with_body(client, provider_name, api_url, api_key, body, extra_headers).await
+}
+
+async fn compact_response_with_body<Response: DeserializeOwned>(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    body: String,
+    extra_headers: &CustomHeaders,
+) -> Result<Response, RequestError> {
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(format!("{api_url}/responses/compact"))
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()))
         .extra_headers(extra_headers)
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|error| RequestError::Other(error.into()))?,
-        ))
+        .body(AsyncBody::from(body))
         .map_err(|error| RequestError::Other(error.into()))?;
 
     let mut response = client.send(request).await?;

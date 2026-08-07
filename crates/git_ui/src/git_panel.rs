@@ -1319,7 +1319,7 @@ impl GitPanel {
                 view_mode: GitPanelViewMode::from_settings(cx),
                 tree_expanded_dirs: HashMap::default(),
                 projected_entries_by_path: HashMap::default(),
-                focus_handle: cx.focus_handle(),
+                focus_handle,
                 fs,
                 new_count: 0,
                 new_staged_count: 0,
@@ -7104,13 +7104,12 @@ impl GitPanel {
             return;
         }
         self.active_tab = tab;
+        self.focus_handle(cx).focus(window, cx);
         match tab {
             GitPanelTab::History => {
-                self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
             }
             GitPanelTab::Changes => {
-                self.focus_handle.focus(window, cx);
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
@@ -8884,7 +8883,9 @@ impl Render for GitPanel {
 
 impl Focusable for GitPanel {
     fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
-        if self.entries.is_empty() || self.commit_editor_expanded {
+        if self.active_tab == GitPanelTab::Changes
+            && (self.entries.is_empty() || self.commit_editor_expanded)
+        {
             self.commit_editor.focus_handle(cx)
         } else {
             self.focus_handle.clone()
@@ -13111,6 +13112,19 @@ mod tests {
             assert!(!panel.entries.is_empty());
             assert!(!panel.commit_editor_expanded);
             assert_eq!(panel.focus_handle(cx), panel.focus_handle.clone());
+        });
+
+        // History is rendered by the panel itself, so it must never route
+        // activation focus to the commit editor—even when there are no
+        // changes or the commit editor was expanded on the Changes tab.
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            let entries = std::mem::take(&mut panel.entries);
+            panel.active_tab = GitPanelTab::History;
+            panel.commit_editor_expanded = true;
+            assert_eq!(panel.focus_handle(cx), panel.focus_handle.clone());
+            panel.entries = entries;
+            panel.active_tab = GitPanelTab::Changes;
+            panel.commit_editor_expanded = false;
         });
 
         // Expand the editor so we can later confirm that toggling focus

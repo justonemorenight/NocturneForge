@@ -40,9 +40,56 @@ Some Zed AI features have their own model or prompt settings in `settings.json`,
 - `agent.thread_summary_model`
 - `agent.compaction_model`
 - `agent.subagent_model`
+- `agent.chatgpt_subagent_roles`
+- `agent.review_control_location`
 - `agent.commit_message_instructions`
 - `agent.commit_message_skill`
 - `agent.inline_alternatives`
+
+`agent.chatgpt_subagent_roles` controls native role routing only for the
+ChatGPT Subscription provider. Disable it to restore the standard
+`agent.subagent_model` or parent-model inheritance flow:
+
+```json [settings]
+{
+  "agent": {
+    "chatgpt_subagent_roles": {
+      "enabled": true,
+      "explorer": { "model": "gpt-5.6-luna", "effort": "low" },
+      "flow_reader": { "model": "gpt-5.6-luna", "effort": "medium" },
+      "coding_worker": { "model": "gpt-5.6-luna", "effort": "xhigh" }
+    }
+  }
+}
+```
+
+While role routing is enabled, `explorer` and `flow-reader` remain read-only,
+while `coding-worker` uses the workspace's normal write profile and sandbox.
+These permission boundaries are not configurable through this setting.
+
+### Review Controls {#review-controls}
+
+Set `agent.review_control_location` to `toolbar` to keep Agent review controls
+in the editor toolbar, or to `island` to reveal them at the bottom-right of the
+diff hunk while hovering it. The island does not reserve editor width or change
+line wrapping.
+
+The `editor.toolbar.agent_review` setting remains the independent visibility
+switch for single-file review controls. Set it to `false` to hide either
+single-file location.
+
+```json [settings]
+{
+  "agent": {
+    "review_control_location": "island"
+  },
+  "editor": {
+    "toolbar": {
+      "agent_review": true
+    }
+  }
+}
+```
 
 Use `agent.commit_message_instructions` for instructions that apply only to generated Git commit messages:
 
