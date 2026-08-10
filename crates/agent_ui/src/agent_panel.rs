@@ -67,7 +67,9 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{DiffReviewComment, Editor, MultiBuffer, actions::SendReviewToAgent};
+use editor::{
+    DiffReviewComment, Editor, MultiBuffer, ReviewFeedback, actions::SendReviewToAgent,
+};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -672,25 +674,42 @@ pub fn init(cx: &mut App) {
                     if !panel.read(cx).has_open_project(cx) {
                         return;
                     }
-                    let comments = editor.update(cx, |editor, cx| editor.take_review_comments(cx));
-                    let Some(initial_content) = build_diff_review_initial_content(&comments) else {
+                    let feedback = editor.read(cx).review_feedback(cx);
+                    if feedback.is_empty() {
                         return;
-                    };
+                    }
 
                     workspace.focus_panel::<AgentPanel>(window, cx);
-                    panel.update(cx, |panel, cx| {
-                        panel.external_thread(
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(initial_content),
-                            true,
-                            AgentThreadSource::GitPanel,
-                            window,
-                            cx,
-                        );
-                    });
+                    match panel.update(cx, |panel, cx| {
+                        panel.send_review_feedback(feedback, window, cx)
+                    }) {
+                        Ok(true) => editor.update(cx, |editor, cx| {
+                            editor.mark_review_feedback_sent(cx);
+                        }),
+                        Ok(false) => {
+                            let comments =
+                                editor.update(cx, |editor, cx| editor.take_review_comments(cx));
+                            let Some(initial_content) = build_diff_review_initial_content(&comments)
+                            else {
+                                return;
+                            };
+                            panel.update(cx, |panel, cx| {
+                                panel.external_thread(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(initial_content),
+                                    true,
+                                    AgentThreadSource::GitPanel,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        Err(error) => workspace
+                            .show_error(format!("Failed to send review feedback: {error:#}"), cx),
+                    }
                 })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
@@ -4296,6 +4315,21 @@ impl AgentPanel {
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()
+    }
+
+    pub fn send_review_feedback(
+        &mut self,
+        feedback: Vec<ReviewFeedback>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        let Some(thread_view) = self.active_thread_view(cx) else {
+            return Ok(false);
+        };
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_review_feedback(feedback, window, cx)
+        })?;
+        Ok(true)
     }
 
     pub fn active_agent_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
