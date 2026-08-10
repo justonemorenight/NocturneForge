@@ -110,7 +110,8 @@ pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DiffHunkControlsPosition, DiffHunkDelegate, DiffReviewComment, ResolvedDiffHunk,
     ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate, RestoreOnlyUnstagedDiffHunkDelegate,
-    UncommittedDiffHunkDelegate, render_diff_hunk_controls, set_blame_renderer,
+    ReviewComment, ReviewCommentStatus, ReviewFeedback, ReviewSession, ReviewSessionSource,
+    ReviewThread, UncommittedDiffHunkDelegate, render_diff_hunk_controls, set_blame_renderer,
 };
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{
