@@ -1,7 +1,7 @@
 use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::HashSet;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use git::{
     repository::RepoPath,
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
@@ -423,8 +423,11 @@ impl DiffBufferList {
         project_path: crate::ProjectPath,
         repo: Entity<Repository>,
         cx: &Context<'_, Project>,
-    ) -> Task<Result<LoadedDiffBuffer>> {
-        let task = cx.spawn(async move |project, cx| {
+    ) -> LocalBoxFuture<'static, Result<LoadedDiffBuffer>> {
+        let project = cx.entity();
+        let mut cx = cx.to_async();
+        async move {
+            let cx = &mut cx;
             let buffer = project
                 .update(cx, |project, cx| project.open_buffer(project_path, cx))?
                 .await?;
@@ -499,8 +502,8 @@ impl DiffBufferList {
                 diff: changes,
                 conflict_set,
             })
-        });
-        task
+        }
+        .boxed_local()
     }
 }
 
@@ -530,9 +533,8 @@ pub struct LoadedDiffBuffer {
     pub conflict_set: Option<Entity<ConflictSet>>,
 }
 
-#[derive(Debug)]
 pub struct DiffBuffer {
     pub repo_path: RepoPath,
     pub file_status: FileStatus,
-    pub load: Task<Result<LoadedDiffBuffer>>,
+    pub load: LocalBoxFuture<'static, Result<LoadedDiffBuffer>>,
 }
