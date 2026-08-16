@@ -71,6 +71,7 @@ pub struct ActionLog {
     /// Stores undo information for the most recent reject operation
     last_reject_undo: Option<LastRejectUndo>,
     review_decisions: VecDeque<ReviewDecision>,
+    review_decision_bytes: usize,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
     last_reported_large_diff_state: Cell<Option<bool>>,
@@ -89,6 +90,7 @@ impl ActionLog {
             linked_action_log: None,
             last_reject_undo: None,
             review_decisions: VecDeque::new(),
+            review_decision_bytes: 0,
             file_read_times: HashMap::default(),
             last_reported_large_diff_state: Cell::new(None),
             lsp_lease_counters: Arc::default(),
@@ -335,19 +337,37 @@ impl ActionLog {
         &mut self,
         buffer: &Entity<Buffer>,
         transaction_id: clock::Lamport,
-        before: ReviewBufferState,
-        after: ReviewBufferState,
+        before: ReviewStateRoot,
+        after: ReviewStateRoot,
+        patch_delta: ReviewPatchDelta,
+        changed_base_bytes: usize,
     ) {
         const MAX_REVIEW_DECISIONS: usize = 256;
+        const MAX_REVIEW_DECISION_BYTES: usize = 32 * 1024 * 1024;
 
-        self.review_decisions.push_back(ReviewDecision {
+        let decision = ReviewDecision {
             buffer: buffer.downgrade(),
             transaction_id,
             before,
             after,
-        });
-        while self.review_decisions.len() > MAX_REVIEW_DECISIONS {
-            self.review_decisions.pop_front();
+            patch_delta,
+            changed_base_bytes,
+        };
+        self.review_decision_bytes = self
+            .review_decision_bytes
+            .saturating_add(decision.estimated_bytes());
+        self.review_decisions.push_back(decision);
+        // Keep the newest command even when that command alone exceeds the soft byte budget;
+        // otherwise Ctrl+Z could immediately lose the review decision it is meant to reverse.
+        while self.review_decisions.len() > MAX_REVIEW_DECISIONS
+            || (self.review_decision_bytes > MAX_REVIEW_DECISION_BYTES
+                && self.review_decisions.len() > 1)
+        {
+            if let Some(decision) = self.review_decisions.pop_front() {
+                self.review_decision_bytes = self
+                    .review_decision_bytes
+                    .saturating_sub(decision.estimated_bytes());
+            }
         }
     }
 
@@ -367,7 +387,7 @@ impl ActionLog {
         }) else {
             return;
         };
-        let state = if undo {
+        let state_root = if undo {
             decision.before.clone()
         } else {
             decision.after.clone()
@@ -376,7 +396,30 @@ impl ActionLog {
             return;
         };
 
-        state.restore(tracked_buffer, buffer.read(cx).text_snapshot());
+        let unreviewed_edits = if undo {
+            decision.patch_delta.undo(&tracked_buffer.unreviewed_edits)
+        } else {
+            decision.patch_delta.redo(&tracked_buffer.unreviewed_edits)
+        };
+        let Some(unreviewed_edits) = unreviewed_edits else {
+            log::warn!(
+                "review history no longer matches the canonical diff; recomputing from the restored base"
+            );
+            state_root.restore(
+                tracked_buffer,
+                Patch::default(),
+                buffer.read(cx).text_snapshot(),
+            );
+            tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+            cx.notify();
+            return;
+        };
+
+        state_root.restore(
+            tracked_buffer,
+            unreviewed_edits,
+            buffer.read(cx).text_snapshot(),
+        );
         tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
         cx.notify();
     }
@@ -1094,7 +1137,7 @@ impl ActionLog {
         };
 
         let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
-        let mut review_states = None;
+        let mut review_decision = None;
         match tracked_buffer.status {
             TrackedBufferStatus::Deleted => {
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -1102,13 +1145,15 @@ impl ActionLog {
                 cx.notify();
             }
             _ => {
-                let before = ReviewBufferState::capture(tracked_buffer);
+                let before = ReviewStateRoot::capture(tracked_buffer);
                 let buffer = buffer.read(cx);
                 let buffer_range =
                     buffer_range.start.to_point(buffer)..buffer_range.end.to_point(buffer);
                 let mut delta = 0i32;
-                let previous_unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
+                let mut resolved_edits = Vec::new();
+                let mut changed_base_bytes = 0usize;
                 tracked_buffer.unreviewed_edits.retain_mut(|edit| {
+                    let original_edit = edit.clone();
                     edit.old.start = (edit.old.start as i32 + delta) as u32;
                     edit.old.end = (edit.old.end as i32 + delta) as u32;
 
@@ -1131,6 +1176,9 @@ impl ActionLog {
                                 Point::new(edit.new.end, 0),
                                 tracked_buffer.snapshot.max_point(),
                             ));
+                        changed_base_bytes = changed_base_bytes
+                            .saturating_add(old_range.len())
+                            .saturating_add(new_range.len());
                         tracked_buffer.diff_base.replace(
                             old_range,
                             &tracked_buffer
@@ -1140,6 +1188,7 @@ impl ActionLog {
                         );
                         delta += edit.new_len() as i32 - edit.old_len() as i32;
                         metrics.add_edit(edit);
+                        resolved_edits.push(original_edit);
                         false
                     }
                 });
@@ -1148,20 +1197,31 @@ impl ActionLog {
                 {
                     tracked_buffer.status = TrackedBufferStatus::Modified;
                 }
-                tracked_buffer.review_state_changed_before_recompute |=
-                    tracked_buffer.unreviewed_edits != previous_unreviewed_edits;
+                tracked_buffer.review_state_changed_before_recompute |= !resolved_edits.is_empty();
                 tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
-                let after = ReviewBufferState::capture(tracked_buffer);
-                if before.unreviewed_edits != after.unreviewed_edits {
-                    review_states = Some((before, after));
+                let after = ReviewStateRoot::capture(tracked_buffer);
+                if !resolved_edits.is_empty() {
+                    review_decision = Some((
+                        before,
+                        after,
+                        ReviewPatchDelta::new(resolved_edits, ReviewPatchShiftAxis::Old),
+                        changed_base_bytes,
+                    ));
                 }
             }
         }
-        if let Some((before, after)) = review_states {
+        if let Some((before, after, patch_delta, changed_base_bytes)) = review_decision {
             let now = cx.background_executor().now();
             let transaction_id =
                 buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
-            self.record_review_decision(&buffer, transaction_id, before, after);
+            self.record_review_decision(
+                &buffer,
+                transaction_id,
+                before,
+                after,
+                patch_delta,
+                changed_base_bytes,
+            );
         }
         if let Some(telemetry) = telemetry {
             telemetry_report_accepted_edits(&telemetry, metrics);
@@ -1188,7 +1248,11 @@ impl ActionLog {
             } => {
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
                 let task = if let Some(existing_file_content) = existing_file_content {
-                    let before = ReviewBufferState::capture(tracked_buffer);
+                    let before = ReviewStateRoot::capture(tracked_buffer);
+                    let changed_base_bytes = tracked_buffer
+                        .diff_base
+                        .len()
+                        .saturating_add(existing_file_content.len());
                     // Capture the agent's content before restoring existing file content
                     let agent_content = buffer.read(cx).text();
                     let buffer_id = buffer.read(cx).remote_id();
@@ -1207,13 +1271,21 @@ impl ActionLog {
 
                     tracked_buffer.status = TrackedBufferStatus::Modified;
                     tracked_buffer.diff_base = existing_file_content.clone();
-                    tracked_buffer.unreviewed_edits.clear();
+                    let resolved_edits = std::mem::take(&mut tracked_buffer.unreviewed_edits)
+                        .into_iter()
+                        .collect();
                     tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
                     tracked_buffer.review_state_changed_before_recompute = true;
                     tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
-                    let after = ReviewBufferState::capture(tracked_buffer);
+                    let after = ReviewStateRoot::capture(tracked_buffer);
                     if let Some(transaction_id) = transaction_id {
-                        review_decision = Some((transaction_id, before, after));
+                        review_decision = Some((
+                            transaction_id,
+                            before,
+                            after,
+                            ReviewPatchDelta::new(resolved_edits, ReviewPatchShiftAxis::New),
+                            changed_base_bytes,
+                        ));
                     }
 
                     undo_info = Some(PerBufferUndo {
@@ -1291,8 +1363,8 @@ impl ActionLog {
                 save
             }
             TrackedBufferStatus::Modified => {
-                let before = ReviewBufferState::capture(tracked_buffer);
-                let (edits_to_restore, transaction_id, remaining_unreviewed_edits) =
+                let before = ReviewStateRoot::capture(tracked_buffer);
+                let (edits_to_restore, transaction_id, remaining_unreviewed_edits, resolved_edits) =
                     buffer.update(cx, |buffer, cx| {
                         let mut buffer_row_ranges = buffer_ranges
                             .into_iter()
@@ -1304,6 +1376,7 @@ impl ActionLog {
                         let mut edits_to_revert = Vec::new();
                         let mut edits_for_undo = Vec::new();
                         let mut remaining_edits = Vec::new();
+                        let mut resolved_edits = Vec::new();
                         let mut new_row_delta = 0i64;
                         for edit in tracked_buffer.unreviewed_edits.edits() {
                             let new_range = tracked_buffer
@@ -1330,6 +1403,7 @@ impl ActionLog {
 
                             if revert {
                                 metrics.add_edit(edit);
+                                resolved_edits.push(edit.clone());
                                 let old_range = tracked_buffer
                                     .diff_base
                                     .point_to_offset(Point::new(edit.old.start, 0))
@@ -1375,7 +1449,12 @@ impl ActionLog {
                             buffer.finalize_last_transaction();
                             transaction_id
                         };
-                        (edits_for_undo, transaction_id, Patch::new(remaining_edits))
+                        (
+                            edits_for_undo,
+                            transaction_id,
+                            Patch::new(remaining_edits),
+                            resolved_edits,
+                        )
                     });
 
                 if transaction_id.is_some() {
@@ -1395,8 +1474,14 @@ impl ActionLog {
                 }
 
                 if let Some(transaction_id) = transaction_id {
-                    let after = ReviewBufferState::capture(tracked_buffer);
-                    review_decision = Some((transaction_id, before, after));
+                    let after = ReviewStateRoot::capture(tracked_buffer);
+                    review_decision = Some((
+                        transaction_id,
+                        before,
+                        after,
+                        ReviewPatchDelta::new(resolved_edits, ReviewPatchShiftAxis::New),
+                        0,
+                    ));
                 }
 
                 self.project
@@ -1406,8 +1491,17 @@ impl ActionLog {
         if let Some(telemetry) = telemetry {
             telemetry_report_rejected_edits(&telemetry, metrics);
         }
-        if let Some((transaction_id, before, after)) = review_decision {
-            self.record_review_decision(&buffer, transaction_id, before, after);
+        if let Some((transaction_id, before, after, patch_delta, changed_base_bytes)) =
+            review_decision
+        {
+            self.record_review_decision(
+                &buffer,
+                transaction_id,
+                before,
+                after,
+                patch_delta,
+                changed_base_bytes,
+            );
         }
         (task, undo_info)
     }
@@ -1427,29 +1521,48 @@ impl ActionLog {
             match tracked_buffer.status {
                 TrackedBufferStatus::Deleted => false,
                 _ => {
-                    let before = ReviewBufferState::capture(tracked_buffer);
+                    let before = ReviewStateRoot::capture(tracked_buffer);
+                    let changed_base_bytes = tracked_buffer
+                        .diff_base
+                        .len()
+                        .saturating_add(tracked_buffer.snapshot.len());
                     if let TrackedBufferStatus::Created { .. } = &mut tracked_buffer.status {
                         tracked_buffer.status = TrackedBufferStatus::Modified;
                     }
+                    let resolved_edits = std::mem::take(&mut tracked_buffer.unreviewed_edits)
+                        .into_iter()
+                        .collect::<Vec<_>>();
                     tracked_buffer.review_state_changed_before_recompute |=
-                        !tracked_buffer.unreviewed_edits.is_empty();
-                    tracked_buffer.unreviewed_edits.clear();
+                        !resolved_edits.is_empty();
                     tracked_buffer.diff_base = tracked_buffer.snapshot.as_rope().clone();
                     tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
-                    let after = ReviewBufferState::capture(tracked_buffer);
-                    if before.unreviewed_edits != after.unreviewed_edits {
-                        review_states.push((buffer.clone(), before, after));
+                    let after = ReviewStateRoot::capture(tracked_buffer);
+                    if !resolved_edits.is_empty() {
+                        review_states.push((
+                            buffer.clone(),
+                            before,
+                            after,
+                            ReviewPatchDelta::new(resolved_edits, ReviewPatchShiftAxis::Old),
+                            changed_base_bytes,
+                        ));
                     }
                     true
                 }
             }
         });
 
-        for (buffer, before, after) in review_states {
+        for (buffer, before, after, patch_delta, changed_base_bytes) in review_states {
             let now = cx.background_executor().now();
             let transaction_id =
                 buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
-            self.record_review_decision(&buffer, transaction_id, before, after);
+            self.record_review_decision(
+                &buffer,
+                transaction_id,
+                before,
+                after,
+                patch_delta,
+                changed_base_bytes,
+            );
         }
 
         cx.notify();
@@ -2203,35 +2316,179 @@ enum TrackedBufferStatus {
 }
 
 #[derive(Clone)]
-struct ReviewBufferState {
+struct ReviewStateRoot {
     diff_base: Rope,
-    unreviewed_edits: Patch<u32>,
     status: TrackedBufferStatus,
 }
 
-impl ReviewBufferState {
+impl ReviewStateRoot {
     fn capture(tracked_buffer: &TrackedBuffer) -> Self {
         Self {
             diff_base: tracked_buffer.diff_base.clone(),
-            unreviewed_edits: tracked_buffer.unreviewed_edits.clone(),
             status: tracked_buffer.status.clone(),
         }
     }
 
-    fn restore(self, tracked_buffer: &mut TrackedBuffer, snapshot: text::BufferSnapshot) {
+    fn restore(
+        self,
+        tracked_buffer: &mut TrackedBuffer,
+        unreviewed_edits: Patch<u32>,
+        snapshot: text::BufferSnapshot,
+    ) {
         tracked_buffer.diff_base = self.diff_base;
-        tracked_buffer.unreviewed_edits = self.unreviewed_edits;
+        tracked_buffer.unreviewed_edits = unreviewed_edits;
         tracked_buffer.status = self.status;
         tracked_buffer.snapshot = snapshot;
         tracked_buffer.review_state_changed_before_recompute = true;
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReviewPatchShiftAxis {
+    Old,
+    New,
+}
+
+struct ReviewPatchDelta {
+    resolved_edits: Vec<Edit<u32>>,
+    shift_axis: ReviewPatchShiftAxis,
+}
+
+impl ReviewPatchDelta {
+    fn new(mut resolved_edits: Vec<Edit<u32>>, shift_axis: ReviewPatchShiftAxis) -> Self {
+        resolved_edits.shrink_to_fit();
+        Self {
+            resolved_edits,
+            shift_axis,
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.resolved_edits
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Edit<u32>>())
+    }
+
+    fn redo(&self, edits: &Patch<u32>) -> Option<Patch<u32>> {
+        let mut resolved_edits = self.resolved_edits.iter().peekable();
+        let mut shifted_rows = 0i64;
+        let mut result = Vec::with_capacity(
+            edits
+                .edits()
+                .len()
+                .saturating_sub(self.resolved_edits.len()),
+        );
+
+        for edit in edits.edits() {
+            if resolved_edits
+                .peek()
+                .is_some_and(|resolved| *resolved == edit)
+            {
+                shifted_rows += self.row_shift(edit);
+                resolved_edits.next();
+            } else {
+                let mut edit = edit.clone();
+                self.shift_edit(&mut edit, shifted_rows)?;
+                result.push(edit);
+            }
+        }
+
+        if resolved_edits.next().is_some() {
+            return None;
+        }
+        checked_review_patch(result)
+    }
+
+    fn undo(&self, edits: &Patch<u32>) -> Option<Patch<u32>> {
+        let mut current_edits = edits.edits().iter().peekable();
+        let mut resolved_edits = self.resolved_edits.iter().peekable();
+        let mut shifted_rows = 0i64;
+        let mut result = Vec::with_capacity(
+            edits
+                .edits()
+                .len()
+                .saturating_add(self.resolved_edits.len()),
+        );
+
+        while current_edits.peek().is_some() || resolved_edits.peek().is_some() {
+            let take_resolved = match (current_edits.peek(), resolved_edits.peek()) {
+                (Some(current), Some(resolved)) => {
+                    self.stable_range(resolved) < self.stable_range(current)
+                }
+                (None, Some(_)) => true,
+                _ => false,
+            };
+
+            if take_resolved {
+                let resolved = resolved_edits.next()?.clone();
+                shifted_rows += self.row_shift(&resolved);
+                result.push(resolved);
+            } else {
+                let mut current = current_edits.next()?.clone();
+                self.shift_edit(&mut current, -shifted_rows)?;
+                result.push(current);
+            }
+        }
+
+        checked_review_patch(result)
+    }
+
+    fn stable_range(&self, edit: &Edit<u32>) -> (u32, u32) {
+        let range = match self.shift_axis {
+            ReviewPatchShiftAxis::Old => &edit.new,
+            ReviewPatchShiftAxis::New => &edit.old,
+        };
+        (range.start, range.end)
+    }
+
+    fn row_shift(&self, edit: &Edit<u32>) -> i64 {
+        match self.shift_axis {
+            ReviewPatchShiftAxis::Old => edit.new_len() as i64 - edit.old_len() as i64,
+            ReviewPatchShiftAxis::New => edit.old_len() as i64 - edit.new_len() as i64,
+        }
+    }
+
+    fn shift_edit(&self, edit: &mut Edit<u32>, rows: i64) -> Option<()> {
+        let range = match self.shift_axis {
+            ReviewPatchShiftAxis::Old => &mut edit.old,
+            ReviewPatchShiftAxis::New => &mut edit.new,
+        };
+        range.start = shift_row(range.start, rows)?;
+        range.end = shift_row(range.end, rows)?;
+        Some(())
+    }
+}
+
+fn checked_review_patch(edits: Vec<Edit<u32>>) -> Option<Patch<u32>> {
+    if edits.windows(2).any(|edits| {
+        edits[1].old.start <= edits[0].old.end || edits[1].new.start <= edits[0].new.end
+    }) {
+        return None;
+    }
+    Some(Patch::new(edits))
+}
+
+fn shift_row(row: u32, delta: i64) -> Option<u32> {
+    let shifted = row as i64 + delta;
+    u32::try_from(shifted).ok()
+}
+
 struct ReviewDecision {
     buffer: WeakEntity<Buffer>,
     transaction_id: clock::Lamport,
-    before: ReviewBufferState,
-    after: ReviewBufferState,
+    before: ReviewStateRoot,
+    after: ReviewStateRoot,
+    patch_delta: ReviewPatchDelta,
+    changed_base_bytes: usize,
+}
+
+impl ReviewDecision {
+    fn estimated_bytes(&self) -> usize {
+        self.patch_delta
+            .estimated_bytes()
+            .saturating_add(self.changed_base_bytes)
+            .saturating_add(std::mem::size_of::<Self>())
+    }
 }
 
 pub struct TrackedBuffer {
@@ -2315,6 +2572,171 @@ mod tests {
     use language::Point;
     use project::{FakeFs, Fs, Project, RemoveOptions};
     use rand::prelude::*;
+
+    #[test]
+    fn test_review_patch_delta_round_trips_keep_with_row_shifts() {
+        let first = Edit {
+            old: 1..2,
+            new: 1..4,
+        };
+        let second = Edit {
+            old: 5..7,
+            new: 7..8,
+        };
+        let third = Edit {
+            old: 10..10,
+            new: 11..13,
+        };
+        let before = Patch::new(vec![first.clone(), second.clone(), third.clone()]);
+        let after = Patch::new(vec![Edit {
+            old: 7..9,
+            new: 7..8,
+        }]);
+        let delta = ReviewPatchDelta::new(vec![first, third], ReviewPatchShiftAxis::Old);
+
+        assert_eq!(delta.redo(&before), Some(after.clone()));
+        assert_eq!(delta.undo(&after), Some(before));
+    }
+
+    #[test]
+    fn test_review_patch_delta_round_trips_reject_with_row_shifts() {
+        let first = Edit {
+            old: 1..2,
+            new: 1..4,
+        };
+        let second = Edit {
+            old: 5..7,
+            new: 7..8,
+        };
+        let third = Edit {
+            old: 10..10,
+            new: 11..13,
+        };
+        let before = Patch::new(vec![first.clone(), second.clone(), third.clone()]);
+        let after = Patch::new(vec![
+            Edit {
+                old: 5..7,
+                new: 5..6,
+            },
+            Edit {
+                old: 10..10,
+                new: 9..11,
+            },
+        ]);
+        let delta = ReviewPatchDelta::new(vec![first], ReviewPatchShiftAxis::New);
+
+        assert_eq!(delta.redo(&before), Some(after.clone()));
+        assert_eq!(delta.undo(&after), Some(before));
+    }
+
+    #[test]
+    fn test_review_patch_deltas_compose_in_lifo_order() {
+        let first = Edit {
+            old: 1..2,
+            new: 1..4,
+        };
+        let second = Edit {
+            old: 5..7,
+            new: 7..8,
+        };
+        let third = Edit {
+            old: 10..10,
+            new: 11..13,
+        };
+        let initial = Patch::new(vec![first.clone(), second, third]);
+        let keep_first = ReviewPatchDelta::new(vec![first], ReviewPatchShiftAxis::Old);
+        let after_keep = keep_first.redo(&initial).unwrap();
+        let reject_second = ReviewPatchDelta::new(
+            vec![after_keep.edits()[0].clone()],
+            ReviewPatchShiftAxis::New,
+        );
+        let after_reject = reject_second.redo(&after_keep).unwrap();
+
+        let restored_after_keep = reject_second.undo(&after_reject).unwrap();
+        let restored_initial = keep_first.undo(&restored_after_keep).unwrap();
+        assert_eq!(restored_after_keep, after_keep);
+        assert_eq!(restored_initial, initial);
+        assert_eq!(keep_first.redo(&restored_initial), Some(after_keep.clone()));
+        assert_eq!(reject_second.redo(&after_keep), Some(after_reject));
+    }
+
+    #[test]
+    fn test_review_patch_delta_memory_tracks_resolved_edits_only() {
+        let pending_edits = (0..20_000)
+            .map(|row| Edit {
+                old: row * 2..row * 2 + 1,
+                new: row * 2..row * 2 + 1,
+            })
+            .collect::<Vec<_>>();
+        let delta = ReviewPatchDelta::new(
+            vec![pending_edits[10_000].clone()],
+            ReviewPatchShiftAxis::Old,
+        );
+
+        assert_eq!(delta.estimated_bytes(), std::mem::size_of::<Edit<u32>>());
+    }
+
+    #[gpui::test]
+    async fn test_review_history_is_bounded_by_count_and_estimated_bytes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        for _ in 0..257 {
+            let now = cx.executor().now();
+            let transaction_id =
+                buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
+            action_log.update(cx, |log, _cx| {
+                let root = ReviewStateRoot::capture(&log.tracked_buffers[&buffer]);
+                log.record_review_decision(
+                    &buffer,
+                    transaction_id,
+                    root.clone(),
+                    root,
+                    ReviewPatchDelta::new(Vec::new(), ReviewPatchShiftAxis::Old),
+                    0,
+                );
+            });
+        }
+        assert_eq!(
+            action_log.read_with(cx, |log, _cx| log.review_decisions.len()),
+            256
+        );
+
+        for _ in 0..2 {
+            let now = cx.executor().now();
+            let transaction_id =
+                buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
+            action_log.update(cx, |log, _cx| {
+                let root = ReviewStateRoot::capture(&log.tracked_buffers[&buffer]);
+                log.record_review_decision(
+                    &buffer,
+                    transaction_id,
+                    root.clone(),
+                    root,
+                    ReviewPatchDelta::new(Vec::new(), ReviewPatchShiftAxis::Old),
+                    20 * 1024 * 1024,
+                );
+            });
+        }
+
+        action_log.read_with(cx, |log, _cx| {
+            assert_eq!(log.review_decisions.len(), 1);
+            assert!(log.review_decision_bytes >= 20 * 1024 * 1024);
+        });
+    }
 
     #[gpui::test]
     async fn test_legacy_lsp_lease_matches_tracked_buffer_lifetime(cx: &mut TestAppContext) {
