@@ -258,6 +258,10 @@ impl ResponseInput {
     pub fn retain(&mut self, predicate: impl FnMut(&ResponseInputItem) -> bool) {
         self.generated_items.retain(predicate);
     }
+
+    pub fn push(&mut self, item: ResponseInputItem) {
+        self.generated_items.push(item);
+    }
 }
 
 impl Serialize for ResponseInput {
@@ -303,6 +307,7 @@ pub enum ResponseInputItem {
     CustomToolCallOutput(ResponseCustomToolCallOutputItem),
     Reasoning(ResponseReasoningInputItem),
     Compaction(ResponseCompactionItem),
+    CompactionTrigger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -570,6 +575,7 @@ pub enum StreamEvent {
     ReasoningSummaryTextDelta {
         item_id: String,
         output_index: usize,
+        summary_index: usize,
         delta: String,
     },
     #[serde(rename = "response.reasoning_summary_text.done")]
@@ -870,7 +876,7 @@ async fn compact_response_with_body<Response: DeserializeOwned>(
             provider: provider_name.to_owned(),
             status_code: response.status(),
             body,
-            headers: response.headers().clone(),
+            headers: Box::new(response.headers().clone()),
         })
     }
 }
@@ -883,17 +889,41 @@ pub async fn stream_response(
     request: Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
-    let uri = format!("{api_url}/responses");
     let is_streaming = request.stream;
+    let body = serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?;
+    stream_response_with_body(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        body,
+        is_streaming,
+        extra_headers,
+    )
+    .await
+}
+
+/// Sends a Responses request from a pre-serialized body.
+///
+/// This is used by callers that need to retry a streamed request without
+/// rebuilding the input item tree (which may include opaque provider items).
+pub async fn stream_response_with_body(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    body: String,
+    is_streaming: bool,
+    extra_headers: &CustomHeaders,
+) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    let uri = format!("{api_url}/responses");
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()))
         .extra_headers(extra_headers)
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
-        ))
+        .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
     let mut response = client.send(request).await?;
@@ -994,12 +1024,15 @@ pub async fn stream_response(
                             }
                             ResponseOutputItem::Reasoning(reasoning) => {
                                 if let Some(ref item_id) = reasoning.id {
-                                    for part in &reasoning.summary {
+                                    for (summary_index, part) in
+                                        reasoning.summary.iter().enumerate()
+                                    {
                                         if let ReasoningSummaryPart::SummaryText { text } = part {
                                             all_events.push(
                                                 StreamEvent::ReasoningSummaryTextDelta {
                                                     item_id: item_id.clone(),
                                                     output_index,
+                                                    summary_index,
                                                     delta: text.clone(),
                                                 },
                                             );
@@ -1057,7 +1090,7 @@ pub async fn stream_response(
             provider: provider_name.to_owned(),
             status_code: response.status(),
             body,
-            headers: response.headers().clone(),
+            headers: Box::new(response.headers().clone()),
         })
     }
 }

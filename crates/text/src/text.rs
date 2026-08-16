@@ -387,6 +387,20 @@ impl History {
         id
     }
 
+    fn push_empty_undo_transaction(
+        &mut self,
+        start: clock::Global,
+        now: Instant,
+        clock: &mut clock::Lamport,
+    ) -> TransactionId {
+        self.redo_stack.clear();
+        let transaction_id = self.push_empty_transaction(start, now, clock);
+        if let Some(entry) = self.undo_stack.last_mut() {
+            entry.suppress_grouping = true;
+        }
+        transaction_id
+    }
+
     fn push_undo(&mut self, op_id: clock::Lamport) {
         assert_ne!(self.transaction_depth, 0);
         if let Some(Operation::Edit(_)) = self.operations.get(&op_id) {
@@ -1369,7 +1383,10 @@ impl Buffer {
         Some(self.undo_or_redo(transaction))
     }
 
-    pub fn undo_to_transaction(&mut self, transaction_id: TransactionId) -> Vec<Operation> {
+    pub fn undo_to_transaction(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> Vec<(TransactionId, Operation)> {
         let transactions = self
             .history
             .remove_from_undo_until(transaction_id)
@@ -1379,7 +1396,10 @@ impl Buffer {
 
         transactions
             .into_iter()
-            .map(|transaction| self.undo_or_redo(transaction))
+            .map(|transaction| {
+                let transaction_id = transaction.id;
+                (transaction_id, self.undo_or_redo(transaction))
+            })
             .collect()
     }
 
@@ -1406,7 +1426,10 @@ impl Buffer {
         }
     }
 
-    pub fn redo_to_transaction(&mut self, transaction_id: TransactionId) -> Vec<Operation> {
+    pub fn redo_to_transaction(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> Vec<(TransactionId, Operation)> {
         let transactions = self
             .history
             .remove_from_redo(transaction_id)
@@ -1416,7 +1439,10 @@ impl Buffer {
 
         transactions
             .into_iter()
-            .map(|transaction| self.undo_or_redo(transaction))
+            .map(|transaction| {
+                let transaction_id = transaction.id;
+                (transaction_id, self.undo_or_redo(transaction))
+            })
             .collect()
     }
 
@@ -1464,6 +1490,14 @@ impl Buffer {
     pub fn push_empty_transaction(&mut self, now: Instant) -> TransactionId {
         self.history
             .push_empty_transaction(self.version.clone(), now, &mut self.lamport_clock)
+    }
+
+    /// Adds an empty, standalone transaction that participates in normal undo
+    /// and redo. This is useful for state changes associated with a buffer that
+    /// do not themselves edit its text.
+    pub fn push_empty_undo_transaction(&mut self, now: Instant) -> TransactionId {
+        self.history
+            .push_empty_undo_transaction(self.version.clone(), now, &mut self.lamport_clock)
     }
 
     pub fn edited_ranges_for_transaction_id<D>(

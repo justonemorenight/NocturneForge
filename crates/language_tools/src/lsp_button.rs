@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     rc::Rc,
@@ -52,7 +51,7 @@ struct LanguageServerState {
     lsp_store: WeakEntity<LspStore>,
     active_editor: Option<ActiveEditor>,
     language_servers: LanguageServers,
-    process_memory_cache: Rc<RefCell<ProcessMemoryCache>>,
+    process_memory_cache: Entity<ProcessMemoryCache>,
 }
 
 impl std::fmt::Debug for LanguageServerState {
@@ -70,72 +69,127 @@ impl std::fmt::Debug for LanguageServerState {
 const PROCESS_MEMORY_CACHE_DURATION: Duration = Duration::from_secs(5);
 
 struct ProcessMemoryCache {
-    system: System,
     memory_usage: HashMap<u32, u64>,
+    active_processes: HashSet<u32>,
+    sampled_processes: HashSet<u32>,
+    pending_processes: HashSet<u32>,
     last_refresh: Option<Instant>,
+    refresh_task: Option<Task<()>>,
 }
 
 impl ProcessMemoryCache {
     fn new() -> Self {
         Self {
-            system: System::new(),
             memory_usage: HashMap::new(),
+            active_processes: HashSet::default(),
+            sampled_processes: HashSet::default(),
+            pending_processes: HashSet::default(),
             last_refresh: None,
+            refresh_task: None,
         }
     }
 
-    fn get_memory_usage(&mut self, process_id: u32) -> u64 {
+    fn get_memory_usage(&self, process_id: u32) -> Option<u64> {
+        self.memory_usage.get(&process_id).copied()
+    }
+
+    fn request_refresh(
+        &mut self,
+        process_ids: impl IntoIterator<Item = u32>,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_processes = process_ids.into_iter().collect();
+        self.memory_usage
+            .retain(|process_id, _| self.active_processes.contains(process_id));
+        self.sampled_processes
+            .retain(|process_id| self.active_processes.contains(process_id));
+        self.pending_processes
+            .retain(|process_id| self.active_processes.contains(process_id));
+
         let cache_expired = self
             .last_refresh
             .map(|last| last.elapsed() >= PROCESS_MEMORY_CACHE_DURATION)
             .unwrap_or(true);
 
         if cache_expired {
-            let refresh_kind = RefreshKind::nothing()
-                .with_processes(ProcessRefreshKind::nothing().without_tasks().with_memory());
-            self.system.refresh_specifics(refresh_kind);
-            self.memory_usage.clear();
-            self.last_refresh = Some(Instant::now());
+            self.sampled_processes.clear();
         }
 
-        if let Some(&memory) = self.memory_usage.get(&process_id) {
-            return memory;
+        self.pending_processes.extend(
+            self.active_processes
+                .iter()
+                .copied()
+                .filter(|process_id| !self.sampled_processes.contains(process_id)),
+        );
+
+        if self.pending_processes.is_empty() || self.refresh_task.is_some() {
+            return;
         }
 
-        let root_pid = Pid::from_u32(process_id);
+        let process_ids = std::mem::take(&mut self.pending_processes);
+        let process_ids_to_sample = process_ids.clone();
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let memory_usage = cx
+                .background_spawn(async move {
+                    let mut system = System::new();
+                    let refresh_kind = RefreshKind::nothing().with_processes(
+                        ProcessRefreshKind::nothing().without_tasks().with_memory(),
+                    );
+                    system.refresh_specifics(refresh_kind);
 
-        let parent_map: HashMap<Pid, Pid> = self
-            .system
-            .processes()
-            .iter()
-            .filter_map(|(&pid, process)| Some((pid, process.parent()?)))
-            .collect();
+                    let mut children_by_parent: HashMap<Pid, Vec<Pid>> = HashMap::new();
+                    for (&pid, process) in system.processes() {
+                        if let Some(parent) = process.parent() {
+                            children_by_parent.entry(parent).or_default().push(pid);
+                        }
+                    }
 
-        let total_memory = self
-            .system
-            .processes()
-            .iter()
-            .filter(|(pid, _)| self.is_descendant_of(**pid, root_pid, &parent_map))
-            .map(|(_, process)| process.memory())
-            .sum();
+                    let memory_usage = process_ids_to_sample
+                        .iter()
+                        .map(|&process_id| {
+                            let root = Pid::from_u32(process_id);
+                            let mut total = 0;
+                            let mut pending = vec![root];
+                            let mut visited = HashSet::default();
+                            while let Some(pid) = pending.pop() {
+                                if !visited.insert(pid) {
+                                    continue;
+                                }
+                                total += system.process(pid).map_or(0, |process| process.memory());
+                                if let Some(children) = children_by_parent.get(&pid) {
+                                    pending.extend(children.iter().copied());
+                                }
+                            }
+                            (process_id, total)
+                        })
+                        .collect::<HashMap<_, _>>();
+                    memory_usage
+                })
+                .await;
 
-        self.memory_usage.insert(process_id, total_memory);
-        total_memory
-    }
+            this.update(cx, |this, cx| {
+                this.sampled_processes.extend(
+                    process_ids
+                        .into_iter()
+                        .filter(|process_id| this.active_processes.contains(process_id)),
+                );
+                this.memory_usage.extend(
+                    memory_usage
+                        .into_iter()
+                        .filter(|(process_id, _)| this.active_processes.contains(process_id)),
+                );
+                this.last_refresh = Some(Instant::now());
+                this.refresh_task = None;
+                this.pending_processes
+                    .retain(|process_id| !this.sampled_processes.contains(process_id));
+                cx.refresh_windows();
 
-    fn is_descendant_of(&self, pid: Pid, root_pid: Pid, parent_map: &HashMap<Pid, Pid>) -> bool {
-        let mut current = pid;
-        let mut visited = HashSet::default();
-        while current != root_pid {
-            if !visited.insert(current) {
-                return false;
-            }
-            match parent_map.get(&current) {
-                Some(&parent) => current = parent,
-                None => return false,
-            }
-        }
-        true
+                if !this.pending_processes.is_empty() {
+                    this.request_refresh(this.active_processes.clone(), cx);
+                }
+            })
+            .ok();
+        }));
     }
 }
 
@@ -280,6 +334,14 @@ impl LanguageServerState {
             .unwrap_or_default();
 
         let process_memory_cache = self.process_memory_cache.clone();
+        process_memory_cache.update(cx, |cache, cx| {
+            cache.request_refresh(
+                server_metadata
+                    .values()
+                    .filter_map(|(_, _, process_id)| *process_id),
+                cx,
+            );
+        });
 
         let mut first_button_encountered = false;
         for item in &self.items {
@@ -586,8 +648,8 @@ impl LanguageServerState {
                             let server_message = server_message.clone();
                             let process_memory_cache = process_memory_cache.clone();
                             move |_, cx| {
-                                let memory_usage = process_id.map(|pid| {
-                                    process_memory_cache.borrow_mut().get_memory_usage(pid)
+                                let memory_usage = process_id.and_then(|pid| {
+                                    process_memory_cache.read(cx).get_memory_usage(pid)
                                 });
 
                                 let memory_label = memory_usage.map(|bytes| {
@@ -599,6 +661,9 @@ impl LanguageServerState {
                                     } else {
                                         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
                                     }
+                                });
+                                let memory_label = process_id.map(|_| {
+                                    memory_label.unwrap_or_else(|| "Collecting…".to_owned())
                                 });
 
                                 let version_label =
@@ -869,13 +934,14 @@ impl LspButton {
                 lsp_button.on_lsp_store_event(e, window, cx)
             });
 
+        let process_memory_cache = cx.new(|_| ProcessMemoryCache::new());
         let server_state = cx.new(|_| LanguageServerState {
             workspace: workspace.weak_handle(),
             items: Vec::new(),
             lsp_store: lsp_store.downgrade(),
             active_editor: None,
             language_servers,
-            process_memory_cache: Rc::new(RefCell::new(ProcessMemoryCache::new())),
+            process_memory_cache,
         });
 
         let mut lsp_button = Self {

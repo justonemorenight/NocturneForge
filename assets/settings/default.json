@@ -1060,6 +1060,8 @@
     "commit_message_skill": "commit-message",
     // Whether the agent is enabled.
     "enabled": true,
+    // Whether to create and update git checkpoints around Agent turns.
+    "enable_checkpoints": true,
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
@@ -1187,14 +1189,14 @@
       // Whether to automatically compact the agent's context near the limit.
       "enabled": true,
       // The threshold at which auto-compaction runs. One of:
-      //   - A percentage string ending in "%" (e.g. "90%"), measured against
+      //   - A percentage string ending in "%" (e.g. "75%"), measured against
       //     the model's context window. Decimals are allowed (e.g. "95.5%").
       //   - A positive integer: compact after that many tokens have been used
       //     (e.g. 100000 compacts after 100,000 tokens are used).
       //   - A negative integer: compact once that many tokens remain in the
       //     context window (e.g. -20000 compacts once fewer than 20,000 remain).
       // 0 is not a valid threshold.
-      "threshold": "90%",
+      "threshold": "75%",
     },
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
@@ -1665,6 +1667,14 @@
   // that are overly broad can slow down Zed's file scanning. `file_scan_exclusions` takes
   // precedence over these inclusions.
   "file_scan_inclusions": [".env*"],
+  // Maximum directory depth to eagerly index outside of git repositories;
+  // contents of directories at this depth or deeper are indexed on demand.
+  // Repositories rooted shallower than this depth are always indexed fully.
+  // In projects that are not rooted at a git repository, repositories directly
+  // inside a root folder activate their git features immediately; deeper ones
+  // activate on first use.
+  // `0` means no limit and activates all git repositories immediately.
+  "file_scan_depth": 5,
   // When to scan content of linked directories.
   // May take 2 values:
   //  1. Only scan symlinked directories when they've been expanded in the workspace:

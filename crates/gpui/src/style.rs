@@ -192,11 +192,10 @@ pub struct Style {
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
-    /// Whether scrolling should be restricted to the axis indicated by the mouse wheel.
+    /// Whether scrolling should be restricted to the input gesture's axis.
     ///
-    /// This means that:
-    /// - The mouse wheel alone will only ever scroll the Y axis.
-    /// - Holding `Shift` and using the mouse wheel will scroll the X axis.
+    /// Precise scroll gestures lock to their initially dominant axis, while ordinary wheel input
+    /// is not remapped to another axis.
     ///
     /// ## Motivation
     ///

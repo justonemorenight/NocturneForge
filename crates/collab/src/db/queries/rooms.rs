@@ -673,6 +673,7 @@ impl Database {
                             is_ignored: db_entry.is_ignored,
                             is_external: db_entry.is_external,
                             is_hidden: db_entry.is_hidden,
+                            is_unloaded: false,
                             // This is only used in the summarization backlog, so if it's None,
                             // that just means we won't be able to detect when to resummarize
                             // based on total number of backlogged bytes - instead, we'd go

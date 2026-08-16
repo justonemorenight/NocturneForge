@@ -5,7 +5,6 @@ mod path_range;
 mod selection;
 
 use base64::Engine as _;
-use futures::FutureExt as _;
 use gpui::EdgesRefinement;
 use gpui::HitboxBehavior;
 use gpui::UnderlineStyle;
@@ -42,7 +41,7 @@ use gpui::{
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point, quad,
 };
-use language::{CharClassifier, Language, LanguageRegistry, Rope};
+use language::{CapturedRange, CharClassifier, HighlightMap, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
@@ -951,6 +950,7 @@ impl Markdown {
     fn copy_as_markdown(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.context_menu_selected_markdown.take() {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            self.clear_context_menu_capture();
             return;
         }
         if self.selection.end <= self.selection.start {
@@ -1012,6 +1012,13 @@ impl Markdown {
         self.context_menu_capture_generation
     }
 
+    pub fn clear_context_menu_capture(&mut self) {
+        self.context_menu_link = None;
+        self.context_menu_selected_text = None;
+        self.context_menu_selected_markdown = None;
+        self.context_menu_capture_generation = 0;
+    }
+
     fn parse(&mut self, cx: &mut Context<Self>) {
         if self.source().is_empty() {
             self.should_reparse = false;
@@ -1020,6 +1027,8 @@ impl Markdown {
             self.pending_autoscroll = None;
             self.parsed_markdown = ParsedMarkdown {
                 source: self.source.clone(),
+                fallback_code_block_language: None,
+                code_block_highlights: Arc::default(),
                 ..Default::default()
             };
             self.active_root_block = None;
@@ -1054,6 +1063,14 @@ impl Markdown {
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
         let fallback = self.fallback_code_block_language.clone();
+        let previous_parse = (!should_parse_links_only).then(|| PreviousParse {
+            source: self.parsed_markdown.source.clone(),
+            languages_by_name: self.parsed_markdown.languages_by_name.clone(),
+            languages_by_path: self.parsed_markdown.languages_by_path.clone(),
+            fallback_code_block_language: self.parsed_markdown.fallback_code_block_language.clone(),
+            code_block_highlights: self.parsed_markdown.code_block_highlights.clone(),
+            images_by_source_offset: self.images_by_source_offset.clone(),
+        });
 
         let parsed = cx.background_spawn(async move {
             if should_parse_links_only {
@@ -1069,6 +1086,8 @@ impl Markdown {
                         mermaid_diagrams: BTreeMap::default(),
                         heading_slugs: HashMap::default(),
                         footnote_definitions: HashMap::default(),
+                        fallback_code_block_language: None,
+                        code_block_highlights: Arc::default(),
                         volatile_blocks: HashSet::default(),
                     },
                     Default::default(),
@@ -1090,6 +1109,14 @@ impl Markdown {
             let heading_slugs = parsed.heading_slugs;
             let footnote_definitions = parsed.footnote_definitions;
             let volatile_blocks = parsed.volatile_blocks;
+            let shared_prefix_len = previous_parse.as_ref().map_or(0, |previous_parse| {
+                source
+                    .as_bytes()
+                    .iter()
+                    .zip(previous_parse.source.as_bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
             let mermaid_diagrams = if should_render_mermaid_diagrams {
                 extract_mermaid_diagrams(&source, &events)
             } else {
@@ -1098,16 +1125,10 @@ impl Markdown {
             let mut images_by_source_offset = HashMap::default();
             let mut languages_by_name = TreeMap::default();
             let mut languages_by_path = TreeMap::default();
+            let mut fallback_code_block_language = None;
             if let Some(registry) = language_registry.as_ref() {
                 for name in language_names {
-                    let language = if !name.is_empty() {
-                        registry.language_for_name_or_extension(&name).left_future()
-                    } else if let Some(fallback) = &fallback {
-                        registry.language_for_name(fallback.as_ref()).right_future()
-                    } else {
-                        continue;
-                    };
-                    if let Ok(language) = language.await {
+                    if let Ok(language) = registry.language_for_name_or_extension(&name).await {
                         languages_by_name.insert(name, language);
                     }
                 }
@@ -1120,12 +1141,45 @@ impl Markdown {
                         languages_by_path.insert(path, language);
                     }
                 }
+
+                let has_untagged_code_block = events.iter().any(|(_, event)| {
+                    matches!(
+                        event,
+                        MarkdownEvent::Start(MarkdownTag::CodeBlock {
+                            kind: CodeBlockKind::Fenced,
+                            ..
+                        })
+                    )
+                });
+                if has_untagged_code_block && let Some(fallback) = &fallback {
+                    fallback_code_block_language =
+                        registry.language_for_name(fallback.as_ref()).await.ok();
+                }
             }
+
+            let code_block_highlights = compute_code_block_highlights(
+                &source,
+                &events,
+                &mermaid_diagrams,
+                &languages_by_name,
+                &languages_by_path,
+                fallback_code_block_language.as_ref(),
+                previous_parse.as_ref(),
+                shared_prefix_len,
+            );
 
             for (range, event) in &events {
                 if let MarkdownEvent::Start(MarkdownTag::Image { dest_url, .. }) = event
                     && let Some(data_url) = dest_url.strip_prefix("data:")
                 {
+                    if range.end <= shared_prefix_len
+                        && let Some(image) = previous_parse
+                            .as_ref()
+                            .and_then(|previous| previous.images_by_source_offset.get(&range.start))
+                    {
+                        images_by_source_offset.insert(range.start, image.clone());
+                        continue;
+                    }
                     let Some((mime_info, data)) = data_url.split_once(',') else {
                         continue;
                     };
@@ -1159,6 +1213,8 @@ impl Markdown {
                     mermaid_diagrams,
                     heading_slugs,
                     footnote_definitions,
+                    fallback_code_block_language,
+                    code_block_highlights: Arc::new(code_block_highlights),
                     volatile_blocks,
                 },
                 images_by_source_offset,
@@ -1307,10 +1363,14 @@ pub struct ParsedMarkdown {
     pub(crate) mermaid_diagrams: BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
     pub heading_slugs: HashMap<SharedString, usize>,
     pub footnote_definitions: HashMap<SharedString, usize>,
+    pub(crate) fallback_code_block_language: Option<Arc<Language>>,
+    pub(crate) code_block_highlights: Arc<CodeBlockHighlights>,
     /// Source offsets of blocks with an unresolved reference, whose render can
     /// change once a later chunk defines it — so their heights are never reused.
     pub(crate) volatile_blocks: HashSet<usize>,
 }
+
+pub(crate) type CodeBlockHighlights = HashMap<usize, Arc<[CapturedRange]>>;
 
 impl ParsedMarkdown {
     pub fn source(&self) -> &SharedString {
@@ -1365,6 +1425,155 @@ impl ParsedMarkdown {
             &self.root_block_starts,
             selection,
         )
+    }
+}
+
+struct PendingCodeBlock<'a> {
+    language: Arc<Language>,
+    reusable_from_previous_parse: bool,
+    texts: Vec<(Range<usize>, &'a str)>,
+}
+
+const STREAMING_CODE_BLOCK_HIGHLIGHT_BUDGET: usize = 64 * 1024;
+
+struct PreviousParse {
+    source: SharedString,
+    languages_by_name: TreeMap<SharedString, Arc<Language>>,
+    languages_by_path: TreeMap<Arc<str>, Arc<Language>>,
+    fallback_code_block_language: Option<Arc<Language>>,
+    code_block_highlights: Arc<CodeBlockHighlights>,
+    images_by_source_offset: HashMap<usize, Arc<Image>>,
+}
+
+fn compute_code_block_highlights(
+    source: &str,
+    events: &[(Range<usize>, MarkdownEvent)],
+    mermaid_diagrams: &BTreeMap<usize, ParsedMarkdownMermaidDiagram>,
+    languages_by_name: &TreeMap<SharedString, Arc<Language>>,
+    languages_by_path: &TreeMap<Arc<str>, Arc<Language>>,
+    fallback_code_block_language: Option<&Arc<Language>>,
+    previous_parse: Option<&PreviousParse>,
+    shared_prefix_len: usize,
+) -> CodeBlockHighlights {
+    let mut code_block_highlights = CodeBlockHighlights::default();
+    let mut pending_block: Option<PendingCodeBlock> = None;
+    for (range, event) in events {
+        match event {
+            MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, metadata }) => {
+                if mermaid_diagrams.contains_key(&range.start) {
+                    pending_block = None;
+                    continue;
+                }
+                let is_large_streaming_fence = matches!(
+                    kind,
+                    CodeBlockKind::Fenced
+                        | CodeBlockKind::FencedLang(_)
+                        | CodeBlockKind::FencedSrc(_)
+                ) && !metadata.is_fenced_closed
+                    && metadata.content_range.len() > STREAMING_CODE_BLOCK_HIGHLIGHT_BUDGET;
+                if is_large_streaming_fence {
+                    // Re-highlighting an ever-growing unterminated block after
+                    // every streamed chunk is quadratic over the lifetime of
+                    // the response. Keep it readable as plain code while it is
+                    // growing; the closed block is highlighted in full once.
+                    pending_block = None;
+                    continue;
+                }
+                let (language, previous_language) = match kind {
+                    CodeBlockKind::FencedLang(name) => (
+                        languages_by_name.get(name).cloned(),
+                        previous_parse
+                            .and_then(|previous| previous.languages_by_name.get(name).cloned()),
+                    ),
+                    CodeBlockKind::FencedSrc(path_range) => (
+                        languages_by_path.get(&path_range.path).cloned(),
+                        previous_parse.and_then(|previous| {
+                            previous.languages_by_path.get(&path_range.path).cloned()
+                        }),
+                    ),
+                    CodeBlockKind::Fenced => (
+                        fallback_code_block_language.cloned(),
+                        previous_parse
+                            .and_then(|previous| previous.fallback_code_block_language.clone()),
+                    ),
+                    CodeBlockKind::Indented => (None, None),
+                };
+                pending_block = language.map(|language| PendingCodeBlock {
+                    reusable_from_previous_parse: previous_language
+                        .is_some_and(|previous| Arc::ptr_eq(&previous, &language)),
+                    language,
+                    texts: Vec::new(),
+                });
+            }
+            MarkdownEvent::End(MarkdownTagEnd::CodeBlock) => {
+                if let Some(block) = pending_block.take() {
+                    if let Some(previous_parse) = previous_parse
+                        && block.reusable_from_previous_parse
+                        && range.end <= shared_prefix_len
+                    {
+                        for (text_range, _) in &block.texts {
+                            if let Some(highlights) =
+                                previous_parse.code_block_highlights.get(&text_range.start)
+                            {
+                                code_block_highlights.insert(text_range.start, highlights.clone());
+                            }
+                        }
+                    } else {
+                        highlight_code_block(block, &mut code_block_highlights);
+                    }
+                }
+            }
+            MarkdownEvent::Text => {
+                if let Some(block) = &mut pending_block {
+                    block.texts.push((range.clone(), &source[range.clone()]));
+                }
+            }
+            MarkdownEvent::SubstitutedText(text) => {
+                if let Some(block) = &mut pending_block {
+                    block.texts.push((range.clone(), text.as_str()));
+                }
+            }
+            _ => {}
+        }
+    }
+    code_block_highlights
+}
+
+fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut CodeBlockHighlights) {
+    let mut combined = String::new();
+    let mut text_offsets = Vec::with_capacity(block.texts.len());
+    for (_, text) in &block.texts {
+        text_offsets.push(combined.len());
+        combined.push_str(text);
+    }
+    let mut highlights = block
+        .language
+        .highlight_text_captures(&Rope::from(combined.as_str()), 0..combined.len())
+        .into_iter()
+        .peekable();
+    for ((source_range, text), text_offset) in block.texts.iter().zip(text_offsets) {
+        let text_end = text_offset + text.len();
+        let mut text_highlights = Vec::new();
+        while let Some(captured) = highlights.peek() {
+            if captured.range.start >= text_end {
+                break;
+            }
+            let start = captured.range.start.max(text_offset);
+            let end = captured.range.end.min(text_end);
+            if end > start {
+                text_highlights.push(CapturedRange {
+                    range: start - text_offset..end - text_offset,
+                    capture_ids: captured.capture_ids.clone(),
+                });
+            }
+            if captured.range.end > text_end {
+                break;
+            }
+            highlights.next();
+        }
+        if !text_highlights.is_empty() {
+            code_block_highlights.insert(source_range.start, Arc::from(text_highlights));
+        }
     }
 }
 
@@ -2338,6 +2547,7 @@ impl MarkdownElement {
             &self.style.container_style,
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
+            parsed_markdown.code_block_highlights.clone(),
         );
         let builder = &mut owned_builder;
         let mut current_img_block_range: Option<Range<usize>> = None;
@@ -2489,7 +2699,9 @@ impl MarkdownElement {
                             }
 
                             let language = match kind {
-                                CodeBlockKind::Fenced => None,
+                                CodeBlockKind::Fenced => {
+                                    parsed_markdown.fallback_code_block_language.clone()
+                                }
                                 CodeBlockKind::FencedLang(language) => {
                                     parsed_markdown.languages_by_name.get(language).cloned()
                                 }
@@ -2550,13 +2762,12 @@ impl MarkdownElement {
                                     let code_block = div()
                                         .id(("code-block", range.start))
                                         .rounded_lg()
-                                        .map(|mut code_block| {
+                                        .map(|code_block| {
                                             if let Some(scroll_handle) = scroll_handle.as_ref() {
-                                                code_block.style().restrict_scroll_to_axis =
-                                                    Some(true);
                                                 code_block
                                                     .flex()
                                                     .overflow_x_scroll()
+                                                    .restrict_scroll_to_axis()
                                                     .track_scroll(scroll_handle)
                                             } else {
                                                 code_block.w_full()
@@ -2722,7 +2933,8 @@ impl MarkdownElement {
                                     .border(px(1.5))
                                     .border_color(cx.theme().colors().border)
                                     .rounded_sm()
-                                    .overflow_hidden(),
+                                    .overflow_x_scroll()
+                                    .restrict_scroll_to_axis(),
                                 range,
                                 markdown_end,
                             );
@@ -3694,7 +3906,8 @@ struct MarkdownElementBuilder {
     rendered_footnote_separator: bool,
     base_text_style: TextStyle,
     text_style_stack: Vec<TextStyleRefinement>,
-    code_block_stack: Vec<Option<Arc<Language>>>,
+    code_block_stack: Vec<Option<(Arc<Language>, HighlightMap)>>,
+    code_block_highlights: Arc<CodeBlockHighlights>,
     link_depth: usize,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
@@ -3737,6 +3950,7 @@ impl MarkdownElementBuilder {
         container_style: &StyleRefinement,
         base_text_style: TextStyle,
         syntax_theme: Arc<SyntaxTheme>,
+        code_block_highlights: Arc<CodeBlockHighlights>,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -3754,6 +3968,7 @@ impl MarkdownElementBuilder {
             base_text_style,
             text_style_stack: Vec::new(),
             code_block_stack: Vec::new(),
+            code_block_highlights,
             link_depth: 0,
             list_stack: Vec::new(),
             table: TableState::default(),
@@ -3923,7 +4138,14 @@ impl MarkdownElementBuilder {
     }
 
     fn push_code_block(&mut self, language: Option<Arc<Language>>) {
-        self.code_block_stack.push(language);
+        let entry = language.map(|language| {
+            let highlight_map = language
+                .grammar()
+                .map(|grammar| grammar.highlight_map())
+                .unwrap_or_default();
+            (language, highlight_map)
+        });
+        self.code_block_stack.push(entry);
     }
 
     fn pop_code_block(&mut self) {
@@ -3955,24 +4177,29 @@ impl MarkdownElementBuilder {
         // Compute the base text style once
         let text_style = self.text_style();
 
-        if let Some(Some(language)) = self.code_block_stack.last() {
+        if let Some((_, highlight_map)) = self.code_block_stack.last().and_then(Option::as_ref)
+            && let Some(highlights) = self.code_block_highlights.get(&source_range.start)
+        {
             let mut offset = 0;
-            for (range, highlight_id) in language.highlight_text(&Rope::from(text), 0..text.len()) {
-                if range.start > offset {
+            for captured in highlights.iter() {
+                if captured.range.start > offset {
                     self.pending_line
                         .runs
-                        .push(text_style.to_run(range.start - offset));
+                        .push(text_style.to_run(captured.range.start - offset));
                 }
 
-                let run_len = range.len();
-                if let Some(highlight) = self.syntax_theme.get(highlight_id).cloned() {
+                let run_len = captured.range.len();
+                let highlight = highlight_map
+                    .get_innermost(&captured.capture_ids)
+                    .and_then(|highlight_id| self.syntax_theme.get(highlight_id).cloned());
+                if let Some(highlight) = highlight {
                     self.pending_line
                         .runs
                         .push(text_style.clone().highlight(highlight).to_run(run_len));
                 } else {
                     self.pending_line.runs.push(text_style.to_run(run_len));
                 }
-                offset = range.end;
+                offset = captured.range.end;
             }
 
             if offset < text.len() {
@@ -4088,7 +4315,11 @@ impl MarkdownElementBuilder {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
-            language: self.code_block_stack.last().cloned().flatten(),
+            language: self
+                .code_block_stack
+                .last()
+                .and_then(|entry| entry.as_ref())
+                .map(|(language, _)| language.clone()),
             text_align,
         });
         self.append_child(text.into_any());

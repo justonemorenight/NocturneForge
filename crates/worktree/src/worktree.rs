@@ -2785,6 +2785,10 @@ impl Snapshot {
         self.entries_by_path.summary().non_ignored_file_count
     }
 
+    pub fn deferred_scan_dir_count(&self) -> usize {
+        self.entries_by_path.summary().deferred_scan_dir_count
+    }
+
     fn traverse_from_offset(
         &self,
         include_files: bool,
@@ -3085,10 +3089,21 @@ impl LocalSnapshot {
                 repo_excludes.push(repo_exclude.clone());
             }
 
-            if repo_root.is_none() {
-                let metadata = fs.metadata(&ancestor.join(DOT_GIT)).await.ok().flatten();
-                if metadata.is_some() {
+            let is_repo_root = fs
+                .metadata(&ancestor.join(DOT_GIT))
+                .await
+                .is_ok_and(|metadata| metadata.is_some());
+            if is_repo_root {
+                if repo_root.is_none() {
                     repo_root = Some(Arc::from(ancestor));
+                }
+
+                // Once the repository containing this worktree root is found,
+                // do not keep walking into unrelated ancestors. This must be
+                // checked independently of `repo_root`: an abs path may first
+                // encounter a nested repository below the worktree root.
+                if self.abs_path.as_path().starts_with(ancestor) {
+                    break;
                 }
             }
         }
@@ -3124,10 +3139,23 @@ impl LocalSnapshot {
     }
 
     #[cfg(feature = "test-support")]
-    pub fn expanded_entries(&self) -> impl Iterator<Item = &Entry> {
-        self.entries_by_path
-            .cursor::<()>(())
-            .filter(|entry| entry.kind == EntryKind::Dir && (entry.is_external || entry.is_ignored))
+    pub fn expanded_entries(&self, file_scan_depth: Option<u32>) -> impl Iterator<Item = &Entry> {
+        let file_scan_depth = if self.root_repo_common_dir.is_some() {
+            None
+        } else {
+            file_scan_depth
+        };
+        self.entries_by_path.cursor::<()>(()).filter(move |entry| {
+            entry.kind == EntryKind::Dir
+                && (entry.is_external
+                    || entry.is_ignored
+                    || (!entry.is_always_included
+                        && is_beyond_scan_depth(file_scan_depth, &entry.path)
+                        && !self
+                            .git_repositories
+                            .values()
+                            .any(|repo| repo.work_directory.directory_contains(&entry.path))))
+        })
     }
 
     #[cfg(feature = "test-support")]
@@ -4183,6 +4211,12 @@ impl sum_tree::Item for Entry {
             non_ignored_count,
             file_count,
             non_ignored_file_count,
+            deferred_scan_dir_count: usize::from(
+                self.kind == EntryKind::UnloadedDir
+                    && !self.is_ignored
+                    && !self.is_external
+                    && !self.path.is_empty(),
+            ),
         }
     }
 }
@@ -4202,6 +4236,7 @@ pub struct EntrySummary {
     non_ignored_count: usize,
     file_count: usize,
     non_ignored_file_count: usize,
+    deferred_scan_dir_count: usize,
 }
 
 impl Default for EntrySummary {
@@ -4212,6 +4247,7 @@ impl Default for EntrySummary {
             non_ignored_count: 0,
             file_count: 0,
             non_ignored_file_count: 0,
+            deferred_scan_dir_count: 0,
         }
     }
 }
@@ -4227,6 +4263,7 @@ impl sum_tree::ContextLessSummary for EntrySummary {
         self.non_ignored_count += rhs.non_ignored_count;
         self.file_count += rhs.file_count;
         self.non_ignored_file_count += rhs.non_ignored_file_count;
+        self.deferred_scan_dir_count += rhs.deferred_scan_dir_count;
     }
 }
 
@@ -4453,6 +4490,17 @@ impl BackgroundScanner {
         {
             let mut state = self.state.lock().await;
             state.snapshot.completed_scan_id = state.snapshot.scan_id;
+            if state.scanning_enabled {
+                let deferred_scan_dir_count = state.snapshot.deferred_scan_dir_count();
+                if deferred_scan_dir_count > 0
+                    && let Some(file_scan_depth) = self.settings.file_scan_depth
+                {
+                    log::info!(
+                        "deferred indexing of {deferred_scan_dir_count} directories in {:?} that are outside of git repositories and deeper than file_scan_depth={file_scan_depth}",
+                        root_abs_path.as_path(),
+                    );
+                }
+            }
         }
 
         self.send_status_update(false, SmallVec::new(), &[]).await;
@@ -5461,10 +5509,20 @@ impl BackgroundScanner {
         for entry in &mut new_entries {
             state.reuse_entry_id(entry);
             if entry.is_dir() {
-                if !self.should_scan_directory(&state, entry) {
+                if !self.should_scan_directory(&state, entry, ignore_stack.repo_root.is_some()) {
                     log::debug!("defer scanning directory {:?}", entry.path);
                     entry.kind = EntryKind::UnloadedDir;
                     new_jobs[job_ix] = None;
+                    if !entry.is_ignored
+                        && !entry.is_external
+                        && state.snapshot.child_entries(&entry.path).next().is_some()
+                    {
+                        state.remove_path_from_snapshot_and_unwatch(
+                            &entry.path,
+                            self.watcher.as_ref(),
+                            true,
+                        );
+                    }
                 }
                 job_ix += 1;
             }
@@ -5627,10 +5685,13 @@ impl BackgroundScanner {
                     fs_entry.is_hidden = self.settings.is_path_hidden(path);
 
                     if let (Some(scan_queue_tx), true) = (&scan_queue_tx, is_dir) {
-                        if self.should_scan_directory(&state, &fs_entry)
-                            || (self.track_git_repositories
-                                && fs_entry.path.is_empty()
-                                && abs_path.file_name() == Some(OsStr::new(DOT_GIT)))
+                        if self.should_scan_directory(
+                            &state,
+                            &fs_entry,
+                            ignore_stack.repo_root.is_some(),
+                        ) || (self.track_git_repositories
+                            && fs_entry.path.is_empty()
+                            && abs_path.file_name() == Some(OsStr::new(DOT_GIT)))
                         {
                             state
                                 .enqueue_scan_dir(
@@ -5913,9 +5974,7 @@ impl BackgroundScanner {
             return;
         };
 
-        if let Ok(Some(metadata)) = self.fs.metadata(&job.abs_path.join(DOT_GIT)).await
-            && metadata.is_dir
-        {
+        if let Ok(Some(_)) = self.fs.metadata(&job.abs_path.join(DOT_GIT)).await {
             ignore_stack.repo_root = Some(job.abs_path.clone());
         }
 
@@ -5931,10 +5990,16 @@ impl BackgroundScanner {
                     ignore_stack.clone()
                 };
 
-                // Scan any directories that were previously ignored and weren't previously scanned.
-                if was_ignored && !entry.is_ignored && entry.kind.is_unloaded() {
+                // Scan any unloaded directories that became scannable: no longer
+                // ignored, or newly inside a repository that exempts them from
+                // the scan depth limit.
+                if !entry.is_ignored
+                    && entry.kind.is_unloaded()
+                    && (was_ignored || ignore_stack.repo_root.is_some())
+                {
                     let state = self.state.lock().await;
-                    if self.should_scan_directory(&state, &entry) {
+                    if self.should_scan_directory(&state, &entry, ignore_stack.repo_root.is_some())
+                    {
                         state
                             .enqueue_scan_dir(
                                 abs_path.clone(),
@@ -6105,7 +6170,12 @@ impl BackgroundScanner {
         !self.share_private_files && self.settings.is_path_private(path)
     }
 
-    fn should_scan_directory(&self, state: &BackgroundScannerState, entry: &Entry) -> bool {
+    fn should_scan_directory(
+        &self,
+        state: &BackgroundScannerState,
+        entry: &Entry,
+        in_repo: bool,
+    ) -> bool {
         // `scan_symlinks` is documented as "only scan symlinked directories when
         // they've been expanded" (the default), so symlink entries — which are
         // exactly the entries carrying a `canonical_path` — defer their scan
@@ -6119,11 +6189,13 @@ impl BackgroundScanner {
         let follow_symlinks = self.settings.scan_symlinks == settings::ScanSymlinksSetting::Always
             || entry.path.is_empty()
             || entry.canonical_path.is_none();
+        let beyond_scan_depth =
+            !in_repo && is_beyond_scan_depth(self.settings.file_scan_depth, &entry.path);
         let scannable = state.scanning_enabled
             && follow_symlinks
             && (!entry.is_external
                 || self.settings.scan_symlinks == settings::ScanSymlinksSetting::Always)
-            && (!entry.is_ignored || entry.is_always_included);
+            && (!(entry.is_ignored || beyond_scan_depth) || entry.is_always_included);
 
         scannable
             || entry.path.file_name() == Some(DOT_GIT)
@@ -6365,6 +6437,10 @@ fn build_diff(
     }
 
     changes.into()
+}
+
+fn is_beyond_scan_depth(file_scan_depth: Option<u32>, path: &RelPath) -> bool {
+    file_scan_depth.is_some_and(|depth| path.components().count() >= depth as usize)
 }
 
 fn swap_to_front(child_paths: &mut Vec<PathBuf>, file: &str) {
@@ -6845,6 +6921,7 @@ impl<'a> From<&'a Entry> for proto::Entry {
                 .canonical_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            is_unloaded: entry.kind == EntryKind::UnloadedDir,
         }
     }
 }
@@ -6856,7 +6933,11 @@ impl TryFrom<(&CharBag, &PathMatcher, proto::Entry)> for Entry {
         (root_char_bag, always_included, entry): (&CharBag, &PathMatcher, proto::Entry),
     ) -> Result<Self> {
         let kind = if entry.is_dir {
-            EntryKind::Dir
+            if entry.is_unloaded {
+                EntryKind::UnloadedDir
+            } else {
+                EntryKind::Dir
+            }
         } else {
             EntryKind::File
         };
@@ -7012,7 +7093,7 @@ impl fs::Watcher for NullWatcher {
     }
 }
 
-async fn decode_file_text(
+pub async fn decode_file_text(
     fs: &dyn Fs,
     abs_path: &Path,
 ) -> Result<(String, &'static Encoding, bool)> {
@@ -7062,7 +7143,7 @@ async fn decode_file_text(
     decode_byte_full(content, bom_encoding, byte_content)
 }
 
-fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteContent) {
+pub fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteContent) {
     if let Some((encoding, _bom_len)) = Encoding::for_bom(prefix) {
         return (Some(encoding), ByteContent::Unknown);
     }
@@ -7222,6 +7303,38 @@ mod tests {
         );
     }
 
+    // Mimics binary formats that interleave short ASCII fragments with small
+    // length/type fields (as seen in some game/asset binary formats, e.g.
+    // Tibia-style OTBM maps): most high bytes are zero, matching UTF-16LE's
+    // null-byte pattern for ASCII, but the low bytes are mostly non-word
+    // "tag" values rather than real letters/digits/spaces.
+    fn build_tag_interleaved_binary_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let tags: [u8; 6] = [0xFE, 0xFF, 0x25, 0x2B, 0xA3, 0xC5];
+        let mut i = 0;
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.push(tags[i % tags.len()]);
+            bytes.push(0x00);
+            i += 1;
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+        bytes
+    }
+
+    #[test]
+    fn test_tag_interleaved_binary_not_misdetected_as_utf16le() {
+        let bytes = build_tag_interleaved_binary_bytes();
+        assert_eq!(bytes.len(), FILE_ANALYSIS_BYTES);
+
+        let result = analyze_byte_content(&bytes);
+        assert_eq!(
+            result,
+            ByteContent::Binary,
+            "binary data with sparse non-word low bytes and null high bytes \
+             should not be misdetected as UTF-16LE text"
+        );
+    }
+
     #[test]
     fn test_utf16le_text_detected_as_utf16le() {
         let text = "Hello, world! This is a UTF-16 test string. ";
@@ -7237,6 +7350,30 @@ mod tests {
     #[test]
     fn test_utf16be_text_detected_as_utf16be() {
         let text = "Hello, world! This is a UTF-16 test string. ";
+        let mut bytes = Vec::new();
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.extend(text.encode_utf16().flat_map(|u| u.to_be_bytes()));
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+
+        assert_eq!(analyze_byte_content(&bytes), ByteContent::Utf16Be);
+    }
+
+    #[test]
+    fn test_utf16le_cyrillic_text_detected_as_utf16le() {
+        let text = "Привет, мир! Это тестовая строка в UTF-16. ";
+        let mut bytes = Vec::new();
+        while bytes.len() < FILE_ANALYSIS_BYTES {
+            bytes.extend(text.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        }
+        bytes.truncate(FILE_ANALYSIS_BYTES);
+
+        assert_eq!(analyze_byte_content(&bytes), ByteContent::Utf16Le);
+    }
+
+    #[test]
+    fn test_utf16be_greek_text_detected_as_utf16be() {
+        let text = "Γεια σου κόσμε! Αυτή είναι μια δοκιμαστική συμβολοσειρά. ";
         let mut bytes = Vec::new();
         while bytes.len() < FILE_ANALYSIS_BYTES {
             bytes.extend(text.encode_utf16().flat_map(|u| u.to_be_bytes()));

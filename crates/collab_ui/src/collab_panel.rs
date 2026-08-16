@@ -1451,7 +1451,7 @@ impl CollabPanel {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
                     context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self(window);
+                    this.activation_focus_handle(cx).focus(window, cx);
                 }
                 this.context_menu.take();
                 cx.notify();
@@ -1635,7 +1635,7 @@ impl CollabPanel {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
                     context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self(window);
+                    this.activation_focus_handle(cx).focus(window, cx);
                 }
                 this.context_menu.take();
                 cx.notify();
@@ -1698,7 +1698,7 @@ impl CollabPanel {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
                     context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self(window);
+                    this.activation_focus_handle(cx).focus(window, cx);
                 }
                 this.context_menu.take();
                 cx.notify();
@@ -1931,7 +1931,7 @@ impl CollabPanel {
                     cx.notify();
                 }
             }
-            cx.focus_self(window);
+            self.activation_focus_handle(cx).focus(window, cx);
             true
         } else {
             false
@@ -1998,7 +1998,7 @@ impl CollabPanel {
         self.serialize(cx);
         self.update_entries(true, cx);
         cx.notify();
-        cx.focus_self(window);
+        self.activation_focus_handle(cx).focus(window, cx);
     }
 
     fn is_channel_collapsed(&self, channel_id: ChannelId) -> bool {
@@ -2511,8 +2511,10 @@ impl CollabPanel {
                         .update(cx, |channels, _| channels.remove_channel(channel_id))
                         .await
                         .notify_workspace_async_err(workspace, &mut cx);
-                    this.update_in(cx, |_, window, cx| cx.focus_self(window))
-                        .ok();
+                    this.update_in(cx, |this, window, cx| {
+                        this.activation_focus_handle(cx).focus(window, cx);
+                    })
+                    .ok();
                 }
                 anyhow::Ok(())
             })
@@ -3755,6 +3757,20 @@ impl Render for CollabPanel {
 impl EventEmitter<PanelEvent> for CollabPanel {}
 
 impl Panel for CollabPanel {
+    fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        let status = *self.client.status().borrow();
+        let collaboration_disabled = self
+            .user_store
+            .read(cx)
+            .current_organization_configuration()
+            .is_some_and(|config| !config.is_collaboration_enabled);
+        if !collaboration_disabled && status.is_or_was_connected() && !status.is_signing_in() {
+            self.filter_editor.focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
+        }
+    }
+
     fn position(&self, _window: &Window, cx: &App) -> DockPosition {
         CollaborationPanelSettings::get_global(cx).dock
     }
@@ -3827,8 +3843,8 @@ impl Panel for CollabPanel {
 }
 
 impl Focusable for CollabPanel {
-    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
-        self.filter_editor.focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
     }
 }
 

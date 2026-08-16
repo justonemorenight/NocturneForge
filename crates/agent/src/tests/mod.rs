@@ -304,6 +304,14 @@ fn disable_sandboxing(cx: &mut TestAppContext) {
     });
 }
 
+fn disable_auto_compaction(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.auto_compact.enabled = false;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+}
+
 #[gpui::test]
 async fn test_echo(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
@@ -3397,6 +3405,7 @@ async fn test_latest_token_usage_counts_cached_input_tokens(cx: &mut TestAppCont
 #[gpui::test]
 async fn test_prompt_too_large_marks_token_usage_exceeded(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    disable_auto_compaction(cx);
     let fake_model = model.as_fake();
 
     thread
@@ -3448,6 +3457,7 @@ async fn test_prompt_too_large_marks_token_usage_exceeded(cx: &mut TestAppContex
 #[gpui::test]
 async fn test_prompt_too_large_uses_reported_token_count(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    disable_auto_compaction(cx);
     let fake_model = model.as_fake();
 
     thread

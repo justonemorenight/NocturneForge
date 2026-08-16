@@ -6,8 +6,10 @@ use gpui::{
     App, Context, FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, Task, UnderlineStyle,
 };
 use itertools::Itertools;
-use language::language_settings::LanguageSettings;
+use language::{LanguageName, LanguageRegistry, language_settings::LanguageSettings};
+use lsp::LanguageServerId;
 use project::{
+    LspStore,
     lsp_store::{
         BufferSemanticToken, BufferSemanticTokens, RefreshForServer, SemanticTokenStylizer,
         TokenType,
@@ -289,6 +291,15 @@ impl Editor {
                         let Some(project) = project.upgrade() else {
                             return;
                         };
+                        let precedences = {
+                            let project = project.read(cx);
+                            server_precedences(
+                                project.lsp_store().read(cx),
+                                project.languages(),
+                                language_name.as_ref(),
+                                &tokens,
+                            )
+                        };
                         editor.display_map.update(cx, |display_map, cx| {
                             project.read(cx).lsp_store().update(cx, |lsp_store, cx| {
                                 let mut token_highlights = Vec::new();
@@ -306,6 +317,7 @@ impl Editor {
                                     token_highlights.extend(buffer_into_editor_highlights(
                                         &server_tokens,
                                         stylizer,
+                                        precedences.get(&server_id).copied().unwrap_or_default(),
                                         &multi_buffer_snapshot,
                                         &mut interner,
                                         theme,
@@ -313,7 +325,10 @@ impl Editor {
                                 }
 
                                 token_highlights.sort_by(|a, b| {
-                                    a.range.start.cmp(&b.range.start, &multi_buffer_snapshot)
+                                    a.range
+                                        .start
+                                        .cmp(&b.range.start, &multi_buffer_snapshot)
+                                        .then_with(|| a.precedence.cmp(&b.precedence))
                                 });
                                 Arc::make_mut(&mut display_map.semantic_token_highlights).insert(
                                     buffer_id,
@@ -330,9 +345,41 @@ impl Editor {
     }
 }
 
+fn server_precedences(
+    lsp_store: &LspStore,
+    languages: &LanguageRegistry,
+    language_name: Option<&LanguageName>,
+    tokens: &HashMap<LanguageServerId, Arc<[BufferSemanticToken]>>,
+) -> HashMap<LanguageServerId, u32> {
+    let ordered_adapters = language_name
+        .map(|language_name| languages.lsp_adapters(language_name))
+        .unwrap_or_default();
+
+    let configured_base = tokens.keys().map(|id| id.0).max().map_or(0, |max| max + 1);
+
+    tokens
+        .keys()
+        .map(|&server_id| {
+            let configured_precedence = lsp_store
+                .language_server_adapter_for_id(server_id)
+                .and_then(|adapter| {
+                    ordered_adapters
+                        .iter()
+                        .position(|ordered_adapter| ordered_adapter.name == adapter.name)
+                });
+            let precedence = match configured_precedence {
+                Some(index) => configured_base + index,
+                None => server_id.0,
+            };
+            (server_id, precedence as u32)
+        })
+        .collect()
+}
+
 fn buffer_into_editor_highlights<'a, 'b>(
     buffer_tokens: &'a [BufferSemanticToken],
     stylizer: &'a SemanticTokenStylizer,
+    precedence: u32,
     multi_buffer_snapshot: &'a multi_buffer::MultiBufferSnapshot,
     interner: &'b mut HighlightStyleInterner,
     theme: &'a SyntaxTheme,
@@ -346,7 +393,7 @@ fn buffer_into_editor_highlights<'a, 'b>(
         .into_iter()
         .tuples::<(_, _)>()
         .zip(buffer_tokens)
-        .filter_map(|((multi_buffer_start, multi_buffer_end), token)| {
+        .filter_map(move |((multi_buffer_start, multi_buffer_end), token)| {
             let range = multi_buffer_start?..multi_buffer_end?;
             let style = convert_token(stylizer, theme, token.token_type, token.token_modifiers)?;
             let style = interner.intern(style);
@@ -356,6 +403,7 @@ fn buffer_into_editor_highlights<'a, 'b>(
                 token_type: token.token_type,
                 token_modifiers: token.token_modifiers,
                 server_id: stylizer.server_id(),
+                precedence,
             })
         })
 }

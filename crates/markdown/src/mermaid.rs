@@ -1,4 +1,5 @@
 use collections::HashMap;
+use futures::FutureExt as _;
 use gpui::{
     Animation, AnimationExt, AnyElement, ClipboardItem, Context, Entity, ImageSource, RenderImage,
     StyledText, Task, img, pulsating_between,
@@ -6,7 +7,10 @@ use gpui::{
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use ui::{CopyButton, TintColor, prelude::*};
 
@@ -17,6 +21,23 @@ use theme_settings::ThemeSettings;
 use super::{CopyButtonVisibility, Markdown, MarkdownStyle, ParsedMarkdown};
 
 type MermaidDiagramCache = HashMap<ParsedMarkdownMermaidDiagramContents, Arc<CachedMermaidDiagram>>;
+
+const MAX_MERMAID_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_MERMAID_LINES: usize = 2_000;
+const MAX_MERMAID_COMPLEXITY: usize = 20_000;
+const MAX_MERMAID_DIAGRAMS_PER_DOCUMENT: usize = 16;
+const MAX_MERMAID_SVG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACTIVE_MERMAID_RENDERS: usize = 4;
+const MERMAID_RENDER_TIMEOUT: Duration = Duration::from_secs(5);
+static ACTIVE_MERMAID_RENDERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveMermaidRenderGuard;
+
+impl Drop for ActiveMermaidRenderGuard {
+    fn drop(&mut self) {
+        ACTIVE_MERMAID_RENDERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedMarkdownMermaidDiagram {
@@ -105,17 +126,51 @@ impl CachedMermaidDiagram {
         let mermaid_theme = build_mermaid_theme(cx);
 
         let task = cx.spawn(async move |this, cx| {
-            let value = cx
-                .background_spawn(async move {
-                    let svg_string =
-                        mermaid_render::render_to_svg(&contents.contents, &mermaid_theme)?;
-                    let scale = contents.scale as f32 / 100.0;
-                    svg_renderer
-                        .render_single_frame(svg_string.as_bytes(), scale)
-                        .map_err(|error| anyhow::anyhow!("{error}"))
+            let acquired = ACTIVE_MERMAID_RENDERS
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    (active < MAX_ACTIVE_MERMAID_RENDERS).then_some(active + 1)
                 })
-                .await;
-            let _ = render_image_clone.set(value);
+                .is_ok();
+            if !acquired {
+                if render_image_clone
+                    .set(Err(anyhow::anyhow!(
+                        "Too many Mermaid diagrams are rendering"
+                    )))
+                    .is_ok()
+                {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                }
+                return;
+            }
+            // The guard must live inside the background render future. Mermaid's
+            // renderer is synchronous, so timing out the UI wait cannot preempt
+            // work that is already executing. Keeping the slot owned by the
+            // actual render prevents repeated timeouts from spawning an
+            // unbounded number of still-running CPU tasks.
+            let active_render_guard = ActiveMermaidRenderGuard;
+            let render = cx.background_spawn(async move {
+                let _active_render_guard = active_render_guard;
+                let svg_string = mermaid_render::render_to_svg(&contents.contents, &mermaid_theme)?;
+                if svg_string.len() > MAX_MERMAID_SVG_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "Mermaid diagram output exceeded the size limit"
+                    ));
+                }
+                let scale = contents.scale as f32 / 100.0;
+                svg_renderer
+                    .render_single_frame(svg_string.as_bytes(), scale)
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+            });
+            let timeout = cx.background_executor().timer(MERMAID_RENDER_TIMEOUT);
+            let value = futures::select_biased! {
+                result = render.fuse() => result,
+                _ = timeout.fuse() => Err(anyhow::anyhow!(
+                    "Mermaid diagram rendering exceeded the time limit"
+                )),
+            };
+            if render_image_clone.set(value).is_err() {
+                return;
+            }
             this.update(cx, |_, cx| {
                 cx.notify();
             })
@@ -260,6 +315,32 @@ fn is_supported_diagram_type(source: &str) -> bool {
         .any(|prefix| first_token.eq_ignore_ascii_case(prefix))
 }
 
+fn is_within_mermaid_budget(source: &str) -> bool {
+    if source.len() > MAX_MERMAID_SOURCE_BYTES {
+        return false;
+    }
+    let mut lines = 0;
+    let mut complexity = 0usize;
+    for line in source.lines() {
+        lines += 1;
+        if lines > MAX_MERMAID_LINES {
+            return false;
+        }
+        complexity = complexity.saturating_add(
+            1 + line.split_ascii_whitespace().count()
+                + line
+                    .bytes()
+                    .filter(|byte| byte.is_ascii_punctuation())
+                    .count()
+                    / 2,
+        );
+        if complexity > MAX_MERMAID_COMPLEXITY {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn extract_mermaid_diagrams(
     source: &str,
     events: &[(Range<usize>, MarkdownEvent)],
@@ -295,6 +376,17 @@ pub(crate) fn extract_mermaid_diagrams(
         if !is_supported_diagram_type(&contents) {
             continue;
         }
+        if !is_within_mermaid_budget(&contents) {
+            // Keep oversized or unusually complex diagrams as ordinary code
+            // blocks. This bounds parser/render work while preserving a useful
+            // fallback for agent output that cannot be rendered safely.
+            continue;
+        }
+        if mermaid_diagrams.len() >= MAX_MERMAID_DIAGRAMS_PER_DOCUMENT {
+            // Leave diagrams beyond the per-document cap as code so a single
+            // streamed response cannot fan out unbounded render tasks.
+            continue;
+        }
         mermaid_diagrams.insert(
             source_range.start,
             ParsedMarkdownMermaidDiagram {
@@ -322,6 +414,8 @@ pub(crate) fn render_mermaid_diagram(
     let cached = mermaid_state.cache.get(&parsed.contents);
     let render_result = cached.and_then(|cached| cached.render_image.get());
     let show_interactive = copy_button_visibility != CopyButtonVisibility::Hidden;
+    // Preview keeps diagrams at natural size + scroll instead of crushing them via max_w_full (#61051).
+    let allow_overflow_x = style.code_block_overflow_x_scroll;
 
     let code = parsed.contents.contents.clone();
 
@@ -333,16 +427,7 @@ pub(crate) fn render_mermaid_diagram(
             let body = if showing_code {
                 render_mermaid_code_view(&parsed.contents.contents)
             } else {
-                div()
-                    .w_full()
-                    .child(
-                        img(ImageSource::Render(render_image.clone()))
-                            .max_w_full()
-                            .with_fallback(|| {
-                                Label::new("Failed to Load Mermaid Diagram").into_any_element()
-                            }),
-                    )
-                    .into_any_element()
+                render_mermaid_image(render_image.clone(), allow_overflow_x, source_offset)
             };
 
             container
@@ -382,16 +467,11 @@ pub(crate) fn render_mermaid_diagram(
                 container
                     .child(
                         div()
-                            .w_full()
-                            .child(
-                                img(ImageSource::Render(fallback.clone()))
-                                    .max_w_full()
-                                    .with_fallback(|| {
-                                        div()
-                                            .child(Label::new("Failed to load mermaid diagram"))
-                                            .into_any_element()
-                                    }),
-                            )
+                            .child(render_mermaid_image(
+                                fallback.clone(),
+                                allow_overflow_x,
+                                source_offset,
+                            ))
                             .with_animation(
                                 "mermaid-fallback-pulse",
                                 Animation::new(Duration::from_secs(2))
@@ -436,6 +516,30 @@ pub(crate) fn render_mermaid_diagram(
                     .into_any_element()
             }
         }
+    }
+}
+
+/// Renders a mermaid diagram image, scrolling at intrinsic size in preview or fit-to-pane elsewhere.
+fn render_mermaid_image(
+    render_image: Arc<RenderImage>,
+    allow_overflow_x: bool,
+    source_offset: usize,
+) -> AnyElement {
+    let image = img(ImageSource::Render(render_image))
+        .with_fallback(|| Label::new("Failed to Load Mermaid Diagram").into_any_element());
+
+    if allow_overflow_x {
+        div()
+            .id(("mermaid-scroll", source_offset))
+            .w_full()
+            .map(|mut container| {
+                container.style().restrict_scroll_to_axis = Some(true);
+                container.overflow_x_scroll()
+            })
+            .child(image)
+            .into_any_element()
+    } else {
+        div().w_full().child(image.max_w_full()).into_any_element()
     }
 }
 

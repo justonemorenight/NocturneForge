@@ -233,10 +233,11 @@ const COMPACTION_REQUEST_BYTES_PER_TOKEN: u64 = 3;
 const COMPACTION_REQUEST_HEADROOM_PERCENT: u64 = 80;
 const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
 const COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT: usize = 64 * 1024;
-const COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE: &str =
-    "Output exceeded the available model context and was truncated.";
+const NORMAL_TOOL_OUTPUT_BYTE_LIMIT: usize = COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT;
+const NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET: usize = 256 * 1024;
+const REQUEST_IMAGE_TOKEN_ESTIMATE: usize = 4_000;
+const COMPACTION_TARGET_THRESHOLD_PERCENT: u64 = 90;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
-const MIN_USER_MESSAGES_BEFORE_RECOMPACTION: usize = 2;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -2881,25 +2882,29 @@ impl Thread {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         let mut auto_compactions = 0;
+        let mut prompt_too_large_compaction_attempted = false;
+        let mut skip_auto_compaction = false;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
         loop {
-            match Self::perform_compaction_if_needed(
+            let skip_auto_compaction_for_iteration = std::mem::take(&mut skip_auto_compaction);
+            let (model, request) = match Self::perform_compaction_if_needed(
                 this,
                 event_stream,
                 cancellation_rx.clone(),
                 auto_compactions,
+                intent,
+                skip_auto_compaction_for_iteration,
                 cx,
             )
             .await
             {
-                // On success the telemetry event is deferred until the
-                // completion below reports usage, so we can record an
-                // accurate post-compaction context size (see
-                // `handle_completion_event`).
-                Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded)) => {}
+                Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded { model, request })) => {
+                    (model, request)
+                }
                 Ok(ControlFlow::Continue(CompactionRunStatus::Completed)) => {
                     auto_compactions += 1;
+                    continue;
                 }
                 Ok(ControlFlow::Break(())) => {
                     this.update(cx, |this, _| {
@@ -2961,22 +2966,11 @@ impl Thread {
                         }
                     }
                 }
-            }
+            };
 
-            // Re-read the model and refresh tools on each iteration so that
-            // mid-turn changes (e.g. the user switches model, toggles tools,
-            // or changes profile) take effect between tool-call rounds.
-            // If a refusal fallback is active, use that model instead.
-            let (model, request) = this.update(cx, |this, cx| {
-                let model = refusal_fallback_model
-                    .clone()
-                    .or_else(|| this.model().cloned())
-                    .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-                this.refresh_turn_tools(cx);
-                let request = this.build_completion_request(intent, cx)?;
-                this.current_request_token_usage = TokenUsage::default();
-                anyhow::Ok((model, request))
-            })??;
+            this.update(cx, |this, _| {
+                this.current_request_token_usage = TokenUsage::default()
+            })?;
 
             telemetry::event!(
                 "Agent Thread Completion",
@@ -3190,8 +3184,60 @@ impl Thread {
             }
 
             if let Some(error) = error {
+                if let LanguageModelCompletionError::PromptTooLarge { tokens } = &error
+                    && !prompt_too_large_compaction_attempted
+                {
+                    let prompt_too_large_tokens = *tokens;
+                    let auto_compact_enabled = this.read_with(cx, |_this, cx| {
+                        AgentSettings::get_global(cx).auto_compact.enabled
+                    })?;
+                    if auto_compact_enabled {
+                        let can_retry_safely = this.update(cx, |this, cx| {
+                            this.mark_token_limit_exceeded(prompt_too_large_tokens, cx);
+                            this.discard_partial_response_for_prompt_too_large(intent)
+                        })?;
+                        if !can_retry_safely {
+                            return Err(anyhow!(error));
+                        }
+                        prompt_too_large_compaction_attempted = true;
+                        match Self::recover_from_prompt_too_large(
+                            this,
+                            event_stream,
+                            cancellation_rx.clone(),
+                            intent,
+                            cx,
+                        )
+                        .await
+                        {
+                            Ok(ControlFlow::Break(())) => {
+                                this.update(cx, |this, _| {
+                                    this.emit_compaction_telemetry_outcome("canceled", None)
+                                })?;
+                                return Ok(());
+                            }
+                            Ok(ControlFlow::Continue(())) => {
+                                // The recovery is deliberately a one-shot path. Do not let
+                                // the normal auto-compaction check compact the same turn again
+                                // if the rebuilt request is still too large.
+                                skip_auto_compaction = true;
+                                attempt = 0;
+                                continue;
+                            }
+                            Err(recovery_error) => {
+                                this.update(cx, |this, _| {
+                                    this.emit_compaction_telemetry_outcome(
+                                        "failed",
+                                        Some(recovery_error.to_string()),
+                                    )
+                                })?;
+                                return Err(recovery_error);
+                            }
+                        }
+                    }
+                }
                 attempt += 1;
-                match Self::retry_completion_error(
+                let completion_error_message = error.to_string();
+                let retry_result = Self::retry_completion_error(
                     this,
                     event_stream,
                     &mut cancellation_rx,
@@ -3199,8 +3245,20 @@ impl Thread {
                     attempt,
                     cx,
                 )
-                .await?
-                {
+                .await;
+                let retry_result = match retry_result {
+                    Ok(retry_result) => retry_result,
+                    Err(retry_error) => {
+                        this.update(cx, |this, _| {
+                            this.emit_compaction_telemetry_outcome(
+                                "failed",
+                                Some(completion_error_message),
+                            )
+                        })?;
+                        return Err(retry_error);
+                    }
+                };
+                match retry_result {
                     ControlFlow::Break(_) => return Ok(()),
                     ControlFlow::Continue(_) => {}
                 }
@@ -3262,11 +3320,29 @@ impl Thread {
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
         completed_auto_compactions: usize,
+        intent: CompletionIntent,
+        skip_auto_compaction: bool,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<(), CompactionRunStatus>> {
-        let Some((target, operation)) = this.update(cx, |this, cx| {
-            let Some(insertion_ix) = this.auto_compaction_target_ix(cx)? else {
-                return anyhow::Ok(None);
+        let preparation = this.update(cx, |this, cx| {
+            this.refresh_turn_tools(cx);
+            let model = this
+                .model()
+                .cloned()
+                .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+            let request = this.build_completion_request(intent, cx)?;
+            let estimated_tokens = estimate_request_tokens(&request, model.as_ref())?;
+            if skip_auto_compaction {
+                return anyhow::Ok(ControlFlow::Break((model, request)));
+            }
+            let Some(insertion_ix) = this.compaction_target_ix_for_request(
+                intent,
+                estimated_tokens,
+                completed_auto_compactions > 0,
+                cx,
+            )?
+            else {
+                return anyhow::Ok(ControlFlow::Break((model, request)));
             };
             if completed_auto_compactions >= MAX_AUTO_COMPACTIONS_PER_TURN {
                 return Err(anyhow!(
@@ -3284,10 +3360,16 @@ impl Thread {
                 this.pending_compaction_telemetry =
                     this.build_compaction_telemetry("auto", operation.model(), cx);
             }
-            anyhow::Ok(Some((target, operation)))
-        })??
-        else {
-            return Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded));
+            anyhow::Ok(ControlFlow::Continue((target, operation)))
+        })??;
+        let (target, operation) = match preparation {
+            ControlFlow::Break((model, request)) => {
+                return Ok(ControlFlow::Continue(CompactionRunStatus::NotNeeded {
+                    model,
+                    request,
+                }));
+            }
+            ControlFlow::Continue(preparation) => preparation,
         };
 
         match Self::run_compaction(
@@ -3304,6 +3386,43 @@ impl Thread {
             ControlFlow::Break(()) => Ok(ControlFlow::Break(())),
             ControlFlow::Continue(()) => Ok(ControlFlow::Continue(CompactionRunStatus::Completed)),
         }
+    }
+
+    async fn recover_from_prompt_too_large(
+        this: &WeakEntity<Self>,
+        event_stream: &ThreadEventStream,
+        cancellation_rx: watch::Receiver<bool>,
+        intent: CompletionIntent,
+        cx: &mut AsyncApp,
+    ) -> Result<ControlFlow<()>> {
+        let (target, operation) = this.update(cx, |this, cx| {
+            let insertion_ix = this
+                .prompt_too_large_compaction_insertion_ix(intent)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Prompt is too large and there is no earlier context that can be compacted"
+                    )
+                })?;
+            let target = CompactionTarget::new(&this.messages, insertion_ix)?;
+            let operation = this.compaction_operation(&target, cx)?;
+            this.current_request_token_usage = TokenUsage::default();
+            if this.pending_compaction_telemetry.is_none() {
+                this.pending_compaction_telemetry =
+                    this.build_compaction_telemetry("prompt_too_large", operation.model(), cx);
+            }
+            anyhow::Ok((target, operation))
+        })??;
+
+        Self::run_compaction(
+            this,
+            event_stream,
+            cancellation_rx,
+            target,
+            CompactionMode::Auto,
+            operation,
+            cx,
+        )
+        .await
     }
 
     async fn run_compaction(
@@ -4433,7 +4552,7 @@ impl Thread {
         let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
 
-        let request = LanguageModelRequest {
+        let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(completion_intent),
@@ -4450,6 +4569,12 @@ impl Thread {
             speed: self.speed(),
             compact_at_tokens: None,
         };
+        let preserve_current_tool_group = completion_intent == CompletionIntent::ToolResults
+            || self
+                .pending_message
+                .as_ref()
+                .is_some_and(|message| !message.tool_results.is_empty());
+        budget_historical_tool_outputs(&mut request, preserve_current_tool_group);
 
         log::debug!("Completion request built successfully");
         Ok(request)
@@ -4781,6 +4906,7 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
         let auto_compact = AgentSettings::get_global(cx).auto_compact;
         if !auto_compact.enabled {
@@ -4839,32 +4965,150 @@ impl Thread {
         Some(insertion_ix)
     }
 
-    fn auto_compaction_target_ix(&self, cx: &App) -> Result<Option<usize>> {
-        let Some(insertion_ix) = self.compaction_message_target_ix(cx) else {
+    fn compaction_target_ix_for_request(
+        &self,
+        intent: CompletionIntent,
+        estimated_tokens: u64,
+        allow_recompaction: bool,
+        cx: &App,
+    ) -> Result<Option<usize>> {
+        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        if !auto_compact.enabled {
             return Ok(None);
+        }
+
+        let model = self
+            .model()
+            .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+        let max_input_tokens = model
+            .max_token_count()
+            .saturating_sub(model.max_output_tokens().unwrap_or_default());
+        if max_input_tokens < MIN_COMPACTION_CONTEXT_WINDOW {
+            return Ok(None);
+        }
+
+        let latest_usage_tokens = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, message)| {
+                let Message::User(user_message) = &**message else {
+                    return None;
+                };
+                self.request_token_usage
+                    .get(&user_message.id)
+                    .copied()
+                    .map(|usage| (ix, usage))
+            })
+            .filter(|(usage_ix, _)| {
+                !latest_compaction_message_ix_before(&self.messages, self.messages.len())
+                    .is_some_and(|compaction_ix| compaction_ix > *usage_ix)
+            })
+            .map(|(_, usage)| total_input_tokens(usage).saturating_add(usage.output_tokens))
+            .unwrap_or_default();
+        let active_tokens = estimated_tokens.max(latest_usage_tokens);
+        let threshold =
+            auto_compact_threshold_token_count(auto_compact.threshold, max_input_tokens);
+        let required_tokens = if allow_recompaction {
+            compaction_target_token_count(auto_compact.threshold, max_input_tokens)
+        } else {
+            threshold
         };
+        if active_tokens < required_tokens {
+            return Ok(None);
+        }
+
+        let insertion_ix = self
+            .active_tool_group_start_ix(intent)
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(ix, message)| {
+                        let Message::User(UserMessage { id, .. }) = &**message else {
+                            return None;
+                        };
+                        (!self.request_token_usage.contains_key(id)).then_some(ix)
+                    })
+            })
+            .unwrap_or(self.messages.len());
+
+        if insertion_ix == 0 {
+            return Err(anyhow!(
+                "Automatic compaction has no historical context to summarize"
+            ));
+        }
 
         if let Some(compaction_ix) =
             latest_compaction_message_ix_before(&self.messages, insertion_ix)
         {
-            let user_messages_after_compaction = self.messages[compaction_ix + 1..insertion_ix]
-                .iter()
-                .filter(|message| {
-                    matches!(
-                        &***message,
-                        Message::User(UserMessage { content, .. }) if !content.is_empty()
-                    )
-                })
-                .count();
-            if user_messages_after_compaction < MIN_USER_MESSAGES_BEFORE_RECOMPACTION {
+            if !allow_recompaction {
+                return Ok(None);
+            }
+            if compaction_ix + 1 >= insertion_ix {
                 return Err(anyhow!(
-                    "Context is still above the automatic compaction threshold immediately after \
-                     compaction. Start a new thread or remove large images and tool output."
+                    "Automatic compaction cannot create additional headroom without compacting the active tool-call result"
                 ));
             }
         }
 
         Ok(Some(insertion_ix))
+    }
+
+    fn active_tool_group_start_ix(&self, intent: CompletionIntent) -> Option<usize> {
+        if intent != CompletionIntent::ToolResults {
+            return None;
+        }
+
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, message)| {
+                let Message::Agent(agent_message) = &**message else {
+                    return None;
+                };
+                (!agent_message.tool_results.is_empty()).then_some(ix)
+            })
+    }
+
+    fn prompt_too_large_compaction_insertion_ix(&self, intent: CompletionIntent) -> Option<usize> {
+        self.active_tool_group_start_ix(intent).or_else(|| {
+            self.messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(ix, message)| matches!(&**message, Message::User(_)).then_some(ix))
+        })
+    }
+
+    fn discard_partial_response_for_prompt_too_large(&mut self, intent: CompletionIntent) -> bool {
+        let Some(request_boundary_ix) = self.prompt_too_large_compaction_insertion_ix(intent)
+        else {
+            return false;
+        };
+        let has_completed_tool_side_effect =
+            self.messages[request_boundary_ix + 1..]
+                .iter()
+                .any(|message| {
+                    let Message::Agent(agent_message) = &**message else {
+                        return false;
+                    };
+                    !agent_message.tool_results.is_empty()
+                        || agent_message
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, AgentMessageContent::ToolUse(_)))
+                });
+        if has_completed_tool_side_effect {
+            return false;
+        }
+
+        self.messages.truncate(request_boundary_ix + 1);
+        self.pending_message.take();
+        true
     }
 
     /// Insertion point for a manually-triggered compaction.
@@ -4972,6 +5216,7 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         });
+        budget_historical_tool_outputs(&mut request, false);
 
         request
     }
@@ -5178,7 +5423,8 @@ impl Thread {
             | NoApiKey { .. }
             | ApiEndpointNotFound { .. }
             | PromptTooLarge { .. }
-            | RequestPayloadTooLarge { .. } => None,
+            | RequestPayloadTooLarge { .. }
+            | InvalidEncryptedContent { .. } => None,
             // These errors might be transient, so retry them
             SerializeRequest { .. } | BuildRequestBody { .. } | StreamEndedUnexpectedly { .. } => {
                 Some(RetryStrategy::Fixed {
@@ -5229,6 +5475,11 @@ fn auto_compact_threshold_token_count(
             max_token_count.saturating_sub(tokens).saturating_add(1)
         }
     }
+}
+
+fn compaction_target_token_count(threshold: AutoCompactThreshold, max_input_tokens: u64) -> u64 {
+    let threshold = auto_compact_threshold_token_count(threshold, max_input_tokens);
+    threshold.saturating_mul(COMPACTION_TARGET_THRESHOLD_PERCENT) / 100
 }
 
 /// Snapshot of the data needed to report an `"Agent Compaction Completed"`
@@ -5452,7 +5703,10 @@ impl CompactionOperation {
 }
 
 enum CompactionRunStatus {
-    NotNeeded,
+    NotNeeded {
+        model: Arc<dyn LanguageModel>,
+        request: LanguageModelRequest,
+    },
     Completed,
 }
 
@@ -5490,12 +5744,11 @@ fn prepare_provider_compaction_request(
             let MessageContent::ToolResult(tool_result) = content else {
                 continue;
             };
-            for part in &mut tool_result.content {
-                if matches!(part, LanguageModelToolResultContent::Text(text) if text.len() > COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT)
-                {
-                    *part = COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE.into();
-                    truncated_oversized_output = true;
-                }
+            let byte_count = tool_output_byte_len(tool_result);
+            if byte_count > COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT {
+                tool_result.content = vec![tool_output_truncation_marker(byte_count)];
+                tool_result.output = None;
+                truncated_oversized_output = true;
             }
         }
     }
@@ -5509,7 +5762,9 @@ fn prepare_provider_compaction_request(
             let MessageContent::ToolResult(tool_result) = content else {
                 continue;
             };
-            let replacement = vec![COMPACTION_TOOL_OUTPUT_TRUNCATED_MESSAGE.into()];
+            let replacement = vec![tool_output_truncation_marker(tool_output_byte_len(
+                tool_result,
+            ))];
             if tool_result.content != replacement {
                 tool_result.content = replacement;
                 removed_historical_tool_output = true;
@@ -5527,6 +5782,127 @@ fn serialized_request_len(request: &LanguageModelRequest) -> Result<usize> {
     serde_json::to_vec(request)
         .map(|request| request.len())
         .context("failed to size provider-native compaction request")
+}
+
+fn estimate_request_tokens(
+    request: &LanguageModelRequest,
+    model: &dyn LanguageModel,
+) -> Result<u64> {
+    let mut request = request.clone();
+    let provider_id = model.provider_id();
+    if let Some(compaction_message_ix) = request.messages.iter().rposition(|message| {
+        message.content.iter().any(|content| {
+            matches!(
+                content,
+                MessageContent::Compaction(CompactedContext::ProviderState(state))
+                    if state.provider_id() == &provider_id
+            )
+        })
+    }) {
+        request.messages.drain(..compaction_message_ix);
+    }
+
+    let image_estimate = "x".repeat(
+        REQUEST_IMAGE_TOKEN_ESTIMATE.saturating_mul(COMPACTION_REQUEST_BYTES_PER_TOKEN as usize),
+    );
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            match content {
+                MessageContent::Image(image) => image.source = image_estimate.clone().into(),
+                MessageContent::ToolResult(tool_result) => {
+                    // `output` is replay/debug metadata, not model-visible tool content.
+                    tool_result.output = None;
+                    for content in &mut tool_result.content {
+                        if let LanguageModelToolResultContent::Image(image) = content {
+                            image.source = image_estimate.clone().into();
+                        }
+                    }
+                }
+                MessageContent::Text(_)
+                | MessageContent::Thinking { .. }
+                | MessageContent::RedactedThinking(_)
+                | MessageContent::ToolUse(_)
+                | MessageContent::Compaction(_) => {}
+            }
+        }
+    }
+    let bytes = serialized_request_len(&request)? as u64;
+    Ok(
+        bytes.saturating_add(COMPACTION_REQUEST_BYTES_PER_TOKEN.saturating_sub(1))
+            / COMPACTION_REQUEST_BYTES_PER_TOKEN,
+    )
+}
+
+fn tool_output_byte_len(tool_result: &LanguageModelToolResult) -> usize {
+    let content_bytes = tool_output_content_byte_len(tool_result);
+    let output_bytes = tool_result
+        .output
+        .as_ref()
+        .and_then(|output| serde_json::to_vec(output).ok())
+        .map_or(0, |output| output.len());
+    content_bytes.saturating_add(output_bytes)
+}
+
+fn tool_output_content_byte_len(tool_result: &LanguageModelToolResult) -> usize {
+    tool_result
+        .content
+        .iter()
+        .map(|part| match part {
+            LanguageModelToolResultContent::Text(text) => text.len(),
+            LanguageModelToolResultContent::Image(image) => image.len(),
+        })
+        .sum()
+}
+
+fn tool_output_truncation_marker(byte_count: usize) -> LanguageModelToolResultContent {
+    format!(
+        "[Tool output truncated: {byte_count} bytes. The complete output remains in the thread transcript.]"
+    )
+    .into()
+}
+
+fn budget_historical_tool_outputs(
+    request: &mut LanguageModelRequest,
+    preserve_latest_tool_group: bool,
+) {
+    let protected_tool_result_message = if preserve_latest_tool_group {
+        request
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(ix, message)| {
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, MessageContent::ToolResult(_)))
+                    .then_some(ix)
+            })
+    } else {
+        None
+    };
+
+    let mut remaining_byte_budget = NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET;
+    for (message_ix, message) in request.messages.iter_mut().enumerate().rev() {
+        if protected_tool_result_message == Some(message_ix) {
+            continue;
+        }
+        for content in message.content.iter_mut().rev() {
+            let MessageContent::ToolResult(tool_result) = content else {
+                continue;
+            };
+            let byte_count = tool_output_byte_len(tool_result);
+            let model_visible_byte_count = tool_output_content_byte_len(tool_result);
+            tool_result.output = None;
+            if model_visible_byte_count <= NORMAL_TOOL_OUTPUT_BYTE_LIMIT
+                && model_visible_byte_count <= remaining_byte_budget
+            {
+                remaining_byte_budget -= model_visible_byte_count;
+            } else {
+                tool_result.content = vec![tool_output_truncation_marker(byte_count)];
+            }
+        }
+    }
 }
 
 struct RunningTurn {
@@ -7668,6 +8044,230 @@ mod tests {
             .collect()
     }
 
+    fn tool_result_request_message(id: &str, content_bytes: usize) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: LanguageModelToolUseId::from(id),
+                tool_name: "test_tool".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text(
+                    "x".repeat(content_bytes).into(),
+                )],
+                output: Some(json!({ "debug": "not model visible" })),
+            })],
+            cache: false,
+            reasoning_details: None,
+        }
+    }
+
+    #[test]
+    fn test_compaction_request_budgets_historical_tool_outputs_newest_first() {
+        let mut request = LanguageModelRequest {
+            messages: (0..5)
+                .map(|ix| {
+                    tool_result_request_message(
+                        &format!("tool-{ix}"),
+                        NORMAL_TOOL_OUTPUT_BYTE_LIMIT - 1024,
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        budget_historical_tool_outputs(&mut request, false);
+
+        let retained = request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.content.as_slice(),
+                    [MessageContent::ToolResult(LanguageModelToolResult { content, .. })]
+                        if matches!(content.as_slice(), [LanguageModelToolResultContent::Text(text)] if text.len() == NORMAL_TOOL_OUTPUT_BYTE_LIMIT - 1024)
+                )
+            })
+            .count();
+        assert_eq!(retained, 4);
+        assert!(request.messages[0].string_contents().contains("truncated"));
+        assert!(request.messages.iter().all(|message| {
+            matches!(
+                message.content.as_slice(),
+                [MessageContent::ToolResult(LanguageModelToolResult {
+                    output: None,
+                    ..
+                })]
+            )
+        }));
+    }
+
+    #[test]
+    fn test_compaction_request_preserves_current_tool_result_group() {
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                tool_result_request_message("historical", NORMAL_TOOL_OUTPUT_BYTE_LIMIT + 1),
+                tool_result_request_message("current", NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET + 1),
+            ],
+            ..Default::default()
+        };
+
+        budget_historical_tool_outputs(&mut request, true);
+
+        assert!(request.messages[0].string_contents().contains("truncated"));
+        assert_eq!(
+            request.messages[1].string_contents().len(),
+            NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET + 1
+        );
+    }
+
+    #[test]
+    fn test_compaction_request_estimate_uses_vision_cost_not_base64_size() {
+        let model = FakeLanguageModel::default();
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Image(LanguageModelImage {
+                    source: "x".repeat(1024 * 1024).into(),
+                })],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+
+        let estimated_tokens = estimate_request_tokens(&request, &model).unwrap();
+        assert!(estimated_tokens >= REQUEST_IMAGE_TOKEN_ESTIMATE as u64);
+        assert!(estimated_tokens < 10_000);
+    }
+
+    #[test]
+    fn test_compaction_request_estimate_honors_provider_replacement_window() {
+        let model = FakeLanguageModel::default();
+        let request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("old".repeat(300_000))],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Compaction(CompactedContext::ProviderState(
+                        language_model::ProviderCompactionState::new(
+                            model.provider_id(),
+                            "test",
+                            "opaque replacement",
+                        ),
+                    ))],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("new tail".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(estimate_request_tokens(&request, &model).unwrap() < 10_000);
+    }
+
+    #[gpui::test]
+    async fn test_compaction_threshold_accounts_for_pending_request(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_max_token_count(100_000);
+        let old_user_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.request_token_usage.insert(
+                    old_user_message_id,
+                    language_model::TokenUsage {
+                        input_tokens: 1,
+                        ..Default::default()
+                    },
+                );
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    &"large pending prompt ".repeat(20_000),
+                ));
+
+                let request = thread
+                    .build_completion_request(CompletionIntent::UserPrompt, cx)
+                    .expect("candidate request should build");
+                let estimated_tokens = estimate_request_tokens(&request, model.as_ref())
+                    .expect("candidate request should serialize");
+                assert_eq!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::UserPrompt,
+                            estimated_tokens,
+                            false,
+                            cx,
+                        )
+                        .unwrap(),
+                    Some(2)
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_threshold_ignores_usage_before_latest_compaction(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let old_user_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.request_token_usage.insert(
+                    old_user_message_id,
+                    language_model::TokenUsage {
+                        input_tokens: 950_000,
+                        ..Default::default()
+                    },
+                );
+                thread.messages.push(summary_compaction("small summary"));
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "new prompt"));
+
+                let request = thread
+                    .build_completion_request(CompletionIntent::UserPrompt, cx)
+                    .expect("candidate request should build");
+                let estimated_tokens = estimate_request_tokens(&request, model.as_ref())
+                    .expect("candidate request should serialize");
+                assert_eq!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::UserPrompt,
+                            estimated_tokens,
+                            true,
+                            cx,
+                        )
+                        .unwrap(),
+                    None
+                );
+            });
+        });
+    }
+
     #[gpui::test]
     async fn test_thread_summary_request_uses_compacted_history(cx: &mut TestAppContext) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
@@ -7758,6 +8358,13 @@ mod tests {
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                },
+            );
             thread.update(cx, |thread, cx| {
                 thread.set_model(model, cx);
                 thread
@@ -7794,6 +8401,13 @@ mod tests {
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                },
+            );
             thread.update(cx, |thread, cx| {
                 thread.set_model(model, cx);
                 thread.messages.push(user_text_message(
@@ -8054,6 +8668,87 @@ mod tests {
                 ));
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_prompt_too_large_recovers_once_without_losing_user_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+            });
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["new prompt"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let initial_request = model.pending_completions().pop().unwrap();
+        model.send_completion_stream_error(
+            &initial_request,
+            LanguageModelCompletionError::PromptTooLarge { tokens: None },
+        );
+        model.end_completion_stream(&initial_request);
+        cx.run_until_parked();
+
+        let compaction_request = model.pending_completions().pop().unwrap();
+        assert_eq!(
+            compaction_request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        model.send_completion_stream_text_chunk(&compaction_request, "compacted old context");
+        model.end_completion_stream(&compaction_request);
+        cx.run_until_parked();
+
+        let retry_request = model.pending_completions().pop().unwrap();
+        assert_eq!(retry_request.intent, Some(CompletionIntent::UserPrompt));
+        assert_eq!(
+            request_texts_after_system(&retry_request.messages),
+            vec![
+                "old user".to_string(),
+                summary_request_text("compacted old context"),
+                "new prompt".to_string(),
+            ]
+        );
+
+        model.send_completion_stream_error(
+            &retry_request,
+            LanguageModelCompletionError::PromptTooLarge { tokens: None },
+        );
+        model.end_completion_stream(&retry_request);
+        cx.run_until_parked();
+
+        assert!(model.pending_completions().is_empty());
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(
+                thread
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(&***message, Message::Compaction(_)))
+                    .count(),
+                1
+            );
+            assert!(thread.messages.iter().any(|message| {
+                matches!(
+                    &**message,
+                    Message::User(UserMessage { content, .. })
+                        if content.iter().any(|content| matches!(content, UserMessageContent::Text(text) if text == "new prompt"))
+                )
+            }));
         });
     }
 

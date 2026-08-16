@@ -2,6 +2,7 @@ mod highlights_tree_view;
 mod key_context_view;
 pub mod lsp_button;
 pub mod lsp_log_view;
+mod resource_monitor;
 mod syntax_tree_view;
 
 #[cfg(test)]
@@ -11,6 +12,7 @@ use gpui::{App, AppContext, Entity};
 
 pub use highlights_tree_view::{HighlightsTreeToolbarItemView, HighlightsTreeView};
 pub use lsp_log_view::LspLogView;
+pub use resource_monitor::ResourceMonitorButton;
 pub use syntax_tree_view::{SyntaxTreeToolbarItemView, SyntaxTreeView};
 use ui::{Context, Window};
 use workspace::{Item, ItemHandle, SplitDirection, Workspace};
@@ -20,6 +22,7 @@ pub fn init(cx: &mut App) {
     lsp_log_view::init(false, cx);
     syntax_tree_view::init(cx);
     key_context_view::init(cx);
+    resource_monitor::init(cx);
 }
 
 fn get_or_create_tool<T>(

@@ -121,7 +121,7 @@ impl LspStore {
                     update,
                 } = semantic_tokens_data;
                 *update = None;
-                raw_tokens.servers.clear();
+                raw_tokens.servers.remove(&refresh.server_id);
             }
         }
 
@@ -188,16 +188,41 @@ impl LspStore {
                         .await,
                     )
                 } else {
-                    lsp_store.update(cx, |lsp_store, cx| {
+                    let remaining_tokens = lsp_store.update(cx, |lsp_store, cx| {
+                        let mut remaining_tokens = None;
                         if let Some(current_lsp_data) =
                             lsp_store.current_lsp_data(buffer.read(cx).remote_id())
                         {
                             if current_lsp_data.buffer_version == version_queried_for {
-                                current_lsp_data.semantic_tokens = None;
+                                if refresh.is_none()
+                                    || current_lsp_data
+                                        .semantic_tokens
+                                        .as_ref()
+                                        .is_none_or(|tokens| tokens.raw_tokens.servers.is_empty())
+                                {
+                                    current_lsp_data.semantic_tokens = None;
+                                } else if let Some(semantic_tokens) =
+                                    current_lsp_data.semantic_tokens.as_ref()
+                                {
+                                    let buffer_snapshot =
+                                        buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                                    remaining_tokens =
+                                        Some((semantic_tokens.raw_tokens.clone(), buffer_snapshot));
+                                }
                             }
                         }
+                        remaining_tokens
                     })?;
-                    None
+                    match remaining_tokens {
+                        Some((raw_tokens, buffer_snapshot)) => Some(
+                            cx.background_spawn(raw_to_buffer_semantic_tokens(
+                                raw_tokens,
+                                buffer_snapshot.text.clone(),
+                            ))
+                            .await,
+                        ),
+                        None => None,
+                    }
                 };
                 Ok(BufferSemanticTokens { tokens: res })
             })

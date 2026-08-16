@@ -1965,7 +1965,10 @@ impl MultiBuffer {
                 self.capability = buffer.read(cx).capability();
                 return;
             }
-            BufferEvent::Operation { .. } | BufferEvent::ReloadNeeded => return,
+            BufferEvent::Operation { .. }
+            | BufferEvent::ReloadNeeded
+            | BufferEvent::TransactionUndone { .. }
+            | BufferEvent::TransactionRedone { .. } => return,
         });
     }
 

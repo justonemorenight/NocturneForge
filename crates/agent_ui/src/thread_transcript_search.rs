@@ -504,11 +504,14 @@ impl ThreadTranscriptSearchStore {
             return;
         };
         store.update(cx, |this, _cx| {
+            let now = Instant::now();
+            this.pending_navigation
+                .retain(|_, pending| pending.expires_at > now);
             this.pending_navigation.insert(
                 thread_id,
                 PendingNavigation {
                     navigation,
-                    expires_at: Instant::now() + NAVIGATION_TTL,
+                    expires_at: now + NAVIGATION_TTL,
                 },
             );
         });

@@ -1551,6 +1551,7 @@ impl Render for MarkdownPreviewView {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll_handle)
+                        .restrict_scroll_to_axis()
                         .p_4()
                         .child({
                             let markdown_element =

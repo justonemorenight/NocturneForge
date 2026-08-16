@@ -1,6 +1,7 @@
 use crate::{AgentServer, AgentServerDelegate, load_proxy_env};
 use acp_thread::AgentConnection;
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::{AgentSettings, AutoCompactThreshold};
 use anyhow::{Context as _, Result};
 use collections::HashSet;
 use fs::Fs;
@@ -10,8 +11,8 @@ use project::{
     Project,
     agent_server_store::{AgentId, AllAgentServersSettings},
 };
-use settings::{AgentConfigOptionValue, SettingsStore, update_settings_file};
-use std::{rc::Rc, sync::Arc};
+use settings::{AgentConfigOptionValue, Settings as _, SettingsStore, update_settings_file};
+use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 use ui::IconName;
 
 pub const GEMINI_ID: &str = "gemini";
@@ -229,7 +230,16 @@ impl AgentServer for CustomAgentServer {
         if is_registry_agent {
             match agent_id.as_ref() {
                 CLAUDE_AGENT_ID => {
+                    // Claude Code's CLI resolves the model aliases from
+                    // ~/.claude/settings.json. The registry ACP process is a
+                    // separate executable and only receives its process
+                    // environment, so bridge the routing/model environment
+                    // here. Keep this in Zed's launcher rather than patching
+                    // the downloaded ACP package; registry updates therefore
+                    // cannot remove the behavior.
+                    extra_env.extend(claude_code_settings_env());
                     extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
+                    configure_claude_native_auto_compaction(&mut extra_env, cx);
                 }
                 CODEX_ID => {
                     if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
@@ -285,6 +295,102 @@ impl AgentServer for CustomAgentServer {
     }
 }
 
+/// Environment values in Claude Code's user settings that affect the model
+/// or the Anthropic-compatible gateway. Claude's CLI loads these itself, but
+/// `claude-agent-acp` is launched as a separate process by Zed and does not
+/// merge `settings.env` into the SDK query environment.
+fn claude_code_settings_env() -> HashMap<String, String> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| util::paths::home_dir().join(".claude"));
+    let path = config_dir.join("settings.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return HashMap::default();
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        log::warn!("Failed to parse Claude Code settings at {}", path.display());
+        return HashMap::default();
+    };
+    let Some(env) = settings.get("env").and_then(serde_json::Value::as_object) else {
+        return HashMap::default();
+    };
+
+    const FORWARDED_KEYS: &[&str] = &[
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "CLAUDE_MODEL_CONFIG",
+    ];
+    let mut forwarded = FORWARDED_KEYS
+        .iter()
+        .filter_map(|key| {
+            env.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| ((*key).to_owned(), value.to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    // The CLI treats `model: "opus"` as an alias and resolves it through
+    // `ANTHROPIC_DEFAULT_OPUS_MODEL`. ACP's resolver only has a direct
+    // `ANTHROPIC_MODEL` override, so make the same resolution explicit. An
+    // explicit ANTHROPIC_MODEL always wins and is left untouched.
+    if !forwarded.contains_key("ANTHROPIC_MODEL") {
+        let alias = settings
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|model| model.split('[').next())
+            .unwrap_or_default();
+        let default_key = match alias {
+            "opus" => "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "sonnet" => "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "haiku" => "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            _ => return forwarded,
+        };
+        if let Some(model) = forwarded.get(default_key).cloned() {
+            forwarded.insert("ANTHROPIC_MODEL".to_owned(), model);
+        }
+    }
+
+    forwarded
+}
+
+/// Let Claude Code own compaction inside its model/tool loop when it is running
+/// behind a custom `ANTHROPIC_BASE_URL`.
+///
+/// Claude Code 2.1.161 and later gate native auto-compaction for custom base
+/// URLs unless the URL is explicitly treated as first-party. Percentage
+/// thresholds map directly to Claude Code's native environment setting. Token
+/// thresholds cannot be represented there, so those continue to use Zed's
+/// idle-turn ACP fallback instead.
+///
+/// User-provided agent-server environment variables are applied after these
+/// defaults, so either value can still be overridden without rebuilding Zed.
+fn configure_claude_native_auto_compaction(
+    extra_env: &mut collections::HashMap<String, String>,
+    cx: &App,
+) {
+    let auto_compact = AgentSettings::get_global(cx).auto_compact;
+    if !auto_compact.enabled {
+        return;
+    }
+
+    let AutoCompactThreshold::Percentage(threshold) = auto_compact.threshold else {
+        return;
+    };
+
+    extra_env.insert(
+        "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL".into(),
+        "1".into(),
+    );
+    extra_env.insert(
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".into(),
+        format!("{}", threshold * 100.0),
+    );
+}
+
 fn api_key_for_gemini_cli(cx: &mut App) -> Task<Result<String>> {
     let env_var = EnvVar::new("GEMINI_API_KEY".into()).or(EnvVar::new("GOOGLE_AI_API_KEY".into()));
     if let Some(key) = env_var.value {
@@ -338,7 +444,6 @@ mod tests {
     use project::agent_registry_store::{
         AgentRegistryStore, RegistryAgent, RegistryAgentMetadata, RegistryNpxAgent,
     };
-    use settings::Settings as _;
     use ui::SharedString;
 
     fn init_test(cx: &mut TestAppContext) {

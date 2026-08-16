@@ -5,6 +5,7 @@ mod terminal;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp};
+use agent_settings::{AgentSettings, AutoCompactThreshold};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
 pub use connection::*;
@@ -13,7 +14,7 @@ use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{
     AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, SharedString, Subscription,
-    Task, WeakEntity,
+    Task, TaskExt, WeakEntity,
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
@@ -29,6 +30,7 @@ use project::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
+use settings::Settings;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
@@ -2041,6 +2043,23 @@ impl TokenUsage {
     }
 }
 
+fn acp_auto_compaction_threshold_reached(
+    threshold: AutoCompactThreshold,
+    usage: &TokenUsage,
+) -> bool {
+    match threshold {
+        AutoCompactThreshold::Percentage(percent) => {
+            usage.max_tokens > 0
+                && usage.used_tokens >= ((usage.max_tokens as f64) * percent).ceil() as u64
+        }
+        AutoCompactThreshold::TokensUsed(tokens) => usage.used_tokens >= tokens,
+        AutoCompactThreshold::TokensRemaining(tokens) => {
+            usage.max_tokens > 0
+                && usage.used_tokens >= usage.max_tokens.saturating_sub(tokens).saturating_add(1)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TokenUsageRatio {
     Normal,
@@ -2074,7 +2093,25 @@ pub fn refusal_fallback_model_from_meta(meta: &Option<acp::Meta>) -> Option<Shar
 struct RunningTurn {
     id: u32,
     send_task: Task<()>,
+    settled: oneshot::Receiver<()>,
+    activity_generation: u64,
+    saw_activity: bool,
 }
+
+#[derive(Default)]
+struct AcpAutoCompactionState {
+    generation: u64,
+    running: bool,
+    consecutive_failures: u8,
+}
+
+const CLAUDE_ACP_AGENT_ID: &str = "claude-acp";
+const ACP_AUTO_COMPACTION_COMMAND: &str = "compact";
+const ACP_AUTO_COMPACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ACP_AUTO_COMPACTION_RETRY_DELAY: Duration = Duration::from_secs(30);
+const ACP_AUTO_COMPACTION_MAX_ATTEMPTS: u8 = 2;
+const CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const CLAUDE_ACP_STALLED_TURN_SILENT_POLLS: u8 = 10;
 
 /// Supplies the editor's authoritative draft at lifecycle boundaries where the
 /// debounced `draft_prompt` cache may not have caught up yet.
@@ -2095,7 +2132,9 @@ pub struct AcpThread {
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
     shared_buffers: HashMap<WeakEntity<Buffer>, BufferSnapshot>,
     turn_id: u32,
+    turn_cancellation_generation: u64,
     running_turn: Option<RunningTurn>,
+    auto_compaction: AcpAutoCompactionState,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -2330,7 +2369,9 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            auto_compaction: AcpAutoCompactionState::default(),
             turn_id: 0,
+            turn_cancellation_generation: 0,
             connection,
             session_id,
             token_usage: None,
@@ -2603,6 +2644,30 @@ impl AcpThread {
         false
     }
 
+    fn has_in_progress_subagent_tool_calls(&self) -> bool {
+        for entry in self.entries.iter().rev() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => return false,
+                AgentThreadEntry::ToolCall(call)
+                    if call.is_subagent()
+                        && matches!(
+                            call.status,
+                            ToolCallStatus::InProgress | ToolCallStatus::Pending
+                        ) =>
+                {
+                    return true;
+                }
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction(_) => {}
+            }
+        }
+
+        false
+    }
+
     pub fn used_tools_since_last_user_message(&self) -> bool {
         for entry in self.entries.iter().rev() {
             match entry {
@@ -2623,6 +2688,11 @@ impl AcpThread {
         update: acp::SessionUpdate,
         cx: &mut Context<Self>,
     ) -> Result<(), acp::Error> {
+        if let Some(turn) = self.running_turn.as_mut() {
+            turn.activity_generation = turn.activity_generation.wrapping_add(1);
+            turn.saw_activity = true;
+        }
+
         match update {
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk {
                 content,
@@ -2700,6 +2770,7 @@ impl AcpThread {
             }) => {
                 self.available_commands = available_commands.clone();
                 cx.emit(AcpThreadEvent::AvailableCommandsUpdated(available_commands));
+                self.maybe_auto_compact(cx);
             }
             acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate {
                 current_mode_id,
@@ -2720,6 +2791,7 @@ impl AcpThread {
                     });
                 }
                 cx.emit(AcpThreadEvent::TokenUsageUpdated);
+                self.maybe_auto_compact(cx);
             }
             _ => {}
         }
@@ -3748,6 +3820,249 @@ impl AcpThread {
         self.send_inner(message, false, cx)
     }
 
+    fn maybe_auto_compact(&mut self, cx: &mut Context<Self>) {
+        if self.connection.agent_id().as_ref() != CLAUDE_ACP_AGENT_ID {
+            return;
+        }
+
+        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        if !auto_compact.enabled
+            || !self
+                .available_commands
+                .iter()
+                .any(|command| command.name.as_str() == ACP_AUTO_COMPACTION_COMMAND)
+        {
+            self.auto_compaction.consecutive_failures = 0;
+            return;
+        }
+
+        let Some(usage) = self.token_usage.as_ref() else {
+            return;
+        };
+        if !acp_auto_compaction_threshold_reached(auto_compact.threshold, usage) {
+            self.auto_compaction.consecutive_failures = 0;
+            return;
+        }
+
+        if self.auto_compaction.running || self.running_turn.is_some() {
+            return;
+        }
+        if self.auto_compaction.consecutive_failures >= ACP_AUTO_COMPACTION_MAX_ATTEMPTS {
+            return;
+        }
+
+        self.auto_compaction.generation = self.auto_compaction.generation.wrapping_add(1);
+        let generation = self.auto_compaction.generation;
+        self.auto_compaction.running = true;
+
+        let used_tokens = usage.used_tokens;
+        let max_tokens = usage.max_tokens;
+        log::info!(
+            "Starting claude-acp auto-compaction for session {} at {used_tokens}/{max_tokens} tokens",
+            self.session_id
+        );
+
+        let mut compact = self.send_command(vec!["/compact".into()], cx).fuse();
+        let compact_turn_id = self.turn_id;
+        let mut timeout = cx
+            .background_executor()
+            .timer(ACP_AUTO_COMPACTION_TIMEOUT)
+            .fuse();
+
+        cx.spawn(async move |this, cx| {
+            let result = futures::select_biased! {
+                result = compact => Some(result),
+                _ = timeout => None,
+            };
+
+            if result.is_none() {
+                let cancel = this.update(cx, |this, cx| {
+                    let owns_running_turn = this.auto_compaction.generation == generation
+                        && this.auto_compaction.running
+                        && this
+                            .running_turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.id == compact_turn_id);
+                    owns_running_turn.then(|| this.cancel(cx))
+                })?;
+                if let Some(cancel) = cancel {
+                    cancel.await;
+                }
+            }
+
+            let should_retry = this.update(cx, |this, cx| {
+                if this.auto_compaction.generation != generation {
+                    return false;
+                }
+
+                this.auto_compaction.running = false;
+                let above_threshold = this.token_usage.as_ref().is_some_and(|usage| {
+                    acp_auto_compaction_threshold_reached(
+                        AgentSettings::get_global(cx).auto_compact.threshold,
+                        usage,
+                    )
+                });
+                let completed = matches!(
+                    &result,
+                    Some(Ok(Some(response)))
+                        if response.stop_reason != acp::StopReason::Cancelled
+                );
+
+                if completed && !above_threshold {
+                    this.auto_compaction.consecutive_failures = 0;
+                    log::info!(
+                        "Completed claude-acp auto-compaction for session {}",
+                        this.session_id
+                    );
+                    return false;
+                }
+
+                if matches!(&result, Some(Ok(None)))
+                    || matches!(
+                        &result,
+                        Some(Ok(Some(response)))
+                            if response.stop_reason == acp::StopReason::Cancelled
+                    )
+                {
+                    log::debug!(
+                        "claude-acp auto-compaction was interrupted for session {}",
+                        this.session_id
+                    );
+                    return above_threshold;
+                }
+
+                this.auto_compaction.consecutive_failures =
+                    this.auto_compaction.consecutive_failures.saturating_add(1);
+                match &result {
+                    None => log::error!(
+                        "claude-acp auto-compaction timed out after {:?} for session {}",
+                        ACP_AUTO_COMPACTION_TIMEOUT,
+                        this.session_id
+                    ),
+                    Some(Err(error)) => log::error!(
+                        "claude-acp auto-compaction failed for session {}: {error:#}",
+                        this.session_id
+                    ),
+                    Some(Ok(_)) => log::error!(
+                        "claude-acp auto-compaction completed without reducing context usage for session {}",
+                        this.session_id
+                    ),
+                }
+
+                above_threshold
+                    && this.auto_compaction.consecutive_failures
+                        < ACP_AUTO_COMPACTION_MAX_ATTEMPTS
+            })?;
+
+            if should_retry {
+                cx.background_executor()
+                    .timer(ACP_AUTO_COMPACTION_RETRY_DELAY)
+                    .await;
+                this.update(cx, |this, cx| this.maybe_auto_compact(cx))?;
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn start_claude_stalled_turn_watchdog(&self, turn_id: u32, cx: &mut Context<Self>) {
+        if self.connection.agent_id().as_ref() != CLAUDE_ACP_AGENT_ID {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let mut observed_generation = 0;
+            let mut silent_polls = 0u8;
+
+            loop {
+                cx.background_executor()
+                    .timer(CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL)
+                    .await;
+
+                let snapshot = match this.update(cx, |this, _cx| {
+                    let Some(turn) = this
+                        .running_turn
+                        .as_ref()
+                        .filter(|turn| turn.id == turn_id)
+                    else {
+                        return None;
+                    };
+
+                    let blocked = this.auto_compaction.running
+                        || this.has_in_progress_tool_calls()
+                        || this.is_waiting_for_confirmation();
+                    Some((turn.activity_generation, turn.saw_activity, blocked))
+                }) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return anyhow::Ok(()),
+                };
+
+                let Some((activity_generation, saw_activity, blocked)) = snapshot else {
+                    return anyhow::Ok(());
+                };
+
+                if activity_generation != observed_generation {
+                    observed_generation = activity_generation;
+                    silent_polls = 0;
+                    continue;
+                }
+
+                if !saw_activity || blocked {
+                    silent_polls = 0;
+                    continue;
+                }
+
+                silent_polls = silent_polls.saturating_add(1);
+                if silent_polls < CLAUDE_ACP_STALLED_TURN_SILENT_POLLS {
+                    continue;
+                }
+
+                let cancel = match this.update(cx, |this, cx| {
+                    let Some(turn) = this
+                        .running_turn
+                        .as_ref()
+                        .filter(|turn| turn.id == turn_id)
+                    else {
+                        return None;
+                    };
+
+                    let is_still_silent = turn.activity_generation == observed_generation;
+                    let is_blocked = this.auto_compaction.running
+                        || this.has_in_progress_tool_calls()
+                        || this.is_waiting_for_confirmation();
+                    if !turn.saw_activity || !is_still_silent || is_blocked {
+                        return None;
+                    }
+
+                    log::warn!(
+                        "Cancelling stalled claude-acp turn {} for session {} after {:?} without ACP activity",
+                        turn_id,
+                        this.session_id,
+                        CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL
+                            * u32::from(CLAUDE_ACP_STALLED_TURN_SILENT_POLLS)
+                    );
+                    Some(this.cancel(cx))
+                }) {
+                    Ok(cancel) => cancel,
+                    Err(_) => return anyhow::Ok(()),
+                };
+
+                if let Some(cancel) = cancel {
+                    // The adapter may be stuck precisely because its prompt future never
+                    // resolves after the final update. Sending the ACP cancellation happens
+                    // synchronously in `cancel`; dropping this task then aborts the parked
+                    // send future instead of retaining the thread indefinitely.
+                    drop(cancel);
+                    return anyhow::Ok(());
+                }
+
+                silent_polls = 0;
+            }
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn send_inner(
         &mut self,
         message: Vec<acp::ContentBlock>,
@@ -3762,6 +4077,7 @@ impl AcpThread {
         );
         let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
         let git_store = self.project.read(cx).git_store().clone();
+        let enable_checkpoints = AgentSettings::get_global(cx).enable_checkpoints;
 
         let client_user_message_ids = self.connection.client_user_message_ids(cx);
         let client_id = client_user_message_ids
@@ -3786,20 +4102,22 @@ impl AcpThread {
                 })
                 .ok();
 
-                let old_checkpoint = git_store
-                    .update(cx, |git, cx| git.checkpoint(cx))
-                    .await
-                    .context("failed to get old checkpoint")
-                    .log_err();
-                this.update(cx, |this, _cx| {
-                    if let Some((_ix, message)) = this.last_user_message() {
-                        message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
-                            git_checkpoint,
-                            show: false,
-                        });
-                    }
-                })
-                .ok();
+                if enable_checkpoints {
+                    let old_checkpoint = git_store
+                        .update(cx, |git, cx| git.checkpoint(cx))
+                        .await
+                        .context("failed to get old checkpoint")
+                        .log_err();
+                    this.update(cx, |this, _cx| {
+                        if let Some((_ix, message)) = this.last_user_message() {
+                            message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
+                                git_checkpoint,
+                                show: false,
+                            });
+                        }
+                    })
+                    .ok();
+                }
             }
 
             this.update(cx, |this, cx| {
@@ -3841,160 +4159,213 @@ impl AcpThread {
         self.had_error = false;
 
         let (tx, rx) = oneshot::channel();
-        let cancel_task = self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx);
+        let defer_until_background_subagents_finish = self.connection.agent_id().as_ref()
+            == CLAUDE_ACP_AGENT_ID
+            && self.running_turn.is_some()
+            && self.has_in_progress_subagent_tool_calls();
+        let previous_turn = if defer_until_background_subagents_finish {
+            self.running_turn.take()
+        } else {
+            None
+        };
+        let cancel_task = if previous_turn.is_none() {
+            Some(self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx))
+        } else {
+            None
+        };
 
         self.turn_id += 1;
         let turn_id = self.turn_id;
+        let cancellation_generation = self.turn_cancellation_generation;
+        let guard_cancellation_generation = defer_until_background_subagents_finish;
+        let (settled_tx, settled_rx) = oneshot::channel();
         self.running_turn = Some(RunningTurn {
             id: turn_id,
             send_task: cx.spawn(async move |this, cx| {
-                cancel_task.await;
+                if let Some(previous_turn) = previous_turn {
+                    previous_turn.send_task.await;
+                    previous_turn.settled.await.ok();
+                } else if let Some(cancel_task) = cancel_task {
+                    cancel_task.await;
+                }
+
+                // A queued chain may contain more than one user follow-up, so
+                // checking only the latest turn id would incorrectly discard
+                // earlier queued prompts. Explicit cancellation advances this
+                // generation and invalidates the entire chain instead.
+                if guard_cancellation_generation {
+                    let was_cancelled = this
+                        .read_with(cx, |this, _cx| {
+                            this.turn_cancellation_generation != cancellation_generation
+                        })
+                        .unwrap_or(true);
+                    if was_cancelled {
+                        return;
+                    }
+                }
+
                 tx.send(f(this, cx).await).ok();
             }),
+            settled: settled_rx,
+            activity_generation: 0,
+            saw_activity: false,
         });
+        self.start_claude_stalled_turn_watchdog(turn_id, cx);
         cx.emit(AcpThreadEvent::StatusChanged);
 
         cx.spawn(async move |this, cx| {
-            let response = rx.await;
+            let result = async {
+                let response = rx.await;
 
-            this.update(cx, |this, cx| this.update_last_checkpoint(cx))?
-                .await?;
+                this.update(cx, |this, cx| this.update_last_checkpoint(cx))?
+                    .await?;
 
-            this.update(cx, |this, cx| {
-                if this.parent_session_id.is_none() {
-                    this.project
-                        .update(cx, |project, cx| project.set_agent_location(None, cx));
-                }
-
-                let is_same_turn = this
-                    .running_turn
-                    .as_ref()
-                    .is_some_and(|turn| turn_id == turn.id);
-
-                // If the user submitted a follow up message, running_turn might
-                // already point to a different turn. Therefore we only want to
-                // take the task if it's the same turn. We do this before the
-                // dropped-tx guard below so the panel exits its generating
-                // state even when the send_task is cancelled before tx.send().
-                if is_same_turn {
-                    this.running_turn.take();
-                }
-
-                let Ok(response) = response else {
-                    if is_same_turn {
-                        cx.emit(AcpThreadEvent::StatusChanged);
+                this.update(cx, |this, cx| {
+                    if this.parent_session_id.is_none() {
+                        this.project
+                            .update(cx, |project, cx| project.set_agent_location(None, cx));
                     }
-                    // tx dropped, just return
-                    return Ok(None);
-                };
 
-                match response {
-                    Ok(r) => {
-                        Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
+                    let is_same_turn = this
+                        .running_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn_id == turn.id);
 
-                        if r.stop_reason == acp::StopReason::MaxTokens {
+                    // If the user submitted a follow up message, running_turn might
+                    // already point to a different turn. Therefore we only want to
+                    // take the task if it's the same turn. We do this before the
+                    // dropped-tx guard below so the panel exits its generating
+                    // state even when the send_task is cancelled before tx.send().
+                    if is_same_turn {
+                        this.running_turn.take();
+                    }
+
+                    let Ok(response) = response else {
+                        if is_same_turn {
+                            cx.emit(AcpThreadEvent::StatusChanged);
+                        }
+                        // tx dropped, just return
+                        return Ok(None);
+                    };
+
+                    match response {
+                        Ok(r) => {
+                            Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
+
+                            if r.stop_reason == acp::StopReason::MaxTokens {
+                                if is_same_turn {
+                                    cx.emit(AcpThreadEvent::StatusChanged);
+                                }
+                                this.had_error = true;
+                                cx.emit(AcpThreadEvent::Error);
+                                log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
+
+                                let exceeded_max_output_tokens =
+                                    this.token_usage.as_ref().is_some_and(|u| {
+                                        u.max_output_tokens
+                                            .is_some_and(|max| u.output_tokens >= max)
+                                    });
+
+                                if exceeded_max_output_tokens {
+                                    log::error!(
+                                        "Max output tokens reached. Usage: {:?}",
+                                        this.token_usage
+                                    );
+                                } else {
+                                    log::error!(
+                                        "Max tokens reached. Usage: {:?}",
+                                        this.token_usage
+                                    );
+                                }
+                                if is_same_turn {
+                                    this.cancel_pending_turn_entries(cx);
+                                }
+                                return Err(anyhow!(MaxOutputTokensError));
+                            }
+
+                            let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
+                            if canceled && is_same_turn {
+                                this.cancel_pending_turn_entries(cx);
+                            }
+
+                            if !canceled {
+                                this.snapshot_completed_plan(cx);
+                            }
+
+                            // Handle refusal - distinguish between user prompt and tool call refusals
+                            if let acp::StopReason::Refusal = r.stop_reason {
+                                this.had_error = true;
+                                if let Some((user_msg_ix, _)) = this.last_user_message() {
+                                    // Check if there's a completed tool call with results after the last user message
+                                    // This indicates the refusal is in response to tool output, not the user's prompt
+                                    let has_completed_tool_call_after_user_msg =
+                                        this.entries.iter().skip(user_msg_ix + 1).any(|entry| {
+                                            if let AgentThreadEntry::ToolCall(tool_call) = entry {
+                                                // Check if the tool call has completed and has output
+                                                matches!(
+                                                    tool_call.status,
+                                                    ToolCallStatus::Completed
+                                                ) && tool_call.raw_output.is_some()
+                                            } else {
+                                                false
+                                            }
+                                        });
+
+                                    if has_completed_tool_call_after_user_msg {
+                                        // Refusal is due to tool output - don't truncate, just notify
+                                        // The model refused based on what the tool returned
+                                        cx.emit(AcpThreadEvent::Refusal);
+                                    } else {
+                                        // User prompt was refused - truncate back to before the user message
+                                        let range = user_msg_ix..this.entries.len();
+                                        if range.start < range.end {
+                                            this.entries.truncate(user_msg_ix);
+                                            cx.emit(AcpThreadEvent::EntriesRemoved(range));
+                                        }
+                                        cx.emit(AcpThreadEvent::Refusal);
+                                    }
+                                } else {
+                                    // No user message found, treat as general refusal
+                                    cx.emit(AcpThreadEvent::Refusal);
+                                }
+                            }
+
+                            if cx.has_flag::<AcpBetaFeatureFlag>()
+                                && let Some(response_usage) = &r.usage
+                            {
+                                let usage = this.token_usage.get_or_insert_with(Default::default);
+                                usage.input_tokens = response_usage.input_tokens;
+                                usage.output_tokens = response_usage.output_tokens;
+                                cx.emit(AcpThreadEvent::TokenUsageUpdated);
+                            }
+
                             if is_same_turn {
                                 cx.emit(AcpThreadEvent::StatusChanged);
                             }
-                            this.had_error = true;
-                            cx.emit(AcpThreadEvent::Error);
-                            log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
-
-                            let exceeded_max_output_tokens =
-                                this.token_usage.as_ref().is_some_and(|u| {
-                                    u.max_output_tokens
-                                        .is_some_and(|max| u.output_tokens >= max)
-                                });
-
-                            if exceeded_max_output_tokens {
-                                log::error!(
-                                    "Max output tokens reached. Usage: {:?}",
-                                    this.token_usage
-                                );
-                            } else {
-                                log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
+                            cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                            this.maybe_auto_compact(cx);
+                            Ok(Some(r))
+                        }
+                        Err(e) => {
+                            if is_same_turn {
+                                cx.emit(AcpThreadEvent::StatusChanged);
                             }
+                            Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
                             if is_same_turn {
                                 this.cancel_pending_turn_entries(cx);
                             }
-                            return Err(anyhow!(MaxOutputTokensError));
-                        }
-
-                        let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
-                        if canceled && is_same_turn {
-                            this.cancel_pending_turn_entries(cx);
-                        }
-
-                        if !canceled {
-                            this.snapshot_completed_plan(cx);
-                        }
-
-                        // Handle refusal - distinguish between user prompt and tool call refusals
-                        if let acp::StopReason::Refusal = r.stop_reason {
                             this.had_error = true;
-                            if let Some((user_msg_ix, _)) = this.last_user_message() {
-                                // Check if there's a completed tool call with results after the last user message
-                                // This indicates the refusal is in response to tool output, not the user's prompt
-                                let has_completed_tool_call_after_user_msg =
-                                    this.entries.iter().skip(user_msg_ix + 1).any(|entry| {
-                                        if let AgentThreadEntry::ToolCall(tool_call) = entry {
-                                            // Check if the tool call has completed and has output
-                                            matches!(tool_call.status, ToolCallStatus::Completed)
-                                                && tool_call.raw_output.is_some()
-                                        } else {
-                                            false
-                                        }
-                                    });
-
-                                if has_completed_tool_call_after_user_msg {
-                                    // Refusal is due to tool output - don't truncate, just notify
-                                    // The model refused based on what the tool returned
-                                    cx.emit(AcpThreadEvent::Refusal);
-                                } else {
-                                    // User prompt was refused - truncate back to before the user message
-                                    let range = user_msg_ix..this.entries.len();
-                                    if range.start < range.end {
-                                        this.entries.truncate(user_msg_ix);
-                                        cx.emit(AcpThreadEvent::EntriesRemoved(range));
-                                    }
-                                    cx.emit(AcpThreadEvent::Refusal);
-                                }
-                            } else {
-                                // No user message found, treat as general refusal
-                                cx.emit(AcpThreadEvent::Refusal);
-                            }
+                            cx.emit(AcpThreadEvent::Error);
+                            log::error!("Error in run turn: {:?}", e);
+                            Err(e)
                         }
-
-                        if cx.has_flag::<AcpBetaFeatureFlag>()
-                            && let Some(response_usage) = &r.usage
-                        {
-                            let usage = this.token_usage.get_or_insert_with(Default::default);
-                            usage.input_tokens = response_usage.input_tokens;
-                            usage.output_tokens = response_usage.output_tokens;
-                            cx.emit(AcpThreadEvent::TokenUsageUpdated);
-                        }
-
-                        if is_same_turn {
-                            cx.emit(AcpThreadEvent::StatusChanged);
-                        }
-                        cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
-                        Ok(Some(r))
                     }
-                    Err(e) => {
-                        if is_same_turn {
-                            cx.emit(AcpThreadEvent::StatusChanged);
-                        }
-                        Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
-                        if is_same_turn {
-                            this.cancel_pending_turn_entries(cx);
-                        }
-                        this.had_error = true;
-                        cx.emit(AcpThreadEvent::Error);
-                        log::error!("Error in run turn: {:?}", e);
-                        Err(e)
-                    }
-                }
-            })?
+                })?
+            }
+            .await;
+
+            settled_tx.send(()).ok();
+            result
         })
         .boxed()
     }
@@ -4014,6 +4385,7 @@ impl AcpThread {
         let Some(turn) = self.running_turn.take() else {
             return Task::ready(());
         };
+        self.turn_cancellation_generation = self.turn_cancellation_generation.wrapping_add(1);
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.connection.cancel(&self.session_id, cx);
         cx.emit(AcpThreadEvent::StatusChanged);
@@ -4189,6 +4561,10 @@ impl AcpThread {
     }
 
     fn update_last_checkpoint_if_changed(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if !AgentSettings::get_global(cx).enable_checkpoints {
+            return Task::ready(Ok(()));
+        }
+
         let Some(turn_id) = self.running_turn.as_ref().map(|turn| turn.id) else {
             return Task::ready(Ok(()));
         };
@@ -4260,6 +4636,10 @@ impl AcpThread {
     }
 
     fn update_last_checkpoint(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if !AgentSettings::get_global(cx).enable_checkpoints {
+            return Task::ready(Ok(()));
+        }
+
         let git_store = self.project.read(cx).git_store().clone();
 
         let Some((_, message)) = self.last_user_message() else {
@@ -4939,6 +5319,45 @@ mod tests {
         let unknown =
             acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), "future-category".into())]);
         assert_eq!(command_category_from_meta(&Some(unknown)), None);
+    }
+
+    #[test]
+    fn acp_auto_compaction_thresholds_match_native_agent_semantics() {
+        let usage = TokenUsage {
+            max_tokens: 200_000,
+            used_tokens: 180_000,
+            ..Default::default()
+        };
+
+        assert!(acp_auto_compaction_threshold_reached(
+            AutoCompactThreshold::Percentage(0.9),
+            &usage
+        ));
+        assert!(acp_auto_compaction_threshold_reached(
+            AutoCompactThreshold::TokensUsed(180_000),
+            &usage
+        ));
+        assert!(!acp_auto_compaction_threshold_reached(
+            AutoCompactThreshold::TokensRemaining(20_000),
+            &usage
+        ));
+
+        let usage = TokenUsage {
+            used_tokens: 180_001,
+            ..usage
+        };
+        assert!(acp_auto_compaction_threshold_reached(
+            AutoCompactThreshold::TokensRemaining(20_000),
+            &usage
+        ));
+        assert!(!acp_auto_compaction_threshold_reached(
+            AutoCompactThreshold::Percentage(0.9),
+            &TokenUsage {
+                max_tokens: 0,
+                used_tokens: u64::MAX,
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]
@@ -8792,6 +9211,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeAgentConnection {
+        agent_id: Option<AgentId>,
         auth_methods: Vec<acp::AuthMethod>,
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
@@ -8811,6 +9231,7 @@ mod tests {
     impl FakeAgentConnection {
         fn new() -> Self {
             Self {
+                agent_id: None,
                 auth_methods: Vec::new(),
                 supports_truncate: true,
                 on_user_message: None,
@@ -8821,6 +9242,11 @@ mod tests {
 
         fn without_truncate_support(mut self) -> Self {
             self.supports_truncate = false;
+            self
+        }
+
+        fn with_agent_id(mut self, agent_id: impl Into<AgentId>) -> Self {
+            self.agent_id = Some(agent_id.into());
             self
         }
 
@@ -8846,7 +9272,9 @@ mod tests {
 
     impl AgentConnection for FakeAgentConnection {
         fn agent_id(&self) -> AgentId {
-            AgentId::new("fake")
+            self.agent_id
+                .clone()
+                .unwrap_or_else(|| AgentId::new("fake"))
         }
 
         fn telemetry_id(&self) -> SharedString {
@@ -9608,6 +10036,90 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_claude_follow_up_waits_for_background_subagent(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (first_complete_tx, first_complete_rx) = oneshot::channel::<()>();
+        let first_complete_rx = RefCell::new(Some(first_complete_rx));
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let subagent_tool_id = acp::ToolCallId::new("background-subagent");
+
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .with_agent_id(CLAUDE_ACP_AGENT_ID)
+                .on_user_message({
+                    let prompt_count = prompt_count.clone();
+                    let subagent_tool_id = subagent_tool_id.clone();
+                    move |_params, thread, mut cx| {
+                        let prompt_ix = prompt_count.fetch_add(1, SeqCst);
+                        let first_complete_rx = first_complete_rx.borrow_mut().take();
+                        let subagent_tool_id = subagent_tool_id.clone();
+                        async move {
+                            if prompt_ix == 0 {
+                                thread.update(&mut cx, |thread, cx| {
+                                    thread.handle_session_update(
+                                        acp::SessionUpdate::ToolCall(
+                                            acp::ToolCall::new(
+                                                subagent_tool_id,
+                                                "Background subagent",
+                                            )
+                                            .status(acp::ToolCallStatus::InProgress),
+                                        ),
+                                        cx,
+                                    )
+                                })??;
+
+                                if let Some(rx) = first_complete_rx {
+                                    rx.await.ok();
+                                }
+                            }
+
+                            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                        }
+                        .boxed_local()
+                    }
+                }),
+        );
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call_mut(&subagent_tool_id)
+                .expect("background subagent tool call should exist");
+            tool_call.tool_name = Some("spawn_agent".into());
+        });
+
+        let second_request = thread.update(cx, |thread, cx| thread.send_raw("second", cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            prompt_count.load(SeqCst),
+            1,
+            "follow-up must not start until the background subagent turn settles"
+        );
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread.tool_call(&subagent_tool_id).unwrap();
+            assert!(matches!(tool_call.status, ToolCallStatus::InProgress));
+        });
+
+        first_complete_tx.send(()).unwrap();
+        first_request.await.unwrap();
+        second_request.await.unwrap();
+
+        assert_eq!(prompt_count.load(SeqCst), 2);
+    }
+
+    #[gpui::test]
     async fn test_stale_cancelled_response_does_not_cancel_current_compaction(
         cx: &mut TestAppContext,
     ) {
@@ -10236,5 +10748,100 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+    }
+
+    #[gpui::test]
+    async fn test_claude_stalled_turn_watchdog_cancels_after_observed_activity(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .with_agent_id(CLAUDE_ACP_AGENT_ID)
+                .on_user_message(|_params, _thread, _cx| {
+                    async move { futures::future::pending::<Result<acp::PromptResponse>>().await }
+                        .boxed_local()
+                }),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let request = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(1, 10_000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        for _ in 0..=CLAUDE_ACP_STALLED_TURN_SILENT_POLLS {
+            cx.executor()
+                .advance_clock(CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle,
+            "a claude-acp turn that stops producing updates should be cancelled"
+        );
+        assert!(matches!(request.await, Ok(None)));
+    }
+
+    #[gpui::test]
+    async fn test_stalled_turn_watchdog_does_not_apply_to_other_agents(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |_params, _thread, _cx| {
+                async move { futures::future::pending::<Result<acp::PromptResponse>>().await }
+                    .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let request = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(1, 10_000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        for _ in 0..=CLAUDE_ACP_STALLED_TURN_SILENT_POLLS {
+            cx.executor()
+                .advance_clock(CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL);
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating,
+            "the claude-acp workaround must not change other ACP agents"
+        );
+
+        let cancel = thread.update(cx, |thread, cx| thread.cancel(cx));
+        drop(cancel);
+        assert!(matches!(request.await, Ok(None)));
     }
 }

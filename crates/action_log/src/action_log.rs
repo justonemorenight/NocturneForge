@@ -33,6 +33,7 @@ pub struct PerBufferUndo {
     pub buffer: WeakEntity<Buffer>,
     pub edits_to_restore: Vec<(Range<Anchor>, String)>,
     pub status: UndoBufferStatus,
+    pub transaction_id: Option<clock::Lamport>,
 }
 
 /// Tracks the buffer status for undo purposes
@@ -69,6 +70,7 @@ pub struct ActionLog {
     linked_action_log: Option<Entity<ActionLog>>,
     /// Stores undo information for the most recent reject operation
     last_reject_undo: Option<LastRejectUndo>,
+    review_decisions: VecDeque<ReviewDecision>,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
     last_reported_large_diff_state: Cell<Option<bool>>,
@@ -86,6 +88,7 @@ impl ActionLog {
             project,
             linked_action_log: None,
             last_reject_undo: None,
+            review_decisions: VecDeque::new(),
             file_read_times: HashMap::default(),
             last_reported_large_diff_state: Cell::new(None),
             lsp_lease_counters: Arc::default(),
@@ -318,8 +321,64 @@ impl ActionLog {
             BufferEvent::FileHandleChanged => {
                 self.handle_buffer_file_changed(buffer, cx);
             }
+            BufferEvent::TransactionUndone { transaction_id } => {
+                self.restore_review_decision(&buffer, *transaction_id, true, cx);
+            }
+            BufferEvent::TransactionRedone { transaction_id } => {
+                self.restore_review_decision(&buffer, *transaction_id, false, cx);
+            }
             _ => {}
         };
+    }
+
+    fn record_review_decision(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        transaction_id: clock::Lamport,
+        before: ReviewBufferState,
+        after: ReviewBufferState,
+    ) {
+        const MAX_REVIEW_DECISIONS: usize = 256;
+
+        self.review_decisions.push_back(ReviewDecision {
+            buffer: buffer.downgrade(),
+            transaction_id,
+            before,
+            after,
+        });
+        while self.review_decisions.len() > MAX_REVIEW_DECISIONS {
+            self.review_decisions.pop_front();
+        }
+    }
+
+    fn restore_review_decision(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        transaction_id: clock::Lamport,
+        undo: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(decision) = self.review_decisions.iter().rev().find(|decision| {
+            decision.transaction_id == transaction_id
+                && decision
+                    .buffer
+                    .upgrade()
+                    .is_some_and(|candidate| candidate == *buffer)
+        }) else {
+            return;
+        };
+        let state = if undo {
+            decision.before.clone()
+        } else {
+            decision.after.clone()
+        };
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(buffer) else {
+            return;
+        };
+
+        state.restore(tracked_buffer, buffer.read(cx).text_snapshot());
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        cx.notify();
     }
 
     fn handle_buffer_edited(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -1035,6 +1094,7 @@ impl ActionLog {
         };
 
         let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
+        let mut review_states = None;
         match tracked_buffer.status {
             TrackedBufferStatus::Deleted => {
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -1042,6 +1102,7 @@ impl ActionLog {
                 cx.notify();
             }
             _ => {
+                let before = ReviewBufferState::capture(tracked_buffer);
                 let buffer = buffer.read(cx);
                 let buffer_range =
                     buffer_range.start.to_point(buffer)..buffer_range.end.to_point(buffer);
@@ -1090,7 +1151,17 @@ impl ActionLog {
                 tracked_buffer.review_state_changed_before_recompute |=
                     tracked_buffer.unreviewed_edits != previous_unreviewed_edits;
                 tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
+                let after = ReviewBufferState::capture(tracked_buffer);
+                if before.unreviewed_edits != after.unreviewed_edits {
+                    review_states = Some((before, after));
+                }
             }
+        }
+        if let Some((before, after)) = review_states {
+            let now = cx.background_executor().now();
+            let transaction_id =
+                buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
+            self.record_review_decision(&buffer, transaction_id, before, after);
         }
         if let Some(telemetry) = telemetry {
             telemetry_report_accepted_edits(&telemetry, metrics);
@@ -1110,23 +1181,40 @@ impl ActionLog {
 
         let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
         let mut undo_info: Option<PerBufferUndo> = None;
-        let task = match &tracked_buffer.status {
+        let mut review_decision = None;
+        let task = match tracked_buffer.status.clone() {
             TrackedBufferStatus::Created {
                 existing_file_content,
             } => {
+                metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
                 let task = if let Some(existing_file_content) = existing_file_content {
+                    let before = ReviewBufferState::capture(tracked_buffer);
                     // Capture the agent's content before restoring existing file content
                     let agent_content = buffer.read(cx).text();
                     let buffer_id = buffer.read(cx).remote_id();
 
-                    buffer.update(cx, |buffer, cx| {
+                    let transaction_id = buffer.update(cx, |buffer, cx| {
+                        buffer.finalize_last_transaction();
                         buffer.start_transaction();
                         buffer.set_text("", cx);
                         for chunk in existing_file_content.chunks() {
                             buffer.append(chunk, cx);
                         }
-                        buffer.end_transaction(cx);
+                        let transaction_id = buffer.end_transaction(cx);
+                        buffer.finalize_last_transaction();
+                        transaction_id
                     });
+
+                    tracked_buffer.status = TrackedBufferStatus::Modified;
+                    tracked_buffer.diff_base = existing_file_content.clone();
+                    tracked_buffer.unreviewed_edits.clear();
+                    tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
+                    tracked_buffer.review_state_changed_before_recompute = true;
+                    tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+                    let after = ReviewBufferState::capture(tracked_buffer);
+                    if let Some(transaction_id) = transaction_id {
+                        review_decision = Some((transaction_id, before, after));
+                    }
 
                     undo_info = Some(PerBufferUndo {
                         buffer: buffer.downgrade(),
@@ -1137,6 +1225,7 @@ impl ActionLog {
                         status: UndoBufferStatus::Created {
                             had_existing_content: true,
                         },
+                        transaction_id,
                     });
 
                     self.project
@@ -1180,8 +1269,9 @@ impl ActionLog {
                     }
                 };
 
-                metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
-                self.tracked_buffers.remove(&buffer);
+                if matches!(tracked_buffer.status, TrackedBufferStatus::Created { .. }) {
+                    self.tracked_buffers.remove(&buffer);
+                }
                 cx.notify();
                 task
             }
@@ -1201,82 +1291,123 @@ impl ActionLog {
                 save
             }
             TrackedBufferStatus::Modified => {
-                let edits_to_restore = buffer.update(cx, |buffer, cx| {
-                    let mut buffer_row_ranges = buffer_ranges
-                        .into_iter()
-                        .map(|range| {
-                            range.start.to_point(buffer).row..range.end.to_point(buffer).row
-                        })
-                        .peekable();
+                let before = ReviewBufferState::capture(tracked_buffer);
+                let (edits_to_restore, transaction_id, remaining_unreviewed_edits) =
+                    buffer.update(cx, |buffer, cx| {
+                        let mut buffer_row_ranges = buffer_ranges
+                            .into_iter()
+                            .map(|range| {
+                                range.start.to_point(buffer).row..range.end.to_point(buffer).row
+                            })
+                            .peekable();
 
-                    let mut edits_to_revert = Vec::new();
-                    let mut edits_for_undo = Vec::new();
-                    for edit in tracked_buffer.unreviewed_edits.edits() {
-                        let new_range = tracked_buffer
-                            .snapshot
-                            .anchor_before(Point::new(edit.new.start, 0))
-                            ..tracked_buffer.snapshot.anchor_after(cmp::min(
-                                Point::new(edit.new.end, 0),
-                                tracked_buffer.snapshot.max_point(),
-                            ));
-                        let new_row_range = new_range.start.to_point(buffer).row
-                            ..new_range.end.to_point(buffer).row;
+                        let mut edits_to_revert = Vec::new();
+                        let mut edits_for_undo = Vec::new();
+                        let mut remaining_edits = Vec::new();
+                        let mut new_row_delta = 0i64;
+                        for edit in tracked_buffer.unreviewed_edits.edits() {
+                            let new_range = tracked_buffer
+                                .snapshot
+                                .anchor_before(Point::new(edit.new.start, 0))
+                                ..tracked_buffer.snapshot.anchor_after(cmp::min(
+                                    Point::new(edit.new.end, 0),
+                                    tracked_buffer.snapshot.max_point(),
+                                ));
+                            let new_row_range = new_range.start.to_point(buffer).row
+                                ..new_range.end.to_point(buffer).row;
 
-                        let mut revert = false;
-                        while let Some(buffer_row_range) = buffer_row_ranges.peek() {
-                            if buffer_row_range.end < new_row_range.start {
-                                buffer_row_ranges.next();
-                            } else if buffer_row_range.start > new_row_range.end {
-                                break;
+                            let mut revert = false;
+                            while let Some(buffer_row_range) = buffer_row_ranges.peek() {
+                                if buffer_row_range.end < new_row_range.start {
+                                    buffer_row_ranges.next();
+                                } else if buffer_row_range.start > new_row_range.end {
+                                    break;
+                                } else {
+                                    revert = true;
+                                    break;
+                                }
+                            }
+
+                            if revert {
+                                metrics.add_edit(edit);
+                                let old_range = tracked_buffer
+                                    .diff_base
+                                    .point_to_offset(Point::new(edit.old.start, 0))
+                                    ..tracked_buffer.diff_base.point_to_offset(cmp::min(
+                                        Point::new(edit.old.end, 0),
+                                        tracked_buffer.diff_base.max_point(),
+                                    ));
+                                let old_text = tracked_buffer
+                                    .diff_base
+                                    .chunks_in_range(old_range)
+                                    .collect::<String>();
+
+                                // Capture the agent's text before we revert it (for undo)
+                                let new_range_offset = new_range.start.to_offset(buffer)
+                                    ..new_range.end.to_offset(buffer);
+                                let agent_text =
+                                    buffer.text_for_range(new_range_offset).collect::<String>();
+                                edits_for_undo.push((new_range.clone(), agent_text));
+
+                                edits_to_revert.push((new_range, old_text));
+                                new_row_delta += edit.old_len() as i64 - edit.new_len() as i64;
                             } else {
-                                revert = true;
-                                break;
+                                let mut remaining_edit = edit.clone();
+                                remaining_edit.new.start = (remaining_edit.new.start as i64
+                                    + new_row_delta)
+                                    .clamp(0, u32::MAX as i64)
+                                    as u32;
+                                remaining_edit.new.end = (remaining_edit.new.end as i64
+                                    + new_row_delta)
+                                    .clamp(0, u32::MAX as i64)
+                                    as u32;
+                                remaining_edits.push(remaining_edit);
                             }
                         }
 
-                        if revert {
-                            metrics.add_edit(edit);
-                            let old_range = tracked_buffer
-                                .diff_base
-                                .point_to_offset(Point::new(edit.old.start, 0))
-                                ..tracked_buffer.diff_base.point_to_offset(cmp::min(
-                                    Point::new(edit.old.end, 0),
-                                    tracked_buffer.diff_base.max_point(),
-                                ));
-                            let old_text = tracked_buffer
-                                .diff_base
-                                .chunks_in_range(old_range)
-                                .collect::<String>();
+                        let transaction_id = if edits_to_revert.is_empty() {
+                            None
+                        } else {
+                            buffer.finalize_last_transaction();
+                            buffer.start_transaction();
+                            buffer.edit(edits_to_revert, None, cx);
+                            let transaction_id = buffer.end_transaction(cx);
+                            buffer.finalize_last_transaction();
+                            transaction_id
+                        };
+                        (edits_for_undo, transaction_id, Patch::new(remaining_edits))
+                    });
 
-                            // Capture the agent's text before we revert it (for undo)
-                            let new_range_offset =
-                                new_range.start.to_offset(buffer)..new_range.end.to_offset(buffer);
-                            let agent_text =
-                                buffer.text_for_range(new_range_offset).collect::<String>();
-                            edits_for_undo.push((new_range.clone(), agent_text));
-
-                            edits_to_revert.push((new_range, old_text));
-                        }
-                    }
-
-                    buffer.edit(edits_to_revert, None, cx);
-                    edits_for_undo
-                });
+                if transaction_id.is_some() {
+                    tracked_buffer.unreviewed_edits = remaining_unreviewed_edits;
+                    tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
+                    tracked_buffer.review_state_changed_before_recompute = true;
+                    tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+                }
 
                 if !edits_to_restore.is_empty() {
                     undo_info = Some(PerBufferUndo {
                         buffer: buffer.downgrade(),
                         edits_to_restore,
                         status: UndoBufferStatus::Modified,
+                        transaction_id,
                     });
                 }
 
+                if let Some(transaction_id) = transaction_id {
+                    let after = ReviewBufferState::capture(tracked_buffer);
+                    review_decision = Some((transaction_id, before, after));
+                }
+
                 self.project
-                    .update(cx, |project, cx| project.save_buffer(buffer, cx))
+                    .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
             }
         };
         if let Some(telemetry) = telemetry {
             telemetry_report_rejected_edits(&telemetry, metrics);
+        }
+        if let Some((transaction_id, before, after)) = review_decision {
+            self.record_review_decision(&buffer, transaction_id, before, after);
         }
         (task, undo_info)
     }
@@ -1286,6 +1417,7 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) {
+        let mut review_states = Vec::new();
         self.tracked_buffers.retain(|buffer, tracked_buffer| {
             let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
             metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -1295,6 +1427,7 @@ impl ActionLog {
             match tracked_buffer.status {
                 TrackedBufferStatus::Deleted => false,
                 _ => {
+                    let before = ReviewBufferState::capture(tracked_buffer);
                     if let TrackedBufferStatus::Created { .. } = &mut tracked_buffer.status {
                         tracked_buffer.status = TrackedBufferStatus::Modified;
                     }
@@ -1303,10 +1436,21 @@ impl ActionLog {
                     tracked_buffer.unreviewed_edits.clear();
                     tracked_buffer.diff_base = tracked_buffer.snapshot.as_rope().clone();
                     tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
+                    let after = ReviewBufferState::capture(tracked_buffer);
+                    if before.unreviewed_edits != after.unreviewed_edits {
+                        review_states.push((buffer.clone(), before, after));
+                    }
                     true
                 }
             }
         });
+
+        for (buffer, before, after) in review_states {
+            let now = cx.background_executor().now();
+            let transaction_id =
+                buffer.update(cx, |buffer, _cx| buffer.push_empty_undo_transaction(now));
+            self.record_review_decision(&buffer, transaction_id, before, after);
+        }
 
         cx.notify();
     }
@@ -1378,6 +1522,18 @@ impl ActionLog {
             let Some(buffer) = per_buffer_undo.buffer.upgrade() else {
                 continue;
             };
+
+            if let Some(transaction_id) = per_buffer_undo.transaction_id {
+                let undone =
+                    buffer.update(cx, |buffer, cx| buffer.undo_transaction(transaction_id, cx));
+                if undone {
+                    let save = self
+                        .project
+                        .update(cx, |project, cx| project.save_buffer(buffer, cx));
+                    save_tasks.push(save);
+                    continue;
+                }
+            }
 
             buffer.update(cx, |buffer, cx| {
                 let mut valid_edits = Vec::new();
@@ -2039,11 +2195,43 @@ impl AgentLspLeaseCounters {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum TrackedBufferStatus {
     Created { existing_file_content: Option<Rope> },
     Modified,
     Deleted,
+}
+
+#[derive(Clone)]
+struct ReviewBufferState {
+    diff_base: Rope,
+    unreviewed_edits: Patch<u32>,
+    status: TrackedBufferStatus,
+}
+
+impl ReviewBufferState {
+    fn capture(tracked_buffer: &TrackedBuffer) -> Self {
+        Self {
+            diff_base: tracked_buffer.diff_base.clone(),
+            unreviewed_edits: tracked_buffer.unreviewed_edits.clone(),
+            status: tracked_buffer.status.clone(),
+        }
+    }
+
+    fn restore(self, tracked_buffer: &mut TrackedBuffer, snapshot: text::BufferSnapshot) {
+        tracked_buffer.diff_base = self.diff_base;
+        tracked_buffer.unreviewed_edits = self.unreviewed_edits;
+        tracked_buffer.status = self.status;
+        tracked_buffer.snapshot = snapshot;
+        tracked_buffer.review_state_changed_before_recompute = true;
+    }
+}
+
+struct ReviewDecision {
+    buffer: WeakEntity<Buffer>,
+    transaction_id: clock::Lamport,
+    before: ReviewBufferState,
+    after: ReviewBufferState,
 }
 
 pub struct TrackedBuffer {
@@ -2576,6 +2764,63 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_undo_and_redo_keep_restore_review_state(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "abc\ndef\nghi\njkl\nmno"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [
+                        (Point::new(1, 0)..Point::new(1, 3), "DEF"),
+                        (Point::new(4, 0)..Point::new(4, 3), "MNO"),
+                    ],
+                    None,
+                    cx,
+                )
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 2);
+
+        action_log.update(cx, |log, cx| {
+            log.keep_edits_in_range(buffer.clone(), Point::new(1, 0)..Point::new(2, 0), None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 1);
+
+        buffer.update(cx, |buffer, cx| buffer.undo(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\nDEF\nghi\njkl\nMNO"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 2);
+
+        buffer.update(cx, |buffer, cx| buffer.redo(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\nDEF\nghi\njkl\nMNO"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 1);
     }
 
     #[gpui::test(iterations = 10)]
@@ -3208,6 +3453,76 @@ mod tests {
             "abc\ndef\nghi\njkl\nmno"
         );
         assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
+    }
+
+    #[gpui::test]
+    async fn test_undo_and_redo_reject_restore_text_and_review_state(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "abc\ndef\nghi\njkl\nmno"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [
+                        (Point::new(1, 0)..Point::new(1, 3), "DEF"),
+                        (Point::new(4, 0)..Point::new(4, 3), "MNO"),
+                    ],
+                    None,
+                    cx,
+                )
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 2);
+
+        action_log
+            .update(cx, |log, cx| {
+                let (task, _) = log.reject_edits_in_ranges(
+                    buffer.clone(),
+                    vec![Point::new(1, 0)..Point::new(2, 0)],
+                    None,
+                    cx,
+                );
+                task
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\ndef\nghi\njkl\nMNO"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 1);
+
+        buffer.update(cx, |buffer, cx| buffer.undo(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\nDEF\nghi\njkl\nMNO"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 2);
+
+        buffer.update(cx, |buffer, cx| buffer.redo(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "abc\ndef\nghi\njkl\nMNO"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx)[0].1.len(), 1);
     }
 
     #[gpui::test(iterations = 10)]
@@ -4117,6 +4432,7 @@ mod tests {
             buffer.read_with(cx, |buffer, _| buffer.text()),
             "abc\nAGENT_EDIT\nghi"
         );
+        assert!(!unreviewed_hunks(&action_log, cx).is_empty());
 
         // Verify undo state is cleared
         assert!(!action_log.read_with(cx, |log, _| log.has_pending_undo()));

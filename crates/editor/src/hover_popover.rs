@@ -14,7 +14,6 @@ use gpui::{
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
     TextStyleRefinement, Window, canvas, div, px,
 };
-use itertools::Itertools;
 use language::{DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
@@ -37,6 +36,7 @@ pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
 pub const MIN_POPOVER_LINE_HEIGHT: f32 = 4.;
 pub const POPOVER_RIGHT_OFFSET: Pixels = px(8.0);
 pub const HOVER_POPOVER_GAP: Pixels = px(10.);
+const MAX_HOVER_BYTES: usize = 100_000;
 
 /// Bindable action which uses the most recent selection head to trigger a hover
 pub fn hover(editor: &mut Editor, _: &Hover, window: &mut Window, cx: &mut Context<Editor>) {
@@ -660,17 +660,7 @@ fn parse_blocks(
     language: Option<Arc<Language>>,
     cx: &mut AsyncWindowContext,
 ) -> Option<Entity<Markdown>> {
-    let combined_text = blocks
-        .iter()
-        .map(|block| match &block.kind {
-            project::HoverBlockKind::PlainText | project::HoverBlockKind::Markdown => {
-                Cow::Borrowed(block.text.trim())
-            }
-            project::HoverBlockKind::Code { language } => {
-                Cow::Owned(format!("```{}\n{}\n```", language, block.text.trim()))
-            }
-        })
-        .join("\n\n");
+    let combined_text = combine_hover_blocks(blocks);
 
     cx.new_window_entity(|_window, cx| {
         Markdown::new(
@@ -681,6 +671,208 @@ fn parse_blocks(
         )
     })
     .ok()
+}
+
+fn combine_hover_blocks(blocks: &[HoverBlock]) -> String {
+    let mut combined = String::new();
+    let mut budget = MAX_HOVER_BYTES;
+    let mut dropped_blocks = false;
+
+    for (index, block) in blocks.iter().enumerate() {
+        let text = block.text.trim();
+        let separator = if combined.is_empty() { "" } else { "\n\n" };
+        let is_last_block = index + 1 == blocks.len();
+        let reserved_for_dropped_marker = if is_last_block { 0 } else { "\n\n…".len() };
+        let mut truncated_inline = false;
+        let piece = match &block.kind {
+            project::HoverBlockKind::PlainText | project::HoverBlockKind::Markdown => {
+                let block_budget =
+                    budget.saturating_sub(separator.len() + reserved_for_dropped_marker);
+                match fit_in_budget(text.len(), block_budget) {
+                    BudgetFit::Fits => Cow::Borrowed(text),
+                    BudgetFit::TooSmall => {
+                        dropped_blocks = true;
+                        break;
+                    }
+                    BudgetFit::NeedsTruncation => {
+                        truncated_inline = true;
+                        Cow::Owned(truncate_hover_markdown(text, block_budget))
+                    }
+                }
+            }
+            project::HoverBlockKind::Code { language } => {
+                let language = language.replace(['`', '\r', '\n'], "");
+                let block_budget = budget
+                    .saturating_sub(separator.len() + reserved_for_dropped_marker)
+                    .saturating_sub(wrapping_code_fence(text).len() * 2)
+                    .saturating_sub(language.len() + "\n\n".len());
+                let text = match fit_in_budget(text.len(), block_budget) {
+                    BudgetFit::Fits => Cow::Borrowed(text),
+                    BudgetFit::TooSmall => {
+                        dropped_blocks = true;
+                        break;
+                    }
+                    BudgetFit::NeedsTruncation => {
+                        truncated_inline = true;
+                        Cow::Owned(format!(
+                            "{}…",
+                            truncated_to_byte_budget(text, block_budget.saturating_sub("…".len()))
+                        ))
+                    }
+                };
+                let fence = wrapping_code_fence(&text);
+                Cow::Owned(format!("{fence}{language}\n{text}\n{fence}"))
+            }
+        };
+        budget = budget.saturating_sub(separator.len() + piece.len());
+        combined.push_str(separator);
+        combined.push_str(&piece);
+        if truncated_inline {
+            dropped_blocks = !is_last_block;
+            break;
+        }
+    }
+
+    if dropped_blocks {
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push('…');
+    }
+    combined
+}
+
+enum BudgetFit {
+    Fits,
+    NeedsTruncation,
+    TooSmall,
+}
+
+fn fit_in_budget(len: usize, budget: usize) -> BudgetFit {
+    if len <= budget {
+        BudgetFit::Fits
+    } else if budget <= "…".len() {
+        BudgetFit::TooSmall
+    } else {
+        BudgetFit::NeedsTruncation
+    }
+}
+
+fn truncated_to_byte_budget(text: &str, budget: usize) -> &str {
+    let mut end = budget.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn wrapping_code_fence(text: &str) -> String {
+    let mut longest_run = 0;
+    let mut current_run = 0;
+    for byte in text.bytes() {
+        if byte == b'`' {
+            current_run += 1;
+            longest_run = longest_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    "`".repeat((longest_run + 1).max(3))
+}
+
+fn truncate_hover_markdown(text: &str, max_len: usize) -> String {
+    let mut cut = max_len.saturating_sub("…".len()).min(text.len());
+    loop {
+        let mut truncated = truncated_to_byte_budget(text, cut);
+        if let Some(&split_byte) = text.as_bytes().get(truncated.len())
+            && (split_byte == b'`' || split_byte == b'~')
+        {
+            let mut end = truncated.len();
+            while end > 0 && text.as_bytes()[end - 1] == split_byte {
+                end -= 1;
+            }
+            truncated = &text[..end];
+        }
+        if let Some(&next_byte) = text.as_bytes().get(truncated.len())
+            && next_byte != b'\n'
+            && !truncated.ends_with('\n')
+            && ends_with_code_fence_line(truncated)
+        {
+            let line_start = truncated.rfind('\n').map_or(0, |index| index + 1);
+            truncated = &text[..line_start];
+        }
+        let ellipsis = if ends_with_code_fence_line(truncated) {
+            "\n…"
+        } else {
+            "…"
+        };
+        let closing_fence = unclosed_code_fence(truncated);
+        let total_len = truncated.len()
+            + ellipsis.len()
+            + closing_fence
+                .as_ref()
+                .map_or(0, |fence| "\n".len() + fence.len());
+        if total_len <= max_len || truncated.is_empty() {
+            return match closing_fence {
+                Some(fence) => format!("{truncated}{ellipsis}\n{fence}"),
+                None => format!("{truncated}{ellipsis}"),
+            };
+        }
+        cut = truncated.len().saturating_sub(total_len - max_len);
+    }
+}
+
+fn ends_with_code_fence_line(text: &str) -> bool {
+    text.lines()
+        .next_back()
+        .is_some_and(|line| parse_code_fence(line).is_some())
+}
+
+struct CodeFence {
+    fence_char: char,
+    len: usize,
+    has_info: bool,
+}
+
+fn parse_code_fence(line: &str) -> Option<CodeFence> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let first_char @ ('`' | '~') = trimmed.chars().next()? else {
+        return None;
+    };
+    let len = trimmed.chars().take_while(|&c| c == first_char).count();
+    if len < 3 {
+        return None;
+    }
+    let info = trimmed[len..].trim();
+    if first_char == '`' && info.contains('`') {
+        return None;
+    }
+    Some(CodeFence {
+        fence_char: first_char,
+        len,
+        has_info: !info.is_empty(),
+    })
+}
+
+fn unclosed_code_fence(markdown: &str) -> Option<String> {
+    let mut open_fence: Option<CodeFence> = None;
+    for line in markdown.lines() {
+        let Some(fence) = parse_code_fence(line) else {
+            continue;
+        };
+        match &open_fence {
+            None => open_fence = Some(fence),
+            Some(open) => {
+                if fence.fence_char == open.fence_char && fence.len >= open.len && !fence.has_info {
+                    open_fence = None;
+                }
+            }
+        }
+    }
+    open_fence.map(|fence| fence.fence_char.to_string().repeat(fence.len))
 }
 
 pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {

@@ -238,6 +238,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Whether to create and update git checkpoints around Agent turns.
+    ///
+    /// Default: true
+    pub enable_checkpoints: Option<bool>,
     /// Whether to show the agent panel button in the status bar.
     ///
     /// Default: true

@@ -776,19 +776,19 @@ pub fn authorize_file_edit(
             None => {}
         }
 
-        match resolved {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                let authorize = cx.update(|cx| {
-                    let context = ToolPermissionContext::new(
-                        &tool_name,
-                        vec![path_owned.to_string_lossy().to_string()],
-                    );
-                    event_stream.authorize(&title, context, cx)
-                });
-                authorize.await
-            }
-        }
+        // A resolved project path is still subject to the configured tool
+        // permission. Previously this branch returned `Ok(())` for every
+        // resolved path, so `default: "confirm"` was bypassed for existing
+        // files. Explicit Allow was already handled above; Confirm must reach
+        // authorization before the edit session applies streamed content.
+        let authorize = cx.update(|cx| {
+            let context = ToolPermissionContext::new(
+                &tool_name,
+                vec![path_owned.to_string_lossy().to_string()],
+            );
+            event_stream.authorize(&title, context, cx)
+        });
+        authorize.await
     })
 }
 

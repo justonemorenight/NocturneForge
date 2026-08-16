@@ -976,6 +976,7 @@ mod tests {
 
         let agent_settings = AgentSettings {
             enabled: true,
+            enable_checkpoints: true,
             button: true,
             dock: DockPosition::Right,
             flexible: true,

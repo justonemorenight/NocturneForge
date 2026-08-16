@@ -15,7 +15,7 @@ use acp_thread::{
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
-    SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
+    SkillLoadingIssuesUpdated, SubagentRole, ThreadSandbox, VerifiedSandboxStatus,
 };
 use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
@@ -43,7 +43,7 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    ButtonLike, CalloutBorderPosition, Checkbox, Chip, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
@@ -406,14 +406,14 @@ fn render_cat_numbered_code_block(
     // `restrict_scroll_to_axis` then keeps vertical wheel events flowing through
     // to the outer thread scroller. This mirrors the standard markdown
     // code-block path in `crates/markdown/src/markdown.rs`.
-    let mut code_scroll = div()
+    let code_scroll = div()
         .id(code_scroll_id)
         .flex()
         .flex_1()
         .min_w_0()
         .overflow_x_scroll()
+        .restrict_scroll_to_axis()
         .child(div().flex_none().child(code_text));
-    code_scroll.style().restrict_scroll_to_axis = Some(true);
 
     container
         .child(
@@ -665,7 +665,13 @@ pub struct ThreadView {
     pub(super) unseen_entry_count: usize,
 }
 impl Focusable for ThreadView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ThreadView {
+    pub(crate) fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         if self.parent_session_id.is_some() {
             self.focus_handle.clone()
         } else {
@@ -2226,7 +2232,7 @@ impl ThreadView {
             this.update_in(cx, |thread, window, cx| {
                 cx.emit(AcpThreadViewEvent::Interacted);
                 thread.send_impl(message_editor, window, cx);
-                thread.focus_handle(cx).focus(window, cx);
+                thread.activation_focus_handle(cx).focus(window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -4531,6 +4537,90 @@ impl ThreadView {
             })
     }
 
+    fn render_subagent_runtime(&self, cx: &App) -> Option<Div> {
+        let thread = self.as_native_thread(cx)?;
+        let thread = thread.read(cx);
+        let model = thread.model()?;
+
+        let model_name = model.name().0;
+        let provider_name = model.provider_name().0;
+        let model_id = model.id().0;
+        let role = thread.subagent_role().map(|role| match role {
+            SubagentRole::Explorer => "Explorer",
+            SubagentRole::FlowReader => "Flow reader",
+            SubagentRole::CodingWorker => "Coding worker",
+        });
+
+        let thinking_is_active = model.supports_thinking()
+            && (!model.supports_disabling_thinking() || thread.thinking_enabled());
+        let effort = if thinking_is_active {
+            let effort_levels = model.supported_effort_levels();
+            thread
+                .thinking_effort()
+                .and_then(|selected| {
+                    effort_levels
+                        .iter()
+                        .find(|level| level.value.as_ref() == selected.as_str())
+                })
+                .cloned()
+                .or_else(|| effort_levels.iter().find(|level| level.is_default).cloned())
+                .map(|level| level.name)
+                .or_else(|| {
+                    thread
+                        .thinking_effort()
+                        .map(|effort| SharedString::from(effort.clone()))
+                })
+        } else {
+            None
+        };
+
+        let label = effort.as_ref().map_or_else(
+            || model_name.clone(),
+            |effort| format!("{model_name} · {effort}").into(),
+        );
+        let effort_detail = effort.clone();
+        let role_detail = role.unwrap_or("Default subagent");
+
+        Some(
+            div().min_w_0().max_w_48().overflow_hidden().child(
+                Chip::new(label)
+                    .label_color(Color::Muted)
+                    .truncate()
+                    .tooltip(Tooltip::element(move |_window, _cx| {
+                        v_flex()
+                            .gap_1()
+                            .child(Label::new("Subagent runtime").size(LabelSize::Small))
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(format!("{provider_name} · {model_name}"))
+                                            .size(LabelSize::Small),
+                                    )
+                                    .child(
+                                        Label::new(format!("Model ID: {model_id}"))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(format!("Role: {role_detail}"))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .when_some(effort_detail.clone(), |this, effort| {
+                                        this.child(
+                                            Label::new(format!("Effort: {effort}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                            .into_any_element()
+                    })),
+            ),
+        )
+    }
+
     pub(crate) fn render_subagent_titlebar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         if self.parent_session_id.is_none() {
             return None;
@@ -4583,6 +4673,7 @@ impl ThreadView {
                         .child(
                             h_flex()
                                 .gap_0p5()
+                                .children(self.render_subagent_runtime(cx))
                                 .when(!is_done, |this| {
                                     this.child(
                                         IconButton::new("stop_subagent", IconName::Stop)
@@ -5134,6 +5225,7 @@ impl ThreadView {
             Some(
                 h_flex()
                     .id("circular_progress_tokens")
+                    .flex_none()
                     .mt_px()
                     .mr_1()
                     .child(
@@ -8122,33 +8214,34 @@ impl ThreadView {
                     let this = entity.read(cx);
                     let is_at_top = this.list_state.logical_scroll_top().item_ix == 0;
 
-                    let chunks =
-                        this.thread.read(cx).entries().get(entry_ix).and_then(
-                            |entry| match &entry {
-                                AgentThreadEntry::AssistantMessage(msg) => Some(&msg.chunks),
-                                _ => None,
-                            },
-                        );
-
-                    let context_menu_markdown = chunks.and_then(|chunks| {
-                        chunks
-                            .iter()
-                            .filter_map(|chunk| {
-                                let markdown = match chunk {
-                                    AssistantMessageChunk::Message { block, .. } => {
-                                        block.markdown()
-                                    }
-                                    AssistantMessageChunk::Thought { block, .. } => {
-                                        block.markdown()
-                                    }
-                                }?;
-                                let generation =
-                                    markdown.read(cx).context_menu_capture_generation();
-                                (generation > 0).then_some((generation, markdown))
-                            })
-                            .max_by_key(|(generation, _)| *generation)
-                            .map(|(_, markdown)| markdown)
-                    });
+                    let context_menu_markdown = this
+                        .thread
+                        .read(cx)
+                        .entries()
+                        .get(entry_ix)
+                        .and_then(|entry| match entry {
+                            AgentThreadEntry::AssistantMessage(message) => Some(&message.chunks),
+                            _ => None,
+                        })
+                        .and_then(|chunks| {
+                            chunks
+                                .iter()
+                                .filter_map(|chunk| {
+                                    let markdown = match chunk {
+                                        AssistantMessageChunk::Message { block, .. } => {
+                                            block.markdown()
+                                        }
+                                        AssistantMessageChunk::Thought { block, .. } => {
+                                            block.markdown()
+                                        }
+                                    }?;
+                                    let generation =
+                                        markdown.read(cx).context_menu_capture_generation();
+                                    (generation > 0).then_some((generation, markdown))
+                                })
+                                .max_by_key(|(generation, _)| *generation)
+                                .map(|(_, markdown)| markdown.clone())
+                        });
 
                     let selected_markdown = context_menu_markdown.as_ref().and_then(|markdown| {
                         markdown.read(cx).context_menu_selected_markdown().cloned()
@@ -8158,6 +8251,11 @@ impl ThreadView {
                     let context_menu_link = context_menu_markdown
                         .as_ref()
                         .and_then(|markdown| markdown.read(cx).context_menu_link().cloned());
+                    if let Some(markdown) = &context_menu_markdown {
+                        markdown.update(cx, |markdown, _cx| {
+                            markdown.clear_context_menu_capture();
+                        });
+                    }
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -8992,8 +9090,13 @@ impl ThreadView {
                             .iter()
                             .enumerate()
                             .map(|(content_ix, content)| {
-                                div().id(("tool-call-output", entry_ix)).child(
-                                    self.render_tool_call_content(
+                                let output_id = SharedString::from(format!(
+                                    "tool-call-output-{entry_ix}-{content_ix}"
+                                ));
+                                div()
+                                    .id(output_id.clone())
+                                    .debug_selector(move || output_id.to_string())
+                                    .child(self.render_tool_call_content(
                                         active_session_id,
                                         entry_ix,
                                         content,
@@ -9004,8 +9107,7 @@ impl ThreadView {
                                         focus_handle,
                                         window,
                                         cx,
-                                    ),
-                                )
+                                    ))
                             }),
                     )
                     .when(!use_card_layout, |this| {

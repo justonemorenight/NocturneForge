@@ -48,8 +48,11 @@ use gpui::{
 use image_viewer::ImageInfo;
 use language::Capability;
 use language_onboarding::BasedPyrightBanner;
-use language_tools::lsp_button::{self, LspButton};
 use language_tools::lsp_log_view::LspLogToolbarItemView;
+use language_tools::{
+    ResourceMonitorButton,
+    lsp_button::{self, LspButton},
+};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use migrate::{MigrationBanner, MigrationEvent, MigrationNotification, MigrationType};
 use migrator::migrate_keymap;
@@ -618,6 +621,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let lsp_button_menu_handle = PopoverMenuHandle::default();
         let lsp_button =
             cx.new(|cx| LspButton::new(workspace, lsp_button_menu_handle.clone(), window, cx));
+        let resource_monitor =
+            cx.new(|cx| ResourceMonitorButton::new(workspace.project().clone(), window, cx));
         workspace.register_action({
             move |_, _: &lsp_button::ToggleMenu, window, cx| {
                 lsp_button_menu_handle.toggle(window, cx);
@@ -647,6 +652,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            status_bar.add_right_item(resource_monitor, window, cx);
         });
 
         let panels_task = initialize_panels(window, cx);
@@ -2789,6 +2795,87 @@ mod tests {
             .unwrap();
 
         futures::future::join_all(all_tasks).await;
+    }
+
+    #[gpui::test]
+    async fn test_partial_file_index_status_bar_message(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        set_file_scan_depth(cx, 1);
+
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "junk": {
+                    "a": {
+                        "b": {
+                            "deep.txt": ""
+                        }
+                    }
+                },
+                "top.txt": ""
+            }),
+        )
+        .await;
+
+        let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        let indicator = workspace.update_in(cx, |workspace, window, cx| {
+            activity_indicator::ActivityIndicator::new(workspace, languages, window, cx)
+        });
+        cx.run_until_parked();
+
+        indicator.update(cx, |indicator, cx| {
+            assert_eq!(
+                indicator.message_to_render(cx),
+                Some("Partial file index".to_string())
+            );
+        });
+
+        set_file_scan_depth(cx, 0);
+        cx.run_until_parked();
+
+        indicator.update(cx, |indicator, cx| {
+            assert_eq!(indicator.message_to_render(cx), None);
+        });
+
+        set_file_scan_depth(cx, 1);
+        cx.run_until_parked();
+
+        indicator.update(cx, |indicator, cx| {
+            assert_eq!(
+                indicator.message_to_render(cx),
+                Some("Partial file index".to_string())
+            );
+        });
+
+        cx.executor().advance_clock(
+            activity_indicator::DEFERRED_SCAN_MESSAGE_TIMEOUT + Duration::from_secs(1),
+        );
+        cx.run_until_parked();
+
+        indicator.update(cx, |indicator, cx| {
+            assert_eq!(indicator.message_to_render(cx), None);
+        });
+
+        fs.insert_tree(
+            path!("/root/other"),
+            json!({
+                "x": {
+                    "y": ""
+                }
+            }),
+        )
+        .await;
+        cx.run_until_parked();
+
+        indicator.update(cx, |indicator, cx| {
+            assert_eq!(indicator.message_to_render(cx), None);
+        });
     }
 
     #[gpui::test]
@@ -5414,7 +5501,6 @@ mod tests {
                 "console",
                 "context_server",
                 "copilot",
-                "csv",
                 "debug_panel",
                 "debugger",
                 "dev",
@@ -5468,6 +5554,7 @@ mod tests {
                 "svg",
                 "syntax_tree_view",
                 "tab_switcher",
+                "tabular_data",
                 "task",
                 "terminal",
                 "terminal_panel",
@@ -5637,6 +5724,16 @@ mod tests {
 
     pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         init_test_with_state(cx, cx.update(AppState::test))
+    }
+
+    fn set_file_scan_depth(cx: &mut TestAppContext, depth: u32) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_depth = Some(depth);
+                });
+            });
+        });
     }
 
     fn init_test_with_state(

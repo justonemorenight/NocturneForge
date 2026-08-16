@@ -337,6 +337,10 @@ pub enum BufferEvent {
     DiagnosticsUpdated,
     /// The buffer gained or lost editing capabilities.
     CapabilityChanged,
+    /// A transaction was moved from the undo stack to the redo stack.
+    TransactionUndone { transaction_id: TransactionId },
+    /// A transaction was moved from the redo stack to the undo stack.
+    TransactionRedone { transaction_id: TransactionId },
 }
 
 /// The file associated with a buffer.
@@ -2584,6 +2588,11 @@ impl Buffer {
         self.text.push_empty_transaction(now)
     }
 
+    /// Adds an empty, standalone transaction to the normal undo history.
+    pub fn push_empty_undo_transaction(&mut self, now: Instant) -> TransactionId {
+        self.text.push_empty_undo_transaction(now)
+    }
+
     /// Prevent the last transaction from being grouped with any subsequent transactions,
     /// even if they occur with the buffer's undo grouping duration.
     pub fn finalize_last_transaction(&mut self) -> Option<&Transaction> {
@@ -3242,6 +3251,7 @@ impl Buffer {
             self.send_operation(Operation::Buffer(operation), true, cx);
             self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx);
             self.restore_encoding_for_transaction(transaction_id, was_dirty);
+            cx.emit(BufferEvent::TransactionUndone { transaction_id });
             Some(transaction_id)
         } else {
             None
@@ -3259,6 +3269,7 @@ impl Buffer {
         if let Some(operation) = self.text.undo_transaction(transaction_id) {
             self.send_operation(Operation::Buffer(operation), true, cx);
             self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx);
+            cx.emit(BufferEvent::TransactionUndone { transaction_id });
             true
         } else {
             false
@@ -3276,8 +3287,9 @@ impl Buffer {
 
         let operations = self.text.undo_to_transaction(transaction_id);
         let undone = !operations.is_empty();
-        for operation in operations {
+        for (transaction_id, operation) in operations {
             self.send_operation(Operation::Buffer(operation), true, cx);
+            cx.emit(BufferEvent::TransactionUndone { transaction_id });
         }
         if undone {
             self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx)
@@ -3302,6 +3314,7 @@ impl Buffer {
             self.send_operation(Operation::Buffer(operation), true, cx);
             self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx);
             self.restore_encoding_for_transaction(transaction_id, was_dirty);
+            cx.emit(BufferEvent::TransactionRedone { transaction_id });
             Some(transaction_id)
         } else {
             None
@@ -3337,8 +3350,9 @@ impl Buffer {
 
         let operations = self.text.redo_to_transaction(transaction_id);
         let redone = !operations.is_empty();
-        for operation in operations {
+        for (transaction_id, operation) in operations {
             self.send_operation(Operation::Buffer(operation), true, cx);
+            cx.emit(BufferEvent::TransactionRedone { transaction_id });
         }
         if redone {
             self.did_edit(&old_version, was_dirty, BufferEditSource::User, cx)

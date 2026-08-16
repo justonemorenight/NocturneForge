@@ -103,6 +103,19 @@ impl IgnoreStack {
                 }
             }
             IgnoreStackEntry::RepoExclude { ignore, parent } => {
+                // Repository-local excludes are anchored at the worktree they
+                // belong to.  Gitignore matching accepts paths it cannot strip
+                // from the ignore root, which would otherwise let an
+                // `info/exclude` pattern for a parent directory ignore an
+                // unrelated worktree in its entirety.
+                if !abs_path.starts_with(ignore.path()) {
+                    return IgnoreStack {
+                        repo_root: self.repo_root.clone(),
+                        top: parent.clone(),
+                    }
+                    .is_abs_path_ignored(abs_path, is_dir);
+                }
+
                 match ignore.matched(abs_path, is_dir) {
                     ignore::Match::None => IgnoreStack {
                         repo_root: self.repo_root.clone(),

@@ -735,7 +735,7 @@ impl ConversationView {
                 view.is_following_tail = view.list_state.is_following_tail();
                 cx.notify();
             });
-            view.focus_handle(cx).focus(window, cx);
+            view.read(cx).activation_focus_handle(cx).focus(window, cx);
         }
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         cx.notify();
@@ -3415,11 +3415,16 @@ fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
 }
 
 impl Focusable for ConversationView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match self.active_thread() {
-            Some(thread) => thread.read(cx).focus_handle(cx),
-            None => self.focus_handle.clone(),
-        }
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ConversationView {
+    pub(crate) fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.active_thread()
+            .map(|thread| thread.read(cx).activation_focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 

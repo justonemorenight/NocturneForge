@@ -202,8 +202,8 @@ pub enum AutoCompactThreshold {
 
 impl AutoCompactThreshold {
     /// The threshold used when none is configured, or when the configured value
-    /// is invalid (90% of the context window).
-    pub const DEFAULT: Self = Self::Percentage(0.9);
+    /// is invalid (75% of the context window).
+    pub const DEFAULT: Self = Self::Percentage(0.75);
 }
 
 impl fmt::Display for AutoCompactThreshold {
@@ -254,6 +254,7 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
+    pub enable_checkpoints: bool,
     pub button: bool,
     pub dock: DockPosition,
     pub flexible: bool,
@@ -802,6 +803,7 @@ impl Settings for AgentSettings {
         let agent = content.agent.clone().unwrap();
         Self {
             enabled: agent.enabled.unwrap(),
+            enable_checkpoints: agent.enable_checkpoints.unwrap(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
             sidebar_side: agent.sidebar_side.unwrap(),
@@ -1013,7 +1015,7 @@ mod tests {
             parse_auto_compact_threshold("90%").unwrap(),
             Percentage(0.9)
         );
-        assert_eq!(AutoCompactThreshold::DEFAULT, Percentage(0.9));
+        assert_eq!(AutoCompactThreshold::DEFAULT, Percentage(0.75));
         assert_eq!(
             parse_auto_compact_threshold("  92.5% ").unwrap(),
             Percentage(0.925)

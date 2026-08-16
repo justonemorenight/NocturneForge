@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn should_render_pending_and_accepted_url_elicitations() {
+    fn should_render_pending_and_resolved_elicitations() {
         let pending = Elicitation {
             id: ElicitationEntryId("pending".into()),
             request: acp::CreateElicitationRequest::new(
@@ -380,7 +380,20 @@ mod tests {
             ),
             status: ElicitationStatus::Accepted,
         };
-        assert!(!should_render_elicitation(&accepted_form));
+        assert!(should_render_elicitation(&accepted_form));
+
+        let declined_form = Elicitation {
+            id: ElicitationEntryId("declined-form".into()),
+            request: acp::CreateElicitationRequest::new(
+                acp::ElicitationFormMode::new(
+                    preview_request_scope(3),
+                    acp::ElicitationSchema::new(),
+                ),
+                "Review this request.",
+            ),
+            status: ElicitationStatus::Declined,
+        };
+        assert!(should_render_elicitation(&declined_form));
     }
 
     #[test]
@@ -1149,9 +1162,12 @@ impl ElicitationCardHandlers {
 
 pub(crate) fn should_render_elicitation(elicitation: &Elicitation) -> bool {
     matches!(
-        (&elicitation.status, &elicitation.request.mode),
-        (ElicitationStatus::Pending { .. }, _)
-            | (ElicitationStatus::Accepted, acp::ElicitationMode::Url(_))
+        elicitation.status,
+        ElicitationStatus::Pending { .. }
+            | ElicitationStatus::Accepted
+            | ElicitationStatus::Declined
+            | ElicitationStatus::Canceled
+            | ElicitationStatus::Completed
     )
 }
 
