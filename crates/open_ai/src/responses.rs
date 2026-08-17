@@ -861,7 +861,13 @@ async fn compact_response_with_body<Response: DeserializeOwned>(
         .body(AsyncBody::from(body))
         .map_err(|error| RequestError::Other(error.into()))?;
 
-    let mut response = client.send(request).await?;
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(|error| RequestError::HttpSend {
+            provider: provider_name.to_owned(),
+            error,
+        })?;
     let mut body = String::new();
     response
         .body_mut()
@@ -926,7 +932,13 @@ pub async fn stream_response_with_body(
         .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
-    let mut response = client.send(request).await?;
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(|error| RequestError::HttpSend {
+            provider: provider_name.to_owned(),
+            error,
+        })?;
     if response.status().is_success() {
         if is_streaming {
             let reader = BufReader::new(response.into_body());
@@ -1251,6 +1263,43 @@ mod tests {
             matches!(error, RequestError::Other(_)),
             "expected malformed JSON to produce a request error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn responses_transport_preserves_typed_send_errors() {
+        let http_client =
+            FakeHttpClient::create(|_| async move { Err(anyhow!("network unavailable")) });
+
+        let compact_error = block_on(compact_response(
+            http_client.as_ref(),
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "secret",
+            compact_test_request(),
+            &CustomHeaders::default(),
+        ))
+        .err()
+        .expect("compact send error");
+        assert!(matches!(
+            compact_error,
+            RequestError::HttpSend { provider, .. } if provider == "OpenAI"
+        ));
+
+        let stream_error = block_on(stream_response_with_body(
+            http_client.as_ref(),
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "secret",
+            "{}".to_string(),
+            true,
+            &CustomHeaders::default(),
+        ))
+        .err()
+        .expect("stream send error");
+        assert!(matches!(
+            stream_error,
+            RequestError::HttpSend { provider, .. } if provider == "OpenAI"
+        ));
     }
 
     #[test]
