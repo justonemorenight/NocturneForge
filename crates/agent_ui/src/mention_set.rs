@@ -110,12 +110,20 @@ impl MentionSet {
         crease_snapshot: &CreaseSnapshot,
         buffer_snapshot: &MultiBufferSnapshot,
     ) {
-        for (crease_id, crease) in crease_snapshot.creases() {
-            if !crease.range().start.is_valid(buffer_snapshot) {
-                self.mentions.remove(&crease_id);
-                self.crease_entities.remove(&crease_id);
-            }
-        }
+        let active_creases = crease_snapshot
+            .creases()
+            .filter_map(|(crease_id, crease)| {
+                crease
+                    .range()
+                    .start
+                    .is_valid(buffer_snapshot)
+                    .then_some(crease_id)
+            })
+            .collect::<HashSet<_>>();
+        self.mentions
+            .retain(|crease_id, _| active_creases.contains(crease_id));
+        self.crease_entities
+            .retain(|crease_id, _| active_creases.contains(crease_id));
     }
 
     pub fn insert_mention(

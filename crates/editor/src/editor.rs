@@ -7643,6 +7643,7 @@ impl Editor {
                 cx,
             );
             cx.emit(EditorEvent::Edited { transaction_id });
+            cx.emit(EditorEvent::TransactionRedone { transaction_id });
         }
     }
 
@@ -11874,6 +11875,9 @@ pub enum EditorEvent {
         autoscroll: bool,
     },
     TransactionUndone {
+        transaction_id: clock::Lamport,
+    },
+    TransactionRedone {
         transaction_id: clock::Lamport,
     },
     TransactionBegun {
