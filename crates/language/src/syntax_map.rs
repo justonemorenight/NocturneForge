@@ -2,7 +2,8 @@
 mod syntax_map_tests;
 
 use crate::{
-    Grammar, InjectionConfig, Language, LanguageId, LanguageRegistry, QUERY_CURSORS, with_parser,
+    CaptureId, CapturedRange, Grammar, InjectionConfig, Language, LanguageId, LanguageRegistry,
+    QUERY_CURSORS, with_parser,
 };
 use collections::HashMap;
 use futures::FutureExt;
@@ -88,6 +89,62 @@ pub struct SyntaxMapCapture<'a> {
     pub node: Node<'a>,
     pub index: u32,
     pub grammar_index: usize,
+}
+
+pub(crate) fn flattened_highlight_regions(
+    mut captures: SyntaxMapCaptures<'_>,
+    range: Range<usize>,
+) -> Vec<CapturedRange> {
+    let capture_refs = iter::from_fn(move || {
+        let capture = captures.next()?;
+        Some((capture.node.byte_range(), CaptureId(capture.index)))
+    });
+    flatten_capture_regions(range, capture_refs)
+}
+
+fn flatten_capture_regions(
+    range: Range<usize>,
+    mut captures: impl Iterator<Item = (Range<usize>, CaptureId)>,
+) -> Vec<CapturedRange> {
+    let mut result = Vec::new();
+    let mut stack = Vec::<(Range<usize>, CaptureId)>::new();
+    let mut offset = range.start;
+    let mut next_capture = captures.next();
+    loop {
+        stack.retain(|(capture_range, _)| capture_range.end > offset);
+        while let Some((capture_range, capture_id)) = next_capture.take() {
+            if capture_range.start > offset {
+                next_capture = Some((capture_range, capture_id));
+                break;
+            }
+            if capture_range.end > offset {
+                stack.push((capture_range, capture_id));
+            }
+            next_capture = captures.next();
+        }
+        let mut next_boundary = range.end;
+        if let Some(min_end) = stack
+            .iter()
+            .map(|(capture_range, _)| capture_range.end)
+            .min()
+        {
+            next_boundary = next_boundary.min(min_end);
+        }
+        if let Some((capture_range, _)) = &next_capture {
+            next_boundary = next_boundary.min(capture_range.start);
+        }
+        if !stack.is_empty() && next_boundary > offset {
+            result.push(CapturedRange {
+                range: offset..next_boundary,
+                capture_ids: stack.iter().map(|(_, capture_id)| *capture_id).collect(),
+            });
+        }
+        if next_boundary >= range.end {
+            break;
+        }
+        offset = next_boundary;
+    }
+    result
 }
 
 #[derive(Debug)]

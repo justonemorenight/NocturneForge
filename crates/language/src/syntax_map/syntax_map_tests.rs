@@ -1156,6 +1156,48 @@ fn test_random_syntax_map_edits_with_heex(rng: StdRng, cx: &mut App) {
     test_random_edits(text, registry, language, rng);
 }
 
+#[test]
+fn test_flatten_capture_regions_with_nested_captures() {
+    let outer = CaptureId(1);
+    let inner = CaptureId(2);
+    assert_eq!(
+        flattened(0..12, &[(0..10, outer), (2..5, inner)]),
+        vec![
+            (0..2, vec![outer]),
+            (2..5, vec![outer, inner]),
+            (5..10, vec![outer]),
+        ],
+    );
+}
+
+#[test]
+fn test_flatten_capture_regions_with_overlapping_captures() {
+    let first = CaptureId(1);
+    let second = CaptureId(2);
+    assert_eq!(
+        flattened(0..25, &[(0..10, first), (2..20, second)]),
+        vec![
+            (0..2, vec![first]),
+            (2..10, vec![first, second]),
+            (10..20, vec![second]),
+        ],
+        "a capture must not extend past its own end when overlapping another capture"
+    );
+}
+
+#[test]
+fn test_flatten_capture_regions_clips_to_the_requested_range() {
+    let capture = CaptureId(1);
+    assert_eq!(
+        flattened(5..8, &[(0..10, capture)]),
+        vec![(5..8, vec![capture])],
+    );
+    assert_eq!(
+        flattened(0..6, &[(4..10, capture)]),
+        vec![(4..6, vec![capture])],
+    );
+}
+
 fn test_random_edits(
     text: String,
     registry: Arc<LanguageRegistry>,
@@ -1557,6 +1599,16 @@ fn comment_lang() -> Language {
         },
         Some(tree_sitter_json::LANGUAGE.into()),
     )
+}
+
+fn flattened(
+    range: Range<usize>,
+    captures: &[(Range<usize>, CaptureId)],
+) -> Vec<(Range<usize>, Vec<CaptureId>)> {
+    flatten_capture_regions(range, captures.iter().cloned())
+        .into_iter()
+        .map(|region| (region.range, region.capture_ids.to_vec()))
+        .collect()
 }
 
 fn range_for_text(buffer: &Buffer, text: &str) -> Range<usize> {

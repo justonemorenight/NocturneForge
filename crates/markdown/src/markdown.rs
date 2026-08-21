@@ -768,19 +768,7 @@ impl Markdown {
                 return None;
             };
 
-            match kind {
-                CodeBlockKind::FencedLang(language) => self
-                    .parsed_markdown
-                    .languages_by_name
-                    .get(language)
-                    .cloned(),
-                CodeBlockKind::FencedSrc(path_range) => self
-                    .parsed_markdown
-                    .languages_by_path
-                    .get(&path_range.path)
-                    .cloned(),
-                CodeBlockKind::Fenced | CodeBlockKind::Indented => None,
-            }
+            self.parsed_markdown.code_block_language(kind)
         })
     }
 
@@ -1427,7 +1415,19 @@ impl ParsedMarkdown {
             selection,
         )
     }
+
+    pub(crate) fn code_block_language(&self, kind: &CodeBlockKind) -> Option<Arc<Language>> {
+        match kind {
+            CodeBlockKind::FencedLang(name) => self.languages_by_name.get(name).cloned(),
+            CodeBlockKind::FencedSrc(path_range) => {
+                self.languages_by_path.get(&path_range.path).cloned()
+            }
+            CodeBlockKind::Fenced => self.fallback_code_block_language.clone(),
+            CodeBlockKind::Indented => None,
+        }
+    }
 }
+
 
 struct PendingCodeBlock<'a> {
     language: Arc<Language>,
@@ -1547,11 +1547,10 @@ fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut Cod
         text_offsets.push(combined.len());
         combined.push_str(text);
     }
-    let mut highlights = block
+    let captures = block
         .language
-        .highlight_text_captures(&Rope::from(combined.as_str()), 0..combined.len())
-        .into_iter()
-        .peekable();
+        .highlight_text_captures(&Rope::from(combined.as_str()), 0..combined.len());
+    let mut highlights = captures.iter().peekable();
     for ((source_range, text), text_offset) in block.texts.iter().zip(text_offsets) {
         let text_end = text_offset + text.len();
         let mut text_highlights = Vec::new();
@@ -2654,19 +2653,7 @@ impl MarkdownElement {
                                 continue;
                             }
 
-                            let language = match kind {
-                                CodeBlockKind::Fenced => {
-                                    parsed_markdown.fallback_code_block_language.clone()
-                                }
-                                CodeBlockKind::FencedLang(language) => {
-                                    parsed_markdown.languages_by_name.get(language).cloned()
-                                }
-                                CodeBlockKind::FencedSrc(path_range) => parsed_markdown
-                                    .languages_by_path
-                                    .get(&path_range.path)
-                                    .cloned(),
-                                _ => None,
-                            };
+                            let language = parsed_markdown.code_block_language(kind);
 
                             let is_indented = matches!(kind, CodeBlockKind::Indented);
                             let scroll_handle = if self.style.code_block_overflow_x_scroll {
@@ -5808,6 +5795,194 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_code_block_highlights_cached_at_parse_time(cx: &mut TestAppContext) {
+        let source = "```rust\nfn main() {}\n```";
+        let (language, markdown) = markdown_with_rust_language(source, cx);
+        let theme = SyntaxTheme::new(
+            [
+                ("keyword", gpui::red()),
+                ("function", gpui::blue()),
+                ("type", gpui::green()),
+            ]
+            .into_iter()
+            .map(|(name, color)| {
+                (
+                    name.to_owned(),
+                    gpui::HighlightStyle {
+                        color: Some(color),
+                        ..gpui::HighlightStyle::default()
+                    },
+                )
+            }),
+        );
+        language.set_theme(&theme);
+
+        let code_text = "fn main() {}\n";
+        let code_start = source.find(code_text).unwrap();
+        let cached = cached_code_block_highlights(&markdown, code_start, cx);
+        let highlight_map = language.grammar().unwrap().highlight_map();
+        let resolved = cached
+            .iter()
+            .filter_map(|captured| {
+                let highlight_id = highlight_map.get_innermost(&captured.capture_ids)?;
+                Some((captured.range.clone(), highlight_id))
+            })
+            .collect::<Vec<_>>();
+        let expected = language.highlight_text(&Rope::from(code_text), 0..code_text.len());
+        assert_eq!(
+            resolved, expected,
+            "cached capture id stacks resolved through a theme applied after parsing must match direct highlighting"
+        );
+        assert!(!expected.is_empty(), "rust code must produce highlights");
+    }
+
+    #[gpui::test]
+    fn test_code_block_highlights_reused_when_streaming(cx: &mut TestAppContext) {
+        let source = "```rust\nfn main() {}\n```\n\nSome trailing text";
+        let (language, markdown) = markdown_with_rust_language(source, cx);
+
+        let code_start = source.find("fn main").unwrap();
+        let first_parse_highlights = cached_code_block_highlights(&markdown, code_start, cx);
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.append(" that keeps streaming in\n\n```rust\nlet x = 1;\n```", cx)
+        });
+        cx.run_until_parked();
+
+        let second_parse_highlights = cached_code_block_highlights(&markdown, code_start, cx);
+        assert!(
+            Arc::ptr_eq(&first_parse_highlights, &second_parse_highlights),
+            "highlights of an unchanged code block must be reused across parses"
+        );
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.replace("```rust\nfn main() { panic!() }\n```", cx)
+        });
+        cx.run_until_parked();
+
+        let changed_highlights = cached_code_block_highlights(&markdown, code_start, cx);
+        let changed_code = "fn main() { panic!() }\n";
+        assert_eq!(
+            changed_highlights.as_ref(),
+            language
+                .highlight_text_captures(&Rope::from(changed_code), 0..changed_code.len())
+                .as_ref(),
+            "highlights of a changed code block must be recomputed"
+        );
+    }
+
+    #[gpui::test]
+    fn test_mermaid_blocks_are_not_highlighted(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let mermaid_language = Arc::new(
+            Language::new(
+                LanguageConfig {
+                    name: "mermaid".into(),
+                    ..LanguageConfig::default()
+                },
+                Some(language::rust_lang().grammar().unwrap().ts_language.clone()),
+            )
+            .with_highlights_query("(identifier) @variable")
+            .unwrap(),
+        );
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        language_registry.add(mermaid_language);
+
+        let source = "```mermaid\ngraph TD;\n```";
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                source.into(),
+                Some(language_registry),
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    ..MarkdownOptions::default()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |markdown, _| {
+            let parsed = markdown.parsed_markdown();
+            assert_eq!(
+                parsed.mermaid_diagrams.len(),
+                1,
+                "the block must be recognized as a mermaid diagram"
+            );
+            assert_eq!(
+                parsed.code_block_highlights.len(),
+                0,
+                "mermaid blocks must not be highlighted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_fallback_language_highlights_untagged_code_blocks(cx: &mut TestAppContext) {
+        let language = language::rust_lang();
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        language_registry.add(language.clone());
+
+        let source = "```\nfn main() {}\n```\n";
+        let markdown = cx.new(|cx| {
+            Markdown::new(
+                source.into(),
+                Some(language_registry),
+                Some(language.name()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |markdown, _| {
+            let parsed = markdown.parsed_markdown();
+            let fallback = parsed
+                .fallback_code_block_language
+                .as_ref()
+                .expect("the fallback language must be resolved for untagged code blocks");
+            assert_eq!(fallback.name(), language.name());
+
+            let code_start = source.find("fn main").unwrap();
+            let cached = parsed
+                .code_block_highlights
+                .get(&code_start)
+                .expect("untagged code blocks must be highlighted with the fallback language");
+            assert!(!cached.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn test_no_fallback_language_without_untagged_code_blocks(cx: &mut TestAppContext) {
+        let language = language::rust_lang();
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        language_registry.add(language.clone());
+
+        let source = "```rust\nfn main() {}\n```\n";
+        let markdown = cx.new(|cx| {
+            Markdown::new(
+                source.into(),
+                Some(language_registry),
+                Some(language.name()),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        markdown.read_with(cx, |markdown, _| {
+            assert_eq!(
+                markdown
+                    .parsed_markdown()
+                    .fallback_code_block_language
+                    .as_ref()
+                    .map(|language| language.name()),
+                None,
+                "The fallback language must not be loaded when no code block needs it"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn test_frontmatter_renders_without_delimiters(cx: &mut TestAppContext) {
         let rendered = render_markdown_with_options(
             "---\ntitle: Post\n---\nBody",
@@ -7191,5 +7366,34 @@ mod tests {
                 px(24.0)
             );
         });
+    }
+
+
+    fn markdown_with_rust_language(
+        source: &str,
+        cx: &mut TestAppContext,
+    ) -> (Arc<Language>, Entity<Markdown>) {
+        let language = language::rust_lang();
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        language_registry.add(language.clone());
+        let source = SharedString::from(source.to_owned());
+        let markdown = cx.new(|cx| Markdown::new(source, Some(language_registry), None, cx));
+        cx.run_until_parked();
+        (language, markdown)
+    }
+
+    fn cached_code_block_highlights(
+        markdown: &Entity<Markdown>,
+        code_start: usize,
+        cx: &mut TestAppContext,
+    ) -> Arc<[CapturedRange]> {
+        markdown.read_with(cx, |markdown, _| {
+            markdown
+                .parsed_markdown()
+                .code_block_highlights
+                .get(&code_start)
+                .expect("code block highlights must be computed during parse")
+                .clone()
+        })
     }
 }
