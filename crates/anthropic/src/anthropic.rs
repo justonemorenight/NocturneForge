@@ -320,7 +320,7 @@ pub async fn list_models(
     api_url: &str,
     api_key: &str,
     extra_headers: &CustomHeaders,
-) -> Result<Vec<Model>> {
+) -> Result<Vec<Model>, AnthropicError> {
     let uri = format!("{api_url}/v1/models?limit=1000");
 
     let request = HttpRequest::builder()
@@ -331,29 +331,27 @@ pub async fn list_models(
         .header("Accept", "application/json")
         .extra_headers(extra_headers)
         .body(AsyncBody::default())
-        .context("failed to build Anthropic models list request")?;
+        .map_err(AnthropicError::BuildRequestBody)?;
 
     let mut response = client
         .send(request)
         .await
-        .context("failed to send Anthropic models list request")?;
+        .map_err(AnthropicError::HttpSend)?;
+
+    if !response.status().is_success() {
+        let rate_limits = RateLimitInfo::from_headers(response.headers());
+        return Err(handle_error_response(response, rate_limits).await);
+    }
 
     let mut body = String::new();
     response
         .body_mut()
         .read_to_string(&mut body)
         .await
-        .context("failed to read Anthropic models list response")?;
-
-    anyhow::ensure!(
-        response.status().is_success(),
-        "failed to list Anthropic models: {} {}",
-        response.status(),
-        body,
-    );
+        .map_err(AnthropicError::ReadResponse)?;
 
     let parsed: ListModelsResponse =
-        serde_json::from_str(&body).context("failed to parse Anthropic models list response")?;
+        serde_json::from_str(&body).map_err(AnthropicError::DeserializeResponse)?;
 
     let models = parsed
         .data
@@ -1096,14 +1094,20 @@ pub enum ApiErrorCode {
     InvalidRequestError,
     /// 401 - `authentication_error`: There's an issue with your API key.
     AuthenticationError,
+    /// 402 - `billing_error`: There's an issue with the account's billing.
+    BillingError,
     /// 403 - `permission_error`: Your API key does not have permission to use the specified resource.
     PermissionError,
     /// 404 - `not_found_error`: The requested resource was not found.
     NotFoundError,
+    /// 409 - `conflict_error`: The request conflicts with the current state of the resource.
+    ConflictError,
     /// 413 - `request_too_large`: Request exceeds the maximum allowed number of bytes.
     RequestTooLarge,
     /// 429 - `rate_limit_error`: Your account has hit a rate limit.
     RateLimitError,
+    /// 504 - `timeout_error`: Anthropic's gateway timed out while processing the request.
+    TimeoutError,
     /// 500 - `api_error`: An unexpected error has occurred internal to Anthropic's systems.
     ApiError,
     /// 529 - `overloaded_error`: Anthropic's API is temporarily overloaded.
@@ -1211,16 +1215,27 @@ pub fn completion_error_from_anthropic_api(
                 provider,
                 message: error.message,
             },
+            BillingError => Error::PaymentRequired,
             PermissionError => Error::PermissionError {
                 provider,
                 message: error.message,
             },
             NotFoundError => Error::ApiEndpointNotFound { provider },
+            ConflictError => Error::HttpResponseError {
+                provider,
+                status_code: StatusCode::CONFLICT,
+                message: error.message,
+            },
             RequestTooLarge => Error::PromptTooLarge {
                 tokens: language_model_core::parse_prompt_too_long(&error.message),
             },
             RateLimitError => Error::RateLimitExceeded {
                 provider,
+                retry_after: None,
+            },
+            TimeoutError => Error::UpstreamProviderError {
+                message: error.message,
+                status: StatusCode::GATEWAY_TIMEOUT,
                 retry_after: None,
             },
             ApiError => Error::ApiInternalServerError {
@@ -1239,6 +1254,94 @@ pub fn completion_error_from_anthropic_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_client::FakeHttpClient;
+
+    #[test]
+    fn list_models_maps_anthropic_billing_errors_to_payment_required() {
+        let client = FakeHttpClient::create(|_| async move {
+            Ok(http::Response::builder()
+                .status(StatusCode::PAYMENT_REQUIRED)
+                .body(AsyncBody::from(
+                    r#"{"type":"error","error":{"type":"billing_error","message":"There is a problem with your billing information."},"request_id":"request-id"}"#,
+                ))
+                .expect("valid response"))
+        });
+
+        let error = futures::executor::block_on(list_models(
+            client.as_ref(),
+            ANTHROPIC_API_URL,
+            "test-key",
+            &CustomHeaders::default(),
+        ))
+        .expect_err("billing error should fail");
+        let completion_error: language_model_core::LanguageModelCompletionError = error.into();
+
+        assert!(matches!(
+            completion_error,
+            language_model_core::LanguageModelCompletionError::PaymentRequired
+        ));
+    }
+
+    #[test]
+    fn list_models_maps_anthropic_conflict_errors_to_http_conflict() {
+        let client = FakeHttpClient::create(|_| async move {
+            Ok(http::Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(AsyncBody::from(
+                    r#"{"type":"error","error":{"type":"conflict_error","message":"The resource was modified concurrently."},"request_id":"request-id"}"#,
+                ))
+                .expect("valid response"))
+        });
+
+        let error = futures::executor::block_on(list_models(
+            client.as_ref(),
+            ANTHROPIC_API_URL,
+            "test-key",
+            &CustomHeaders::default(),
+        ))
+        .expect_err("conflict should fail");
+        let completion_error: language_model_core::LanguageModelCompletionError = error.into();
+
+        assert!(matches!(
+            completion_error,
+            language_model_core::LanguageModelCompletionError::HttpResponseError {
+                provider,
+                status_code: StatusCode::CONFLICT,
+                message,
+            } if provider == language_model_core::ANTHROPIC_PROVIDER_NAME
+                && message == "The resource was modified concurrently."
+        ));
+    }
+
+    #[test]
+    fn list_models_maps_anthropic_timeout_errors_to_gateway_timeout() {
+        let client = FakeHttpClient::create(|_| async move {
+            Ok(http::Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .body(AsyncBody::from(
+                    r#"{"type":"error","error":{"type":"timeout_error","message":"The request timed out."},"request_id":"request-id"}"#,
+                ))
+                .expect("valid response"))
+        });
+
+        let error = futures::executor::block_on(list_models(
+            client.as_ref(),
+            ANTHROPIC_API_URL,
+            "test-key",
+            &CustomHeaders::default(),
+        ))
+        .expect_err("timeout should fail");
+        let completion_error: language_model_core::LanguageModelCompletionError = error.into();
+
+        assert!(matches!(
+            completion_error,
+            language_model_core::LanguageModelCompletionError::UpstreamProviderError {
+                message,
+                status: StatusCode::GATEWAY_TIMEOUT,
+                retry_after: None,
+            } if message == "The request timed out."
+        ));
+    }
 
     fn listed_entry(id: &str, capabilities: ModelCapabilities) -> ListModelEntry {
         ListModelEntry {
