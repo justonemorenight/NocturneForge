@@ -863,11 +863,13 @@ async fn compact_response_with_body<Response: DeserializeOwned>(
         .body(AsyncBody::from(body))
         .map_err(|error| RequestError::Other(error.into()))?;
 
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
     let mut response = client
         .send(request)
         .await
         .map_err(|error| RequestError::HttpSend {
             provider: provider_name.to_owned(),
+            host,
             error,
         })?;
     let mut body = String::new();
@@ -934,11 +936,13 @@ pub async fn stream_response_with_body(
         .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
     let mut response = client
         .send(request)
         .await
         .map_err(|error| RequestError::HttpSend {
             provider: provider_name.to_owned(),
+            host,
             error,
         })?;
     if response.status().is_success() {
@@ -1282,10 +1286,18 @@ mod tests {
         ))
         .err()
         .expect("compact send error");
-        assert!(matches!(
-            compact_error,
-            RequestError::HttpSend { provider, .. } if provider == "OpenAI"
-        ));
+        match compact_error {
+            RequestError::HttpSend {
+                provider,
+                host,
+                error,
+            } => {
+                assert_eq!(provider, "OpenAI");
+                assert_eq!(host, "api.openai.com");
+                assert_eq!(error.to_string(), "network unavailable");
+            }
+            error => panic!("expected an HTTP send error, got {error:?}"),
+        }
 
         let stream_error = block_on(stream_response_with_body(
             http_client.as_ref(),
@@ -1298,10 +1310,18 @@ mod tests {
         ))
         .err()
         .expect("stream send error");
-        assert!(matches!(
-            stream_error,
-            RequestError::HttpSend { provider, .. } if provider == "OpenAI"
-        ));
+        match stream_error {
+            RequestError::HttpSend {
+                provider,
+                host,
+                error,
+            } => {
+                assert_eq!(provider, "OpenAI");
+                assert_eq!(host, "api.openai.com");
+                assert_eq!(error.to_string(), "network unavailable");
+            }
+            error => panic!("expected an HTTP send error, got {error:?}"),
+        }
     }
 
     #[test]

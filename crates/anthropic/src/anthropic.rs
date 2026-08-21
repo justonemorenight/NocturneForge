@@ -333,10 +333,11 @@ pub async fn list_models(
         .body(AsyncBody::default())
         .map_err(AnthropicError::BuildRequestBody)?;
 
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
     let mut response = client
         .send(request)
         .await
-        .map_err(AnthropicError::HttpSend)?;
+        .map_err(|error| AnthropicError::HttpSend { host, error })?;
 
     if !response.status().is_success() {
         let rate_limits = RateLimitInfo::from_headers(response.headers());
@@ -423,10 +424,11 @@ async fn send_request(
         .body(AsyncBody::from(serialized_request))
         .map_err(AnthropicError::BuildRequestBody)?;
 
+    let host = request.uri().host().unwrap_or(api_url).to_owned();
     let response = client
         .send(request)
         .await
-        .map_err(AnthropicError::HttpSend)?;
+        .map_err(|error| AnthropicError::HttpSend { host, error })?;
 
     let rate_limits = RateLimitInfo::from_headers(response.headers());
 
@@ -1053,7 +1055,7 @@ pub enum AnthropicError {
     BuildRequestBody(http::Error),
 
     /// Failed to send the HTTP request
-    HttpSend(anyhow::Error),
+    HttpSend { host: String, error: anyhow::Error },
 
     /// Failed to deserialize the response from JSON
     DeserializeResponse(serde_json::Error),
@@ -1172,7 +1174,11 @@ pub fn completion_error_from_anthropic(
     match error {
         AnthropicError::SerializeRequest(error) => Error::SerializeRequest { provider, error },
         AnthropicError::BuildRequestBody(error) => Error::BuildRequestBody { provider, error },
-        AnthropicError::HttpSend(error) => Error::HttpSend { provider, error },
+        AnthropicError::HttpSend { host, error } => Error::HttpSend {
+            provider,
+            host,
+            error,
+        },
         AnthropicError::DeserializeResponse(error) => {
             Error::DeserializeResponse { provider, error }
         }
@@ -1255,6 +1261,58 @@ pub fn completion_error_from_anthropic_api(
 mod tests {
     use super::*;
     use http_client::FakeHttpClient;
+
+    #[test]
+    fn list_models_preserves_anthropic_api_errors() {
+        let client = FakeHttpClient::create(|_| async move {
+            Ok(http::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(AsyncBody::from(
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"request-id"}"#,
+                ))
+                .expect("valid response"))
+        });
+
+        let error = futures::executor::block_on(list_models(
+            client.as_ref(),
+            ANTHROPIC_API_URL,
+            "invalid-key",
+            &CustomHeaders::default(),
+        ))
+        .expect_err("authentication should fail");
+
+        assert!(matches!(
+            error,
+            AnthropicError::ApiError(ApiError {
+                error_type,
+                message,
+            }) if error_type == "authentication_error" && message == "invalid x-api-key"
+        ));
+    }
+
+    #[test]
+    fn list_models_preserves_anthropic_http_send_hostname() {
+        let client =
+            FakeHttpClient::create(|_| async move { Err(anyhow::anyhow!("DNS lookup failed")) });
+
+        let error = futures::executor::block_on(list_models(
+            client.as_ref(),
+            ANTHROPIC_API_URL,
+            "test-key",
+            &CustomHeaders::default(),
+        ))
+        .expect_err("request should fail");
+        let completion_error: language_model_core::LanguageModelCompletionError = error.into();
+
+        assert!(matches!(
+            completion_error,
+            language_model_core::LanguageModelCompletionError::HttpSend {
+                host,
+                error,
+                ..
+            } if host == "api.anthropic.com" && error.to_string() == "DNS lookup failed"
+        ));
+    }
 
     #[test]
     fn list_models_maps_anthropic_billing_errors_to_payment_required() {
