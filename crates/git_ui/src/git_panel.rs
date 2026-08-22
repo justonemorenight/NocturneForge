@@ -2395,13 +2395,18 @@ impl GitPanel {
                 .repo_path_to_project_path(&entry.repo_path, cx)?;
             let workspace = self.workspace.clone();
 
-            if entry.status.staging().has_staged() {
-                self.change_file_stage(false, vec![entry.clone()], cx);
-            }
             let filename = path.path.file_name()?.to_string();
 
             if !entry.status.is_created() {
-                self.perform_checkout(vec![entry.clone()], window, cx);
+                let commit = if entry.staging == StageStatus::Unstaged {
+                    ""
+                } else {
+                    if entry.status.staging().has_staged() {
+                        self.change_file_stage(false, vec![entry.clone()], cx);
+                    }
+                    "HEAD"
+                };
+                self.perform_checkout(commit, vec![entry.clone()], window, cx);
             } else {
                 let prompt = prompt(&format!("Trash {}?", filename), None, window, cx);
                 cx.spawn_in(window, async move |_, cx| {
@@ -2432,6 +2437,7 @@ impl GitPanel {
 
     fn perform_checkout(
         &mut self,
+        commit: &'static str,
         entries: Vec<GitStatusEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2461,7 +2467,7 @@ impl GitPanel {
             this.update_in(cx, |this, window, cx| {
                 let task = active_repository.update(cx, |repo, cx| {
                     repo.checkout_files(
-                        "HEAD",
+                        commit,
                         entries
                             .into_iter()
                             .map(|entries| entries.repo_path)
@@ -2550,7 +2556,7 @@ impl GitPanel {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(RestoreCancel::RestoreTrackedFiles) = prompt.await {
                 this.update_in(cx, |this, window, cx| {
-                    this.perform_checkout(entries, window, cx);
+                    this.perform_checkout("HEAD", entries, window, cx);
                 })
                 .ok();
             }
