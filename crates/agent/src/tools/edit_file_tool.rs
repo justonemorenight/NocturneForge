@@ -1284,6 +1284,11 @@ mod tests {
     #[gpui::test]
     async fn test_streaming_authorize(cx: &mut TestAppContext) {
         let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Confirm;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
 
         // Test 1: Path with .zed component should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -1307,12 +1312,15 @@ mod tests {
             Some("Edit `/etc/hosts`".into())
         );
 
-        // Test 3: Relative path without .zed should not require confirmation
+        // Test 3: Normal in-project paths follow the Confirm default
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-        cx.update(|cx| edit_tool.authorize(&PathBuf::from("root/src/main.rs"), &stream_tx, cx))
-            .await
-            .unwrap();
-        assert!(stream_rx.try_recv().is_err());
+        let _auth =
+            cx.update(|cx| edit_tool.authorize(&PathBuf::from("root/src/main.rs"), &stream_tx, cx));
+        let event = stream_rx.expect_authorization().await;
+        assert_eq!(
+            event.tool_call.fields.title,
+            Some("Edit `root/src/main.rs`".into())
+        );
 
         // Test 4: Path with .zed in the middle should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -1325,8 +1333,8 @@ mod tests {
             Some("Edit `root/.zed/tasks.json` (local settings)".into())
         );
 
-        // Test 5: When global default is allow, sensitive and outside-project
-        // paths still require confirmation
+        // Test 5: Sensitive paths still require confirmation when the global
+        // default is Allow; other paths are auto-approved.
         cx.update(|cx| {
             let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
             settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
@@ -1806,8 +1814,8 @@ mod tests {
             ),
             (
                 "project/normal_file.rs",
-                false,
-                "Normal project file should not require confirmation",
+                true,
+                "Normal project file follows the Confirm default",
             ),
         ];
 
@@ -1872,8 +1880,8 @@ mod tests {
         .await;
 
         let test_cases = vec![
-            ("frontend/src/main.js", false, "File in first worktree"),
-            ("backend/src/main.rs", false, "File in second worktree"),
+            ("frontend/src/main.js", true, "File in first worktree"),
+            ("backend/src/main.rs", true, "File in second worktree"),
             (
                 "shared/.zed/settings.json",
                 true,
@@ -1927,7 +1935,7 @@ mod tests {
             setup_test_with_fs(cx, fs, &[path!("/project").as_ref()]).await;
 
         let test_cases = vec![
-            ("", false, "Empty path is treated as project root"),
+            ("", true, "Empty path follows the Confirm default"),
             ("/", true, "Root directory should be outside project"),
             (
                 "project/../other",
@@ -1936,13 +1944,17 @@ mod tests {
             ),
             (
                 "project/./src/file.rs",
-                false,
-                "Path with . should work normally",
+                true,
+                "Path with . follows the Confirm default",
             ),
             #[cfg(target_os = "windows")]
             ("C:\\Windows\\System32\\hosts", true, "Windows system path"),
             #[cfg(target_os = "windows")]
-            ("project\\src\\main.rs", false, "Windows-style project path"),
+            (
+                "project\\src\\main.rs",
+                true,
+                "Windows-style project path follows the Confirm default",
+            ),
         ];
 
         for (path, should_confirm, description) in test_cases {
@@ -2001,14 +2013,12 @@ mod tests {
 
             stream_rx.expect_authorization().await;
 
-            // Test normal path with different modes
+            // Normal paths also follow the Confirm default
             let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-            cx.update(|cx| {
+            let _auth = cx.update(|cx| {
                 edit_tool.authorize(&PathBuf::from("project/normal.txt"), &stream_tx, cx)
-            })
-            .await
-            .unwrap();
-            assert!(stream_rx.try_recv().is_err());
+            });
+            stream_rx.expect_authorization().await;
         }
     }
 
@@ -3021,6 +3031,11 @@ mod tests {
         Entity<Thread>,
     ) {
         init_test(cx);
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", initial_tree).await;
         setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await

@@ -528,7 +528,6 @@ mod tests {
     #[gpui::test]
     async fn test_streaming_format_on_save(cx: &mut TestAppContext) {
         init_test(cx);
-
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({"src": {}})).await;
         let (write_tool, project, action_log, fs, thread) =
@@ -606,6 +605,9 @@ mod tests {
                         Some(language::language_settings::FormatterList::default());
                 });
             });
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
 
         // Use streaming pattern so executor can pump the LSP request/response
@@ -654,6 +656,9 @@ mod tests {
                         Some(FormatOnSave::Off);
                 });
             });
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
 
         let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
@@ -694,7 +699,6 @@ mod tests {
     #[gpui::test]
     async fn test_streaming_remove_trailing_whitespace(cx: &mut TestAppContext) {
         init_test(cx);
-
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({"src": {}})).await;
         fs.save(
@@ -719,6 +723,9 @@ mod tests {
                         .remove_trailing_whitespace_on_save = Some(true);
                 });
             });
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
 
         const CONTENT_WITH_TRAILING_WHITESPACE: &str =
@@ -760,6 +767,9 @@ mod tests {
                         .remove_trailing_whitespace_on_save = Some(false);
                 });
             });
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
         });
 
         let tool2 = Arc::new(WriteFileTool::new(
@@ -796,6 +806,11 @@ mod tests {
     #[gpui::test]
     async fn test_streaming_diff_finalization(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/", json!({"main.rs": ""})).await;
         let (write_tool, project, action_log, _fs, thread) =
@@ -1413,6 +1428,11 @@ mod tests {
         Entity<Thread>,
     ) {
         init_test(cx);
+        cx.update(|cx| {
+            let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+            settings.tool_permissions.default = settings::ToolPermissionMode::Allow;
+            agent_settings::AgentSettings::override_global(settings, cx);
+        });
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", initial_tree).await;
         setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await

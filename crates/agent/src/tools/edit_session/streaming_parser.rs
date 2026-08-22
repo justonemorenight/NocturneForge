@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn test_done_chunks_strip_trailing_newline() {
+    fn test_done_chunks_preserve_trailing_newlines() {
         let mut parser = StreamingParser::default();
 
         let events = parser.finalize_edits(&[Edit {
@@ -560,12 +560,12 @@ mod tests {
             &[
                 EditEvent::OldTextChunk {
                     edit_index: 0,
-                    chunk: "before".into(),
+                    chunk: "before\n".into(),
                     done: true,
                 },
                 EditEvent::NewTextChunk {
                     edit_index: 0,
-                    chunk: "after".into(),
+                    chunk: "after\n".into(),
                     done: true,
                 },
             ]
@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_edit_chunks_hold_back_trailing_newline() {
+    fn test_partial_edit_preserves_trailing_newlines() {
         let mut parser = StreamingParser::default();
 
         let events = parser.push_edits(&[PartialEdit {
@@ -591,12 +591,12 @@ mod tests {
             &[
                 EditEvent::OldTextChunk {
                     edit_index: 0,
-                    chunk: "before".into(),
+                    chunk: "before\n".into(),
                     done: true,
                 },
                 EditEvent::NewTextChunk {
                     edit_index: 0,
-                    chunk: "after".into(),
+                    chunk: "after\n".into(),
                     done: true,
                 },
             ]

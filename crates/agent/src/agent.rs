@@ -1808,7 +1808,11 @@ impl NativeAgent {
                 .save_thread(id, db_thread, folder_paths)
                 .await
                 .log_err();
-            thread_store.update(cx, |store, cx| store.reload(cx));
+            let reload_task = thread_store.update(cx, |store, cx| {
+                store.reload(cx);
+                store.reload_task()
+            });
+            reload_task.await;
             Ok(())
         });
     }
