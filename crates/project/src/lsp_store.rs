@@ -77,8 +77,8 @@ use language::{
     CodeLabelExt, Diagnostic, DiagnosticEntry, DiagnosticSet, DiagnosticSourceKind, Diff,
     File as _, Language, LanguageAwareStyling, LanguageName, LanguageRegistry, LocalFile,
     LspAdapter, LspAdapterDelegate, LspInstaller, ManifestDelegate, ManifestName, ModelineSettings,
-    OffsetUtf16, Patch, PointUtf16, TextBufferSnapshot, ToOffset, ToOffsetUtf16, ToPointUtf16,
-    Toolchain, Transaction, Unclipped,
+    OffsetUtf16, Patch, PointUtf16, RelatedInformation, RelatedLocation, TextBufferSnapshot,
+    ToOffset, ToOffsetUtf16, ToPointUtf16, Toolchain, Transaction, Unclipped,
     language_settings::{
         AllLanguageSettings, FormatOnSave, Formatter, LanguageSettings, LineEndingSetting,
         all_language_settings,
@@ -2816,39 +2816,38 @@ impl LocalLspStore {
         let mut sanitized_diagnostics = Vec::with_capacity(diagnostics.len());
 
         for (new_diagnostic, entry) in diagnostics {
-            let start;
-            let end;
-            if new_diagnostic && entry.diagnostic.is_disk_based {
-                // Some diagnostics are based on files on disk instead of buffers'
-                // current contents. Adjust these diagnostics' ranges to reflect
-                // any unsaved edits.
-                // Do not alter the reused ones though, as their coordinates were stored as anchors
-                // and were properly adjusted on reuse.
-                start = Unclipped((*edits_since_save).old_to_new(entry.range.start.0));
-                end = Unclipped((*edits_since_save).old_to_new(entry.range.end.0));
-            } else {
-                start = entry.range.start;
-                end = entry.range.end;
-            }
+            // Some diagnostics are based on files on disk instead of buffers'
+            // current contents. Adjust these diagnostics' ranges to reflect
+            // any unsaved edits.
+            // Do not alter the reused ones though, as their coordinates were stored as anchors
+            // and were properly adjusted on reuse.
+            let is_disk_based = new_diagnostic && entry.diagnostic.is_disk_based;
+            let mut entry = entry.map_coordinates(|range| {
+                let range = if is_disk_based {
+                    Unclipped((*edits_since_save).old_to_new(range.start.0))
+                        ..Unclipped((*edits_since_save).old_to_new(range.end.0))
+                } else {
+                    range.clone()
+                };
+                snapshot.clip_point_utf16(range.start, Bias::Left)
+                    ..snapshot.clip_point_utf16(range.end, Bias::Right)
+            });
 
-            let mut range = snapshot.clip_point_utf16(start, Bias::Left)
-                ..snapshot.clip_point_utf16(end, Bias::Right);
-
-            // Expand empty ranges by one codepoint
-            if range.start == range.end {
+            // Expand empty ranges by one codepoint. Only the diagnostic's own range is
+            // widened: the related locations are reported back as the server framed them.
+            if entry.range.start == entry.range.end {
                 // This will be go to the next boundary when being clipped
-                range.end.column += 1;
-                range.end = snapshot.clip_point_utf16(Unclipped(range.end), Bias::Right);
-                if range.start == range.end && range.end.column > 0 {
-                    range.start.column -= 1;
-                    range.start = snapshot.clip_point_utf16(Unclipped(range.start), Bias::Left);
+                entry.range.end.column += 1;
+                entry.range.end =
+                    snapshot.clip_point_utf16(Unclipped(entry.range.end), Bias::Right);
+                if entry.range.start == entry.range.end && entry.range.end.column > 0 {
+                    entry.range.start.column -= 1;
+                    entry.range.start =
+                        snapshot.clip_point_utf16(Unclipped(entry.range.start), Bias::Left);
                 }
             }
 
-            sanitized_diagnostics.push(DiagnosticEntry {
-                range,
-                diagnostic: entry.diagnostic,
-            });
+            sanitized_diagnostics.push(entry);
         }
         drop(edits_since_save);
 
@@ -9022,12 +9021,10 @@ impl LspStore {
                     .iter()
                     .filter(|v| merge(&document_uri, &v.diagnostic, cx))
                     .map(|v| {
-                        let start = Unclipped(v.range.start.to_point_utf16(&snapshot));
-                        let end = Unclipped(v.range.end.to_point_utf16(&snapshot));
-                        DiagnosticEntry {
-                            range: start..end,
-                            diagnostic: v.diagnostic.clone(),
-                        }
+                        (*v).clone().map_coordinates(|range| {
+                            Unclipped(range.start.to_point_utf16(&snapshot))
+                                ..Unclipped(range.end.to_point_utf16(&snapshot))
+                        })
                     })
                     .collect::<Vec<_>>();
 
@@ -12013,7 +12010,11 @@ impl LspStore {
             if is_supporting {
                 supporting_diagnostics.insert(
                     (source, diagnostic.code.clone(), range),
-                    (diagnostic.severity, is_unnecessary),
+                    (
+                        diagnostic.severity,
+                        is_unnecessary,
+                        related_information_from_lsp(diagnostic, &lsp_diagnostics.uri),
+                    ),
                 );
             } else {
                 let group_id = post_inc(&mut self.as_local_mut().unwrap().next_diagnostic_group_id);
@@ -12026,6 +12027,10 @@ impl LspStore {
 
                 diagnostics.push(DiagnosticEntry {
                     range,
+                    related_information: related_information_from_lsp(
+                        diagnostic,
+                        &lsp_diagnostics.uri,
+                    ),
                     diagnostic: Diagnostic {
                         source: diagnostic.source.clone(),
                         source_kind,
@@ -12054,6 +12059,7 @@ impl LspStore {
                             let range = range_from_lsp(info.location.range);
                             diagnostics.push(DiagnosticEntry {
                                 range,
+                                related_information: None,
                                 diagnostic: Diagnostic {
                                     source: diagnostic.source.clone(),
                                     source_kind,
@@ -12083,18 +12089,20 @@ impl LspStore {
         }
 
         for entry in &mut diagnostics {
-            let diagnostic = &mut entry.diagnostic;
-            if !diagnostic.is_primary {
-                let source = *sources_by_group_id.get(&diagnostic.group_id).unwrap();
-                if let Some(&(severity, is_unnecessary)) = supporting_diagnostics.get(&(
-                    source,
-                    diagnostic.code.clone(),
-                    entry.range.clone(),
-                )) {
+            if !entry.diagnostic.is_primary {
+                let source = *sources_by_group_id.get(&entry.diagnostic.group_id).unwrap();
+                if let Some((severity, is_unnecessary, related_information)) =
+                    supporting_diagnostics.get(&(
+                        source,
+                        entry.diagnostic.code.clone(),
+                        entry.range.clone(),
+                    ))
+                {
                     if let Some(severity) = severity {
-                        diagnostic.severity = severity;
+                        entry.diagnostic.severity = *severity;
                     }
-                    diagnostic.is_unnecessary = is_unnecessary;
+                    entry.diagnostic.is_unnecessary = *is_unnecessary;
+                    entry.related_information = related_information.clone();
                 }
             }
         }
@@ -15396,6 +15404,32 @@ pub(crate) fn collapse_newlines(text: &str, separator: &str) -> String {
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .join(separator)
+}
+
+/// Converts the related information of a published diagnostic, putting the locations
+/// of the document it was published for into that document's coordinates so that they
+/// are converted and followed like the diagnostic's own range.
+fn related_information_from_lsp(
+    diagnostic: &lsp::Diagnostic,
+    document_uri: &lsp::Uri,
+) -> Option<Arc<[RelatedInformation<Unclipped<PointUtf16>>]>> {
+    let infos = diagnostic.related_information.as_ref()?;
+    if infos.is_empty() {
+        return None;
+    }
+    Some(
+        infos
+            .iter()
+            .map(|info| RelatedInformation {
+                location: if &info.location.uri == document_uri {
+                    RelatedLocation::InBuffer(range_from_lsp(info.location.range))
+                } else {
+                    RelatedLocation::InAnotherFile(info.location.clone())
+                },
+                message: info.message.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn include_text(server: &lsp::LanguageServer) -> Option<bool> {

@@ -39,7 +39,7 @@ use gpui::{
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point, quad,
+    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point, quad, relative,
 };
 use language::{CapturedRange, CharClassifier, HighlightMap, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -261,6 +261,7 @@ impl MarkdownStyle {
                     font_features: Some(theme_settings.buffer_font.features.clone()),
                     font_size: Some(buffer_font_size.into()),
                     font_weight: Some(buffer_font_weight),
+                    line_height: Some(relative(theme_settings.buffer_line_height.value())),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -421,7 +422,7 @@ pub struct Markdown {
     context_menu_selected_text: Option<SharedString>,
     context_menu_selected_markdown: Option<SharedString>,
     context_menu_capture_generation: u64,
-    search_highlights: Vec<Range<usize>>,
+    search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
     /// Measured (width, height) per block, keyed by source range so it survives
     /// append-only reparses (only changed tail blocks get new ranges). Lets the
@@ -631,7 +632,7 @@ impl Markdown {
             context_menu_selected_text: None,
             context_menu_selected_markdown: None,
             context_menu_capture_generation: 0,
-            search_highlights: Vec::new(),
+            search_highlights: Rc::default(),
             active_search_highlight: None,
             block_heights: HashMap::default(),
             last_known_width: None,
@@ -855,7 +856,7 @@ impl Markdown {
         self.pending_autoscroll = None;
         self.pending_parse = None;
         self.should_reparse = false;
-        self.search_highlights.clear();
+        self.search_highlights = Rc::default();
         self.active_search_highlight = None;
         // Revised content can reuse the same byte ranges with different rendering,
         // so drop cached heights; append-only growth keeps its cache elsewhere.
@@ -909,7 +910,7 @@ impl Markdown {
                 .windows(2)
                 .all(|ranges| (ranges[0].start, ranges[0].end) <= (ranges[1].start, ranges[1].end))
         );
-        self.search_highlights = highlights;
+        self.search_highlights = highlights.into();
         self.active_search_highlight =
             active.filter(|active| *active < self.search_highlights.len());
         cx.notify();
@@ -917,7 +918,7 @@ impl Markdown {
 
     pub fn clear_search_highlights(&mut self, cx: &mut Context<Self>) {
         if !self.search_highlights.is_empty() || self.active_search_highlight.is_some() {
-            self.search_highlights.clear();
+            self.search_highlights = Rc::default();
             self.active_search_highlight = None;
             cx.notify();
         }
@@ -2073,70 +2074,6 @@ impl MarkdownElement {
         builder.pop_div();
     }
 
-    fn paint_highlight_range(
-        start: usize,
-        end: usize,
-        color: Hsla,
-        rendered_text: &RenderedText,
-        window: &mut Window,
-    ) {
-        for bounds in rendered_text.bounds_for_source_range(start..end) {
-            window.paint_quad(quad(
-                bounds,
-                Pixels::ZERO,
-                color,
-                Edges::default(),
-                Hsla::transparent_black(),
-                BorderStyle::default(),
-            ));
-        }
-    }
-
-    fn paint_selection(&self, rendered_text: &RenderedText, window: &mut Window, cx: &mut App) {
-        let selection = self.markdown.read(cx).selection.clone();
-        Self::paint_highlight_range(
-            selection.start,
-            selection.end,
-            self.style.selection_background_color,
-            rendered_text,
-            window,
-        );
-    }
-
-    fn paint_search_highlights(
-        &self,
-        rendered_text: &RenderedText,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let markdown = self.markdown.read(cx);
-        let active_index = markdown.active_search_highlight;
-        let colors = cx.theme().colors();
-
-        let highlight_bounds = rendered_text.bounds_for_sorted_source_ranges(
-            markdown
-                .search_highlights
-                .iter()
-                .enumerate()
-                .map(|(ix, range)| (ix, range.clone())),
-        );
-        for (highlight_ix, bounds) in highlight_bounds {
-            let color = if Some(highlight_ix) == active_index {
-                colors.search_active_match_background
-            } else {
-                colors.search_match_background
-            };
-            window.paint_quad(quad(
-                bounds,
-                Pixels::ZERO,
-                color,
-                Edges::default(),
-                Hsla::transparent_black(),
-                BorderStyle::default(),
-            ));
-        }
-    }
-
     fn paint_mouse_listeners(
         &mut self,
         hitbox: &Hitbox,
@@ -2543,11 +2480,30 @@ impl MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> RenderedMarkdown {
+        let highlights = {
+            let markdown = self.markdown.read(cx);
+            let colors = cx.theme().colors();
+            let selection = &markdown.selection;
+            MarkdownHighlights {
+                search_highlights: markdown.search_highlights.clone(),
+                active_search_highlight: markdown.active_search_highlight,
+                search_match_color: colors.search_match_background,
+                active_search_match_color: colors.search_active_match_background,
+                selection: (selection.start < selection.end).then(|| {
+                    (
+                        selection.start..selection.end,
+                        self.style.selection_background_color,
+                    )
+                }),
+                next_search_highlight_ix: 0,
+            }
+        };
         let mut owned_builder = MarkdownElementBuilder::new(
             &self.style.container_style,
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
             parsed_markdown.code_block_highlights.clone(),
+            highlights,
         );
         let builder = &mut owned_builder;
         let mut current_img_block_range: Option<Range<usize>> = None;
@@ -3504,8 +3460,6 @@ impl Element for MarkdownElement {
                 self.register_copy_actions(&rendered.text, window);
                 self.paint_mouse_listeners(hitbox, &rendered.text, window, cx);
                 rendered.element.paint(window, cx);
-                self.paint_search_highlights(&rendered.text, window, cx);
-                self.paint_selection(&rendered.text, window, cx);
             }
             MarkdownPrepaintState::Virtualized(prepaint) => {
                 self.register_copy_actions(&prepaint.text, window);
@@ -3513,8 +3467,6 @@ impl Element for MarkdownElement {
                 for block in &mut prepaint.blocks {
                     block.paint(window, cx);
                 }
-                self.paint_search_highlights(&prepaint.text, window, cx);
-                self.paint_selection(&prepaint.text, window, cx);
             }
         }
     }
@@ -3897,7 +3849,7 @@ struct MetadataCellStyle {
 
 struct MarkdownElementBuilder {
     div_stack: Vec<DivStackEntry>,
-    rendered_lines: Vec<RenderedLine>,
+    rendered_lines: Vec<Rc<RenderedLine>>,
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
     rendered_footnote_refs: Vec<RenderedFootnoteRef>,
@@ -3912,6 +3864,58 @@ struct MarkdownElementBuilder {
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+    highlights: MarkdownHighlights,
+}
+
+struct MarkdownHighlights {
+    search_highlights: Rc<[Range<usize>]>,
+    active_search_highlight: Option<usize>,
+    search_match_color: Hsla,
+    active_search_match_color: Hsla,
+    selection: Option<(Range<usize>, Hsla)>,
+    next_search_highlight_ix: usize,
+}
+
+impl MarkdownHighlights {
+    fn highlights_for_line(
+        &mut self,
+        source_range: Range<usize>,
+    ) -> SmallVec<[(Range<usize>, Hsla); 1]> {
+        self.next_search_highlight_ix += self.search_highlights[self.next_search_highlight_ix..]
+            .iter()
+            .take_while(|range| range.end <= source_range.start)
+            .count();
+
+        let mut highlights = SmallVec::new();
+        for (index, range) in self
+            .search_highlights
+            .iter()
+            .enumerate()
+            .skip(self.next_search_highlight_ix)
+        {
+            if range.start >= source_range.end {
+                break;
+            }
+            let clamped = range.start.max(source_range.start)..range.end.min(source_range.end);
+            if clamped.start < clamped.end {
+                highlights.push((
+                    clamped,
+                    if Some(index) == self.active_search_highlight {
+                        self.active_search_match_color
+                    } else {
+                        self.search_match_color
+                    },
+                ));
+            }
+        }
+        if let Some((range, color)) = &self.selection {
+            let clamped = range.start.max(source_range.start)..range.end.min(source_range.end);
+            if clamped.start < clamped.end {
+                highlights.push((clamped, *color));
+            }
+        }
+        highlights
+    }
 }
 
 struct DivStackEntry {
@@ -3951,6 +3955,7 @@ impl MarkdownElementBuilder {
         base_text_style: TextStyle,
         syntax_theme: Arc<SyntaxTheme>,
         code_block_highlights: Arc<CodeBlockHighlights>,
+        highlights: MarkdownHighlights,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -3973,6 +3978,7 @@ impl MarkdownElementBuilder {
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
+            highlights,
         }
     }
 
@@ -4284,7 +4290,7 @@ impl MarkdownElementBuilder {
         text_style.color = Hsla::transparent_black();
         let text = "\u{200B}";
         let styled_text = StyledText::new(text).with_runs(vec![text_style.to_run(text.len())]);
-        self.rendered_lines.push(RenderedLine {
+        self.rendered_lines.push(Rc::new(RenderedLine {
             layout: styled_text.layout().clone(),
             source_mappings: vec![SourceMapping {
                 rendered_index: 0,
@@ -4293,7 +4299,8 @@ impl MarkdownElementBuilder {
             source_end: source_range.end,
             language: None,
             text_align: TextAlign::Left,
-        });
+            highlights: SmallVec::new(),
+        }));
         div()
             .absolute()
             .top_0()
@@ -4310,8 +4317,16 @@ impl MarkdownElementBuilder {
             return;
         }
 
+        let highlights = line
+            .source_mappings
+            .first()
+            .map(|mapping| {
+                self.highlights
+                    .highlights_for_line(mapping.source_index..self.current_source_index)
+            })
+            .unwrap_or_default();
         let text = StyledText::new(line.text).with_runs(line.runs);
-        self.rendered_lines.push(RenderedLine {
+        let rendered_line = Rc::new(RenderedLine {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
@@ -4321,8 +4336,21 @@ impl MarkdownElementBuilder {
                 .and_then(|entry| entry.as_ref())
                 .map(|(language, _)| language.clone()),
             text_align,
+            highlights,
         });
-        self.append_child(text.into_any());
+        if rendered_line.highlights.is_empty() {
+            self.rendered_lines.push(rendered_line);
+            self.append_child(text.into_any());
+        } else {
+            self.rendered_lines.push(rendered_line.clone());
+            self.append_child(
+                HighlightedLine {
+                    text: text.into_any(),
+                    line: rendered_line,
+                }
+                .into_any_element(),
+            );
+        }
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -4343,6 +4371,68 @@ impl MarkdownElementBuilder {
     }
 }
 
+struct HighlightedLine {
+    text: AnyElement,
+    line: Rc<RenderedLine>,
+}
+
+impl Element for HighlightedLine {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        (self.text.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.text.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.text.paint(window, cx);
+        self.line.paint_highlights(window);
+    }
+}
+
+impl IntoElement for HighlightedLine {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 #[derive(Clone)]
 struct RenderedLine {
     layout: TextLayout,
@@ -4350,9 +4440,119 @@ struct RenderedLine {
     source_end: usize,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
+    highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
 }
 
 impl RenderedLine {
+    fn paint_highlights(&self, window: &mut Window) {
+        if self.highlights.is_empty() {
+            return;
+        }
+        let wrapped_line_segments = self.wrapped_line_segments();
+        for (source_range, color) in &self.highlights {
+            self.for_each_bounds_in_source_range(
+                &wrapped_line_segments,
+                source_range.clone(),
+                |bounds| {
+                    window.paint_quad(quad(
+                        bounds,
+                        Pixels::ZERO,
+                        *color,
+                        Edges::default(),
+                        Hsla::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                },
+            );
+        }
+    }
+
+    fn wrapped_line_segments(&self) -> SmallVec<[WrappedLineSegment; 1]> {
+        let layout = &self.layout;
+        let line_height = layout.line_height();
+        let mut row_top = layout.bounds().top();
+        let mut wrapped_line_start = 0;
+        let mut segments = SmallVec::with_capacity(layout.line_layouts().len());
+
+        for wrapped_line in layout.line_layouts() {
+            let wrapped_line_end = wrapped_line_start + wrapped_line.len();
+            let wrapped_line_height = wrapped_line.size(line_height).height;
+            segments.push(WrappedLineSegment {
+                start: wrapped_line_start,
+                end: wrapped_line_end,
+                row_top,
+                layout: wrapped_line,
+            });
+            row_top += wrapped_line_height;
+            wrapped_line_start = wrapped_line_end + 1;
+        }
+        segments
+    }
+
+    fn for_each_bounds_in_source_range(
+        &self,
+        wrapped_line_segments: &[WrappedLineSegment],
+        range: Range<usize>,
+        mut callback: impl FnMut(Bounds<Pixels>),
+    ) {
+        if range.start >= range.end {
+            return;
+        }
+
+        let line_bounds = self.layout.bounds();
+        let line_height = self.layout.line_height();
+        let rendered_start = self.rendered_index_for_source_index(range.start);
+        let rendered_end = self.rendered_index_for_source_index(range.end);
+
+        for segment in wrapped_line_segments {
+            if segment.start >= rendered_end {
+                break;
+            }
+            if segment.end <= rendered_start {
+                continue;
+            }
+
+            let unwrapped_layout = &segment.layout.unwrapped_layout;
+            let mut row_top = segment.row_top;
+            let row_ends = segment
+                .layout
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| {
+                    let glyph = &unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    (segment.start + glyph.index, glyph.position.x)
+                })
+                .chain([(segment.end, unwrapped_layout.width)]);
+            let mut row_start = segment.start;
+            let mut row_start_x = Pixels::ZERO;
+
+            for (row_end, row_end_x) in row_ends {
+                let selection_start = rendered_start.max(row_start);
+                let selection_end = rendered_end.min(row_end);
+                if selection_start < selection_end {
+                    let alignment_offset = self.alignment_offset_for_segment(
+                        line_bounds.size.width,
+                        row_start_x,
+                        row_end_x,
+                    );
+                    let x_for_index = |index| {
+                        line_bounds.left()
+                            + alignment_offset
+                            + unwrapped_layout.x_for_index(index - segment.start)
+                            - row_start_x
+                    };
+                    callback(Bounds::from_corners(
+                        point(x_for_index(selection_start), row_top),
+                        point(x_for_index(selection_end), row_top + line_height),
+                    ));
+                }
+                row_start = row_end;
+                row_start_x = row_end_x;
+                row_top += line_height;
+            }
+        }
+    }
+
     fn rendered_index_for_source_index(&self, source_index: usize) -> usize {
         if source_index >= self.source_end {
             return self.layout.len();
@@ -4535,7 +4735,7 @@ pub struct RenderedMarkdown {
 
 #[derive(Clone)]
 struct RenderedText {
-    lines: Rc<[RenderedLine]>,
+    lines: Rc<[Rc<RenderedLine>]>,
     links: Rc<[RenderedLink]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
     /// Full-document source + events, so copy/search can recover the text of
@@ -4564,6 +4764,7 @@ struct RenderedFootnoteRef {
 }
 
 impl RenderedText {
+    #[cfg(test)]
     fn bounds_for_source_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.bounds_for_sorted_source_ranges([(0, range)])
             .into_iter()
@@ -4571,6 +4772,7 @@ impl RenderedText {
             .collect()
     }
 
+    #[cfg(test)]
     fn bounds_for_sorted_source_ranges(
         &self,
         ranges: impl IntoIterator<Item = (usize, Range<usize>)>,
@@ -4619,6 +4821,7 @@ impl RenderedText {
         all_bounds
     }
 
+    #[cfg(test)]
     fn wrapped_line_segments(line: &RenderedLine) -> SmallVec<[WrappedLineSegment; 1]> {
         let layout = &line.layout;
         let line_height = layout.line_height();
@@ -4642,6 +4845,7 @@ impl RenderedText {
         segments
     }
 
+    #[cfg(test)]
     fn push_bounds_for_line_source_range(
         all_bounds: &mut Vec<(usize, Bounds<Pixels>)>,
         highlight_ix: usize,

@@ -1024,6 +1024,53 @@ impl Dock {
         }
     }
 
+    /// Resizes the active panel and, when this dock is included in
+    /// `resize_all_panels_in_dock`, all panels using the same sizing mode.
+    pub fn resize_panel_sizes(
+        &mut self,
+        size: Option<Pixels>,
+        flex: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.should_resize_all_panels(cx) {
+            self.resize_all_panels(size, flex, window, cx);
+        } else {
+            self.resize_active_panel(size, flex, window, cx);
+        }
+    }
+
+    /// Resets the active panel and, when this dock is included in
+    /// `resize_all_panels_in_dock`, all panels using the same sizing mode.
+    pub fn reset_panel_sizes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_resize_all_panels(cx) {
+            self.reset_all_panel_sizes(window, cx);
+        } else {
+            self.reset_active_panel_size(window, cx);
+        }
+    }
+
+    fn reset_active_panel_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = PanelSizeState::default();
+        self.resize_active_panel(state.size, state.flex, window, cx);
+    }
+
+    fn reset_all_panel_sizes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_entry) = self.active_panel_entry() else {
+            return;
+        };
+        let size =
+            (!panel_uses_flexible_width(self.position, active_entry.panel.as_ref(), window, cx))
+                .then(|| active_entry.panel.default_size(window, cx));
+        self.resize_all_panels(size, None, window, cx);
+    }
+
+    fn should_resize_all_panels(&self, cx: &App) -> bool {
+        WorkspaceSettings::get_global(cx)
+            .resize_all_panels_in_dock
+            .contains(&self.position)
+    }
+
     pub fn resize_all_panels(
         &mut self,
         size: Option<Pixels>,

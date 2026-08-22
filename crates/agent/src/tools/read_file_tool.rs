@@ -1051,10 +1051,9 @@ mod test {
             use settings::SettingsStore;
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.project.worktree.file_scan_exclusions = Some(vec![
-                        "**/.secretdir".to_string(),
-                        "**/.mymetadata".to_string(),
-                    ]);
+                    settings.project.worktree.file_scan_exclusions = Some(
+                        vec!["**/.secretdir".to_string(), "**/.mymetadata".to_string()].into(),
+                    );
                     settings.project.worktree.private_files = Some(
                         vec![
                             "**/.mysecrets".to_string(),
@@ -1358,7 +1357,7 @@ mod test {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.project.worktree.file_scan_exclusions =
-                        Some(vec!["**/.git".to_string(), "**/node_modules".to_string()]);
+                        Some(vec!["**/.git".to_string(), "**/node_modules".to_string()].into());
                     settings.project.worktree.private_files =
                         Some(vec!["**/.env".to_string()].into());
                 });

@@ -3990,7 +3990,7 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |project_settings| {
                     project_settings.project.worktree.file_scan_exclusions =
-                        Some(vec!["excluded_dir".to_string(), "**/.git".to_string()]);
+                        Some(vec!["excluded_dir".to_string(), "**/.git".to_string()].into());
                 });
             });
         });
@@ -5904,7 +5904,7 @@ mod tests {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |worktree_settings| {
                 worktree_settings.project.worktree.file_scan_exclusions =
-                    Some(vec![".zed".to_string()]);
+                    Some(vec![".zed".to_string()].into());
             });
         });
 

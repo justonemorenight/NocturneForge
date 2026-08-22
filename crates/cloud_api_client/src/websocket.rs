@@ -6,7 +6,7 @@ use cloud_api_types::websocket_protocol::MessageToClient;
 use futures::channel::mpsc::unbounded;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{FutureExt as _, SinkExt as _, Stream, StreamExt as _, TryStreamExt as _, pin_mut};
-use gpui::{App, BackgroundExecutor, Task};
+use gpui::{App, AppContext, BackgroundExecutor, Task};
 use yawc::WebSocket;
 use yawc::frame::{FrameView, OpCode};
 
@@ -66,7 +66,8 @@ impl Connection {
             }
         };
 
-        let task = cx.spawn(async move |cx| handle_io(cx.background_executor().clone()).await);
+        let executor = cx.background_executor().clone();
+        let task = cx.background_spawn(async move { handle_io(executor).await });
 
         (message_rx.into_stream().boxed(), task)
     }

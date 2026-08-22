@@ -1761,7 +1761,7 @@ async fn test_following_into_excluded_file(
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.project.worktree.file_scan_exclusions =
-                        Some(vec!["**/.git".to_string()]);
+                        Some(vec!["**/.git".to_string()].into());
                 });
             });
         });

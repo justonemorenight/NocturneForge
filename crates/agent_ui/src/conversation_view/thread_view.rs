@@ -5083,6 +5083,14 @@ impl ThreadView {
         let max = crate::humanize_token_count(usage.max_tokens);
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
+        let prompt_cache_usage = self
+            .as_native_thread(cx)
+            .filter(|thread| {
+                thread.read(cx).model().is_some_and(|model| {
+                    model.provider_id() == LanguageModelProviderId::new("openai-subscribed")
+                })
+            })
+            .map(|_| PromptCacheUsageDisplay::new(usage));
 
         let progress_ratio = if usage.max_tokens > 0 {
             usage.used_tokens as f32 / usage.max_tokens as f32
@@ -5139,6 +5147,7 @@ impl ThreadView {
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
                 let cost_label = cost_label.clone();
+                let prompt_cache_usage = prompt_cache_usage.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -5149,6 +5158,7 @@ impl ThreadView {
                     output_max: output_max_label,
                     show_split,
                     cost_label,
+                    prompt_cache_usage,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
                     project_rules_count,
@@ -6182,6 +6192,94 @@ impl ThreadView {
     }
 }
 
+#[derive(Clone)]
+struct PromptCacheUsageDisplay {
+    latest_hit_rate: String,
+    latest_breakdown: String,
+    cumulative_hit_rate: String,
+    cumulative_breakdown: String,
+}
+
+impl PromptCacheUsageDisplay {
+    fn new(usage: &acp_thread::TokenUsage) -> Self {
+        Self {
+            latest_hit_rate: format_cache_hit_rate(usage.cache_hit_ratio()),
+            latest_breakdown: format_cache_token_breakdown(
+                usage.input_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            ),
+            cumulative_hit_rate: format_cache_hit_rate(usage.cumulative_cache_hit_ratio()),
+            cumulative_breakdown: format_cache_token_breakdown(
+                usage.cumulative_input_tokens,
+                usage.cumulative_cache_read_input_tokens,
+                usage.cumulative_cache_creation_input_tokens,
+            ),
+        }
+    }
+}
+
+fn format_cache_hit_rate(ratio: Option<f64>) -> String {
+    ratio.map_or_else(
+        || "Unavailable".into(),
+        |ratio| format!("{:.1}% hit", ratio * 100.0),
+    )
+}
+
+fn format_cache_token_breakdown(total: u64, cached: u64, created: u64) -> String {
+    let cached = cached.min(total);
+    let created = created.min(total.saturating_sub(cached));
+    let uncached = total.saturating_sub(cached).saturating_sub(created);
+    let cached = crate::humanize_token_count(cached);
+    let uncached = crate::humanize_token_count(uncached);
+
+    if created > 0 {
+        format!(
+            "{cached} cached · {} written · {uncached} uncached",
+            crate::humanize_token_count(created)
+        )
+    } else {
+        format!("{cached} cached · {uncached} uncached")
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_usage_tests {
+    use super::*;
+
+    #[test]
+    fn formats_weighted_prompt_cache_usage() {
+        let display = PromptCacheUsageDisplay::new(&acp_thread::TokenUsage {
+            input_tokens: 100,
+            cache_read_input_tokens: 75,
+            cache_creation_input_tokens: 10,
+            cumulative_input_tokens: 400,
+            cumulative_cache_read_input_tokens: 300,
+            cumulative_cache_creation_input_tokens: 25,
+            ..Default::default()
+        });
+
+        assert_eq!(display.latest_hit_rate, "75.0% hit");
+        assert_eq!(
+            display.latest_breakdown,
+            "75 cached · 10 written · 15 uncached"
+        );
+        assert_eq!(display.cumulative_hit_rate, "75.0% hit");
+        assert_eq!(
+            display.cumulative_breakdown,
+            "300 cached · 25 written · 75 uncached"
+        );
+    }
+
+    #[test]
+    fn formats_missing_prompt_cache_usage() {
+        let display = PromptCacheUsageDisplay::new(&acp_thread::TokenUsage::default());
+
+        assert_eq!(display.latest_hit_rate, "Unavailable");
+        assert_eq!(display.cumulative_hit_rate, "Unavailable");
+    }
+}
+
 struct TokenUsageTooltip {
     percentage: String,
     used: String,
@@ -6192,6 +6290,7 @@ struct TokenUsageTooltip {
     output_max: String,
     show_split: bool,
     cost_label: Option<String>,
+    prompt_cache_usage: Option<PromptCacheUsageDisplay>,
     separator_color: Color,
     global_agents_md_loaded: bool,
     project_rules_count: usize,
@@ -6211,6 +6310,7 @@ impl Render for TokenUsageTooltip {
         let output_max = self.output_max.clone();
         let show_split = self.show_split;
         let cost_label = self.cost_label.clone();
+        let prompt_cache_usage = self.prompt_cache_usage.clone();
         let global_agents_md_loaded = self.global_agents_md_loaded;
         let project_rules_count = self.project_rules_count;
         let project_entry_ids = self.project_entry_ids.clone();
@@ -6254,6 +6354,44 @@ impl Render for TokenUsageTooltip {
                                     .child(Label::new(output_tokens))
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(output_max).color(Color::Muted)),
+                            ),
+                    )
+                })
+                .when_some(prompt_cache_usage, |this, usage| {
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Prompt cache")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(Label::new("Last request:").color(Color::Muted))
+                                    .child(Label::new(usage.latest_hit_rate)),
+                            )
+                            .child(
+                                Label::new(usage.latest_breakdown)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .mt_0p5()
+                                    .child(Label::new("Session:").color(Color::Muted))
+                                    .child(Label::new(usage.cumulative_hit_rate)),
+                            )
+                            .child(
+                                Label::new(usage.cumulative_breakdown)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
                             ),
                     )
                 })

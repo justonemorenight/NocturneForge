@@ -2102,6 +2102,8 @@ The result is still `)))` and not `))))))`, which is what it would be by default
     "**/.svn",
     "**/.hg",
     "**/.jj",
+    "**/.sl",
+    "**/.repo",
     "**/CVS",
     "**/.DS_Store",
     "**/Thumbs.db",
@@ -2111,7 +2113,17 @@ The result is still `)))` and not `))))))`, which is what it would be by default
 }
 ```
 
-Note, specifying `file_scan_exclusions` in settings.json will override the defaults (shown above). If you are looking to exclude additional items you will need to include all the default values in your settings.
+Specifying `file_scan_exclusions` replaces inherited values unless the list contains `"..."`.
+The `"..."` entry expands to the list from the previous settings layer, so this keeps all
+defaults while adding `node_modules`:
+
+```json [settings]
+{
+  "file_scan_exclusions": ["**/node_modules", "..."]
+}
+```
+
+Omit `"..."` when you intentionally want to replace the inherited list completely.
 
 ## File Scan Inclusions
 

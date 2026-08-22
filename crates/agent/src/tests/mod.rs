@@ -722,7 +722,7 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
         tool_name: EchoTool::NAME.into(),
         is_error: false,
         content: vec!["test".into()],
-        output: Some("test".into()),
+        output: None,
     };
     assert_eq!(
         completion.messages[1..],
@@ -977,21 +977,21 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: false,
                 content: vec!["Allowed".into()],
-                output: Some("Allowed".into())
+                output: None
             }),
             language_model::MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: tool_call_auth_2.tool_call.tool_call_id.0.to_string().into(),
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: true,
                 content: vec!["Permission to run tool denied by user".into()],
-                output: Some("Permission to run tool denied by user".into())
+                output: None
             }),
             language_model::MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tool_id_interrupted".into(),
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: true,
                 content: vec!["Permission denied: user sent a follow-up message instead of approving the tool call.".into()],
-                output: Some("Permission denied: user sent a follow-up message instead of approving the tool call.".into())
+                output: None
             })
         ]
     );
@@ -1030,7 +1030,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: false,
                 content: vec!["Allowed".into()],
-                output: Some("Allowed".into())
+                output: None
             }
         )]
     );
@@ -1058,7 +1058,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: false,
                 content: vec!["Allowed".into()],
-                output: Some("Allowed".into())
+                output: None
             }
         )]
     );
@@ -1669,14 +1669,14 @@ async fn test_mcp_tools(cx: &mut TestAppContext) {
                 tool_name: "echo".into(),
                 is_error: false,
                 content: vec!["native".into()],
-                output: Some("native".into()),
+                output: None,
             },),
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tool_2".into(),
                 tool_name: "test_server_echo".into(),
                 is_error: false,
                 content: vec!["mcp".into()],
-                output: Some("mcp".into()),
+                output: None,
             },),
         ]
     );
@@ -3284,6 +3284,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 32_000,
                 output_tokens: 16_000,
+                cumulative_input_tokens: 32_000,
+                ..Default::default()
             })
         );
     });
@@ -3346,6 +3348,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 40_000,
                 output_tokens: 20_000,
+                cumulative_input_tokens: 72_000,
+                ..Default::default()
             })
         );
     });
@@ -3385,6 +3389,11 @@ async fn test_latest_token_usage_counts_cached_input_tokens(cx: &mut TestAppCont
                 max_output_tokens: None,
                 input_tokens: 200,
                 output_tokens: 50,
+                cache_read_input_tokens: 75,
+                cache_creation_input_tokens: 25,
+                cumulative_input_tokens: 200,
+                cumulative_cache_read_input_tokens: 75,
+                cumulative_cache_creation_input_tokens: 25,
             })
         );
     });
@@ -3399,6 +3408,29 @@ async fn test_latest_token_usage_counts_cached_input_tokens(cx: &mut TestAppCont
 
     thread.read_with(cx, |thread, _| {
         assert_eq!(thread.tokens_before_message(&message_2_id), Some(200));
+    });
+
+    fake_model.send_last_completion_stream_text_chunk("Response 2");
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        language_model::TokenUsage {
+            input_tokens: 50,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 450,
+        },
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        let usage = thread.latest_token_usage().unwrap();
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.cache_read_input_tokens, 450);
+        assert_eq!(usage.cumulative_input_tokens, 700);
+        assert_eq!(usage.cumulative_cache_read_input_tokens, 525);
+        assert_eq!(usage.cumulative_cache_creation_input_tokens, 25);
+        assert!((usage.cache_hit_ratio().unwrap() - 0.9).abs() < f64::EPSILON);
+        assert!((usage.cumulative_cache_hit_ratio().unwrap() - 0.75).abs() < f64::EPSILON);
     });
 }
 
@@ -3643,7 +3675,7 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
-    let assert_first_message_state = |cx: &mut TestAppContext| {
+    let assert_first_message_state = |cx: &mut TestAppContext, cumulative_input_tokens| {
         thread.clone().read_with(cx, |thread, _| {
             assert_eq!(
                 thread.to_markdown(),
@@ -3666,12 +3698,14 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                     max_output_tokens: None,
                     input_tokens: 32_000,
                     output_tokens: 16_000,
+                    cumulative_input_tokens,
+                    ..Default::default()
                 })
             );
         });
     };
 
-    assert_first_message_state(cx);
+    assert_first_message_state(cx, 32_000);
 
     let second_message_id = ClientUserMessageId::new();
     thread
@@ -3723,6 +3757,8 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                 max_output_tokens: None,
                 input_tokens: 40_000,
                 output_tokens: 20_000,
+                cumulative_input_tokens: 72_000,
+                ..Default::default()
             })
         );
     });
@@ -3732,7 +3768,7 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    assert_first_message_state(cx);
+    assert_first_message_state(cx, 72_000);
 }
 
 #[gpui::test]
@@ -3989,7 +4025,7 @@ async fn test_building_request_with_pending_tools(cx: &mut TestAppContext) {
                     tool_name: echo_tool_use.name,
                     is_error: false,
                     content: vec!["test".into()],
-                    output: Some("test".into())
+                    output: None
                 })],
                 cache: false,
                 reasoning_details: None,
@@ -4363,7 +4399,7 @@ async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
                         tool_name: tool_use_1.name.clone(),
                         is_error: false,
                         content: vec!["test".into()],
-                        output: Some("test".into())
+                        output: None
                     }
                 )],
                 cache: true,
@@ -4527,7 +4563,7 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
                         tool_name: tool_use.name,
                         is_error: true,
                         content: vec!["tool input was not fully received".into(),],
-                        output: Some("tool input was not fully received".into()),
+                        output: None,
                     }
                 )],
                 cache: true,
@@ -8144,7 +8180,7 @@ async fn test_streaming_tool_error_breaks_stream_loop_immediately(cx: &mut TestA
                         tool_name: tool_use.name,
                         is_error: true,
                         content: vec!["failed".into()],
-                        output: Some("failed".into()),
+                        output: None,
                     }
                 )],
                 cache: true,
@@ -8255,14 +8291,14 @@ async fn test_streaming_tool_error_waits_for_prior_tools_to_complete(cx: &mut Te
                         tool_name: second_tool_use.name,
                         is_error: true,
                         content: vec!["failed".into()],
-                        output: Some("failed".into()),
+                        output: None,
                     }),
                     language_model::MessageContent::ToolResult(LanguageModelToolResult {
                         tool_use_id: first_tool_use.id.clone(),
                         tool_name: first_tool_use.name,
                         is_error: false,
                         content: vec!["hello world".into()],
-                        output: Some("hello world".into()),
+                        output: None,
                     }),
                 ],
                 cache: true,

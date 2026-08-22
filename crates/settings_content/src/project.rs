@@ -14,7 +14,7 @@ use util::serde::default_true;
 
 use crate::{
     AllLanguageSettingsContent, DelayMs, ExtendingVec, ParseStatus, ProjectTerminalSettingsContent,
-    RootUserSettings, SaturatingBool, fallible_options,
+    RootUserSettings, SaturatingBool, SplicingVec, fallible_options,
 };
 
 #[with_fallible_options]
@@ -123,6 +123,9 @@ pub struct WorktreeSettingsContent {
     /// Completely ignore files matching globs from `file_scan_exclusions`. Overrides
     /// `file_scan_inclusions`.
     ///
+    /// A `"..."` entry expands to the value being overridden, allowing custom
+    /// exclusions to extend inherited defaults instead of replacing them.
+    ///
     /// Default: [
     ///   "**/.git",
     ///   "**/.svn",
@@ -134,7 +137,7 @@ pub struct WorktreeSettingsContent {
     ///   "**/.classpath",
     ///   "**/.settings"
     /// ]
-    pub file_scan_exclusions: Option<Vec<String>>,
+    pub file_scan_exclusions: Option<SplicingVec>,
 
     /// Always include files that match these globs when scanning for files, even if they're
     /// ignored by git. This setting is overridden by `file_scan_exclusions`.
@@ -906,6 +909,62 @@ pub enum GitHostingProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{REST_OF_FILE_SCAN_EXCLUSIONS, merge_from::MergeFrom};
+
+    fn exclusions(globs: &[&str]) -> WorktreeSettingsContent {
+        WorktreeSettingsContent {
+            file_scan_exclusions: Some(
+                globs
+                    .iter()
+                    .map(|glob| glob.to_string())
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_file_scan_exclusions_splice_inherited_values() {
+        let mut settings = exclusions(&["**/.git", "**/.DS_Store"]);
+        settings.merge_from(&exclusions(&[
+            "**/node_modules",
+            REST_OF_FILE_SCAN_EXCLUSIONS,
+        ]));
+        assert_eq!(
+            settings.file_scan_exclusions.unwrap().0,
+            vec!["**/node_modules", "**/.git", "**/.DS_Store"]
+        );
+
+        let mut replaced = exclusions(&["**/.git"]);
+        replaced.merge_from(&exclusions(&["**/target"]));
+        assert_eq!(replaced.file_scan_exclusions.unwrap().0, vec!["**/target"]);
+    }
+
+    #[test]
+    fn test_file_scan_exclusions_splice_each_layer() {
+        let mut settings = exclusions(&["**/.git"]);
+        settings.merge_from(&exclusions(&[REST_OF_FILE_SCAN_EXCLUSIONS, "**/target"]));
+        settings.merge_from(&exclusions(&[REST_OF_FILE_SCAN_EXCLUSIONS, "**/dist"]));
+        assert_eq!(
+            settings.file_scan_exclusions.unwrap().0,
+            vec!["**/.git", "**/target", "**/dist"]
+        );
+    }
+
+    #[test]
+    fn test_file_scan_exclusions_splice_deduplicates_entries() {
+        let mut settings = exclusions(&["**/.git", "**/.DS_Store"]);
+        settings.merge_from(&exclusions(&[
+            "**/.git",
+            REST_OF_FILE_SCAN_EXCLUSIONS,
+            REST_OF_FILE_SCAN_EXCLUSIONS,
+        ]));
+        assert_eq!(
+            settings.file_scan_exclusions.unwrap().0,
+            vec!["**/.git", "**/.DS_Store"]
+        );
+    }
 
     #[test]
     fn test_stdio_context_server_without_args() {

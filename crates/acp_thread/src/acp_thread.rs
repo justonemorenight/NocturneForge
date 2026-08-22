@@ -2009,6 +2009,16 @@ pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cumulative_cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2020,6 +2030,17 @@ pub struct SessionCost {
 pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
 
 impl TokenUsage {
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        cache_hit_ratio(self.cache_read_input_tokens, self.input_tokens)
+    }
+
+    pub fn cumulative_cache_hit_ratio(&self) -> Option<f64> {
+        cache_hit_ratio(
+            self.cumulative_cache_read_input_tokens,
+            self.cumulative_input_tokens,
+        )
+    }
+
     pub fn ratio(&self) -> TokenUsageRatio {
         #[cfg(debug_assertions)]
         let warning_threshold: f32 = std::env::var("ZED_THREAD_WARNING_THRESHOLD")
@@ -2041,6 +2062,14 @@ impl TokenUsage {
             TokenUsageRatio::Normal
         }
     }
+}
+
+fn cache_hit_ratio(cached_input_tokens: u64, total_input_tokens: u64) -> Option<f64> {
+    if total_input_tokens == 0 {
+        return None;
+    }
+
+    Some(cached_input_tokens.min(total_input_tokens) as f64 / total_input_tokens as f64)
 }
 
 fn acp_auto_compaction_threshold_reached(
@@ -5475,6 +5504,30 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    #[test]
+    fn prompt_cache_hit_ratios_are_weighted_and_bounded() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cache_read_input_tokens: 75,
+            cumulative_input_tokens: 400,
+            cumulative_cache_read_input_tokens: 300,
+            ..Default::default()
+        };
+
+        assert_eq!(usage.cache_hit_ratio(), Some(0.75));
+        assert_eq!(usage.cumulative_cache_hit_ratio(), Some(0.75));
+        assert_eq!(TokenUsage::default().cache_hit_ratio(), None);
+        assert_eq!(
+            TokenUsage {
+                input_tokens: 100,
+                cache_read_input_tokens: 200,
+                ..Default::default()
+            }
+            .cache_hit_ratio(),
+            Some(1.0)
+        );
     }
 
     #[test]

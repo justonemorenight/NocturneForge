@@ -30,6 +30,8 @@
 // ref: https://gist.github.com/ConradIrwin/f759e1fc29267143c4c7895aa495dca5?h=1
 // ref: https://unicode.org/Public/emoji/13.0/emoji-test.txt
 // https://github.com/bits/UTF-8-Unicode-Test-Documents/blob/master/UTF-8_sequence_separated/utf8_sequence_0-0x10ffff_assigned_including-unprintable-asis.txt
+use unicode_segmentation::GraphemeCursor;
+
 #[ztracing::instrument(skip_all)]
 pub fn is_invisible(c: char) -> bool {
     if c <= '\u{1f}' {
@@ -56,6 +58,15 @@ pub fn replacement(c: char) -> Option<&'static str> {
     } else {
         Some(FIXED_WIDTH_SPACE)
     }
+}
+
+pub fn is_standalone_grapheme(text: &str, start: usize, end: usize) -> bool {
+    let mut cursor = GraphemeCursor::new(start, text.len(), true);
+    if cursor.is_boundary(text, 0) != Ok(true) {
+        return false;
+    }
+    cursor.set_cursor(end);
+    cursor.is_boundary(text, 0) == Ok(true)
 }
 
 const FIXED_WIDTH_SPACE: &str = "\u{2007}";
@@ -130,4 +141,22 @@ fn contains(c: char, list: &[(char, char)]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_invisible_respects_grapheme_boundaries() {
+        assert!(is_standalone_grapheme("a\u{200b}b", 1, 4));
+
+        let joined = "🧑\u{200d}✈️";
+        let joiner_start = joined.find('\u{200d}').unwrap();
+        assert!(!is_standalone_grapheme(
+            joined,
+            joiner_start,
+            joiner_start + '\u{200d}'.len_utf8()
+        ));
+    }
 }

@@ -617,10 +617,13 @@ async fn excluded_create_is_not_recorded(cx: &mut gpui::TestAppContext) {
     cx.update_app(|cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project.worktree.file_scan_exclusions = Some(vec![
-                    "**/token.secret".to_string(),
-                    "**/banana.secret".to_string(),
-                ]);
+                settings.project.worktree.file_scan_exclusions = Some(
+                    vec![
+                        "**/token.secret".to_string(),
+                        "**/banana.secret".to_string(),
+                    ]
+                    .into(),
+                );
             });
         });
 

@@ -992,6 +992,7 @@ pub struct Window {
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
     display_id: Option<DisplayId>,
+    is_resizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
@@ -1021,6 +1022,7 @@ pub struct Window {
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
+    focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
@@ -1709,6 +1711,7 @@ impl Window {
             removed: false,
             platform_window,
             display_id,
+            is_resizable,
             sprite_atlas,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
@@ -1733,6 +1736,7 @@ impl Window {
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
+            focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
@@ -1906,6 +1910,17 @@ impl Window {
     pub fn focused(&self, cx: &App) -> Option<FocusHandle> {
         self.focus
             .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
+    }
+
+    /// While focus-lost listeners are being dispatched, returns the closest ancestor of the
+    /// previously focused element that can still receive focus, making it a suitable target
+    /// for focus restoration. Returns `None` at all other times, or when no such ancestor exists.
+    pub fn focus_lost_restore_target(&self, cx: &App) -> Option<FocusHandle> {
+        let (_leaf, ancestors) = self.focus_lost_path.split_last()?;
+        ancestors.iter().rev().find_map(|id| {
+            self.rendered_frame.dispatch_tree.focusable_node_id(*id)?;
+            FocusHandle::for_id(*id, &cx.focus_handles)
+        })
     }
 
     /// Move focus to the element associated with the given [`FocusHandle`].
@@ -2404,6 +2419,11 @@ impl Window {
         self.platform_window.window_decorations()
     }
 
+    /// Returns whether this window is resizable.
+    pub fn is_resizable(&self) -> bool {
+        self.is_resizable
+    }
+
     /// Returns which window controls are currently visible (Wayland)
     pub fn window_controls(&self) -> WindowControls {
         self.platform_window.window_controls()
@@ -2756,9 +2776,11 @@ impl Window {
             || previous_window_active != current_window_active
         {
             if !previous_focus_path.is_empty() && current_focus_path.is_empty() {
+                self.focus_lost_path = previous_focus_path.clone();
                 self.focus_lost_listeners
                     .clone()
                     .retain(&(), |listener| listener(self, cx));
+                self.focus_lost_path = SmallVec::new();
                 // The focus-lost fallback (e.g. a workspace refocusing itself) may target
                 // an element that isn't part of the element tree, in which case scheduling
                 // a redraw below would dispatch focus-lost again, looping forever. Only

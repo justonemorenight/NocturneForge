@@ -2277,13 +2277,11 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
     buffer.update(cx, |buffer, cx| {
         let snapshot = buffer.snapshot();
         let diagnostics = DiagnosticSet::new(
-            diagnostic_ranges
-                .iter()
-                .enumerate()
-                .map(|(index, range)| DiagnosticEntry {
-                    range: snapshot.offset_to_point_utf16(range.start)
+            diagnostic_ranges.iter().enumerate().map(|(index, range)| {
+                DiagnosticEntry::new(
+                    snapshot.offset_to_point_utf16(range.start)
                         ..snapshot.offset_to_point_utf16(range.end),
-                    diagnostic: Diagnostic {
+                    Diagnostic {
                         severity: match index {
                             0 => DiagnosticSeverity::WARNING,
                             1 => DiagnosticSeverity::ERROR,
@@ -2299,7 +2297,8 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
                         source_kind: language::DiagnosticSourceKind::Pushed,
                         ..Diagnostic::default()
                     },
-                }),
+                )
+            }),
             &snapshot,
         );
         buffer.update_diagnostics(LanguageServerId(0), diagnostics, cx);
@@ -2368,9 +2367,9 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
         let snapshot = buffer.snapshot();
         let diagnostics = DiagnosticSet::new(
             vec![
-                DiagnosticEntry {
-                    range: text::PointUtf16::new(0, 0)..text::PointUtf16::new(0, 3),
-                    diagnostic: Diagnostic {
+                DiagnosticEntry::new(
+                    text::PointUtf16::new(0, 0)..text::PointUtf16::new(0, 3),
+                    Diagnostic {
                         severity: DiagnosticSeverity::ERROR,
                         message: "row zero".to_string(),
                         group_id: 1,
@@ -2378,10 +2377,10 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
                         source_kind: language::DiagnosticSourceKind::Pushed,
                         ..Diagnostic::default()
                     },
-                },
-                DiagnosticEntry {
-                    range: text::PointUtf16::new(2, 0)..text::PointUtf16::new(2, 5),
-                    diagnostic: Diagnostic {
+                ),
+                DiagnosticEntry::new(
+                    text::PointUtf16::new(2, 0)..text::PointUtf16::new(2, 5),
+                    Diagnostic {
                         severity: DiagnosticSeverity::WARNING,
                         message: "row two".to_string(),
                         group_id: 2,
@@ -2389,10 +2388,10 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
                         source_kind: language::DiagnosticSourceKind::Pushed,
                         ..Diagnostic::default()
                     },
-                },
-                DiagnosticEntry {
-                    range: text::PointUtf16::new(4, 0)..text::PointUtf16::new(4, 4),
-                    diagnostic: Diagnostic {
+                ),
+                DiagnosticEntry::new(
+                    text::PointUtf16::new(4, 0)..text::PointUtf16::new(4, 4),
+                    Diagnostic {
                         severity: DiagnosticSeverity::INFORMATION,
                         message: "row four".to_string(),
                         group_id: 3,
@@ -2400,7 +2399,7 @@ fn test_active_buffer_diagnostics_fetching(cx: &mut TestAppContext) {
                         source_kind: language::DiagnosticSourceKind::Pushed,
                         ..Diagnostic::default()
                     },
-                },
+                ),
             ],
             &snapshot,
         );
@@ -2453,16 +2452,18 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
         let snapshot = buffer.snapshot();
         let diagnostics = DiagnosticSet::new(
             (0..25)
-                .map(|row| DiagnosticEntry {
-                    range: text::PointUtf16::new(row, 0)..text::PointUtf16::new(row, 4),
-                    diagnostic: Diagnostic {
-                        severity: DiagnosticSeverity::ERROR,
-                        message: format!("row {row}"),
-                        group_id: row as usize,
-                        is_primary: true,
-                        source_kind: language::DiagnosticSourceKind::Pushed,
-                        ..Diagnostic::default()
-                    },
+                .map(|row| {
+                    DiagnosticEntry::new(
+                        text::PointUtf16::new(row, 0)..text::PointUtf16::new(row, 4),
+                        Diagnostic {
+                            severity: DiagnosticSeverity::ERROR,
+                            message: format!("row {row}"),
+                            group_id: row as usize,
+                            is_primary: true,
+                            source_kind: language::DiagnosticSourceKind::Pushed,
+                            ..Diagnostic::default()
+                        },
+                    )
                 })
                 .collect::<Vec<_>>(),
             &snapshot,
@@ -2495,9 +2496,9 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
     buffer.update(cx, |buffer, cx| {
         let snapshot = buffer.snapshot();
         let diagnostics = DiagnosticSet::new(
-            vec![DiagnosticEntry {
-                range: text::PointUtf16::new(150, 0)..text::PointUtf16::new(150, 4),
-                diagnostic: Diagnostic {
+            vec![DiagnosticEntry::new(
+                text::PointUtf16::new(150, 0)..text::PointUtf16::new(150, 4),
+                Diagnostic {
                     severity: DiagnosticSeverity::ERROR,
                     message: long_message.clone(),
                     group_id: 1,
@@ -2505,7 +2506,7 @@ fn test_active_buffer_diagnostics_collection_limits(cx: &mut TestAppContext) {
                     source_kind: language::DiagnosticSourceKind::Pushed,
                     ..Diagnostic::default()
                 },
-            }],
+            )],
             &snapshot,
         );
         buffer.update_diagnostics(LanguageServerId(0), diagnostics, cx);

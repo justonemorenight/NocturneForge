@@ -3632,6 +3632,89 @@ async fn test_autoscroll_relative(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_autoscroll_horizontally_long_selection_tracks_cursor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(200.), px(300.)));
+
+    let long_line = "x".repeat(250);
+    cx.set_state(&format!("ˇ{long_line}"));
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 0)..Point::new(0, 250)]);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        let scroll_x = editor.snapshot(window, cx).scroll_position().x;
+        let right_edge = scroll_x + editor.visible_column_count().unwrap();
+        assert!(scroll_x <= 250.);
+        assert!(right_edge > 249.);
+    });
+}
+
+#[gpui::test]
+async fn test_autoscroll_horizontally_padded_span_boundary_still_scrolls(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(146.), px(300.)));
+
+    let line = "x".repeat(300);
+    cx.set_state(&format!("ˇ{line}"));
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 100)..Point::new(0, 105)]);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        let scroll_x = editor.snapshot(window, cx).scroll_position().x;
+        let right_edge = scroll_x + editor.visible_column_count().unwrap();
+        assert!(scroll_x <= 105.);
+        assert!(right_edge > 105.);
+    });
+}
+
+#[gpui::test]
+async fn test_autoscroll_horizontally_fitting_selection_reveals_full_span(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(200.), px(300.)));
+
+    let line = "x".repeat(300);
+    cx.set_state(&format!("ˇ{line}"));
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 300)..Point::new(0, 300)]);
+        });
+    });
+    cx.run_until_parked();
+    let scrolled_right_x =
+        cx.update_editor(|editor, window, cx| editor.snapshot(window, cx).scroll_position().x);
+    assert!(scrolled_right_x > 200.);
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 100)..Point::new(0, 105)]);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update_editor(|editor, window, cx| {
+        let scroll_x = editor.snapshot(window, cx).scroll_position().x;
+        let right_edge = scroll_x + editor.visible_column_count().unwrap();
+        assert!(scroll_x < scrolled_right_x);
+        assert!(scroll_x <= 100.5);
+        assert!(right_edge > 105.);
+    });
+}
+
+#[gpui::test]
 async fn test_exclude_overscroll_margin_clamps_scroll_position(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {

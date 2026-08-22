@@ -235,6 +235,9 @@ const COMPACTION_RETAINED_CONTEXT_DIVISOR: usize = 4;
 const COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT: usize = 64 * 1024;
 const NORMAL_TOOL_OUTPUT_BYTE_LIMIT: usize = COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT;
 const NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET: usize = 256 * 1024;
+const ACTIVE_TOOL_OUTPUT_TOTAL_BYTE_BUDGET: usize = 256 * 1024;
+const REQUEST_TOKEN_ESTIMATE_SAFETY_PERCENT: u64 = 95;
+const TOOL_OUTPUT_FIT_SAFETY_BYTES: usize = 16 * 1024;
 const REQUEST_IMAGE_TOKEN_ESTIMATE: usize = 4_000;
 const COMPACTION_TARGET_THRESHOLD_PERCENT: u64 = 90;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
@@ -822,7 +825,15 @@ impl AgentMessage {
         };
 
         for tool_result in self.tool_results.values() {
-            let mut tool_result = tool_result.clone();
+            let mut tool_result = LanguageModelToolResult {
+                tool_use_id: tool_result.tool_use_id.clone(),
+                tool_name: tool_result.tool_name.clone(),
+                is_error: tool_result.is_error,
+                content: tool_result.content.clone(),
+                // Raw output is transcript/replay state and is not model-visible. Avoid
+                // deep-cloning an arbitrarily large JSON value for every request.
+                output: None,
+            };
             // Surprisingly, the API fails if we return an empty string here.
             // It thinks we are sending a tool use without a tool result.
             if tool_result.is_content_empty() {
@@ -2552,6 +2563,7 @@ impl Thread {
         let usage = self.latest_request_token_usage()?;
         let model = self.model()?;
         let input_tokens = total_input_tokens(usage);
+        let cumulative_usage = self.cumulative_token_usage;
 
         Some(acp_thread::TokenUsage {
             max_tokens: model.max_token_count(),
@@ -2559,6 +2571,11 @@ impl Thread {
             used_tokens: usage.total_tokens(),
             input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cumulative_input_tokens: total_input_tokens(cumulative_usage),
+            cumulative_cache_read_input_tokens: cumulative_usage.cache_read_input_tokens,
+            cumulative_cache_creation_input_tokens: cumulative_usage.cache_creation_input_tokens,
         })
     }
 
@@ -3330,7 +3347,27 @@ impl Thread {
                 .model()
                 .cloned()
                 .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-            let request = this.build_completion_request(intent, cx)?;
+            let mut request = this.build_completion_request(intent, cx)?;
+            let max_input_tokens = model
+                .max_token_count()
+                .saturating_sub(model.max_output_tokens().unwrap_or_default());
+            let hard_request_target =
+                max_input_tokens.saturating_mul(REQUEST_TOKEN_ESTIMATE_SAFETY_PERCENT) / 100;
+            fit_latest_tool_outputs_to_token_budget(
+                &mut request,
+                model.as_ref(),
+                hard_request_target,
+            )?;
+            if completed_auto_compactions > 0 {
+                let auto_compact = AgentSettings::get_global(cx).auto_compact;
+                let post_compaction_target =
+                    compaction_target_token_count(auto_compact.threshold, max_input_tokens);
+                fit_latest_tool_outputs_to_token_budget(
+                    &mut request,
+                    model.as_ref(),
+                    post_compaction_target,
+                )?;
+            }
             let estimated_tokens = estimate_request_tokens(&request, model.as_ref())?;
             if skip_auto_compaction {
                 return anyhow::Ok(ControlFlow::Break((model, request)));
@@ -4574,7 +4611,7 @@ impl Thread {
                 .pending_message
                 .as_ref()
                 .is_some_and(|message| !message.tool_results.is_empty());
-        budget_historical_tool_outputs(&mut request, preserve_current_tool_group);
+        budget_tool_outputs(&mut request, preserve_current_tool_group);
 
         log::debug!("Completion request built successfully");
         Ok(request)
@@ -5048,8 +5085,18 @@ impl Thread {
                 return Ok(None);
             }
             if compaction_ix + 1 >= insertion_ix {
+                let safe_input_tokens =
+                    max_input_tokens.saturating_mul(REQUEST_TOKEN_ESTIMATE_SAFETY_PERCENT) / 100;
+                if estimated_tokens <= safe_input_tokens {
+                    log::info!(
+                        "auto-compaction reached the active tool boundary; continuing with bounded request estimated_tokens={} safe_input_tokens={}",
+                        estimated_tokens,
+                        safe_input_tokens
+                    );
+                    return Ok(None);
+                }
                 return Err(anyhow!(
-                    "Automatic compaction cannot create additional headroom without compacting the active tool-call result"
+                    "The active tool-call result exceeds the model context window even after truncation. Run the tool again with a narrower query or range."
                 ));
             }
         }
@@ -5216,7 +5263,7 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         });
-        budget_historical_tool_outputs(&mut request, false);
+        budget_tool_outputs(&mut request, false);
 
         request
     }
@@ -5834,13 +5881,8 @@ fn estimate_request_tokens(
 }
 
 fn tool_output_byte_len(tool_result: &LanguageModelToolResult) -> usize {
-    let content_bytes = tool_output_content_byte_len(tool_result);
-    let output_bytes = tool_result
-        .output
-        .as_ref()
-        .and_then(|output| serde_json::to_vec(output).ok())
-        .map_or(0, |output| output.len());
-    content_bytes.saturating_add(output_bytes)
+    // `output` is replay/debug metadata and never reaches the model.
+    tool_output_content_byte_len(tool_result)
 }
 
 fn tool_output_content_byte_len(tool_result: &LanguageModelToolResult) -> usize {
@@ -5854,30 +5896,133 @@ fn tool_output_content_byte_len(tool_result: &LanguageModelToolResult) -> usize 
         .sum()
 }
 
-fn tool_output_truncation_marker(byte_count: usize) -> LanguageModelToolResultContent {
+fn tool_output_truncation_marker_text(byte_count: usize) -> Arc<str> {
     format!(
-        "[Tool output truncated: {byte_count} bytes. The complete output remains in the thread transcript.]"
+        "[Tool output truncated from {byte_count} bytes. The complete output remains in the thread transcript; call the tool again with a narrower query or range to inspect more.]"
     )
     .into()
 }
 
-fn budget_historical_tool_outputs(
-    request: &mut LanguageModelRequest,
-    preserve_latest_tool_group: bool,
-) {
+fn tool_output_truncation_marker(byte_count: usize) -> LanguageModelToolResultContent {
+    LanguageModelToolResultContent::Text(tool_output_truncation_marker_text(byte_count))
+}
+
+fn truncate_tool_output_text(text: &Arc<str>, byte_budget: usize) -> Arc<str> {
+    if text.len() <= byte_budget {
+        return text.clone();
+    }
+
+    let marker = tool_output_truncation_marker_text(text.len());
+    let separator_bytes = 2;
+    let Some(visible_byte_budget) = byte_budget
+        .checked_sub(marker.len())
+        .and_then(|budget| budget.checked_sub(separator_bytes))
+    else {
+        return marker;
+    };
+
+    let head_byte_budget = visible_byte_budget.div_ceil(2);
+    let tail_byte_budget = visible_byte_budget / 2;
+    let head_end = text.floor_char_boundary(head_byte_budget.min(text.len()));
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail_byte_budget));
+    format!("{}\n{}\n{}", &text[..head_end], marker, &text[tail_start..]).into()
+}
+
+fn truncate_tool_result_content_to_budget(
+    tool_result: &mut LanguageModelToolResult,
+    byte_budget: usize,
+) -> bool {
+    tool_result.output = None;
+    if tool_output_content_byte_len(tool_result) <= byte_budget {
+        return false;
+    }
+
+    let image_bytes = tool_result
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            LanguageModelToolResultContent::Image(image) => Some(image.len()),
+            LanguageModelToolResultContent::Text(_) => None,
+        })
+        .sum::<usize>();
+    let mut remaining_text_budget = byte_budget.saturating_sub(image_bytes);
+    let mut remaining_text_parts = tool_result
+        .content
+        .iter()
+        .filter(|part| matches!(part, LanguageModelToolResultContent::Text(_)))
+        .count();
+    let mut truncated = false;
+
+    for part in &mut tool_result.content {
+        let LanguageModelToolResultContent::Text(text) = part else {
+            continue;
+        };
+        let part_budget = if remaining_text_parts == 0 {
+            0
+        } else {
+            remaining_text_budget / remaining_text_parts
+        };
+        let should_truncate = text.len() > part_budget;
+        let replacement = truncate_tool_output_text(text, part_budget);
+        truncated |= should_truncate;
+        remaining_text_budget = remaining_text_budget.saturating_sub(replacement.len());
+        remaining_text_parts = remaining_text_parts.saturating_sub(1);
+        *text = replacement;
+    }
+
+    truncated
+}
+
+fn budget_tool_result_message(
+    message: &mut LanguageModelRequestMessage,
+    total_byte_budget: usize,
+    per_result_byte_limit: usize,
+) -> bool {
+    let mut remaining_results = message
+        .content
+        .iter()
+        .filter(|content| matches!(content, MessageContent::ToolResult(_)))
+        .count();
+    let mut remaining_byte_budget = total_byte_budget;
+    let mut truncated = false;
+
+    for content in &mut message.content {
+        let MessageContent::ToolResult(tool_result) = content else {
+            continue;
+        };
+        let fair_share = if remaining_results == 0 {
+            0
+        } else {
+            remaining_byte_budget / remaining_results
+        };
+        let result_budget = fair_share.min(per_result_byte_limit);
+        truncated |= truncate_tool_result_content_to_budget(tool_result, result_budget);
+        remaining_byte_budget =
+            remaining_byte_budget.saturating_sub(tool_output_content_byte_len(tool_result));
+        remaining_results = remaining_results.saturating_sub(1);
+    }
+
+    truncated
+}
+
+fn latest_tool_result_message_ix(request: &LanguageModelRequest) -> Option<usize> {
+    request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(ix, message)| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, MessageContent::ToolResult(_)))
+                .then_some(ix)
+        })
+}
+
+fn budget_tool_outputs(request: &mut LanguageModelRequest, preserve_latest_tool_group: bool) {
     let protected_tool_result_message = if preserve_latest_tool_group {
-        request
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(ix, message)| {
-                message
-                    .content
-                    .iter()
-                    .any(|content| matches!(content, MessageContent::ToolResult(_)))
-                    .then_some(ix)
-            })
+        latest_tool_result_message_ix(request)
     } else {
         None
     };
@@ -5891,18 +6036,74 @@ fn budget_historical_tool_outputs(
             let MessageContent::ToolResult(tool_result) = content else {
                 continue;
             };
-            let byte_count = tool_output_byte_len(tool_result);
-            let model_visible_byte_count = tool_output_content_byte_len(tool_result);
             tool_result.output = None;
-            if model_visible_byte_count <= NORMAL_TOOL_OUTPUT_BYTE_LIMIT
-                && model_visible_byte_count <= remaining_byte_budget
-            {
-                remaining_byte_budget -= model_visible_byte_count;
-            } else {
-                tool_result.content = vec![tool_output_truncation_marker(byte_count)];
-            }
+            let result_budget = NORMAL_TOOL_OUTPUT_BYTE_LIMIT.min(remaining_byte_budget);
+            truncate_tool_result_content_to_budget(tool_result, result_budget);
+            remaining_byte_budget =
+                remaining_byte_budget.saturating_sub(tool_output_content_byte_len(tool_result));
         }
     }
+
+    if let Some(message_ix) = protected_tool_result_message {
+        budget_tool_result_message(
+            &mut request.messages[message_ix],
+            ACTIVE_TOOL_OUTPUT_TOTAL_BYTE_BUDGET,
+            NORMAL_TOOL_OUTPUT_BYTE_LIMIT,
+        );
+    }
+}
+
+fn fit_latest_tool_outputs_to_token_budget(
+    request: &mut LanguageModelRequest,
+    model: &dyn LanguageModel,
+    target_tokens: u64,
+) -> Result<bool> {
+    let Some(message_ix) = latest_tool_result_message_ix(request) else {
+        return Ok(false);
+    };
+    let estimated_tokens_before = estimate_request_tokens(request, model)?;
+    if estimated_tokens_before <= target_tokens {
+        return Ok(false);
+    }
+
+    let active_content_bytes = request.messages[message_ix]
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::ToolResult(tool_result) => {
+                Some(tool_output_content_byte_len(tool_result))
+            }
+            _ => None,
+        })
+        .sum::<usize>();
+    let overflow_tokens = estimated_tokens_before.saturating_sub(target_tokens);
+    let overflow_bytes =
+        usize::try_from(overflow_tokens.saturating_mul(COMPACTION_REQUEST_BYTES_PER_TOKEN))
+            .unwrap_or(usize::MAX)
+            .saturating_add(TOOL_OUTPUT_FIT_SAFETY_BYTES);
+    let target_content_bytes = active_content_bytes.saturating_sub(overflow_bytes);
+    let truncated = budget_tool_result_message(
+        &mut request.messages[message_ix],
+        target_content_bytes,
+        NORMAL_TOOL_OUTPUT_BYTE_LIMIT,
+    );
+    if !truncated {
+        return Ok(false);
+    }
+
+    let mut estimated_tokens_after = estimate_request_tokens(request, model)?;
+    if estimated_tokens_after > target_tokens {
+        budget_tool_result_message(&mut request.messages[message_ix], 0, 0);
+        estimated_tokens_after = estimate_request_tokens(request, model)?;
+    }
+    log::info!(
+        "bounded active tool output for request: estimated_tokens_before={} estimated_tokens_after={} target_tokens={} active_content_bytes={}",
+        estimated_tokens_before,
+        estimated_tokens_after,
+        target_tokens,
+        active_content_bytes
+    );
+    Ok(true)
 }
 
 struct RunningTurn {
@@ -8023,6 +8224,22 @@ mod tests {
         Arc::new(Message::Compaction(CompactionInfo::Summary(summary.into())))
     }
 
+    fn agent_tool_result_message(id: &str, content: &str) -> Arc<Message> {
+        let tool_use_id = LanguageModelToolUseId::from(id);
+        let mut message = AgentMessage::default();
+        message.tool_results.insert(
+            tool_use_id.clone(),
+            LanguageModelToolResult {
+                tool_use_id,
+                tool_name: "test_tool".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text(content.into())],
+                output: None,
+            },
+        );
+        Arc::new(Message::Agent(message))
+    }
+
     fn summary_request_text(summary: &str) -> String {
         format!(
             "The previous conversation was compacted. Use this summary as context:\n\n{summary}"
@@ -8062,7 +8279,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_request_budgets_historical_tool_outputs_newest_first() {
+    fn test_completion_request_budgets_historical_tool_outputs_newest_first() {
         let mut request = LanguageModelRequest {
             messages: (0..5)
                 .map(|ix| {
@@ -8075,7 +8292,7 @@ mod tests {
             ..Default::default()
         };
 
-        budget_historical_tool_outputs(&mut request, false);
+        budget_tool_outputs(&mut request, false);
 
         let retained = request
             .messages
@@ -8102,7 +8319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_request_preserves_current_tool_result_group() {
+    fn test_completion_request_bounds_current_tool_result_group() {
         let mut request = LanguageModelRequest {
             messages: vec![
                 tool_result_request_message("historical", NORMAL_TOOL_OUTPUT_BYTE_LIMIT + 1),
@@ -8111,13 +8328,69 @@ mod tests {
             ..Default::default()
         };
 
-        budget_historical_tool_outputs(&mut request, true);
+        budget_tool_outputs(&mut request, true);
 
         assert!(request.messages[0].string_contents().contains("truncated"));
-        assert_eq!(
-            request.messages[1].string_contents().len(),
-            NORMAL_TOOL_OUTPUT_TOTAL_BYTE_BUDGET + 1
+        assert!(request.messages[1].string_contents().contains("truncated"));
+        assert!(request.messages[1].string_contents().len() <= NORMAL_TOOL_OUTPUT_BYTE_LIMIT);
+        assert!(request.messages.iter().all(|message| {
+            matches!(
+                message.content.as_slice(),
+                [MessageContent::ToolResult(LanguageModelToolResult {
+                    output: None,
+                    ..
+                })]
+            )
+        }));
+    }
+
+    #[test]
+    fn test_agent_request_projection_does_not_clone_raw_tool_output() {
+        let tool_use_id = LanguageModelToolUseId::from("tool-call");
+        let raw_output = json!({ "large": "x".repeat(1024 * 1024) });
+        let mut message = AgentMessage::default();
+        message.tool_results.insert(
+            tool_use_id.clone(),
+            LanguageModelToolResult {
+                tool_use_id,
+                tool_name: "test_tool".into(),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text("visible".into())],
+                output: Some(raw_output.clone()),
+            },
         );
+
+        let request_messages = message.to_request();
+        let [MessageContent::ToolResult(projected)] = request_messages[0].content.as_slice() else {
+            panic!("expected a projected tool result");
+        };
+        assert_eq!(projected.output, None);
+        assert_eq!(projected.text_contents(), "visible");
+        assert_eq!(message.tool_results[0].output.as_ref(), Some(&raw_output));
+    }
+
+    #[test]
+    fn test_tool_output_truncation_keeps_utf8_head_and_tail() {
+        let text: Arc<str> = format!("START-{}-END", "ế".repeat(10_000)).into();
+        let truncated = truncate_tool_output_text(&text, 1024);
+
+        assert!(truncated.starts_with("START-"));
+        assert!(truncated.ends_with("-END"));
+        assert!(truncated.contains("Tool output truncated"));
+        assert!(truncated.len() <= 1024);
+    }
+
+    #[test]
+    fn test_active_tool_output_fits_request_token_budget() {
+        let model = FakeLanguageModel::default();
+        let mut request = LanguageModelRequest {
+            messages: vec![tool_result_request_message("current", 400_000)],
+            ..Default::default()
+        };
+
+        assert!(fit_latest_tool_outputs_to_token_budget(&mut request, &model, 10_000).unwrap());
+        assert!(estimate_request_tokens(&request, &model).unwrap() <= 10_000);
+        assert!(request.messages[0].string_contents().contains("truncated"));
     }
 
     #[test]
@@ -8217,6 +8490,56 @@ mod tests {
                         )
                         .unwrap(),
                     Some(2)
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_recompaction_continues_at_active_tool_boundary_when_request_fits(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_max_token_count(100_000);
+
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.75),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.messages.push(summary_compaction("bounded history"));
+                thread
+                    .messages
+                    .push(agent_tool_result_message("active", "bounded result"));
+
+                assert_eq!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::ToolResults,
+                            75_000,
+                            true,
+                            cx,
+                        )
+                        .unwrap(),
+                    None
+                );
+                assert!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::ToolResults,
+                            95_001,
+                            true,
+                            cx,
+                        )
+                        .unwrap_err()
+                        .to_string()
+                        .contains("exceeds the model context window")
                 );
             });
         });

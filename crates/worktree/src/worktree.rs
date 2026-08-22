@@ -58,6 +58,7 @@ use std::{
     ffi::OsStr,
     fmt,
     future::Future,
+    io::Read,
     mem::{self},
     ops::{Deref, DerefMut, Range},
     path::{Path, PathBuf},
@@ -109,7 +110,8 @@ pub enum CreatedEntry {
 #[derive(Debug)]
 pub struct LoadedFile {
     pub file: Arc<File>,
-    pub text: String,
+    pub text: Rope,
+    pub line_ending: LineEnding,
     pub encoding: &'static Encoding,
     pub has_bom: bool,
     pub is_writable: bool,
@@ -1684,7 +1686,8 @@ impl LocalWorktree {
             {
                 anyhow::bail!("File is too large to load");
             }
-            let (text, encoding, has_bom) = decode_file_text(fs.as_ref(), &abs_path).await?;
+            let (text, line_ending, encoding, has_bom) =
+                decode_file_text_to_rope(fs.as_ref(), &abs_path).await?;
             let is_writable = metadata.is_some_and(|metadata| metadata.is_writable);
 
             let worktree = this.upgrade().context("worktree was dropped")?;
@@ -1717,6 +1720,7 @@ impl LocalWorktree {
             Ok(LoadedFile {
                 file,
                 text,
+                line_ending,
                 encoding,
                 has_bom,
                 is_writable,
@@ -7090,24 +7094,11 @@ impl fs::Watcher for NullWatcher {
     }
 }
 
-pub async fn decode_file_text(
-    fs: &dyn Fs,
-    abs_path: &Path,
-) -> Result<(String, &'static Encoding, bool)> {
-    let mut file = fs
-        .open_sync(&abs_path)
-        .await
-        .with_context(|| format!("opening file {abs_path:?}"))?;
-
-    // First, read the beginning of the file to determine its kind and encoding.
-    // We do not want to load an entire large blob into memory only to discard it.
-    let mut file_first_bytes = Vec::with_capacity(FILE_ANALYSIS_BYTES);
+fn read_file_header(file: &mut dyn Read, abs_path: &Path) -> Result<(Vec<u8>, bool)> {
+    let mut header = Vec::with_capacity(FILE_ANALYSIS_BYTES);
     let mut buf = [0u8; FILE_ANALYSIS_BYTES];
     let mut reached_eof = false;
-    loop {
-        if file_first_bytes.len() >= FILE_ANALYSIS_BYTES {
-            break;
-        }
+    while header.len() < FILE_ANALYSIS_BYTES {
         let n = file
             .read(&mut buf)
             .with_context(|| format!("reading bytes of the file {abs_path:?}"))?;
@@ -7115,8 +7106,21 @@ pub async fn decode_file_text(
             reached_eof = true;
             break;
         }
-        file_first_bytes.extend_from_slice(&buf[..n]);
+        header.extend_from_slice(&buf[..n]);
     }
+    Ok((header, reached_eof))
+}
+
+pub async fn decode_file_text(
+    fs: &dyn Fs,
+    abs_path: &Path,
+) -> Result<(String, &'static Encoding, bool)> {
+    let mut file = fs
+        .open_sync(abs_path)
+        .await
+        .with_context(|| format!("opening file {abs_path:?}"))?;
+
+    let (file_first_bytes, reached_eof) = read_file_header(&mut *file, abs_path)?;
     let (bom_encoding, byte_content) = decode_byte_header(&file_first_bytes);
     anyhow::ensure!(
         byte_content != ByteContent::Binary,
@@ -7138,6 +7142,125 @@ pub async fn decode_file_text(
         }
     }
     decode_byte_full(content, bom_encoding, byte_content)
+}
+
+const STREAM_BLOCK_BYTES: usize = 1024 * 1024;
+
+pub async fn decode_file_text_to_rope(
+    fs: &dyn Fs,
+    abs_path: &Path,
+) -> Result<(Rope, LineEnding, &'static Encoding, bool)> {
+    let mut file = fs
+        .open_sync(abs_path)
+        .await
+        .with_context(|| format!("opening file {abs_path:?}"))?;
+
+    let (prefix, reached_eof) = read_file_header(&mut *file, abs_path)?;
+    let (bom_encoding, byte_content) = decode_byte_header(&prefix);
+    anyhow::ensure!(
+        byte_content != ByteContent::Binary,
+        "Binary files are not supported"
+    );
+
+    if bom_encoding.is_none()
+        && byte_content == ByteContent::Unknown
+        && let Some((rope, line_ending)) =
+            stream_utf8_into_rope(&mut *file, prefix, reached_eof, abs_path)?
+    {
+        return Ok((rope, line_ending, encoding_rs::UTF_8, false));
+    }
+
+    let (mut text, encoding, has_bom) = decode_file_text(fs, abs_path).await?;
+    let line_ending = LineEnding::detect(&text);
+    LineEnding::normalize(&mut text);
+    Ok((Rope::from(text), line_ending, encoding, has_bom))
+}
+
+fn stream_utf8_into_rope(
+    file: &mut dyn Read,
+    prefix: Vec<u8>,
+    reached_eof: bool,
+    abs_path: &Path,
+) -> Result<Option<(Rope, LineEnding)>> {
+    let mut rope = Rope::new();
+    let mut line_ending = None;
+    let mut scratch = String::new();
+    let mut pending = prefix;
+    let mut buffer = vec![0u8; STREAM_BLOCK_BYTES];
+    let mut reached_eof = reached_eof;
+
+    loop {
+        while !reached_eof && pending.len() < STREAM_BLOCK_BYTES {
+            let bytes_read = file
+                .read(&mut buffer)
+                .with_context(|| format!("reading bytes of the file {abs_path:?}"))?;
+            if bytes_read == 0 {
+                reached_eof = true;
+            } else {
+                pending.extend_from_slice(&buffer[..bytes_read]);
+            }
+        }
+
+        let valid_length = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(error) if error.error_len().is_none() && !reached_eof => error.valid_up_to(),
+            Err(_) => return Ok(None),
+        };
+        let emitted_length =
+            if !reached_eof && valid_length > 0 && pending[valid_length - 1] == b'\r' {
+                valid_length - 1
+            } else {
+                valid_length
+            };
+        let text = std::str::from_utf8(&pending[..emitted_length])
+            .expect("a prefix of validated UTF-8 is valid UTF-8");
+        if text.contains('\x1b') {
+            return Ok(None);
+        }
+        if line_ending.is_none() && !text.is_empty() {
+            line_ending = Some(LineEnding::detect(text));
+        }
+        push_normalized(&mut rope, text, &mut scratch);
+        pending.drain(..emitted_length);
+
+        if reached_eof {
+            break;
+        }
+    }
+
+    if !pending.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((rope, line_ending.unwrap_or_default())))
+}
+
+fn push_normalized(rope: &mut Rope, text: &str, scratch: &mut String) {
+    if !text.contains('\r') {
+        rope.push(text);
+        return;
+    }
+
+    scratch.clear();
+    scratch.reserve(text.len());
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' {
+            scratch.push_str(&text[start..index]);
+            scratch.push('\n');
+            index += if bytes.get(index + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+            start = index;
+        } else {
+            index += 1;
+        }
+    }
+    scratch.push_str(&text[start..]);
+    rope.push(scratch);
 }
 
 pub fn decode_byte_header(prefix: &[u8]) -> (Option<&'static Encoding>, ByteContent) {
@@ -7207,6 +7330,59 @@ fn decode_byte_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream(bytes: &[u8]) -> Option<(String, LineEnding)> {
+        let mut reader = std::io::Cursor::new(bytes.to_vec());
+        stream_utf8_into_rope(&mut reader, Vec::new(), false, Path::new("test"))
+            .expect("streaming UTF-8 test data")
+            .map(|(rope, line_ending)| (rope.to_string(), line_ending))
+    }
+
+    #[test]
+    fn test_stream_utf8_normalizes_line_endings() {
+        let windows = "one\r\ntwo\r\nthree\r\n".repeat(40);
+        let (text, line_ending) = stream(windows.as_bytes()).unwrap();
+        assert_eq!(text, windows.replace("\r\n", "\n"));
+        assert_eq!(line_ending, LineEnding::Windows);
+
+        let carriage_return = "one\rtwo\rthree\r".repeat(40);
+        assert_eq!(
+            stream(carriage_return.as_bytes()).unwrap().0,
+            carriage_return.replace('\r', "\n")
+        );
+    }
+
+    #[test]
+    fn test_stream_utf8_block_boundaries() {
+        for (suffix, expected) in [("\r\ntail\n", "\ntail\n"), ("\rtail", "\ntail")] {
+            let filler = "a".repeat(STREAM_BLOCK_BYTES - 1);
+            let source = format!("{filler}{suffix}");
+            assert_eq!(
+                stream(source.as_bytes()).unwrap().0,
+                format!("{filler}{expected}"),
+                "suffix = {suffix:?}"
+            );
+        }
+
+        for ch in ['\u{20ac}', '\u{1f600}'] {
+            for split in 1..=ch.len_utf8() {
+                let filler = "a".repeat(STREAM_BLOCK_BYTES - split);
+                let source = format!("{filler}{ch}tail");
+                assert_eq!(
+                    stream(source.as_bytes()).unwrap().0,
+                    source,
+                    "ch = {ch:?}, split = {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_utf8_falls_back_for_non_utf8() {
+        assert_eq!(stream(b"hello \xff\xfeA"), None);
+        assert_eq!(stream(b"hello \xe2\x82"), None);
+        assert_eq!(stream(b"plain \x1b$B text"), None);
+    }
 
     /// reproduction of issue #50785
     fn build_pcm16_wav_bytes() -> Vec<u8> {

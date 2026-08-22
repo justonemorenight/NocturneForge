@@ -12,7 +12,8 @@ use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
 
 use std::{
-    cell::RefCell, future::Future, ops::Deref, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+    cell::RefCell, ffi::OsString, future::Future, ops::Deref, path::PathBuf, rc::Rc, sync::Arc,
+    time::Duration,
 };
 
 /// A TestAppContext is provided to tests created with `#[gpui::test]`, it provides
@@ -404,7 +405,7 @@ impl TestAppContext {
     }
 
     /// Returns true if there's an alert dialog open.
-    pub fn expect_restart(&self) -> oneshot::Receiver<Option<PathBuf>> {
+    pub fn expect_restart(&self) -> oneshot::Receiver<(Option<PathBuf>, Vec<OsString>)> {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.test_platform.expect_restart.borrow_mut().replace(tx);
         rx

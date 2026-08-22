@@ -32,7 +32,7 @@ pub use theme::*;
 pub use title_bar::*;
 pub use workspace::*;
 
-use collections::{HashMap, IndexMap};
+use collections::{HashMap, IndexMap, IndexSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
@@ -1394,6 +1394,36 @@ impl<T> From<Vec<T>> for ExtendingVec<T> {
 impl<T: Clone> merge_from::MergeFrom for ExtendingVec<T> {
     fn merge_from(&mut self, other: &Self) {
         self.0.extend_from_slice(other.0.as_slice());
+    }
+}
+
+pub const REST_OF_FILE_SCAN_EXCLUSIONS: &str = "...";
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SplicingVec(pub Vec<String>);
+
+impl From<Vec<String>> for SplicingVec {
+    fn from(values: Vec<String>) -> Self {
+        Self(values)
+    }
+}
+
+impl merge_from::MergeFrom for SplicingVec {
+    fn merge_from(&mut self, other: &Self) {
+        let inherited = std::mem::take(&mut self.0);
+        self.0 = other
+            .0
+            .iter()
+            .flat_map(|entry| {
+                if entry == REST_OF_FILE_SCAN_EXCLUSIONS {
+                    inherited.clone()
+                } else {
+                    vec![entry.clone()]
+                }
+            })
+            .collect::<IndexSet<_>>()
+            .into_iter()
+            .collect();
     }
 }
 
