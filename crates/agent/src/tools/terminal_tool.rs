@@ -568,6 +568,27 @@ async fn run_terminal_tool(
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    let write_paths = write_paths
+        .into_iter()
+        .map(|requested| {
+            let resolved = sandbox::HostFilesystemLocation::new(&requested)
+                .and_then(|location| location.resolved_path())
+                .map_err(|error| {
+                    format!(
+                        "Cannot request sandbox write access to `{}`: {error}",
+                        requested.display()
+                    )
+                })?;
+            Ok(settings::GrantedWritePath::resolved(requested, resolved))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    #[cfg(target_os = "windows")]
+    let write_paths = write_paths
+        .into_iter()
+        .map(settings::GrantedWritePath::from_requested)
+        .collect();
+
     let request = crate::sandboxing::SandboxRequest {
         network,
         allow_fs_write_all: !want_unsandboxed && want_fs_write_all,

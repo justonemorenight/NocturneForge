@@ -255,6 +255,7 @@ async fn create_out_of_project_directory(
 
     let absolute = resolve_absolute_path(project, &input.path, cx)
         .ok_or_else(|| format!("Couldn't resolve `{}` to an absolute path.", input.path))?;
+    let requested = absolute.clone();
 
     let prepared = cx
         .background_spawn(async move { sandbox::GrantableWriteDir::prepare(&absolute) })
@@ -263,7 +264,10 @@ async fn create_out_of_project_directory(
 
     let canonical = prepared.canonical_path().to_path_buf();
     let request = crate::sandboxing::SandboxRequest {
-        write_paths: vec![canonical.clone()],
+        write_paths: vec![settings::GrantedWritePath::resolved(
+            requested,
+            canonical.clone(),
+        )],
         ..Default::default()
     };
 

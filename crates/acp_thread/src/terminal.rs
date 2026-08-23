@@ -43,7 +43,7 @@ pub struct SandboxWrap {
     /// to make the trust boundary explicit: these originate from
     /// model-requested paths that passed a user-approval prompt. They are
     /// merged with `writable_paths` when generating the sandbox policy.
-    pub extra_write_paths: Vec<PathBuf>,
+    pub extra_write_paths: Vec<settings::GrantedWritePath>,
     /// Outbound network access explicitly approved for this command.
     pub network: SandboxNetworkAccess,
     /// Additional paths that should remain readable but not writable, even when
@@ -167,15 +167,18 @@ impl SandboxWrap {
     /// Linux, so call it off the main thread. On platforms whose sandbox can't
     /// fail to set up this way it always returns `Ok`.
     pub fn can_create_sandbox(&self) -> Result<(), LinuxWslSandboxError> {
-        sandbox::Sandbox::can_create(&self.to_policy()).map_err(LinuxWslSandboxError::from)
+        let policy = self
+            .to_policy()
+            .map_err(|error| LinuxWslSandboxError::Other(error.to_string()))?;
+        sandbox::Sandbox::can_create(&policy).map_err(LinuxWslSandboxError::from)
     }
 
     /// Translate this request into the cross-platform [`sandbox::SandboxPolicy`].
     ///
     /// This is the enforcement-policy construction point, so it **captures** each
     /// grant as a [`sandbox::HostFilesystemLocation`] (pinning the inode / canonical
-    /// path) rather than passing a re-resolvable path. A location that can't be
-    /// captured (e.g. it doesn't exist) is dropped from the grant — fail-closed.
+    /// path) rather than passing a re-resolvable path. A previously resolved grant
+    /// that no longer points to the approved location aborts policy construction.
     ///
     /// This function has **no filesystem side effects**: it never creates paths.
     /// It is used both by the side-effect-free [`Self::can_create_sandbox`] probe
@@ -185,7 +188,7 @@ impl SandboxWrap {
     /// get a grant to a new directory is the `create_directory` tool, which
     /// creates it (pinning the inode) before the grant is recorded. On macOS a
     /// missing leaf still canonicalizes, so such grants are captured directly.
-    fn to_policy(&self) -> sandbox::SandboxPolicy {
+    fn to_policy(&self) -> std::io::Result<sandbox::SandboxPolicy> {
         let protected_paths = self
             .protected_paths
             .iter()
@@ -194,16 +197,17 @@ impl SandboxWrap {
         let fs = if self.allow_fs_write {
             sandbox::SandboxFsPolicy::Unrestricted { protected_paths }
         } else {
-            let writable_paths = self
+            let mut writable_paths = self
                 .writable_paths
                 .iter()
-                .chain(self.extra_write_paths.iter())
-                // Capture only — never create anything here (see the doc comment):
-                // materializing an approved-but-missing grant is deferred to
-                // `Sandbox::new` so it can never happen during the `can_create`
-                // probe, before the user has approved the grant.
                 .filter_map(|path| sandbox::HostFilesystemLocation::new(path).ok())
-                .collect();
+                .collect::<Vec<_>>();
+            writable_paths.extend(
+                self.extra_write_paths
+                    .iter()
+                    .map(granted_write_path_to_location)
+                    .collect::<std::io::Result<Vec<_>>>()?,
+            );
             sandbox::SandboxFsPolicy::Restricted {
                 writable_paths,
                 protected_paths,
@@ -220,8 +224,30 @@ impl SandboxWrap {
                     .collect(),
             },
         };
-        sandbox::SandboxPolicy { fs, network }
+        Ok(sandbox::SandboxPolicy { fs, network })
     }
+}
+
+pub fn granted_write_path_to_location(
+    granted: &settings::GrantedWritePath,
+) -> std::io::Result<sandbox::HostFilesystemLocation> {
+    match &granted.resolved {
+        Some(resolved) => sandbox::HostFilesystemLocation::reopen(&granted.requested, resolved),
+        None => sandbox::HostFilesystemLocation::new(&granted.requested),
+    }
+}
+
+pub fn granted_write_path_to_location_or_log(
+    granted: &settings::GrantedWritePath,
+) -> Option<sandbox::HostFilesystemLocation> {
+    granted_write_path_to_location(granted)
+        .inspect_err(|error| {
+            log::warn!(
+                "dropping sandbox write grant {}: {error}",
+                granted.requested.display()
+            );
+        })
+        .ok()
 }
 
 /// Why the OS sandbox was *not* applied to a terminal command, even though
@@ -282,7 +308,7 @@ pub(crate) async fn prepare_sandbox_wrap(
     };
 
     let mut sandbox =
-        sandbox::Sandbox::new(sandbox_wrap.to_policy()).map_err(anyhow::Error::new)?;
+        sandbox::Sandbox::new(sandbox_wrap.to_policy()?).map_err(anyhow::Error::new)?;
     // Windows/WSL only: tell the sandbox which Linux `zed` to provision inside
     // WSL as its `--wsl-sandbox-helper`. A no-op (and a no-op setter) elsewhere.
     #[cfg(target_os = "windows")]

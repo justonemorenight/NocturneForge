@@ -130,6 +130,47 @@ impl HostFilesystemLocation {
         }
     }
 
+    /// Returns the canonical path pinned by this captured location.
+    pub fn resolved_path(&self) -> std::io::Result<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(self.canonical_path.clone())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux_location_path(self).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "captured sandbox location no longer has a filesystem path",
+                )
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            std::fs::canonicalize(&self.untrusted_path_for_display)
+        }
+    }
+
+    /// Captures `requested` again and rejects it unless it still resolves to `resolved`.
+    pub fn reopen(
+        requested: impl AsRef<Path>,
+        resolved: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        let location = Self::new(requested)?;
+        let current = location.resolved_path()?;
+        if current != resolved.as_ref() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox write grant now resolves to {}, expected {}",
+                    current.display(),
+                    resolved.as_ref().display()
+                ),
+            ));
+        }
+        Ok(location)
+    }
+
     /// The requested path, for **display only** (e.g. the permission-request UI).
     ///
     /// This intentionally returns the untrusted, as-requested path — never the
@@ -1722,5 +1763,29 @@ mod macos_tests {
         // A path whose parent also doesn't exist is returned unchanged.
         let deeper = missing.join(".git");
         assert_eq!(canonicalize_allowing_missing_leaf(&deeper), deeper);
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod granted_write_path_tests {
+    use super::HostFilesystemLocation;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn reopening_location_rejects_redirected_symlink() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let link = directory.path().join("link");
+        std::fs::create_dir(&first).expect("create first target");
+        std::fs::create_dir(&second).expect("create second target");
+        symlink(&first, &link).expect("create symlink");
+
+        let captured = HostFilesystemLocation::new(&link).expect("capture first target");
+        let resolved = captured.resolved_path().expect("resolve captured target");
+        std::fs::remove_file(&link).expect("remove first symlink");
+        symlink(&second, &link).expect("redirect symlink");
+
+        assert!(HostFilesystemLocation::reopen(&link, &resolved).is_err());
     }
 }

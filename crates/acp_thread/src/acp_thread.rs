@@ -3652,10 +3652,8 @@ impl AcpThread {
                 let project = this.project.clone();
 
                 for location in resolved_locations.iter().flatten() {
-                    this.shared_buffers.insert(
-                        location.buffer.clone(),
-                        location.buffer.read(cx).snapshot(),
-                    );
+                    this.shared_buffers
+                        .insert(location.buffer.clone(), location.buffer.read(cx).snapshot());
                 }
                 let Some((ix, tool_call)) = this.tool_call_mut(&id) else {
                     return;
@@ -4890,11 +4888,9 @@ impl AcpThread {
             let buffer = load.await?;
 
             let snapshot = if reuse_shared_snapshot {
-                this.read_with(cx, |this, _| {
-                    this.shared_buffers.get(&buffer).cloned()
-                })
-                .log_err()
-                .flatten()
+                this.read_with(cx, |this, _| this.shared_buffers.get(&buffer).cloned())
+                    .log_err()
+                    .flatten()
             } else {
                 None
             };
@@ -4908,8 +4904,7 @@ impl AcpThread {
 
                 let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
                 this.update(cx, |this, _| {
-                    this.shared_buffers
-                        .insert(buffer.clone(), snapshot.clone());
+                    this.shared_buffers.insert(buffer.clone(), snapshot.clone());
                 })?;
                 snapshot
             };

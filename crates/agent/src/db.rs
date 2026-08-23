@@ -95,7 +95,7 @@ pub struct DbThread {
 pub struct DbSandboxGrants {
     /// Canonicalized paths granted write access; each covers its whole subtree.
     #[serde(default)]
-    pub write_paths: Vec<PathBuf>,
+    pub write_paths: Vec<settings::GrantedWritePath>,
     /// Host patterns granted network access, in canonical string form (e.g.
     /// `github.com`, `*.npmjs.org`). Parsed back into patterns on load.
     #[serde(default)]
@@ -978,7 +978,10 @@ mod tests {
             Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
         );
         let grants = DbSandboxGrants {
-            write_paths: vec![PathBuf::from("/tmp/build")],
+            write_paths: vec![settings::GrantedWritePath::resolved(
+                PathBuf::from("/tmp/link"),
+                PathBuf::from("/tmp/build"),
+            )],
             network_hosts: vec!["github.com".to_string(), "*.npmjs.org".to_string()],
             network_any_host: false,
             allow_fs_write_all: false,

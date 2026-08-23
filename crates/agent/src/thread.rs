@@ -5973,11 +5973,9 @@ fn truncate_tool_result_content_to_budget(
         let LanguageModelToolResultContent::Text(text) = part else {
             continue;
         };
-        let part_budget = if remaining_text_parts == 0 {
-            0
-        } else {
-            remaining_text_budget / remaining_text_parts
-        };
+        let part_budget = remaining_text_budget
+            .checked_div(remaining_text_parts)
+            .unwrap_or_default();
         let should_truncate = text.len() > part_budget;
         let replacement = truncate_tool_output_text(text, part_budget);
         truncated |= should_truncate;
@@ -6006,11 +6004,9 @@ fn budget_tool_result_message(
         let MessageContent::ToolResult(tool_result) = content else {
             continue;
         };
-        let fair_share = if remaining_results == 0 {
-            0
-        } else {
-            remaining_byte_budget / remaining_results
-        };
+        let fair_share = remaining_byte_budget
+            .checked_div(remaining_results)
+            .unwrap_or_default();
         let result_budget = fair_share.min(per_result_byte_limit);
         truncated |= truncate_tool_result_content_to_budget(tool_result, result_budget);
         remaining_byte_budget =
@@ -7158,7 +7154,11 @@ impl ToolCallEventStream {
             network_all_hosts,
             allow_fs_write_all: request.allow_fs_write_all,
             unsandboxed: request.unsandboxed,
-            write_paths: request.write_paths.clone(),
+            write_paths: request
+                .write_paths
+                .iter()
+                .map(|granted| granted.canonical_or_requested().to_path_buf())
+                .collect(),
             reason,
         };
         let allow_thread_label = if self.is_subagent(cx) {
@@ -7367,8 +7367,12 @@ impl ToolCallEventStream {
                 if request.unsandboxed {
                     agent.allow_sandbox_unsandboxed();
                 }
-                for path in request.write_paths {
-                    agent.add_sandbox_write_path(path);
+                for granted in request.write_paths {
+                    agent.add_sandbox_write_path(settings::GrantedWritePathContent {
+                        requested: granted.requested,
+                        resolved: granted.resolved,
+                        on_windows_fs: granted.on_windows_fs,
+                    });
                 }
             });
         });
@@ -9846,10 +9850,10 @@ mod tests {
             allow_fs_write_all: false,
             unsandboxed: false,
             write_paths: vec![
-                PathBuf::from("/tmp/build"),
-                PathBuf::from("/tmp/cache"),
-                PathBuf::from("/tmp/logs"),
-                PathBuf::from("/tmp/secret"),
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/build")),
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/cache")),
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/logs")),
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/secret")),
             ],
         };
 
@@ -9868,7 +9872,14 @@ mod tests {
         assert!(!details.network_all_hosts);
         assert_eq!(details.allow_fs_write_all, request.allow_fs_write_all);
         assert_eq!(details.unsandboxed, request.unsandboxed);
-        assert_eq!(details.write_paths, request.write_paths);
+        assert_eq!(
+            details.write_paths,
+            request
+                .write_paths
+                .iter()
+                .map(|granted| granted.canonical_or_requested().to_path_buf())
+                .collect::<Vec<_>>()
+        );
         assert!(authorization.tool_call.fields.content.is_none());
 
         let acp_thread::PermissionOptions::Flat(options) = &authorization.options else {

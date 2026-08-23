@@ -3,7 +3,9 @@ mod user_agents_md;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::Context as _;
@@ -487,7 +489,7 @@ pub struct SandboxPermissions {
     /// approved "once" or "for this thread", which keeps the sandboxed
     /// tool/prompt in place — see `agent::sandboxing`.
     pub allow_unsandboxed: bool,
-    pub write_paths: Vec<PathBuf>,
+    pub write_paths: Vec<settings::GrantedWritePath>,
     /// Whether sandbox escalation prompts warn about domains or write paths
     /// that contain potentially confusable Unicode characters (homoglyphs,
     /// invisible characters, or bidirectional overrides). Enabled by default.
@@ -882,12 +884,20 @@ fn compile_sandbox_permissions(
     };
 
     let mut write_paths = Vec::new();
-    for path in content.write_paths.map(|paths| paths.0).unwrap_or_default() {
-        // Normalize away `..`/`.` before storing, since coverage checks are
-        // purely lexical; drop paths that escape the filesystem root.
-        if let Ok(normalized) = util::paths::normalize_lexically(&path) {
-            util::paths::insert_subtree(&mut write_paths, normalized);
-        }
+    for entry in content.write_paths.map(|paths| paths.0).unwrap_or_default() {
+        let Ok(requested) = util::paths::normalize_lexically(&entry.requested) else {
+            continue;
+        };
+        let granted = match entry.resolved {
+            Some(resolved) => {
+                let Ok(resolved) = util::paths::normalize_lexically(&resolved) else {
+                    continue;
+                };
+                settings::GrantedWritePath::resolved_on_fs(requested, resolved, entry.on_windows_fs)
+            }
+            None => settings::GrantedWritePath::from_requested(requested),
+        };
+        insert_granted_subtree(&mut write_paths, granted);
     }
 
     let network_hosts = content
@@ -903,6 +913,25 @@ fn compile_sandbox_permissions(
         write_paths,
         warn_confusable_unicode: content.warn_confusable_unicode.unwrap_or(true),
     }
+}
+
+fn insert_granted_subtree(
+    subtrees: &mut Vec<settings::GrantedWritePath>,
+    granted: settings::GrantedWritePath,
+) {
+    if subtrees.iter().any(|existing| {
+        granted
+            .canonical_or_requested()
+            .starts_with(existing.canonical_or_requested())
+    }) {
+        return;
+    }
+    subtrees.retain(|existing| {
+        !existing
+            .canonical_or_requested()
+            .starts_with(granted.canonical_or_requested())
+    });
+    subtrees.push(granted);
 }
 
 fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -> ToolPermissions {
@@ -1257,7 +1286,10 @@ mod tests {
         assert!(permissions.allow_unsandboxed);
         assert_eq!(
             permissions.write_paths,
-            vec![PathBuf::from("/tmp/build"), PathBuf::from("/var/log")]
+            vec![
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/build")),
+                settings::GrantedWritePath::from_requested(PathBuf::from("/var/log")),
+            ]
         );
     }
 
@@ -1275,7 +1307,12 @@ mod tests {
 
         // `/tmp/build/../build/cache` normalizes to `/tmp/build/cache`, which is
         // then pruned as a redundant child of `/tmp/build`.
-        assert_eq!(permissions.write_paths, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            permissions.write_paths,
+            vec![settings::GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build"
+            ))]
+        );
     }
 
     #[test]

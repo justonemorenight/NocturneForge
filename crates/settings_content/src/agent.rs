@@ -562,7 +562,7 @@ impl AgentSettingsContent {
             .allow_unsandboxed = Some(true);
     }
 
-    pub fn add_sandbox_write_path(&mut self, path: PathBuf) {
+    pub fn add_sandbox_write_path(&mut self, granted: GrantedWritePathContent) {
         let write_paths = &mut self
             .sandbox_permissions
             .get_or_insert_default()
@@ -570,7 +570,15 @@ impl AgentSettingsContent {
             .get_or_insert_default()
             .0;
 
-        util::paths::insert_subtree(write_paths, path);
+        let canonical = granted.canonical_or_requested().to_path_buf();
+        if write_paths
+            .iter()
+            .any(|existing| canonical.starts_with(existing.canonical_or_requested()))
+        {
+            return;
+        }
+        write_paths.retain(|existing| !existing.canonical_or_requested().starts_with(&canonical));
+        write_paths.push(granted);
     }
 }
 
@@ -851,6 +859,99 @@ pub enum CustomAgentServerSettings {
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, MergeFrom)]
+pub struct GrantedWritePathContent {
+    pub requested: PathBuf,
+    pub resolved: Option<PathBuf>,
+    pub on_windows_fs: bool,
+}
+
+impl GrantedWritePathContent {
+    fn canonical_or_requested(&self) -> &std::path::Path {
+        self.resolved.as_deref().unwrap_or(&self.requested)
+    }
+}
+
+impl Serialize for GrantedWritePathContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.resolved {
+            None => self.requested.serialize(serializer),
+            Some(resolved) => {
+                use serde::ser::SerializeStruct as _;
+                let field_count = if self.on_windows_fs { 3 } else { 2 };
+                let mut state =
+                    serializer.serialize_struct("GrantedWritePathContent", field_count)?;
+                state.serialize_field("requested", &self.requested)?;
+                state.serialize_field("resolved", resolved)?;
+                if self.on_windows_fs {
+                    state.serialize_field("on_windows_fs", &self.on_windows_fs)?;
+                }
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantedWritePathContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Object {
+            requested: PathBuf,
+            #[serde(default)]
+            resolved: Option<PathBuf>,
+            #[serde(default)]
+            on_windows_fs: bool,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrObject {
+            String(PathBuf),
+            Object(Object),
+        }
+
+        Ok(match StringOrObject::deserialize(deserializer)? {
+            StringOrObject::String(requested) => Self {
+                requested,
+                resolved: None,
+                on_windows_fs: false,
+            },
+            StringOrObject::Object(Object {
+                requested,
+                resolved,
+                on_windows_fs,
+            }) => Self {
+                requested,
+                resolved,
+                on_windows_fs,
+            },
+        })
+    }
+}
+
+impl JsonSchema for GrantedWritePathContent {
+    fn schema_name() -> Cow<'static, str> {
+        "GrantedWritePathContent".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "oneOf": [
+                { "type": "string" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "requested": { "type": "string" },
+                        "resolved": { "type": ["string", "null"] },
+                        "on_windows_fs": { "type": "boolean" }
+                    },
+                    "required": ["requested"]
+                }
+            ]
+        })
+    }
+}
+
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct SandboxPermissionsContent {
@@ -882,7 +983,7 @@ pub struct SandboxPermissionsContent {
     /// Directory subtrees that sandboxed terminal commands may always write
     /// to without prompting. Paths written by Zed are absolute.
     /// Default: []
-    pub write_paths: Option<ExtendingVec<PathBuf>>,
+    pub write_paths: Option<ExtendingVec<GrantedWritePathContent>>,
 
     /// Whether to warn when a sandbox escalation prompt requests a domain or
     /// write path that contains potentially confusable Unicode characters
@@ -1214,7 +1315,11 @@ mod tests {
         );
         settings.allow_sandbox_fs_write_all();
         settings.allow_sandbox_unsandboxed();
-        settings.add_sandbox_write_path(PathBuf::from("/tmp/build"));
+        settings.add_sandbox_write_path(GrantedWritePathContent {
+            requested: PathBuf::from("/tmp/build"),
+            resolved: None,
+            on_windows_fs: false,
+        });
 
         let sandbox_permissions = settings.sandbox_permissions.as_ref().unwrap();
         assert_eq!(sandbox_permissions.allow_all_hosts, Some(true));
@@ -1236,7 +1341,11 @@ mod tests {
                 .unwrap()
                 .0
                 .as_slice(),
-            &[PathBuf::from("/tmp/build")]
+            &[GrantedWritePathContent {
+                requested: PathBuf::from("/tmp/build"),
+                resolved: None,
+                on_windows_fs: false,
+            }]
         );
     }
 
@@ -1244,9 +1353,13 @@ mod tests {
     fn test_add_sandbox_write_path_prunes_redundant_paths() {
         let mut settings = AgentSettingsContent::default();
 
-        settings.add_sandbox_write_path(PathBuf::from("/tmp/build/cache"));
-        settings.add_sandbox_write_path(PathBuf::from("/tmp/build"));
-        settings.add_sandbox_write_path(PathBuf::from("/tmp/build/output"));
+        for path in ["/tmp/build/cache", "/tmp/build", "/tmp/build/output"] {
+            settings.add_sandbox_write_path(GrantedWritePathContent {
+                requested: PathBuf::from(path),
+                resolved: None,
+                on_windows_fs: false,
+            });
+        }
 
         let write_paths = settings
             .sandbox_permissions
@@ -1257,6 +1370,13 @@ mod tests {
             .unwrap()
             .0
             .as_slice();
-        assert_eq!(write_paths, &[PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            write_paths,
+            &[GrantedWritePathContent {
+                requested: PathBuf::from("/tmp/build"),
+                resolved: None,
+                on_windows_fs: false,
+            }]
+        );
     }
 }

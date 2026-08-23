@@ -28,7 +28,7 @@ use gpui::App;
 use http_proxy::HostPattern;
 use project::Project;
 use sandbox::{HostFilesystemLocation, SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
-use settings::Settings;
+use settings::{GrantedWritePath, Settings};
 use std::path::PathBuf;
 
 /// The directory subtrees the sandbox always grants write access to for a
@@ -156,7 +156,7 @@ pub fn settings_sandbox_policy(persistent: &SandboxPermissions) -> SandboxPolicy
             writable_paths: persistent
                 .write_paths
                 .iter()
-                .filter_map(|path| HostFilesystemLocation::new(path).ok())
+                .filter_map(acp_thread::granted_write_path_to_location_or_log)
                 .collect(),
             protected_paths: Vec::new(),
         }
@@ -256,7 +256,7 @@ pub(crate) struct SandboxRequest {
     pub unsandboxed: bool,
     /// Concrete paths the command needs to write to. Each grants its whole
     /// subtree. These are never globs — write access is always a concrete path subtree
-    pub write_paths: Vec<PathBuf>,
+    pub write_paths: Vec<GrantedWritePath>,
 }
 
 impl SandboxRequest {
@@ -294,7 +294,7 @@ pub(crate) struct ThreadSandboxGrants {
     sandbox_fallback: bool,
     /// Canonicalized paths granted write access for the thread. Each covers its
     /// whole subtree; redundant children are pruned on insert.
-    write_paths: Vec<PathBuf>,
+    write_paths: Vec<GrantedWritePath>,
 }
 
 impl ThreadSandboxGrants {
@@ -336,11 +336,11 @@ impl ThreadSandboxGrants {
         }
         request.write_paths.iter().all(|requested| {
             util::paths::path_within_subtree(
-                requested,
+                requested.canonical_or_requested(),
                 self.write_paths
                     .iter()
                     .chain(persistent.write_paths.iter())
-                    .map(PathBuf::as_path),
+                    .map(GrantedWritePath::canonical_or_requested),
             )
         })
     }
@@ -419,7 +419,7 @@ impl ThreadSandboxGrants {
                 writable_paths: self
                     .write_paths
                     .iter()
-                    .filter_map(|path| HostFilesystemLocation::new(path).ok())
+                    .filter_map(acp_thread::granted_write_path_to_location_or_log)
                     .collect(),
                 protected_paths: Vec::new(),
             }
@@ -495,8 +495,8 @@ impl ThreadSandboxGrants {
         }
         self.allow_fs_write_all |= request.allow_fs_write_all;
         self.unsandboxed |= request.unsandboxed;
-        for path in &request.write_paths {
-            util::paths::insert_subtree(&mut self.write_paths, path.clone());
+        for granted in &request.write_paths {
+            insert_granted_subtree(&mut self.write_paths, granted.clone());
         }
     }
 
@@ -539,8 +539,8 @@ impl ThreadSandboxGrants {
         };
 
         let mut write_paths = persistent.write_paths.clone();
-        for path in self.write_paths.iter().chain(request.write_paths.iter()) {
-            util::paths::insert_subtree(&mut write_paths, path.clone());
+        for granted in self.write_paths.iter().chain(request.write_paths.iter()) {
+            insert_granted_subtree(&mut write_paths, granted.clone());
         }
         SandboxRequest {
             network,
@@ -551,6 +551,22 @@ impl ThreadSandboxGrants {
             write_paths,
         }
     }
+}
+
+fn insert_granted_subtree(subtrees: &mut Vec<GrantedWritePath>, granted: GrantedWritePath) {
+    if subtrees.iter().any(|existing| {
+        granted
+            .canonical_or_requested()
+            .starts_with(existing.canonical_or_requested())
+    }) {
+        return;
+    }
+    subtrees.retain(|existing| {
+        !existing
+            .canonical_or_requested()
+            .starts_with(granted.canonical_or_requested())
+    });
+    subtrees.push(granted);
 }
 
 /// Parse persisted host strings into patterns, dropping (and logging) any
@@ -600,7 +616,10 @@ mod tests {
             network,
             allow_fs_write_all: all,
             unsandboxed: false,
-            write_paths: paths.iter().map(PathBuf::from).collect(),
+            write_paths: paths
+                .iter()
+                .map(|path| GrantedWritePath::from_requested(PathBuf::from(path)))
+                .collect(),
         }
     }
 
@@ -778,7 +797,9 @@ mod tests {
         // `settings_sandbox_policy` captures real `HostFilesystemLocation`s.
         let log_dir = tempfile::tempdir().expect("create temp log dir");
         let persistent = SandboxPermissions {
-            write_paths: vec![log_dir.path().to_path_buf()],
+            write_paths: vec![GrantedWritePath::from_requested(
+                log_dir.path().to_path_buf(),
+            )],
             network_hosts: vec!["*.npmjs.org".to_string()],
             ..Default::default()
         };
@@ -898,7 +919,12 @@ mod tests {
         let mut grants = ThreadSandboxGrants::default();
         grants.record(&request(NetworkRequest::None, false, &["/tmp/build/cache"]));
         grants.record(&request(NetworkRequest::None, false, &["/tmp/build"]));
-        assert_eq!(grants.write_paths, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            grants.write_paths,
+            vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build"
+            ))]
+        );
     }
 
     #[test]
@@ -906,7 +932,12 @@ mod tests {
         let mut grants = ThreadSandboxGrants::default();
         grants.record(&request(NetworkRequest::None, false, &["/tmp/build"]));
         grants.record(&request(NetworkRequest::None, false, &["/tmp/build/cache"]));
-        assert_eq!(grants.write_paths, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            grants.write_paths,
+            vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build"
+            ))]
+        );
     }
 
     #[test]
@@ -1001,7 +1032,9 @@ mod tests {
         let mut grants = ThreadSandboxGrants::default();
         grants.record(&request(hosts(&["github.com"]), false, &[]));
         let persistent = SandboxPermissions {
-            write_paths: vec![PathBuf::from("/tmp/build")],
+            write_paths: vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build",
+            ))],
             ..Default::default()
         };
 
@@ -1093,7 +1126,12 @@ mod tests {
         grants.record(&request(NetworkRequest::None, false, &["/tmp/build"]));
 
         let effective = effective(&grants, &request(NetworkRequest::None, false, &[]));
-        assert_eq!(effective.write_paths, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            effective.write_paths,
+            vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build"
+            ))]
+        );
     }
 
     #[test]
@@ -1110,7 +1148,10 @@ mod tests {
         assert_eq!(effective.network, hosts(&["github.com", "npmjs.org"]));
         assert_eq!(
             effective.write_paths,
-            vec![PathBuf::from("/tmp/build"), PathBuf::from("/tmp/once")]
+            vec![
+                GrantedWritePath::from_requested(PathBuf::from("/tmp/build")),
+                GrantedWritePath::from_requested(PathBuf::from("/tmp/once")),
+            ]
         );
     }
 
@@ -1128,14 +1169,21 @@ mod tests {
         let grants = ThreadSandboxGrants::default();
         let persistent = SandboxPermissions {
             allow_all_hosts: true,
-            write_paths: vec![PathBuf::from("/tmp/always")],
+            write_paths: vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/always",
+            ))],
             ..Default::default()
         };
 
         let effective = grants
             .effective_with_persistent(&request(NetworkRequest::None, false, &[]), &persistent);
         assert_eq!(effective.network, NetworkRequest::AnyHost);
-        assert_eq!(effective.write_paths, vec![PathBuf::from("/tmp/always")]);
+        assert_eq!(
+            effective.write_paths,
+            vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/always"
+            ))]
+        );
     }
 
     #[test]
@@ -1147,6 +1195,11 @@ mod tests {
             &grants,
             &request(NetworkRequest::None, false, &["/tmp/build/cache"]),
         );
-        assert_eq!(effective.write_paths, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(
+            effective.write_paths,
+            vec![GrantedWritePath::from_requested(PathBuf::from(
+                "/tmp/build"
+            ))]
+        );
     }
 }
