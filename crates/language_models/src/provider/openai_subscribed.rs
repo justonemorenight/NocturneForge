@@ -92,11 +92,14 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
     }
 
     fn recommended_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        vec![create_language_model(
-            ChatGptModel::Gpt56Sol,
-            &self.state,
-            cx,
-        )]
+        self.state
+            .read(cx)
+            .models()
+            .into_iter()
+            .find(|model| model.id() == "gpt-5.6-sol")
+            .map(|model| create_language_model(model, &self.state, cx))
+            .into_iter()
+            .collect()
     }
 
     fn is_authenticated(&self, cx: &App) -> bool {
