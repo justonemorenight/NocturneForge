@@ -9,7 +9,6 @@ use language_model::{
     LanguageModelProviderState, ProviderAccountSummary, ProviderSettingsView,
 };
 use openai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, create_language_model};
-use release_channel::AppVersion;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use ui::{ConfiguredApiCard, prelude::*};
@@ -31,12 +30,7 @@ impl OpenAiSubscribedProvider {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut App,
     ) -> Self {
-        // The Codex models endpoint caps `client_version` at 32 characters.
-        // Dev builds include the full commit SHA in semver build metadata, so
-        // send the whole semantic version just like Codex CLI does.
-        let version = AppVersion::global(cx);
-        let client_version = format!("{}.{}.{}", version.major, version.minor, version.patch);
-        let state = cx.new(|cx| State::new(http_client, credentials_provider, client_version, cx));
+        let state = cx.new(|cx| State::new(http_client, credentials_provider, cx));
         Self { state }
     }
 }

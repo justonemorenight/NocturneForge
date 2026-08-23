@@ -51,6 +51,11 @@ const MAX_ACCOUNT_SESSIONS: usize = 5;
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const TOKEN_REFRESH_BUFFER_MS: u64 = 5 * 60 * 1000;
+/// Requests the complete account catalog without Codex CLI version filtering.
+///
+/// The backend treats this exact version as an ungated sentinel. Other versions
+/// are compared with each model's `minimal_client_version`.
+const UNGATED_MODEL_CATALOG_CLIENT_VERSION: &str = "0.0.0";
 const RESPONSE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const COMPACTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(100);
 const COMPACTION_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -264,9 +269,26 @@ impl std::fmt::Display for RefreshError {
 }
 
 impl State {
-    /// Creates the state and starts loading any persisted credentials.
+    /// Creates state and starts loading persisted credentials.
+    ///
+    /// Model discovery requests the ungated account catalog because host
+    /// application versions are unrelated to Codex CLI compatibility versions.
+    ///
     /// [`State::load_task`] resolves once the load finishes.
     pub fn new(
+        http_client: Arc<dyn HttpClient>,
+        credentials_provider: Arc<dyn CredentialsProvider>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_client_version(
+            http_client,
+            credentials_provider,
+            UNGATED_MODEL_CATALOG_CLIENT_VERSION.to_string(),
+            cx,
+        )
+    }
+
+    fn new_with_client_version(
         http_client: Arc<dyn HttpClient>,
         credentials_provider: Arc<dyn CredentialsProvider>,
         client_version: String,
@@ -4082,8 +4104,14 @@ mod tests {
                 .body(http_client::AsyncBody::default())?)
         });
 
-        let state =
-            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| State::new(http.clone(), creds_provider.clone(), cx));
+
+        cx.read(|cx| {
+            assert_eq!(
+                state.read(cx).client_version,
+                UNGATED_MODEL_CATALOG_CLIENT_VERSION
+            );
+        });
 
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
@@ -4114,7 +4142,9 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(http, creds_provider.clone(), "test".to_string(), cx)
+        });
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4155,7 +4185,9 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(http, creds_provider.clone(), "test".to_string(), cx)
+        });
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4188,8 +4220,14 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state =
-            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(
+                http.clone(),
+                creds_provider.clone(),
+                "test".to_string(),
+                cx,
+            )
+        });
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4205,7 +4243,8 @@ mod tests {
         );
 
         // A fresh launch must not restore the signed-out account.
-        let state2 = cx.new(|cx| State::new(http, creds_provider, "test".to_string(), cx));
+        let state2 = cx
+            .new(|cx| State::new_with_client_version(http, creds_provider, "test".to_string(), cx));
         let load_task2 = cx
             .read(|cx| state2.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4540,7 +4579,9 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(http, creds_provider.clone(), "test".to_string(), cx)
+        });
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4581,7 +4622,9 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state = cx.new(|cx| State::new(http, creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(http, creds_provider.clone(), "test".to_string(), cx)
+        });
         let load_task = cx
             .read(|cx| state.read(cx).load_task())
             .expect("constructor should start the credentials load");
@@ -4690,8 +4733,14 @@ mod tests {
                 .status(200)
                 .body(http_client::AsyncBody::default())?)
         });
-        let state =
-            cx.new(|cx| State::new(http.clone(), creds_provider.clone(), "test".to_string(), cx));
+        let state = cx.new(|cx| {
+            State::new_with_client_version(
+                http.clone(),
+                creds_provider.clone(),
+                "test".to_string(),
+                cx,
+            )
+        });
 
         // Let the load start (and capture the identity) before signing out.
         cx.run_until_parked();
@@ -4714,7 +4763,8 @@ mod tests {
             "sign-out during initial load must remove migrated credentials"
         );
 
-        let restarted = cx.new(|cx| State::new(http, creds_provider, "test".to_string(), cx));
+        let restarted = cx
+            .new(|cx| State::new_with_client_version(http, creds_provider, "test".to_string(), cx));
         let restarted_load = cx
             .read(|cx| restarted.read(cx).load_task())
             .expect("restart should load credentials");
