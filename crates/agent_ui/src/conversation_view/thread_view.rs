@@ -4578,7 +4578,7 @@ impl ThreadView {
             || model_name.clone(),
             |effort| format!("{model_name} · {effort}").into(),
         );
-        let effort_detail = effort.clone();
+        let effort_detail = effort;
         let role_detail = role.unwrap_or("Default subagent");
 
         Some(

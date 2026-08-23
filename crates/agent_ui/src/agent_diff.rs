@@ -820,7 +820,7 @@ impl DiffHunkDelegate for AgentDiffDelegate {
 }
 
 fn render_all_review_actions_menu(id: &'static str, focus_handle: FocusHandle) -> AnyElement {
-    let menu_focus_handle = focus_handle.clone();
+    let menu_focus_handle = focus_handle;
 
     PopoverMenu::new(id)
         .trigger_with_tooltip(
