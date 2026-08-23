@@ -1243,7 +1243,12 @@ mod test {
     }
 
     #[test]
-    fn test_language_servers_merge_preserves_per_language_config() {
+    fn test_language_servers_merge_keeps_per_language_lists_pure() {
+        let default_typescript_servers = vec![
+            "!typescript-language-server".to_string(),
+            "vtsls".to_string(),
+            REST_OF_LANGUAGE_SERVERS.to_string(),
+        ];
         let mut base = AllLanguageSettingsContent {
             defaults: LanguageSettingsContent {
                 language_servers: Some(vec![REST_OF_LANGUAGE_SERVERS.into()]),
@@ -1253,76 +1258,7 @@ mod test {
                 [(
                     "TypeScript".into(),
                     LanguageSettingsContent {
-                        language_servers: Some(vec![
-                            "!typescript-language-server".into(),
-                            "vtsls".into(),
-                            REST_OF_LANGUAGE_SERVERS.into(),
-                        ]),
-                        ..LanguageSettingsContent::default()
-                    },
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            ..AllLanguageSettingsContent::default()
-        };
-
-        let user = AllLanguageSettingsContent {
-            defaults: LanguageSettingsContent {
-                language_servers: Some(vec![
-                    "!tailwindcss-language-server".into(),
-                    "!eslint".into(),
-                    REST_OF_LANGUAGE_SERVERS.into(),
-                ]),
-                ..LanguageSettingsContent::default()
-            },
-            ..AllLanguageSettingsContent::default()
-        };
-
-        base.merge_from(&user);
-
-        let ts_servers = base.languages.0["TypeScript"]
-            .language_servers
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            ts_servers,
-            &vec![
-                "!typescript-language-server".to_string(),
-                "vtsls".to_string(),
-                "!eslint".to_string(),
-                "!tailwindcss-language-server".to_string(),
-                REST_OF_LANGUAGE_SERVERS.to_string(),
-            ]
-        );
-
-        let default_servers = base.defaults.language_servers.as_ref().unwrap();
-        assert_eq!(
-            default_servers,
-            &vec![
-                "!tailwindcss-language-server".to_string(),
-                "!eslint".to_string(),
-                REST_OF_LANGUAGE_SERVERS.to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_global_language_server_disable_overrides_per_language_enable() {
-        let mut base = AllLanguageSettingsContent {
-            defaults: LanguageSettingsContent {
-                language_servers: Some(vec![REST_OF_LANGUAGE_SERVERS.into()]),
-                ..LanguageSettingsContent::default()
-            },
-            languages: LanguageToSettingsMap(
-                [(
-                    "TypeScript".into(),
-                    LanguageSettingsContent {
-                        language_servers: Some(vec![
-                            "!typescript-language-server".into(),
-                            "vtsls".into(),
-                            REST_OF_LANGUAGE_SERVERS.into(),
-                        ]),
+                        language_servers: Some(default_typescript_servers.clone()),
                         ..LanguageSettingsContent::default()
                     },
                 )]
@@ -1342,22 +1278,49 @@ mod test {
 
         base.merge_from(&user);
 
-        let expected = vec![
-            "!typescript-language-server".to_string(),
-            "!vtsls".to_string(),
-            REST_OF_LANGUAGE_SERVERS.to_string(),
-        ];
         assert_eq!(
-            base.languages
-                .0
-                .get("TypeScript")
-                .and_then(|settings| settings.language_servers.as_deref()),
-            Some(expected.as_slice()),
+            base.languages.0["TypeScript"].language_servers.as_ref(),
+            Some(&default_typescript_servers),
+            "a global list must not rewrite per-language lists"
+        );
+        assert_eq!(
+            base.defaults.language_servers.as_ref(),
+            Some(&vec![
+                "!vtsls".to_string(),
+                REST_OF_LANGUAGE_SERVERS.to_string(),
+            ])
+        );
+
+        let project = AllLanguageSettingsContent {
+            languages: LanguageToSettingsMap(
+                [(
+                    "TypeScript".into(),
+                    LanguageSettingsContent {
+                        language_servers: Some(vec![
+                            "vtsls".into(),
+                            REST_OF_LANGUAGE_SERVERS.into(),
+                        ]),
+                        ..LanguageSettingsContent::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..AllLanguageSettingsContent::default()
+        };
+        base.merge_from(&project);
+        assert_eq!(
+            base.languages.0["TypeScript"].language_servers.as_ref(),
+            Some(&vec![
+                "vtsls".to_string(),
+                REST_OF_LANGUAGE_SERVERS.to_string(),
+            ]),
+            "a per-language list must replace the older one wholesale"
         );
     }
 
     #[test]
-    fn test_language_servers_merge_no_per_language_config_uses_global() {
+    fn test_language_servers_merge_no_per_language_config_stays_unset() {
         let mut base = AllLanguageSettingsContent {
             defaults: LanguageSettingsContent {
                 language_servers: Some(vec![REST_OF_LANGUAGE_SERVERS.into()]),
@@ -1387,10 +1350,16 @@ mod test {
 
         base.merge_from(&user);
 
-        let rust_servers = base.languages.0["Rust"].language_servers.as_ref().unwrap();
         assert_eq!(
-            rust_servers,
-            &vec!["!eslint".to_string(), REST_OF_LANGUAGE_SERVERS.to_string(),]
+            base.languages.0["Rust"].language_servers, None,
+            "languages without their own list must not get a stale copy of the global one"
+        );
+        assert_eq!(
+            base.defaults.language_servers.as_ref(),
+            Some(&vec![
+                "!eslint".to_string(),
+                REST_OF_LANGUAGE_SERVERS.to_string(),
+            ])
         );
     }
 
