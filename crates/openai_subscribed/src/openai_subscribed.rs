@@ -756,10 +756,7 @@ impl State {
                         .fuse();
                     futures::pin_mut!(oauth_flow, timeout);
                     futures::select! {
-                        result = oauth_flow => match result {
-                            Ok(result) => Some(result),
-                            Err(_) => None,
-                        },
+                        result = oauth_flow => result.ok(),
                         _ = timeout => Some(Err(anyhow!(
                             "ChatGPT sign-in timed out after {OAUTH_FLOW_TIMEOUT:?}"
                         ))),
