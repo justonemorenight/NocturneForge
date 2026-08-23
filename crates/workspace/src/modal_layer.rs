@@ -114,6 +114,7 @@ pub struct ModalLayer {
     // can reveal it again with its exact prior state. Left intact across
     // non-reopenable modals (e.g. the command palette), which may trigger the reopen.
     stashed_modal: Option<Box<dyn ModalViewHandle>>,
+    reveal_stashed_modal_on_dismiss: bool,
     dismiss_on_focus_lost: bool,
 }
 
@@ -132,6 +133,7 @@ impl ModalLayer {
         Self {
             active_modal: None,
             stashed_modal: None,
+            reveal_stashed_modal_on_dismiss: false,
             dismiss_on_focus_lost: false,
         }
     }
@@ -204,6 +206,18 @@ impl ModalLayer {
         true
     }
 
+    pub fn reveal_stashed_modal_after_active_dismissal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_modal.is_some() {
+            self.reveal_stashed_modal_on_dismiss = true;
+        } else {
+            self.reveal_stashed_modal(window, cx);
+        }
+    }
+
     /// Attempts to hide the currently active modal.
     ///
     /// The modal's `on_before_dismiss` method is called to determine if dismissal should proceed.
@@ -243,6 +257,11 @@ impl ModalLayer {
             cx.notify();
         }
         self.dismiss_on_focus_lost = false;
+        if std::mem::take(&mut self.reveal_stashed_modal_on_dismiss) {
+            cx.defer_in(window, |this, window, cx| {
+                this.reveal_stashed_modal_after_active_dismissal(window, cx);
+            });
+        }
         true
     }
 

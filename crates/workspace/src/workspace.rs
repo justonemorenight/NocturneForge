@@ -7995,13 +7995,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // When triggered from within another modal (e.g. the command palette), that
-        // modal's dismissal is asynchronous, so defer the reveal until it has closed;
-        // otherwise a modal would still be active and the reveal would be a no-op.
-        cx.defer_in(window, |workspace, window, cx| {
-            workspace.modal_layer.update(cx, |modal_layer, cx| {
-                modal_layer.reveal_stashed_modal(window, cx);
-            });
+        self.modal_layer.update(cx, |modal_layer, cx| {
+            modal_layer.reveal_stashed_modal_after_active_dismissal(window, cx);
         });
     }
 
@@ -12461,7 +12456,7 @@ mod tests {
         assert!(cx.has_pending_prompt());
 
         // Cancel saving item 3.
-        cx.simulate_prompt_answer("Discard Edits");
+        cx.simulate_prompt_answer("Discard");
         cx.executor().run_until_parked();
 
         // Item 3 is reloaded. There's a prompt to save item 4.
