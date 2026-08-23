@@ -39,6 +39,8 @@ use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
     http::{HeaderValue, header::AUTHORIZATION},
 };
+
+use crate::provider::CustomHeaderDefinitions;
 use language_model::{
     AuthenticateError, EnvVar, IconOrSvg, InlineDescription, LanguageModel,
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
@@ -136,7 +138,7 @@ impl BedrockCredentials {
 pub struct AmazonBedrockSettings {
     pub available_models: Vec<AvailableModel>,
     pub mantle_available_models: Vec<MantleAvailableModel>,
-    pub custom_headers: CustomHeaders,
+    pub custom_headers: CustomHeaderDefinitions,
     pub region: Option<String>,
     pub endpoint: Option<String>,
     pub profile_name: Option<String>,
@@ -792,6 +794,7 @@ impl BedrockModel {
     fn stream_completion(
         &self,
         request: bedrock::Request,
+        extra_headers: CustomHeaders,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -805,12 +808,6 @@ impl BedrockModel {
             return futures::future::ready(Err(BedrockError::Other(anyhow!("App state dropped"))))
                 .boxed();
         };
-        let extra_headers = self.state.read_with(cx, |_, cx| {
-            AllLanguageModelSettings::get_global(cx)
-                .bedrock
-                .custom_headers
-                .clone()
-        });
 
         let task = Tokio::spawn(
             cx,
@@ -959,6 +956,12 @@ impl LanguageModel for BedrockModel {
 
         let deny_tool_calls = request.tool_choice == Some(LanguageModelToolChoice::None);
 
+        let extra_headers = self.state.read_with(cx, |_, cx| {
+            AllLanguageModelSettings::get_global(cx)
+                .bedrock
+                .custom_headers
+                .resolve(&request)
+        });
         let request = match into_bedrock(
             request,
             model_id,
@@ -974,7 +977,7 @@ impl LanguageModel for BedrockModel {
             Err(err) => return futures::future::ready(Err(err.into())).boxed(),
         };
 
-        let request = self.stream_completion(request, cx);
+        let request = self.stream_completion(request, extra_headers, cx);
         let display_name = self.model.display_name().to_string();
         let future = self.request_limiter.stream(async move {
             let response = request.await.map_err(|err| match err {
@@ -1291,6 +1294,7 @@ impl BedrockMantleModel {
     fn stream_mantle_request<Request, Event>(
         &self,
         request: Request,
+        extra_headers: CustomHeaders,
         cx: &AsyncApp,
         endpoint: &'static str,
         parse_stream_line: fn(&str) -> Result<Event>,
@@ -1306,12 +1310,6 @@ impl BedrockMantleModel {
             (state.auth.clone(), state.get_region())
         });
         let url = format!("{}/{}", mantle_endpoint_url(&region), endpoint);
-        let extra_headers = cx.read_entity(&self.state, |_, cx| {
-            AllLanguageModelSettings::get_global(cx)
-                .bedrock
-                .custom_headers
-                .clone()
-        });
         let provider_name = PROVIDER_NAME.0.to_string();
         let auth_task = Tokio::spawn_result(
             cx,
@@ -1342,6 +1340,7 @@ impl BedrockMantleModel {
     fn stream_completion(
         &self,
         request: open_ai::Request,
+        extra_headers: CustomHeaders,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -1349,6 +1348,7 @@ impl BedrockMantleModel {
     > {
         self.stream_mantle_request(
             request,
+            extra_headers,
             cx,
             "chat/completions",
             parse_mantle_chat_stream_line,
@@ -1358,6 +1358,7 @@ impl BedrockMantleModel {
     fn stream_response(
         &self,
         request: OpenAiResponseRequest,
+        extra_headers: CustomHeaders,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -1368,7 +1369,13 @@ impl BedrockMantleModel {
     > {
         let mut request = request;
         strip_unsupported_mantle_response_fields(&mut request);
-        self.stream_mantle_request(request, cx, "responses", parse_mantle_response_stream_line)
+        self.stream_mantle_request(
+            request,
+            extra_headers,
+            cx,
+            "responses",
+            parse_mantle_response_stream_line,
+        )
     }
 }
 
@@ -1464,6 +1471,12 @@ impl LanguageModel for BedrockMantleModel {
         let model_id = self.model.request_id().to_string();
         let max_output_tokens = Some(self.model.max_output_tokens());
 
+        let extra_headers = self.state.read_with(cx, |_, cx| {
+            AllLanguageModelSettings::get_global(cx)
+                .bedrock
+                .custom_headers
+                .resolve(&request)
+        });
         match self.model.protocol() {
             MantleProtocol::Responses => {
                 let request = into_open_ai_response(
@@ -1480,7 +1493,7 @@ impl LanguageModel for BedrockMantleModel {
                     Ok(request) => request,
                     Err(error) => return async move { Err(error.into()) }.boxed(),
                 };
-                let completions = self.stream_response(request, cx);
+                let completions = self.stream_response(request, extra_headers, cx);
                 async move {
                     let mapper = OpenAiResponseEventMapper::new(PROVIDER_ID);
                     Ok(mapper.map_stream(completions.await?).boxed())
@@ -1502,7 +1515,7 @@ impl LanguageModel for BedrockMantleModel {
                     Ok(request) => request,
                     Err(error) => return async move { Err(error.into()) }.boxed(),
                 };
-                let completions = self.stream_completion(request, cx);
+                let completions = self.stream_completion(request, extra_headers, cx);
                 async move {
                     let mapper = OpenAiEventMapper::new();
                     Ok(mapper.map_stream(completions.await?).boxed())
