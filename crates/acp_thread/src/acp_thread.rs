@@ -2159,7 +2159,7 @@ pub struct AcpThread {
     action_log: Entity<ActionLog>,
     _git_store_subscription: Subscription,
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
-    shared_buffers: HashMap<WeakEntity<Buffer>, BufferSnapshot>,
+    shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     turn_cancellation_generation: u64,
     running_turn: Option<RunningTurn>,
@@ -3651,10 +3651,9 @@ impl AcpThread {
             this.update(cx, |this, cx| {
                 let project = this.project.clone();
 
-                this.prune_dead_shared_buffers();
                 for location in resolved_locations.iter().flatten() {
                     this.shared_buffers.insert(
-                        location.buffer.downgrade(),
+                        location.buffer.clone(),
                         location.buffer.read(cx).snapshot(),
                     );
                 }
@@ -4864,11 +4863,6 @@ impl AcpThread {
         })
     }
 
-    fn prune_dead_shared_buffers(&mut self) {
-        self.shared_buffers
-            .retain(|buffer, _| buffer.is_upgradable());
-    }
-
     pub fn read_text_file(
         &self,
         path: PathBuf,
@@ -4897,7 +4891,7 @@ impl AcpThread {
 
             let snapshot = if reuse_shared_snapshot {
                 this.read_with(cx, |this, _| {
-                    this.shared_buffers.get(&buffer.downgrade()).cloned()
+                    this.shared_buffers.get(&buffer).cloned()
                 })
                 .log_err()
                 .flatten()
@@ -4914,9 +4908,8 @@ impl AcpThread {
 
                 let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
                 this.update(cx, |this, _| {
-                    this.prune_dead_shared_buffers();
                     this.shared_buffers
-                        .insert(buffer.downgrade(), snapshot.clone());
+                        .insert(buffer.clone(), snapshot.clone());
                 })?;
                 snapshot
             };
@@ -4970,7 +4963,7 @@ impl AcpThread {
             let buffer = load?.await?;
             let snapshot = this.update(cx, |this, cx| {
                 this.shared_buffers
-                    .get(&buffer.downgrade())
+                    .get(&buffer)
                     .cloned()
                     .unwrap_or_else(|| buffer.read(cx).snapshot())
             })?;

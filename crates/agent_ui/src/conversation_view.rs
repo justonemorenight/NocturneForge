@@ -1945,8 +1945,13 @@ impl ConversationView {
         }
 
         self.entry_update_frame_scheduled = true;
-        cx.on_next_frame(window, |this, window, cx| {
-            this.flush_pending_entry_updates(window, cx);
+        let this = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| {
+                    this.flush_pending_entry_updates(window, cx);
+                });
+            }
         });
     }
 
@@ -3415,8 +3420,11 @@ fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
 }
 
 impl Focusable for ConversationView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.active_thread() {
+            Some(thread) => thread.read(cx).focus_handle(cx),
+            None => self.focus_handle.clone(),
+        }
     }
 }
 

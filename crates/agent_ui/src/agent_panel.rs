@@ -2202,7 +2202,7 @@ impl AgentPanel {
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::CloseTerminal => {
-                    this.request_close_terminal_from_terminal_event(terminal_id, cx);
+                    this.request_close_terminal_from_terminal_event(terminal_id, window, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
@@ -2321,10 +2321,12 @@ impl AgentPanel {
     fn request_close_terminal_from_terminal_event(
         &mut self,
         terminal_id: TerminalId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(metadata) = self.terminal_metadata(terminal_id, cx) {
             cx.emit(AgentPanelEvent::TerminalCloseRequested { metadata });
+            self.close_terminal(terminal_id, window, cx);
         }
     }
 
