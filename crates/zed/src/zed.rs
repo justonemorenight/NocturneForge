@@ -2093,9 +2093,7 @@ pub fn watch_user_agents_template(fs: Arc<dyn fs::Fs>, cx: &mut App) {
         UserAgentsTemplateState::Error(message) => {
             let path = paths::agents_template_file().display().to_string();
             log::error!("Failed to load user AGENTS.hbs from {path}: {message}");
-            let body = format!(
-                "Failed to render {path}\n{message}\n\nFalling back to AGENTS.md."
-            );
+            let body = format!("Failed to render {path}\n{message}\n\nFalling back to AGENTS.md.");
             let notification_id = notification_id.clone();
             show_app_notification(notification_id, cx, move |cx| {
                 let body = body.clone();

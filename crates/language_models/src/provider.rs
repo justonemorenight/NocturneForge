@@ -53,9 +53,7 @@ impl CustomHeaderDefinitions {
             .definitions
             .iter()
             .filter_map(|definition| match definition {
-                CustomHeaderDefinition::Static(name, value) => {
-                    Some((name.clone(), value.clone()))
-                }
+                CustomHeaderDefinition::Static(name, value) => Some((name.clone(), value.clone())),
                 CustomHeaderDefinition::AgentThreadId(name) => {
                     let thread_id = agent_thread_id?;
                     match HeaderValue::from_str(thread_id) {
@@ -170,7 +168,10 @@ mod tests {
             ("X-Allowed", "yes"),
         ]);
         let merged = resolve_custom_headers("Test", &settings, &["X-Api-Key"]);
-        assert_eq!(names(&merged.resolve_static()), vec!["x-allowed".to_string()]);
+        assert_eq!(
+            names(&merged.resolve_static()),
+            vec!["x-allowed".to_string()]
+        );
     }
 
     #[test]
@@ -182,7 +183,10 @@ mod tests {
             ("X-Allowed", "yes"),
         ]);
         let merged = resolve_custom_headers("Test", &settings, &["X-Api-Key"]);
-        assert_eq!(names(&merged.resolve_static()), vec!["x-allowed".to_string()]);
+        assert_eq!(
+            names(&merged.resolve_static()),
+            vec!["x-allowed".to_string()]
+        );
     }
 
     #[test]
@@ -206,7 +210,10 @@ mod tests {
             ("X-Allowed", "yes"),
         ]);
         let merged = resolve_custom_headers("Test", &settings, &[]);
-        assert_eq!(names(&merged.resolve_static()), vec!["x-allowed".to_string()]);
+        assert_eq!(
+            names(&merged.resolve_static()),
+            vec!["x-allowed".to_string()]
+        );
     }
 
     #[test]
@@ -219,8 +226,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let definitions =
-            resolve_custom_headers("Test", &settings, &[]);
+        let definitions = resolve_custom_headers("Test", &settings, &[]);
         assert!(definitions.resolve_static().is_empty());
 
         let request = LanguageModelRequest {

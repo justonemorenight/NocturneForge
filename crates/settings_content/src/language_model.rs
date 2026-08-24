@@ -666,10 +666,9 @@ mod tests {
 
     #[test]
     fn parses_agent_thread_id_custom_header_source() {
-        let value = serde_json::from_str::<CustomHeaderValueContent>(
-            r#"{"source":"agent_thread_id"}"#,
-        )
-        .unwrap();
+        let value =
+            serde_json::from_str::<CustomHeaderValueContent>(r#"{"source":"agent_thread_id"}"#)
+                .unwrap();
         assert_eq!(
             value,
             CustomHeaderValueContent::Dynamic {

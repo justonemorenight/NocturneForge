@@ -2439,7 +2439,10 @@ mod tests {
         let guidance = crate::tool_guidance::builtin_guidance(TerminalTool::NAME)
             .expect("terminal should have built-in guidance");
 
-        assert!(guidance.contains("$VAR"), "missing $VAR example: {guidance}");
+        assert!(
+            guidance.contains("$VAR"),
+            "missing $VAR example: {guidance}"
+        );
         assert!(
             guidance.contains("${VAR}"),
             "missing ${{VAR}} example: {guidance}"

@@ -1428,7 +1428,6 @@ impl ParsedMarkdown {
     }
 }
 
-
 struct PendingCodeBlock<'a> {
     language: Arc<Language>,
     reusable_from_previous_parse: bool,
@@ -7367,7 +7366,6 @@ mod tests {
             );
         });
     }
-
 
     fn markdown_with_rust_language(
         source: &str,

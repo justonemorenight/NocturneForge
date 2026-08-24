@@ -927,7 +927,6 @@ pub struct FakeLspAdapter {
     >,
 }
 
-
 pub struct Language {
     pub(crate) id: LanguageId,
     pub(crate) config: LanguageConfig,

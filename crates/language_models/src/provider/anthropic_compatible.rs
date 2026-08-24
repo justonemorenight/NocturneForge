@@ -435,9 +435,9 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let extra_headers = self
-            .state
-            .read_with(cx, |state, _cx| state.settings.custom_headers.resolve(&request));
+        let extra_headers = self.state.read_with(cx, |state, _cx| {
+            state.settings.custom_headers.resolve(&request)
+        });
         let has_tools = !request.tools.is_empty();
         let request_id = self.model.request_id(has_tools).to_string();
         let mut request = match into_anthropic(

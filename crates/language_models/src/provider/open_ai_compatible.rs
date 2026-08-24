@@ -196,7 +196,10 @@ impl OpenAiCompatibleLanguageModel {
 
         let (api_key, api_url) = self.state.read_with(cx, |state, _cx| {
             let api_url = &state.settings.api_url;
-            (state.api_key_state.key(api_url), state.settings.api_url.clone())
+            (
+                state.api_key_state.key(api_url),
+                state.settings.api_url.clone(),
+            )
         });
 
         let provider = self.provider_name.clone();
@@ -230,7 +233,10 @@ impl OpenAiCompatibleLanguageModel {
 
         let (api_key, api_url) = self.state.read_with(cx, |state, _cx| {
             let api_url = &state.settings.api_url;
-            (state.api_key_state.key(api_url), state.settings.api_url.clone())
+            (
+                state.api_key_state.key(api_url),
+                state.settings.api_url.clone(),
+            )
         });
 
         let provider = self.provider_name.clone();
@@ -417,9 +423,9 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
             request.speed = None;
         }
 
-        let extra_headers = self
-            .state
-            .read_with(cx, |state, _cx| state.settings.custom_headers.resolve(&request));
+        let extra_headers = self.state.read_with(cx, |state, _cx| {
+            state.settings.custom_headers.resolve(&request)
+        });
         if self.model.capabilities.chat_completions {
             let reasoning_effort = chat_completion_reasoning_effort(&request, &self.model);
             let request = match into_open_ai(

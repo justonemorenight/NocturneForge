@@ -132,9 +132,11 @@ impl ToolGuidanceStore {
     ) -> Vec<ToolGuidanceSection> {
         // User overrides shadow same-named built-in defaults.
         let mut files = BUILTIN_GUIDANCE.clone();
-        files.extend(self.user_files.iter().map(|(name, content)| {
-            (name.clone(), content.clone())
-        }));
+        files.extend(
+            self.user_files
+                .iter()
+                .map(|(name, content)| (name.clone(), content.clone())),
+        );
 
         let mut sections = Vec::new();
         for tool_name in available_tools {
@@ -185,7 +187,8 @@ fn spawn_watcher(fs: Arc<dyn Fs>, cx: &mut App) -> Task<()> {
         let (events, watcher) = fs.watch(&guidance_dir, Duration::from_millis(100)).await;
         futures::pin_mut!(events);
 
-        let (mut user_files, mut scanned_dirs) = load_user_overrides(fs.as_ref(), &guidance_dir).await;
+        let (mut user_files, mut scanned_dirs) =
+            load_user_overrides(fs.as_ref(), &guidance_dir).await;
         loop {
             for dir in &scanned_dirs {
                 watcher.add(dir).log_err();
@@ -281,4 +284,3 @@ mod tests {
         }
     }
 }
-

@@ -48,7 +48,6 @@ impl HighlightMap {
             .rev()
             .find_map(|&capture_id| self.get(capture_id))
     }
-
 }
 
 impl Default for HighlightMap {

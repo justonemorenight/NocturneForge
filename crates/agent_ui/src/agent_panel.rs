@@ -5679,18 +5679,19 @@ impl AgentPanel {
             .and_then(|md| md.content())
             .is_some();
 
-        let template_badge = match UserAgentsTemplate::global(cx).map(|template| template.customization()) {
-            Some(UserAgentsTemplateCustomization::Default) => Some(("(default)", Color::Muted)),
-            Some(UserAgentsTemplateCustomization::Overridden) => {
-                Some(("(overridden)", Color::Accent))
-            }
-            Some(UserAgentsTemplateCustomization::Invalid) => {
-                Some(("(invalid — using AGENTS.md)", Color::Error))
-            }
-            Some(UserAgentsTemplateCustomization::Absent) | None => {
-                Some(("(will be created)", Color::Muted))
-            }
-        };
+        let template_badge =
+            match UserAgentsTemplate::global(cx).map(|template| template.customization()) {
+                Some(UserAgentsTemplateCustomization::Default) => Some(("(default)", Color::Muted)),
+                Some(UserAgentsTemplateCustomization::Overridden) => {
+                    Some(("(overridden)", Color::Accent))
+                }
+                Some(UserAgentsTemplateCustomization::Invalid) => {
+                    Some(("(invalid — using AGENTS.md)", Color::Error))
+                }
+                Some(UserAgentsTemplateCustomization::Absent) | None => {
+                    Some(("(will be created)", Color::Muted))
+                }
+            };
 
         let workspace = self.workspace.clone();
 
