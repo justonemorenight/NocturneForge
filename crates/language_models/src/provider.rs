@@ -211,12 +211,14 @@ mod tests {
 
     #[test]
     fn resolves_agent_thread_id_from_request() {
-        let settings = HashMap::from([(
+        let settings = [(
             "X-Agent-Thread".to_string(),
             CustomHeaderValueContent::Dynamic {
                 source: CustomHeaderSourceContent::AgentThreadId,
             },
-        )]);
+        )]
+        .into_iter()
+        .collect();
         let definitions =
             resolve_custom_headers("Test", &settings, &[]);
         assert!(definitions.resolve_static().is_empty());
@@ -235,12 +237,14 @@ mod tests {
 
     #[test]
     fn agent_thread_id_header_omitted_without_thread() {
-        let settings = HashMap::from([(
+        let settings = [(
             "X-Agent-Thread".to_string(),
             CustomHeaderValueContent::Dynamic {
                 source: CustomHeaderSourceContent::AgentThreadId,
             },
-        )]);
+        )]
+        .into_iter()
+        .collect();
         let definitions = resolve_custom_headers("Test", &settings, &[]);
         let request = LanguageModelRequest::default();
         assert!(definitions.resolve(&request).is_empty());

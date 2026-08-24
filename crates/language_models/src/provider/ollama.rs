@@ -5,7 +5,7 @@ use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use futures::{Stream, TryFutureExt, stream};
 use gpui::{App, AsyncApp, Context, Entity, Task, TaskExt};
-use http_client::{CustomHeaders, HttpClient};
+use http_client::HttpClient;
 use language_model::{
     ApiKeyState, AuthenticateError, DisabledReason, EnvVar, IconOrSvg, InlineDescription,
     LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelId,
