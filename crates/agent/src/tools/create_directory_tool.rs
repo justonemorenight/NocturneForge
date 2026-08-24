@@ -21,9 +21,18 @@ use std::path::{Path, PathBuf};
 
 /// Creates a new directory at the specified path, and all necessary parent directories. Returns confirmation that the directory was created.
 ///
-/// Use this whenever you need to create new directories. Paths inside the project are created directly.
-///
-/// This tool can also create a directory **outside** the project. When agent terminal commands are sandboxed, doing so grants those commands write access to exactly that new directory — so, rather than requesting write access to a broad existing parent (e.g. your home directory) just to create something inside it, create the specific directory here first and then write into it. The only other supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+#[cfg_attr(
+    any(target_os = "linux", target_os = "macos"),
+    doc = "This tool can also create a directory **outside** the project. When agent terminal \
+    commands are sandboxed, doing so grants those commands write access to exactly that new \
+    directory. The only other supported path outside the project is \
+    `~/.agents/skills` or a descendant, for global agent skills."
+)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    doc = "The only supported path outside the project is `~/.agents/skills` or a descendant, \
+    for global agent skills."
+)]
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateDirectoryToolInput {
     /// The path of the new directory.
