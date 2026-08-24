@@ -25,8 +25,8 @@ use language_model::{
     LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelRequestMessage,
     LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, ProviderSettingsView, RateLimiter, Role, StopReason,
-    TokenUsage,
+    LanguageModelToolUse, MessageContent, ProviderErrorCategory, ProviderSettingsView, RateLimiter,
+    Role, StopReason, TokenUsage,
 };
 use settings::SettingsStore;
 use ui::prelude::*;
@@ -839,28 +839,38 @@ impl CopilotResponsesEventMapper {
             }
 
             copilot_responses::StreamEvent::Failed { response } => {
-                let provider = PROVIDER_NAME;
-                let (status_code, message) = match response.error {
+                let (code, message, category) = match response.error {
                     Some(error) => {
-                        let status_code = StatusCode::from_str(&error.code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        (status_code, error.message)
+                        let category = category_from_copilot_error(&error.code, &error.message);
+                        (Some(error.code), error.message, category)
                     }
                     None => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some("response.failed".to_string()),
                         "response.failed".to_string(),
+                        ProviderErrorCategory::Other,
                     ),
                 };
-                vec![Err(LanguageModelCompletionError::HttpResponseError {
-                    provider,
-                    status_code,
+                vec![Err(LanguageModelCompletionError::from_provider_response(
+                    PROVIDER_NAME,
+                    None,
+                    code,
                     message,
-                })]
+                    None,
+                    category,
+                ))]
             }
 
-            copilot_responses::StreamEvent::GenericError { error } => vec![Err(
-                LanguageModelCompletionError::Other(anyhow!(error.message)),
-            )],
+            copilot_responses::StreamEvent::GenericError { error } => {
+                let category = category_from_copilot_error(&error.code, &error.message);
+                vec![Err(LanguageModelCompletionError::from_provider_response(
+                    PROVIDER_NAME,
+                    None,
+                    Some(error.code),
+                    error.message,
+                    None,
+                    category,
+                ))]
+            }
 
             copilot_responses::StreamEvent::Created { .. }
             | copilot_responses::StreamEvent::Unknown => Vec::new(),
@@ -901,6 +911,13 @@ impl CopilotResponsesEventMapper {
             Err(error) => vec![Err(LanguageModelCompletionError::Other(anyhow!(error)))],
         }
     }
+}
+
+fn category_from_copilot_error(code: &str, message: &str) -> ProviderErrorCategory {
+    StatusCode::from_str(code)
+        .ok()
+        .map(|status| ProviderErrorCategory::from_http_status(status, message))
+        .unwrap_or(ProviderErrorCategory::Other)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1814,7 +1831,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_failed_maps_http_response_error() {
+    fn responses_stream_failed_maps_rate_limit_error() {
         let events = vec![responses::StreamEvent::Failed {
             response: responses::Response {
                 error: Some(responses::ResponseError {
@@ -1834,15 +1851,16 @@ mod tests {
 
         assert_eq!(mapped_results.len(), 1);
         match &mapped_results[0] {
-            Err(LanguageModelCompletionError::HttpResponseError {
-                status_code,
-                message,
+            Err(LanguageModelCompletionError::ProviderRejection {
+                provider,
+                retry_after,
+                category: ProviderErrorCategory::RateLimit,
                 ..
             }) => {
-                assert_eq!(*status_code, http_client::StatusCode::TOO_MANY_REQUESTS);
-                assert_eq!(message, "too many requests");
+                assert_eq!(provider, &PROVIDER_NAME);
+                assert_eq!(*retry_after, None);
             }
-            other => panic!("expected HttpResponseError, got {:?}", other),
+            other => panic!("expected RateLimit ProviderRejection, got {:?}", other),
         }
     }
 

@@ -14,7 +14,8 @@ use http_client::{
 use language_model::{
     CompactionResult, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice, RateLimiter,
+    LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice,
+    ProviderErrorCategory, RateLimiter,
 };
 use open_ai::{
     ReasoningEffort,
@@ -2313,27 +2314,36 @@ fn stream_with_idle_timeout(
 
 fn compaction_error_class(error: &LanguageModelCompletionError) -> &'static str {
     match error {
-        LanguageModelCompletionError::RateLimitExceeded { .. } => "rate_limit",
-        LanguageModelCompletionError::ServerOverloaded { .. }
-        | LanguageModelCompletionError::ApiInternalServerError { .. } => "server_error",
-        LanguageModelCompletionError::AuthenticationError { .. } => "auth",
-        LanguageModelCompletionError::HttpResponseError { status_code, .. }
-            if *status_code == http_client::StatusCode::REQUEST_TIMEOUT =>
-        {
-            "timeout"
-        }
-        LanguageModelCompletionError::HttpResponseError { status_code, .. }
-            if status_code.is_server_error() =>
-        {
-            "server_error"
-        }
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::RateLimit,
+            ..
+        } => "rate_limit",
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Overloaded | ProviderErrorCategory::InternalServer,
+            ..
+        } => "server_error",
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Authentication,
+            ..
+        } => "auth",
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Timeout,
+            ..
+        } => "timeout",
         LanguageModelCompletionError::ApiReadResponseError { .. }
         | LanguageModelCompletionError::HttpSend { .. } => "transport",
         LanguageModelCompletionError::Other(error) if is_transport_error(error) => "transport",
         LanguageModelCompletionError::Other(error) if is_timeout_error(error) => "timeout",
-        LanguageModelCompletionError::PromptTooLarge { .. }
-        | LanguageModelCompletionError::RequestPayloadTooLarge { .. } => "prompt_too_large",
-        LanguageModelCompletionError::BadRequestFormat { .. } => "bad_request",
+        LanguageModelCompletionError::ProviderRejection {
+            category:
+                ProviderErrorCategory::PromptTooLarge { .. }
+                | ProviderErrorCategory::RequestPayloadTooLarge,
+            ..
+        } => "prompt_too_large",
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::InvalidRequest,
+            ..
+        } => "bad_request",
         _ => "non_retryable",
     }
 }
@@ -2350,9 +2360,7 @@ fn compaction_retry_delay(
     completed_attempt: usize,
 ) -> Duration {
     let provider_delay = match error {
-        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }
-        | LanguageModelCompletionError::ServerOverloaded { retry_after, .. }
-        | LanguageModelCompletionError::UpstreamProviderError { retry_after, .. } => *retry_after,
+        LanguageModelCompletionError::ProviderRejection { retry_after, .. } => *retry_after,
         _ => None,
     };
 
@@ -3115,21 +3123,28 @@ mod tests {
 
     #[test]
     fn test_compaction_retry_policy() {
-        let rate_limit = LanguageModelCompletionError::RateLimitExceeded {
-            provider: PROVIDER_NAME,
-            retry_after: Some(Duration::from_secs(7)),
-        };
+        let rate_limit = LanguageModelCompletionError::from_provider_response(
+            PROVIDER_NAME,
+            None,
+            None,
+            "too many requests".to_string(),
+            Some(Duration::from_secs(7)),
+            ProviderErrorCategory::RateLimit,
+        );
         assert!(is_retryable_compaction_error(&rate_limit));
         assert_eq!(
             compaction_retry_delay(&rate_limit, 1),
             Duration::from_secs(7)
         );
 
-        let server_error = LanguageModelCompletionError::HttpResponseError {
-            provider: PROVIDER_NAME,
-            status_code: http_client::StatusCode::BAD_GATEWAY,
-            message: "bad gateway".to_string(),
-        };
+        let server_error = LanguageModelCompletionError::from_provider_response(
+            PROVIDER_NAME,
+            Some(http_client::StatusCode::BAD_GATEWAY),
+            None,
+            "bad gateway".to_string(),
+            None,
+            ProviderErrorCategory::InternalServer,
+        );
         assert!(is_retryable_compaction_error(&server_error));
         assert_eq!(
             compaction_retry_delay(&server_error, 1),
@@ -3140,13 +3155,24 @@ mod tests {
             &LanguageModelCompletionError::Other(anyhow!("connection reset by peer"))
         ));
         assert!(!is_retryable_compaction_error(
-            &LanguageModelCompletionError::PromptTooLarge { tokens: None }
+            &LanguageModelCompletionError::from_provider_response(
+                PROVIDER_NAME,
+                None,
+                None,
+                "prompt too large".to_string(),
+                None,
+                ProviderErrorCategory::PromptTooLarge { tokens: None },
+            )
         ));
         assert!(!is_retryable_compaction_error(
-            &LanguageModelCompletionError::AuthenticationError {
-                provider: PROVIDER_NAME,
-                message: "expired".to_string(),
-            }
+            &LanguageModelCompletionError::from_provider_response(
+                PROVIDER_NAME,
+                None,
+                None,
+                "expired".to_string(),
+                None,
+                ProviderErrorCategory::Authentication,
+            )
         ));
     }
 
