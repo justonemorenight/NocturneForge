@@ -2397,6 +2397,7 @@ pub struct AcpThread {
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
+    pending_terminal_references_logged: HashSet<acp::TerminalId>,
     had_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
@@ -2635,6 +2636,7 @@ impl AcpThread {
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
+            pending_terminal_references_logged: HashSet::default(),
             had_error: false,
             draft_prompt: None,
             draft_prompt_snapshot_providers: HashMap::new(),
@@ -3792,6 +3794,27 @@ impl AcpThread {
             )?;
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         };
+
+        let pending_terminal_ids = self
+            .tool_call(&id)
+            .into_iter()
+            .flat_map(|(_, tool_call)| &tool_call.content)
+            .filter_map(|content| match content {
+                ToolCallContent::PendingTerminal(terminal_id) => Some(terminal_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for terminal_id in pending_terminal_ids {
+            if self
+                .pending_terminal_references_logged
+                .insert(terminal_id.clone())
+            {
+                log::warn!(
+                    "Waiting for ACP terminal {terminal_id} referenced by tool call {id} in session {}",
+                    self.session_id
+                );
+            }
+        }
 
         self.resolve_locations(id, cx);
         Ok(())
@@ -5529,6 +5552,7 @@ impl AcpThread {
                     terminal,
                     cx,
                 );
+                self.pending_terminal_references_logged.remove(&terminal_id);
 
                 let mut updated_entries = HashSet::default();
                 for (entry_index, entry) in self.entries.iter_mut().enumerate() {
