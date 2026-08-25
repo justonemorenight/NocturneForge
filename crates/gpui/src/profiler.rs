@@ -829,6 +829,8 @@ pub enum FrameEvent {
 #[cfg(feature = "profiler")]
 #[derive(Clone)]
 pub struct FrameDurationSnapshot {
+    /// Histogram of durations from the first invalidation through presentation, in nanoseconds.
+    pub dirty_to_present_histogram: Histogram<u64>,
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
     /// Histogram of intervals between consecutively presented frames while the
@@ -865,6 +867,7 @@ enum WindowActivity {
 pub struct WindowProfiler {
     window_id: WindowId,
     active_activities: SmallVec<[WindowActivity; 4]>,
+    dirty_to_present_histogram: Histogram<u64>,
     draw_duration_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
@@ -875,6 +878,7 @@ pub struct WindowProfiler {
     last_present_at: Option<Instant>,
     animating_at_last_present: bool,
     drew_since_last_present: bool,
+    pending_dirty_at: Option<Instant>,
 }
 
 #[cfg(feature = "profiler")]
@@ -884,6 +888,9 @@ impl WindowProfiler {
         Ok(Self {
             window_id,
             active_activities: SmallVec::new(),
+            dirty_to_present_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create dirty-to-present histogram: {error}")
+            })?,
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
             })?,
@@ -902,6 +909,7 @@ impl WindowProfiler {
             last_present_at: None,
             animating_at_last_present: false,
             drew_since_last_present: false,
+            pending_dirty_at: None,
         })
     }
 
@@ -963,6 +971,7 @@ impl WindowProfiler {
         };
 
         self.drew_since_last_present = true;
+        self.pending_dirty_at = dirty_at;
         let draw_end = Instant::now();
         self.record_draw_duration(draw_end.duration_since(draw_start));
         record_frame_event(FrameEvent::Draw(FrameTiming {
@@ -994,6 +1003,7 @@ impl WindowProfiler {
     /// Returns a snapshot of the current frame-duration histograms.
     pub fn frame_duration_snapshot(&self) -> FrameDurationSnapshot {
         FrameDurationSnapshot {
+            dirty_to_present_histogram: self.dirty_to_present_histogram.clone(),
             draw_duration_histogram: self.draw_duration_histogram.clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
         }
@@ -1018,6 +1028,14 @@ impl WindowProfiler {
 
         if !std::mem::take(&mut self.drew_since_last_present) {
             return;
+        }
+
+        if let Some(dirty_at) = self.pending_dirty_at.take()
+            && let Err(error) = self
+                .dirty_to_present_histogram
+                .record(presented_at.duration_since(dirty_at).as_nanos() as u64)
+        {
+            log::error!("failed to record dirty-to-present frame timing: {error}");
         }
 
         let animation_interval = if self.animating_at_last_present && window_active {
@@ -1307,6 +1325,23 @@ mod tests {
 
         draw_and_present(&mut window_profiler, start + FRAME * 3, true, true);
         assert_eq!(window_profiler.present_interval_histogram.len(), 1);
+    }
+
+    #[test]
+    fn records_dirty_to_present_durations() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(8)).expect("window profiler should initialize");
+        let dirty_at = Instant::now() - Duration::from_millis(4);
+        window_profiler.begin_draw();
+        window_profiler.end_draw(Some(dirty_at), 1);
+        let present_end = Instant::now() + Duration::from_millis(6);
+
+        window_profiler.record_present_at(present_end, true, false);
+
+        let snapshot = window_profiler.frame_duration_snapshot();
+        let histogram = snapshot.dirty_to_present_histogram;
+        assert_eq!(histogram.len(), 1);
+        assert!(histogram.max() >= Duration::from_millis(10).as_nanos() as u64);
     }
 
     #[cfg(feature = "profiler")]
