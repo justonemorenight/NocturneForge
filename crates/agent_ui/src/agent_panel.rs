@@ -11648,7 +11648,7 @@ mod tests {
         });
     }
 
-    #[gpui::test]
+    #[gpui::test(iterations = 25)]
     async fn test_select_agent_action_updates_visible_draft(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
