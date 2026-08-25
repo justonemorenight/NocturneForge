@@ -35,7 +35,7 @@ pub struct WorkspaceSettingsContent {
     pub centered_layout: Option<CenteredLayoutSettings>,
     /// Whether or not to prompt the user to confirm before closing the application.
     ///
-    /// Default: false
+    /// Default: true
     pub confirm_quit: Option<bool>,
     /// Whether or not to show the call status icon in the status bar.
     ///
@@ -97,7 +97,7 @@ pub struct WorkspaceSettingsContent {
     /// Aliases for the command palette. When you type a key in this map,
     /// it will be assumed to equal the value.
     ///
-    /// Default: {}
+    /// Defaults to TypeScript test, spec, DOM test, and DOM spec companions.
     #[serde(default)]
     pub command_aliases: HashMap<String, CommandAliasTarget>,
     /// Maximum open tabs in a pane. Will not close an unsaved
