@@ -5149,42 +5149,64 @@ fn handle_session_notification(
         session_list.send_info_update(notification.session_id.clone(), info_update.clone());
     }
 
-    // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
-    if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
-        if let Some(meta) = &tc.meta {
-            if let Some(terminal_info) = meta.get("terminal_info") {
-                if let Some(id_str) = terminal_info.get("terminal_id").and_then(|v| v.as_str()) {
-                    let terminal_id = acp::TerminalId::new(id_str);
-                    let cwd = terminal_info
-                        .get("cwd")
-                        .and_then(|v| v.as_str().map(PathBuf::from));
-
-                    thread
-                        .update(cx, |thread, cx| {
-                            let builder = TerminalBuilder::new_display_only(
-                                CursorShape::default(),
-                                AlternateScroll::On,
-                                None,
-                                0,
-                                cx.background_executor(),
-                                thread.project().read(cx).path_style(cx),
-                            );
-                            let lower = cx.new(|cx| builder.subscribe(cx));
-                            thread.on_terminal_provider_event(
-                                TerminalProviderEvent::Created {
-                                    terminal_id,
-                                    label: tc.title.clone(),
-                                    cwd,
-                                    output_byte_limit: None,
-                                    terminal: lower,
-                                },
-                                cx,
-                            );
-                        })
-                        .log_err();
-                }
-            }
+    // A few ACP adapters attach terminal metadata to the first update rather than the
+    // initial tool call, so accept it at either point in the tool-call lifecycle.
+    let terminal_metadata = match &notification.update {
+        acp::SessionUpdate::ToolCall(tool_call) => tool_call
+            .meta
+            .as_ref()
+            .map(|meta| (meta, tool_call.title.clone())),
+        acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+            tool_call_update.meta.as_ref().map(|meta| {
+                (
+                    meta,
+                    tool_call_update
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Terminal".to_owned()),
+                )
+            })
         }
+        _ => None,
+    };
+    if let Some((meta, label)) = terminal_metadata
+        && let Some(terminal_info) = meta.get("terminal_info")
+        && let Some(id_str) = terminal_info
+            .get("terminal_id")
+            .and_then(|value| value.as_str())
+    {
+        let terminal_id = acp::TerminalId::new(id_str);
+        let cwd = terminal_info
+            .get("cwd")
+            .and_then(|value| value.as_str().map(PathBuf::from));
+
+        thread
+            .update(cx, |thread, cx| {
+                if thread.terminal(terminal_id.clone()).is_ok() {
+                    return;
+                }
+                let builder = TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    thread.project().read(cx).path_style(cx),
+                );
+                let lower = cx.new(|cx| builder.subscribe(cx));
+                thread.on_terminal_provider_event(
+                    TerminalProviderEvent::Created {
+                        terminal_id,
+                        label,
+                        cwd,
+                        output_byte_limit: None,
+                        terminal: lower,
+                    },
+                    cx,
+                );
+            })
+            .log_err();
     }
 
     // Forward the update to the acp_thread as usual.

@@ -1047,7 +1047,8 @@ fn collect_markdowns(
                                 | ContentBlock::Image { .. },
                             )
                             | ToolCallContent::Diff(_)
-                            | ToolCallContent::Terminal(_) => None,
+                            | ToolCallContent::Terminal(_)
+                            | ToolCallContent::PendingTerminal(_) => None,
                         }),
                 );
             }

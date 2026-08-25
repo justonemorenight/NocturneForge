@@ -871,6 +871,40 @@ pub struct ToolCall {
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedTaskGroup {
+    pub context: String,
+    pub tasks: Vec<DelegatedTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedTask {
+    pub name: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub task: String,
+    pub result: Option<DelegatedTaskResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedTaskResult {
+    pub status: String,
+    pub duration: Option<String>,
+    pub lines: Option<String>,
+    pub size: Option<String>,
+    pub preview: Option<String>,
+    pub output_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TodoProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub open: usize,
+    pub active_phase: Option<String>,
+    pub active_task: Option<String>,
+}
+
 impl ToolCall {
     fn from_acp(
         tool_call: acp::ToolCall,
@@ -1088,7 +1122,7 @@ impl ToolCall {
         self.content.iter().filter_map(|content| match content {
             ToolCallContent::Diff(diff) => Some(diff),
             ToolCallContent::ContentBlock(_) => None,
-            ToolCallContent::Terminal(_) => None,
+            ToolCallContent::Terminal(_) | ToolCallContent::PendingTerminal(_) => None,
         })
     }
 
@@ -1096,13 +1130,120 @@ impl ToolCall {
         self.content.iter().filter_map(|content| match content {
             ToolCallContent::Terminal(terminal) => Some(terminal),
             ToolCallContent::ContentBlock(_) => None,
-            ToolCallContent::Diff(_) => None,
+            ToolCallContent::Diff(_) | ToolCallContent::PendingTerminal(_) => None,
         })
     }
 
     pub fn is_subagent(&self) -> bool {
         self.tool_name.as_ref().is_some_and(|s| s == "spawn_agent")
             || self.subagent_session_info.is_some()
+    }
+
+    pub fn delegated_task_group(&self, cx: &App) -> Option<DelegatedTaskGroup> {
+        if self.tool_name.as_deref() != Some("task") {
+            return None;
+        }
+
+        let input = self.raw_input.as_ref()?.as_object()?;
+        let context = input.get("context")?.as_str()?.to_owned();
+        let tasks = input.get("tasks")?.as_array()?;
+        if tasks.is_empty() {
+            return None;
+        }
+
+        let mut result_text = String::new();
+        if let Some(raw_output) = &self.raw_output {
+            collect_json_strings(raw_output, &mut result_text);
+        }
+        for content in &self.content {
+            if let ToolCallContent::ContentBlock(block) = content
+                && let Some(text) = block.text_content(cx)
+            {
+                result_text.push_str(text);
+                result_text.push('\n');
+            }
+        }
+        let results = parse_delegated_task_results(&result_text);
+
+        let tasks = tasks
+            .iter()
+            .map(|task| {
+                let task = task.as_object()?;
+                let name = task.get("name")?.as_str()?.to_owned();
+                Some(DelegatedTask {
+                    result: results
+                        .iter()
+                        .find(|(result_name, _)| result_name == &name)
+                        .map(|(_, result)| result.clone()),
+                    name,
+                    agent: task.get("agent")?.as_str()?.to_owned(),
+                    model: task
+                        .get("model")
+                        .and_then(|model| model.as_str())
+                        .map(ToOwned::to_owned),
+                    task: task.get("task")?.as_str()?.to_owned(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(DelegatedTaskGroup { context, tasks })
+    }
+
+    pub fn todo_progress(&self, cx: &App) -> Option<TodoProgress> {
+        if self.tool_name.as_deref() != Some("todo") {
+            return None;
+        }
+
+        let mut output = String::new();
+        if let Some(raw_output) = &self.raw_output {
+            collect_json_strings(raw_output, &mut output);
+        }
+        for content in &self.content {
+            if let ToolCallContent::ContentBlock(block) = content
+                && let Some(text) = block.text_content(cx)
+            {
+                output.push_str(text);
+                output.push('\n');
+            }
+        }
+
+        let overall = output
+            .lines()
+            .rev()
+            .find(|line| line.trim_start().starts_with("Overall:"))?;
+        let progress = overall
+            .trim_start()
+            .strip_prefix("Overall:")?
+            .trim_start()
+            .split_whitespace()
+            .next()?;
+        let (completed, total) = progress.split_once('/')?;
+        let completed: usize = completed.parse().ok()?;
+        let total: usize = total.parse().ok()?;
+        let open = total.saturating_sub(completed);
+        let active_phase = output.lines().rev().find_map(|line| {
+            let line = line.trim_start().strip_prefix("Active phase ")?;
+            let quote_start = line.find('"')? + 1;
+            let quote_end = line[quote_start..].find('"')? + quote_start;
+            Some(line[quote_start..quote_end].to_owned())
+        });
+        let active_task = output.lines().rev().find_map(|line| {
+            let line = line.trim();
+            if !line.contains("[in_progress]") && !line.contains("(in progress)") {
+                return None;
+            }
+            let line = line.strip_prefix('-').unwrap_or(line).trim();
+            let end = line.find(" [").or_else(|| line.find(" (in progress)"))?;
+            Some(line[..end].to_owned())
+        });
+
+        Some(TodoProgress {
+            completed,
+            total,
+            open,
+            active_phase,
+            active_task,
+        })
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
@@ -1168,6 +1309,84 @@ impl ToolCall {
             })
         })
     }
+}
+
+fn collect_json_strings(value: &serde_json::Value, output: &mut String) {
+    match value {
+        serde_json::Value::String(text) => {
+            output.push_str(text);
+            output.push('\n');
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_strings(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn xml_attribute(tag: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=\"");
+    let start = tag.find(&prefix)? + prefix.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_owned())
+}
+
+fn parse_delegated_task_results(text: &str) -> Vec<(String, DelegatedTaskResult)> {
+    let mut results = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<task-result ") {
+        remaining = &remaining[start..];
+        let Some(header_end) = remaining.find('>') else {
+            break;
+        };
+        let header = &remaining[..=header_end];
+        let Some(block_end) = remaining.find("</task-result>") else {
+            break;
+        };
+        let block = &remaining[..block_end];
+        remaining = &remaining[block_end + "</task-result>".len()..];
+
+        let Some(name) = xml_attribute(header, "id") else {
+            continue;
+        };
+        let status = xml_attribute(header, "status").unwrap_or_else(|| "completed".to_owned());
+        let duration = xml_attribute(header, "duration");
+        let meta = block.find("<meta ").and_then(|start| {
+            block[start..]
+                .find('>')
+                .map(|end| &block[start..=start + end])
+        });
+        let preview_tag = block.find("<preview").and_then(|start| {
+            block[start..]
+                .find('>')
+                .map(|end| &block[start..=start + end])
+        });
+        let preview = block.find("<preview").and_then(|start| {
+            let content_start = block[start..].find('>')? + start + 1;
+            let content_end = block[content_start..].find("</preview>")? + content_start;
+            Some(block[content_start..content_end].trim().to_owned())
+        });
+
+        results.push((
+            name,
+            DelegatedTaskResult {
+                status,
+                duration,
+                lines: meta.and_then(|tag| xml_attribute(tag, "lines")),
+                size: meta.and_then(|tag| xml_attribute(tag, "size")),
+                preview: preview.filter(|preview| !preview.is_empty()),
+                output_uri: preview_tag.and_then(|tag| xml_attribute(tag, "full-output")),
+            },
+        ));
+    }
+    results
 }
 
 // Holds the buffer alive until resolution finishes: `shared_buffers`
@@ -1801,6 +2020,7 @@ pub enum ToolCallContent {
     ContentBlock(ContentBlock),
     Diff(Entity<Diff>),
     Terminal(Entity<Terminal>),
+    PendingTerminal(acp::TerminalId),
 }
 
 impl ToolCallContent {
@@ -1829,11 +2049,12 @@ impl ToolCallContent {
                     cx,
                 )
             })))),
-            acp::ToolCallContent::Terminal(acp::Terminal { terminal_id, .. }) => terminals
-                .get(&terminal_id)
-                .cloned()
-                .map(|terminal| Some(Self::Terminal(terminal)))
-                .ok_or_else(|| anyhow::anyhow!("Terminal with id `{}` not found", terminal_id)),
+            acp::ToolCallContent::Terminal(acp::Terminal { terminal_id, .. }) => {
+                Ok(Some(match terminals.get(&terminal_id) {
+                    Some(terminal) => Self::Terminal(terminal.clone()),
+                    None => Self::PendingTerminal(terminal_id),
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -1883,6 +2104,9 @@ impl ToolCallContent {
             Self::ContentBlock(content) => content.to_markdown(cx).to_string(),
             Self::Diff(diff) => diff.read(cx).to_markdown(cx),
             Self::Terminal(terminal) => terminal.read(cx).to_markdown(cx),
+            Self::PendingTerminal(terminal_id) => {
+                format!("Terminal `{terminal_id}` is starting…")
+            }
         }
     }
 
@@ -5306,6 +5530,20 @@ impl AcpThread {
                     cx,
                 );
 
+                let mut updated_entries = HashSet::default();
+                for (entry_index, entry) in self.entries.iter_mut().enumerate() {
+                    let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                        continue;
+                    };
+                    for content in &mut tool_call.content {
+                        if matches!(content, ToolCallContent::PendingTerminal(id) if id == &terminal_id)
+                        {
+                            *content = ToolCallContent::Terminal(entity.clone());
+                            updated_entries.insert(entry_index);
+                        }
+                    }
+                }
+
                 if let Some(mut chunks) = self.pending_terminal_output.remove(&terminal_id) {
                     for data in chunks.drain(..) {
                         entity.update(cx, |term, cx| {
@@ -5323,6 +5561,9 @@ impl AcpThread {
                     });
                 }
 
+                for entry_index in updated_entries {
+                    cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+                }
                 cx.notify();
             }
             TerminalProviderEvent::Output { terminal_id, data } => {
@@ -5776,6 +6017,118 @@ mod tests {
         let details: SandboxAuthorizationDetails =
             serde_json::from_value(json!({ "network": false })).unwrap();
         assert!(!details.network_all_hosts);
+    }
+
+    #[test]
+    fn parses_delegated_task_results_without_guessing_missing_metadata() {
+        let results = parse_delegated_task_results(
+            r#"<task-result id="Inventory" agent="scout" status="completed" duration="3m50s">
+<meta lines="42" size="11.9KB" />
+<preview full-output="agent://Inventory">Result preview</preview>
+</task-result>
+<task-result id="Patterns" agent="scout" status="failed">
+<preview>Failure preview</preview>
+</task-result>"#,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "Inventory");
+        assert_eq!(results[0].1.status, "completed");
+        assert_eq!(results[0].1.duration.as_deref(), Some("3m50s"));
+        assert_eq!(results[0].1.lines.as_deref(), Some("42"));
+        assert_eq!(results[0].1.size.as_deref(), Some("11.9KB"));
+        assert_eq!(results[0].1.preview.as_deref(), Some("Result preview"));
+        assert_eq!(
+            results[0].1.output_uri.as_deref(),
+            Some("agent://Inventory")
+        );
+        assert_eq!(results[1].0, "Patterns");
+        assert_eq!(results[1].1.status, "failed");
+        assert_eq!(results[1].1.duration, None);
+        assert_eq!(results[1].1.output_uri, None);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_reference_resolves_when_created_after_tool_call(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let terminal_id = acp::TerminalId::new("late-terminal");
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("terminal-tool", "Running command")
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::InProgress)
+                            .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(
+                                terminal_id.clone(),
+                            ))]),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] else {
+                panic!("expected a tool call");
+            };
+            assert!(matches!(
+                tool_call.content.as_slice(),
+                [ToolCallContent::PendingTerminal(id)] if id == &terminal_id
+            ));
+            assert!(matches!(tool_call.status, ToolCallStatus::InProgress));
+        });
+
+        let lower = cx.new(|cx| {
+            let builder = ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            );
+            builder.subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "Late terminal".to_owned(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower,
+                },
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let AgentThreadEntry::ToolCall(tool_call) = &thread.entries[0] else {
+                panic!("expected a tool call");
+            };
+            assert!(matches!(
+                tool_call.content.as_slice(),
+                [ToolCallContent::Terminal(_)]
+            ));
+        });
     }
 
     #[gpui::test]

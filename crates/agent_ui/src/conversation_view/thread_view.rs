@@ -10,8 +10,9 @@ use agent_client_protocol::schema::v1 as acp;
 use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
+    DelegatedTaskGroup, Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry,
+    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
+    TodoProgress, decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -607,6 +608,7 @@ pub struct ThreadView {
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
+    floating_tool_call_scroll_handles: RefCell<HashMap<acp::ToolCallId, ScrollHandle>>,
     pub edits_expanded: bool,
     large_diff_review_prompt: bool,
     full_diff_review_opted_in: bool,
@@ -1110,6 +1112,7 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            floating_tool_call_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             large_diff_review_prompt: false,
             full_diff_review_opted_in: false,
@@ -7201,7 +7204,9 @@ impl ThreadView {
                     let has_visible_content =
                         tool_call.content.iter().any(|content| match content {
                             ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => true,
+                            ToolCallContent::Diff(_)
+                            | ToolCallContent::Terminal(_)
+                            | ToolCallContent::PendingTerminal(_) => true,
                         });
                     if !has_visible_content {
                         return Empty.into_any();
@@ -8962,9 +8967,15 @@ impl ThreadView {
             tool_call.id.0,
             layout.id_str()
         )));
+        let delegated_task_group = tool_call.delegated_task_group(cx);
+        let todo_progress = tool_call.todo_progress(cx);
 
         div().w_full().id(container_id).map(|this| {
-            if tool_call.is_subagent() {
+            if let Some(group) = delegated_task_group {
+                this.child(self.render_delegated_task_group(entry_ix, tool_call, group, cx))
+            } else if let Some(progress) = todo_progress {
+                this.child(self.render_todo_progress(entry_ix, tool_call, progress, cx))
+            } else if tool_call.is_subagent() {
                 this.child(
                     self.render_subagent_tool_call(
                         active_session_id,
@@ -9004,6 +9015,277 @@ impl ThreadView {
                 ))
             }
         })
+    }
+
+    fn render_todo_progress(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        progress: TodoProgress,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let is_complete = progress.completed == progress.total;
+        h_flex()
+            .id(("agent-todo-progress", entry_ix))
+            .mx_5()
+            .my_1()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(self.tool_card_border_color(cx))
+            .child(if is_complete {
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success)
+                    .into_any_element()
+            } else if matches!(
+                tool_call.status,
+                ToolCallStatus::Pending | ToolCallStatus::InProgress
+            ) {
+                SpinnerLabel::new()
+                    .size(LabelSize::Small)
+                    .into_any_element()
+            } else {
+                Icon::new(IconName::Circle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+            })
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        Label::new(format!(
+                            "Plan progress  {}/{}",
+                            progress.completed, progress.total
+                        ))
+                        .size(LabelSize::Small),
+                    )
+                    .when_some(progress.active_task, |this, active_task| {
+                        this.child(
+                            Label::new(active_task)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    }),
+            )
+            .child(div().flex_1())
+            .when_some(progress.active_phase, |this, phase| {
+                this.child(
+                    Label::new(format!("{phase} · {} open", progress.open))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+    }
+
+    fn render_delegated_task_group(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        group: DelegatedTaskGroup,
+        cx: &Context<Self>,
+    ) -> Div {
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call.id);
+        let completed = group
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.result
+                    .as_ref()
+                    .is_some_and(|result| result.status == "completed")
+            })
+            .count();
+        let total = group.tasks.len();
+        let is_running = completed < total
+            && matches!(
+                tool_call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+            );
+        let tool_call_id = tool_call.id.clone();
+
+        v_flex()
+            .mx_5()
+            .my_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(self.tool_card_border_color(cx))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .id(("delegated-task-header", entry_ix))
+                    .h_8()
+                    .px_2()
+                    .gap_2()
+                    .w_full()
+                    .cursor_pointer()
+                    .bg(self.tool_card_header_bg(cx))
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(if is_running {
+                        SpinnerLabel::new()
+                            .size(LabelSize::Small)
+                            .into_any_element()
+                    } else {
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Success)
+                            .into_any_element()
+                    })
+                    .child(
+                        Label::new(format!("Delegated tasks  {completed}/{total}"))
+                            .size(LabelSize::Small),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(if is_expanded {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.entry_view_state.update(cx, |state, _| {
+                            state.toggle_tool_call_expansion(&tool_call_id);
+                        });
+                        this.refresh_thread_search(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .when(is_expanded, |this| {
+                this.child(
+                    v_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(self.tool_card_border_color(cx))
+                        .child(
+                            Label::new("Shared context")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(div().text_sm().child(group.context)),
+                )
+            })
+            .children(
+                group
+                    .tasks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(task_index, task)| {
+                        let result = task.result.as_ref();
+                        let status = result
+                            .map(|result| result.status.as_str())
+                            .unwrap_or(if is_running { "pending" } else { "unknown" });
+                        let metadata = [
+                            Some(format!("Agent: {}", task.agent)),
+                            Some(format!(
+                                "Model: {}",
+                                task.model.as_deref().unwrap_or("Not provided")
+                            )),
+                            result.and_then(|result| {
+                                result
+                                    .duration
+                                    .as_ref()
+                                    .map(|duration| format!("Duration: {duration}"))
+                            }),
+                            result.and_then(|result| match (&result.lines, &result.size) {
+                                (Some(lines), Some(size)) => {
+                                    Some(format!("{lines} lines · {size}"))
+                                }
+                                (Some(lines), None) => Some(format!("{lines} lines")),
+                                (None, Some(size)) => Some(size.clone()),
+                                (None, None) => None,
+                            }),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                        let preview = result.and_then(|result| result.preview.clone());
+                        let output_uri = result.and_then(|result| result.output_uri.clone());
+
+                        v_flex()
+                            .id(format!("delegated-task-{entry_ix}-{task_index}"))
+                            .px_3()
+                            .py_2()
+                            .gap_1()
+                            .when(task_index > 0, |this| {
+                                this.border_t_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(if status == "completed" {
+                                            IconName::Check
+                                        } else if status == "failed" {
+                                            IconName::Close
+                                        } else {
+                                            IconName::Circle
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(
+                                            if status == "completed" {
+                                                Color::Success
+                                            } else if status == "failed" {
+                                                Color::Error
+                                            } else {
+                                                Color::Muted
+                                            },
+                                        ),
+                                    )
+                                    .child(Label::new(task.name).size(LabelSize::Small))
+                                    .child(
+                                        Label::new(status.to_owned())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                Label::new(metadata)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .when(is_expanded, |this| {
+                                this.child(div().text_sm().child(task.task))
+                                    .when_some(preview, |this, preview| {
+                                        this.child(
+                                            v_flex()
+                                                .id(format!(
+                                                    "delegated-task-preview-{entry_ix}-{task_index}"
+                                                ))
+                                                .mt_1()
+                                                .p_2()
+                                                .max_h_56()
+                                                .overflow_y_scroll()
+                                                .rounded_sm()
+                                                .bg(cx.theme().colors().editor_background)
+                                                .child(div().text_sm().child(preview)),
+                                        )
+                                    })
+                                    .when_some(output_uri, |this, output_uri| {
+                                        this.child(
+                                            Label::new(output_uri)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                            })
+                    }),
+            )
     }
 
     fn render_tool_call(
@@ -9512,12 +9794,48 @@ impl ThreadView {
             })
             .map(|this| {
                 if layout == ToolCallLayout::Floating {
+                    let view_full_label = if tool_call
+                        .raw_input
+                        .as_ref()
+                        .is_some_and(|input| input.to_string().contains("xd://propose"))
+                    {
+                        "View full plan"
+                    } else {
+                        "View in conversation"
+                    };
+                    let scroll_handle = self
+                        .floating_tool_call_scroll_handles
+                        .borrow_mut()
+                        .entry(tool_call.id.clone())
+                        .or_insert_with(ScrollHandle::new)
+                        .clone();
+                    let tool_call_id = tool_call.id.clone();
                     this.child(
                         div()
                             .id(("floating-tool-call-body", entry_ix))
-                            .max_h_40()
+                            .min_h_0()
+                            .max_h((window.viewport_size().height * 0.4).min(px(360.)))
                             .overflow_y_scroll()
+                            .track_scroll(&scroll_handle)
                             .child(body),
+                    )
+                    .child(
+                        h_flex().w_full().justify_end().px_2().child(
+                            Button::new(("view-full-tool-call", entry_ix), view_full_label)
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.entry_view_state.update(cx, |state, _| {
+                                        state.expand_tool_call(tool_call_id.clone());
+                                    });
+                                    this.list_state.scroll_to(ListOffset {
+                                        item_ix: entry_ix,
+                                        offset_in_item: px(0.),
+                                    });
+                                    this.sync_after_programmatic_scroll(cx);
+                                    cx.notify();
+                                })),
+                        ),
                     )
                 } else {
                     this.child(body)
@@ -10967,6 +11285,17 @@ impl ThreadView {
                 window,
                 cx,
             ),
+            ToolCallContent::PendingTerminal(terminal_id) => v_flex()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .child(Label::new("Starting terminal…").color(Color::Muted))
+                .child(
+                    Label::new(format!("Terminal {terminal_id}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
         }
     }
 
