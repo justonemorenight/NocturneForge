@@ -198,6 +198,7 @@ impl From<anyhow::Error> for ThreadError {
                     },
                     ProviderErrorCategory::InvalidEncryptedContent
                     | ProviderErrorCategory::RequestPayloadTooLarge
+                    | ProviderErrorCategory::ContentPolicy
                     | ProviderErrorCategory::InvalidRequest
                     | ProviderErrorCategory::Conflict
                     | ProviderErrorCategory::Timeout

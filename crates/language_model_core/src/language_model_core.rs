@@ -131,6 +131,7 @@ pub enum ProviderErrorCategory {
     InvalidEncryptedContent,
     Authentication,
     Permission,
+    ContentPolicy,
     EndpointNotFound,
     PaymentRequired,
     RateLimit,
@@ -432,6 +433,7 @@ fn category_from_cloud_failure(code: &str, message: &str) -> ProviderErrorCatego
         "authentication_error" => ProviderErrorCategory::Authentication,
         "billing_error" | "payment_required_error" => ProviderErrorCategory::PaymentRequired,
         "permission_error" => ProviderErrorCategory::Permission,
+        "cyber_policy" | "invalid_prompt" => ProviderErrorCategory::ContentPolicy,
         "not_found_error" => ProviderErrorCategory::EndpointNotFound,
         "conflict_error" => ProviderErrorCategory::Conflict,
         "rate_limit_error" | "rate_limit_exceeded" => ProviderErrorCategory::RateLimit,
@@ -916,8 +918,7 @@ mod tests {
         let context_error = LanguageModelCompletionError::from_http_status(
             String::from("OpenAI").into(),
             StatusCode::PAYLOAD_TOO_LARGE,
-            "maximum context length is 128000 tokens, however you requested 140000 tokens"
-                .to_string(),
+            "prompt is too long: 140000 tokens > 128000 maximum".to_string(),
             None,
         );
         assert!(matches!(
@@ -972,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_cloud_failure_preserves_unknown_provider_rejection() {
+    fn test_from_cloud_failure_maps_content_policy_rejection() {
         let error = LanguageModelCompletionError::from_cloud_failure(
             OPEN_AI_PROVIDER_NAME,
             "cyber_policy".to_string(),
@@ -988,7 +989,7 @@ mod tests {
                 code: Some(code),
                 message,
                 retry_after: None,
-                category: ProviderErrorCategory::Other,
+                category: ProviderErrorCategory::ContentPolicy,
             } if provider == OPEN_AI_PROVIDER_NAME
                 && code == "cyber_policy"
                 && message == "This content was flagged as potentially violating our terms of use."
