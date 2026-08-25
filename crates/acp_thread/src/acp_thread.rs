@@ -894,6 +894,23 @@ pub struct DelegatedTaskResult {
     pub size: Option<String>,
     pub preview: Option<String>,
     pub output_uri: Option<String>,
+    pub tool_count: Option<u64>,
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+    pub recent_tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedTaskProgress {
+    pub name: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub duration: Option<String>,
+    pub tool_count: Option<u64>,
+    pub requests: Option<u64>,
+    pub tokens: Option<u64>,
+    pub recent_tools: Vec<String>,
+    pub recent_output: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1140,11 +1157,11 @@ impl ToolCall {
     }
 
     pub fn delegated_task_group(&self, cx: &App) -> Option<DelegatedTaskGroup> {
-        if self.tool_name.as_deref() != Some("task") {
+        let input = self.raw_input.as_ref()?.as_object()?;
+        if self.tool_name.as_deref() != Some("task") && !is_delegated_task_input(input) {
             return None;
         }
 
-        let input = self.raw_input.as_ref()?.as_object()?;
         let context = input.get("context")?.as_str()?.to_owned();
         let tasks = input.get("tasks")?.as_array()?;
         if tasks.is_empty() {
@@ -1187,6 +1204,28 @@ impl ToolCall {
             .collect::<Option<Vec<_>>>()?;
 
         Some(DelegatedTaskGroup { context, tasks })
+    }
+
+    pub fn delegated_task_progress(&self) -> Vec<DelegatedTaskProgress> {
+        let mut progress = Vec::new();
+        if let Some(raw_output) = &self.raw_output {
+            collect_delegated_task_progress(raw_output, &mut progress);
+        }
+        progress
+    }
+
+    pub fn delegated_task_progress_names(&self) -> Vec<String> {
+        let mut names = self
+            .delegated_task_progress()
+            .into_iter()
+            .map(|progress| progress.name)
+            .collect::<Vec<_>>();
+        if let Some(input) = &self.raw_input {
+            names.extend(delegated_task_progress_names_from_input(input));
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     pub fn todo_progress(&self, cx: &App) -> Option<TodoProgress> {
@@ -1331,6 +1370,131 @@ fn collect_json_strings(value: &serde_json::Value, output: &mut String) {
     }
 }
 
+fn is_delegated_task_input(input: &serde_json::Map<String, serde_json::Value>) -> bool {
+    input
+        .get("context")
+        .is_some_and(serde_json::Value::is_string)
+        && input
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tasks| {
+                !tasks.is_empty()
+                    && tasks.iter().all(|task| {
+                        task.as_object().is_some_and(|task| {
+                            ["name", "agent", "task"].into_iter().all(|field| {
+                                task.get(field).is_some_and(serde_json::Value::is_string)
+                            })
+                        })
+                    })
+            })
+}
+
+fn delegated_task_progress_names_from_input(value: &serde_json::Value) -> Vec<String> {
+    let Some(input) = value.as_object() else {
+        return Vec::new();
+    };
+    if input.get("op").and_then(serde_json::Value::as_str) != Some("wait") {
+        return Vec::new();
+    }
+    input
+        .get("ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn collect_delegated_task_progress(
+    value: &serde_json::Value,
+    output: &mut Vec<DelegatedTaskProgress>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_delegated_task_progress(value, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "jobs" | "progress")
+                    && let Some(entries) = value.as_array()
+                {
+                    output.extend(entries.iter().filter_map(parse_delegated_task_progress));
+                } else {
+                    collect_delegated_task_progress(value, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_delegated_task_progress(value: &serde_json::Value) -> Option<DelegatedTaskProgress> {
+    let value = value.as_object()?;
+    let name = value
+        .get("id")
+        .or_else(|| value.get("name"))?
+        .as_str()?
+        .to_owned();
+    let status = value.get("status")?.as_str()?.to_owned();
+    let duration = value
+        .get("durationMs")
+        .and_then(serde_json::Value::as_u64)
+        .map(format_duration_ms);
+    let recent_tools = value
+        .get("recentTools")
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.as_str().map(ToOwned::to_owned).or_else(|| {
+                        tool.as_object()?
+                            .get("name")?
+                            .as_str()
+                            .map(ToOwned::to_owned)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let recent_output = value.get("recentOutput").and_then(|value| {
+        let mut text = String::new();
+        collect_json_strings(value, &mut text);
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.chars().take(4_000).collect())
+    });
+
+    Some(DelegatedTaskProgress {
+        name,
+        status,
+        model: value
+            .get("resolvedModel")
+            .or_else(|| value.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        duration,
+        tool_count: value.get("toolCount").and_then(serde_json::Value::as_u64),
+        requests: value.get("requests").and_then(serde_json::Value::as_u64),
+        tokens: value.get("tokens").and_then(serde_json::Value::as_u64),
+        recent_tools,
+        recent_output,
+    })
+}
+
+fn format_duration_ms(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1_000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn xml_attribute(tag: &str, name: &str) -> Option<String> {
     let prefix = format!("{name}=\"");
     let start = tag.find(&prefix)? + prefix.len();
@@ -1383,6 +1547,10 @@ fn parse_delegated_task_results(text: &str) -> Vec<(String, DelegatedTaskResult)
                 size: meta.and_then(|tag| xml_attribute(tag, "size")),
                 preview: preview.filter(|preview| !preview.is_empty()),
                 output_uri: preview_tag.and_then(|tag| xml_attribute(tag, "full-output")),
+                tool_count: None,
+                requests: None,
+                tokens: None,
+                recent_tools: Vec::new(),
             },
         ));
     }
@@ -6070,6 +6238,90 @@ mod tests {
         assert_eq!(results[1].1.status, "failed");
         assert_eq!(results[1].1.duration, None);
         assert_eq!(results[1].1.output_uri, None);
+    }
+
+    #[test]
+    fn recognizes_omp_delegated_task_input_without_private_meta() {
+        let input = json!({
+            "i": "Spawn scout agent to crawl codebase",
+            "context": "Explore and crawl the codebase",
+            "tasks": [{
+                "name": "CodebaseScout",
+                "agent": "scout",
+                "task": "Map the repository"
+            }]
+        });
+        let Some(input) = input.as_object() else {
+            panic!("expected object input");
+        };
+        assert!(is_delegated_task_input(input));
+
+        let unrelated = json!({
+            "context": "not a delegated task",
+            "tasks": [{ "name": "missing required fields" }]
+        });
+        let Some(unrelated) = unrelated.as_object() else {
+            panic!("expected object input");
+        };
+        assert!(!is_delegated_task_input(unrelated));
+    }
+
+    #[test]
+    fn parses_omp_delegated_task_progress_from_task_and_hub_results() {
+        let output = json!({
+            "details": {
+                "progress": [{
+                    "id": "CodebaseScout",
+                    "status": "pending",
+                    "toolCount": 0,
+                    "recentTools": []
+                }],
+                "snapshot": {
+                    "jobs": [{
+                        "id": "CodebaseScout",
+                        "status": "running",
+                        "durationMs": 76_035,
+                        "resolvedModel": "openai-codex/gpt-5.6-sol:medium",
+                        "toolCount": 7,
+                        "requests": 2,
+                        "tokens": 12_345,
+                        "recentTools": ["read", { "name": "search" }],
+                        "recentOutput": ["Inspecting workspace", "Mapping packages"]
+                    }]
+                }
+            }
+        });
+        let mut progress = Vec::new();
+        collect_delegated_task_progress(&output, &mut progress);
+
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0].name, "CodebaseScout");
+        assert_eq!(progress[0].status, "pending");
+        assert_eq!(progress[1].status, "running");
+        assert_eq!(progress[1].duration.as_deref(), Some("1m 16s"));
+        assert_eq!(
+            progress[1].model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol:medium")
+        );
+        assert_eq!(progress[1].tool_count, Some(7));
+        assert_eq!(progress[1].requests, Some(2));
+        assert_eq!(progress[1].tokens, Some(12_345));
+        assert_eq!(progress[1].recent_tools, ["read", "search"]);
+        assert_eq!(
+            progress[1].recent_output.as_deref(),
+            Some("Inspecting workspace\nMapping packages")
+        );
+    }
+
+    #[test]
+    fn recognizes_omp_hub_wait_targets_before_output_arrives() {
+        assert_eq!(
+            delegated_task_progress_names_from_input(&json!({
+                "op": "wait",
+                "ids": ["CodebaseScout", "TestScout"]
+            })),
+            ["CodebaseScout", "TestScout"]
+        );
     }
 
     #[gpui::test]

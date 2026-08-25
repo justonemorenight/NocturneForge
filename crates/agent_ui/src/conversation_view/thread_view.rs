@@ -10,9 +10,10 @@ use agent_client_protocol::schema::v1 as acp;
 use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
-    DelegatedTaskGroup, Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry,
-    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    TodoProgress, decode_path_escapes,
+    DelegatedTaskGroup, DelegatedTaskProgress, DelegatedTaskResult, Elicitation,
+    ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
+    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, TodoProgress,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -57,6 +58,52 @@ use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 const STICKY_PROMPT_PREVIEW_CHARS: usize = 240;
+
+fn apply_delegated_task_progress(group: &mut DelegatedTaskGroup, progress: DelegatedTaskProgress) {
+    let Some(task) = group
+        .tasks
+        .iter_mut()
+        .find(|task| task.name == progress.name)
+    else {
+        return;
+    };
+
+    if progress.model.is_some() {
+        task.model = progress.model;
+    }
+
+    let result = task.result.get_or_insert_with(|| DelegatedTaskResult {
+        status: progress.status.clone(),
+        duration: None,
+        lines: None,
+        size: None,
+        preview: None,
+        output_uri: None,
+        tool_count: None,
+        requests: None,
+        tokens: None,
+        recent_tools: Vec::new(),
+    });
+    result.status = progress.status;
+    if progress.duration.is_some() {
+        result.duration = progress.duration;
+    }
+    if progress.tool_count.is_some() {
+        result.tool_count = progress.tool_count;
+    }
+    if progress.requests.is_some() {
+        result.requests = progress.requests;
+    }
+    if progress.tokens.is_some() {
+        result.tokens = progress.tokens;
+    }
+    if !progress.recent_tools.is_empty() {
+        result.recent_tools = progress.recent_tools;
+    }
+    if progress.recent_output.is_some() {
+        result.preview = progress.recent_output;
+    }
+}
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -8944,6 +8991,62 @@ impl ThreadView {
             })
     }
 
+    fn enriched_delegated_task_group(
+        &self,
+        entry_ix: usize,
+        mut group: DelegatedTaskGroup,
+        cx: &App,
+    ) -> DelegatedTaskGroup {
+        let thread = self.thread.read(cx);
+        for entry in thread.entries().iter().skip(entry_ix) {
+            if matches!(entry, AgentThreadEntry::UserMessage(_)) {
+                break;
+            }
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+            for progress in tool_call.delegated_task_progress() {
+                apply_delegated_task_progress(&mut group, progress);
+            }
+        }
+        group
+    }
+
+    fn is_correlated_delegated_task_progress(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        cx: &App,
+    ) -> bool {
+        let progress_names = tool_call.delegated_task_progress_names();
+        if progress_names.is_empty() {
+            return false;
+        }
+
+        let thread = self.thread.read(cx);
+        let Some(entries_before_tool_call) = thread.entries().get(..entry_ix) else {
+            return false;
+        };
+        let turn_start = entries_before_tool_call
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map_or(0, |index| index + 1);
+        let delegated_task_names = entries_before_tool_call[turn_start..]
+            .iter()
+            .filter_map(|entry| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                tool_call.delegated_task_group(cx)
+            })
+            .flat_map(|group| group.tasks.into_iter().map(|task| task.name))
+            .collect::<std::collections::HashSet<_>>();
+
+        progress_names
+            .iter()
+            .any(|name| delegated_task_names.contains(name))
+    }
+
     fn render_any_tool_call(
         &self,
         active_session_id: &acp::SessionId,
@@ -8967,12 +9070,18 @@ impl ThreadView {
             tool_call.id.0,
             layout.id_str()
         )));
-        let delegated_task_group = tool_call.delegated_task_group(cx);
+        let delegated_task_group = tool_call
+            .delegated_task_group(cx)
+            .map(|group| self.enriched_delegated_task_group(entry_ix, group, cx));
         let todo_progress = tool_call.todo_progress(cx);
+        let is_correlated_delegated_task_progress = delegated_task_group.is_none()
+            && self.is_correlated_delegated_task_progress(entry_ix, tool_call, cx);
 
         div().w_full().id(container_id).map(|this| {
             if let Some(group) = delegated_task_group {
                 this.child(self.render_delegated_task_group(entry_ix, tool_call, group, cx))
+            } else if is_correlated_delegated_task_progress {
+                this
             } else if let Some(progress) = todo_progress {
                 this.child(self.render_todo_progress(entry_ix, tool_call, progress, cx))
             } else if tool_call.is_subagent() {
@@ -9104,13 +9213,20 @@ impl ThreadView {
             })
             .count();
         let total = group.tasks.len();
-        let is_running = completed < total
+        let is_running = group.tasks.iter().any(|task| {
+            task.result.as_ref().is_some_and(|result| {
+                matches!(
+                    result.status.as_str(),
+                    "pending" | "running" | "in_progress"
+                )
+            })
+        }) || (completed < total
             && matches!(
                 tool_call.status,
                 ToolCallStatus::Pending
                     | ToolCallStatus::InProgress
                     | ToolCallStatus::WaitingForConfirmation { .. }
-            );
+            ));
         let tool_call_id = tool_call.id.clone();
 
         v_flex()
@@ -9208,6 +9324,19 @@ impl ThreadView {
                                 (None, Some(size)) => Some(size.clone()),
                                 (None, None) => None,
                             }),
+                            result.and_then(|result| {
+                                result
+                                    .tool_count
+                                    .map(|tool_count| format!("{tool_count} tools"))
+                            }),
+                            result.and_then(|result| {
+                                result
+                                    .requests
+                                    .map(|requests| format!("{requests} requests"))
+                            }),
+                            result.and_then(|result| {
+                                result.tokens.map(|tokens| format!("{tokens} tokens"))
+                            }),
                         ]
                         .into_iter()
                         .flatten()
@@ -9261,6 +9390,18 @@ impl ThreadView {
                             )
                             .when(is_expanded, |this| {
                                 this.child(div().text_sm().child(task.task))
+                                    .when_some(
+                                        result
+                                            .filter(|result| !result.recent_tools.is_empty())
+                                            .map(|result| result.recent_tools.join("  ·  ")),
+                                        |this, recent_tools| {
+                                            this.child(
+                                                Label::new(format!("Recent tools: {recent_tools}"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                        },
+                                    )
                                     .when_some(preview, |this, preview| {
                                         this.child(
                                             v_flex()
@@ -13783,6 +13924,53 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    #[test]
+    fn merges_omp_hub_progress_into_delegated_task() {
+        let mut group = DelegatedTaskGroup {
+            context: "Explore the repository".to_owned(),
+            tasks: vec![acp_thread::DelegatedTask {
+                name: "CodebaseScout".to_owned(),
+                agent: "scout".to_owned(),
+                model: None,
+                task: "Map the codebase".to_owned(),
+                result: None,
+            }],
+        };
+
+        apply_delegated_task_progress(
+            &mut group,
+            DelegatedTaskProgress {
+                name: "CodebaseScout".to_owned(),
+                status: "running".to_owned(),
+                model: Some("openai-codex/gpt-5.6-sol:medium".to_owned()),
+                duration: Some("1m 16s".to_owned()),
+                tool_count: Some(7),
+                requests: Some(2),
+                tokens: Some(12_345),
+                recent_tools: vec!["read".to_owned(), "search".to_owned()],
+                recent_output: Some("Mapping packages".to_owned()),
+            },
+        );
+
+        let Some(task) = group.tasks.first() else {
+            panic!("expected delegated task");
+        };
+        assert_eq!(
+            task.model.as_deref(),
+            Some("openai-codex/gpt-5.6-sol:medium")
+        );
+        let Some(result) = &task.result else {
+            panic!("expected merged delegated task result");
+        };
+        assert_eq!(result.status, "running");
+        assert_eq!(result.duration.as_deref(), Some("1m 16s"));
+        assert_eq!(result.tool_count, Some(7));
+        assert_eq!(result.requests, Some(2));
+        assert_eq!(result.tokens, Some(12_345));
+        assert_eq!(result.recent_tools, ["read", "search"]);
+        assert_eq!(result.preview.as_deref(), Some("Mapping packages"));
     }
 
     #[test]
