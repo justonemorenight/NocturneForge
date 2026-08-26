@@ -599,13 +599,6 @@ impl GitListEntry {
         }
     }
 
-    fn directory_entry(&self) -> Option<&GitTreeDirEntry> {
-        match self {
-            GitListEntry::Directory(entry) => Some(entry),
-            _ => None,
-        }
-    }
-
     /// Returns the tree indentation depth for this entry.
     fn depth(&self) -> usize {
         match self {
@@ -1682,10 +1675,7 @@ impl GitPanel {
                 .is_some_and(GitListEntry::is_selectable)
         };
         let first_entry = match &self.view_mode {
-            GitPanelViewMode::Flat => self
-                .visible_flat_entry_indices()
-                .into_iter()
-                .find(|&index| is_selectable(index)),
+            GitPanelViewMode::Flat => self.entries.iter().position(GitListEntry::is_selectable),
             GitPanelViewMode::Tree(state) => state
                 .logical_indices
                 .iter()
@@ -12546,7 +12536,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_tree_view_select_first_skips_collapsed_section(cx: &mut TestAppContext) {
+    async fn test_tree_view_select_first_skips_collapsed_directory_entries(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
@@ -12556,34 +12548,45 @@ mod tests {
             });
         });
 
-        let (_, _, _, panel, mut cx) = setup_git_panel_with_changes(
+        let (_, _, panel, mut cx) = setup_git_panel_with_changes(
             cx,
             json!({
                 ".git": {},
-                "modified.rs": "fn main() {}",
+                "src": {
+                    "modified.rs": "fn main() {}",
+                },
             }),
-            &[("modified.rs", StatusCode::Modified)],
+            &[("src/modified.rs", StatusCode::Modified)],
         )
         .await;
 
         panel.update_in(&mut cx, |panel, window, cx| {
+            let directory_key = panel
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    GitListEntry::Directory(entry) => Some(entry.key.clone()),
+                    _ => None,
+                })
+                .expect("tree view should contain the src directory");
+            panel.toggle_directory(&directory_key, window, cx);
             panel.selected_entry = None;
-            panel.toggle_section_collapsed(Section::Tracked, window, cx);
+            panel.select_first(&menu::SelectFirst, window, cx);
 
+            let selected_index = panel
+                .selected_entry
+                .expect("the first visible tree entry should be selected");
             let state = panel
                 .view_mode
                 .tree_state()
                 .expect("tree view state should exist");
-            assert_eq!(state.logical_indices, [0]);
-            assert!(panel.selected_entry.is_none());
-
-            panel.toggle_section_collapsed(Section::Tracked, window, cx);
-
-            let selected_entry = panel
-                .get_selected_entry()
-                .and_then(GitListEntry::status_entry)
-                .expect("the first visible file should be selected");
-            assert_eq!(selected_entry.repo_path, repo_path("modified.rs"));
+            assert!(state.logical_indices.contains(&selected_index));
+            assert!(
+                panel
+                    .entries
+                    .get(selected_index)
+                    .is_some_and(GitListEntry::is_selectable)
+            );
         });
     }
 
