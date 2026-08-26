@@ -442,9 +442,13 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
             let completions = self.stream_completion(request, extra_headers, cx);
+            let executor = cx.background_executor().clone();
             async move {
                 let mapper = OpenAiEventMapper::new();
-                Ok(mapper.map_stream(completions.await?).boxed())
+                Ok(language_model::stream_in_background(
+                    mapper.map_stream(completions.await?).boxed(),
+                    executor,
+                ))
             }
             .boxed()
         } else {
@@ -464,9 +468,13 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
             };
             let completions = self.stream_response(request, extra_headers, cx);
             let compaction_state_owner = self.provider_id.clone();
+            let executor = cx.background_executor().clone();
             async move {
                 let mapper = OpenAiResponseEventMapper::new(compaction_state_owner);
-                Ok(mapper.map_stream(completions.await?).boxed())
+                Ok(language_model::stream_in_background(
+                    mapper.map_stream(completions.await?).boxed(),
+                    executor,
+                ))
             }
             .boxed()
         }

@@ -1830,7 +1830,10 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             let (stream, account_scope, operation_guard) = future.await?;
             let mapper =
                 OpenAiResponseEventMapper::new_with_account_scope(PROVIDER_ID, account_scope);
-            let stream = mapper.map_stream(stream.boxed()).boxed();
+            let stream = language_model::stream_in_background(
+                mapper.map_stream(stream.boxed()).boxed(),
+                background_executor.clone(),
+            );
             Ok(stream_with_idle_timeout(
                 stream,
                 background_executor,

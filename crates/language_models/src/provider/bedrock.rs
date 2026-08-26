@@ -979,6 +979,7 @@ impl LanguageModel for BedrockModel {
 
         let request = self.stream_completion(request, extra_headers, cx);
         let display_name = self.model.display_name().to_string();
+        let executor = cx.background_executor().clone();
         let future = self.request_limiter.stream(async move {
             let response = request.await.map_err(|err| match err {
                 BedrockError::Validation(ref msg) => {
@@ -1045,7 +1046,10 @@ impl LanguageModel for BedrockModel {
                 }
                 other => LanguageModelCompletionError::Other(anyhow!(other)),
             })?;
-            let events = map_to_language_model_completion_events(response);
+            let events = language_model::stream_in_background(
+                map_to_language_model_completion_events(response).boxed(),
+                executor,
+            );
 
             if deny_tool_calls {
                 Ok(deny_tool_use_events(events).boxed())
@@ -1527,9 +1531,13 @@ impl LanguageModel for BedrockMantleModel {
                     Err(error) => return async move { Err(error.into()) }.boxed(),
                 };
                 let completions = self.stream_response(request, extra_headers, cx);
+                let executor = cx.background_executor().clone();
                 async move {
                     let mapper = OpenAiResponseEventMapper::new(PROVIDER_ID);
-                    Ok(mapper.map_stream(completions.await?).boxed())
+                    Ok(language_model::stream_in_background(
+                        mapper.map_stream(completions.await?).boxed(),
+                        executor,
+                    ))
                 }
                 .boxed()
             }
@@ -1549,9 +1557,13 @@ impl LanguageModel for BedrockMantleModel {
                     Err(error) => return async move { Err(error.into()) }.boxed(),
                 };
                 let completions = self.stream_completion(request, extra_headers, cx);
+                let executor = cx.background_executor().clone();
                 async move {
                     let mapper = OpenAiEventMapper::new();
-                    Ok(mapper.map_stream(completions.await?).boxed())
+                    Ok(language_model::stream_in_background(
+                        mapper.map_stream(completions.await?).boxed(),
+                        executor,
+                    ))
                 }
                 .boxed()
             }

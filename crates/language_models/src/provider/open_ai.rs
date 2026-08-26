@@ -10,7 +10,7 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice, OPEN_AI_PROVIDER_ID,
-    OPEN_AI_PROVIDER_NAME, ProviderSettingsView, RateLimiter, env_var,
+    OPEN_AI_PROVIDER_NAME, ProviderSettingsView, RateLimiter, env_var, stream_in_background,
 };
 use open_ai::{
     ResponseStreamEvent,
@@ -648,9 +648,13 @@ impl LanguageModel for OpenAiLanguageModel {
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
             let completions = self.stream_response(request, extra_headers, cx);
+            let executor = cx.background_executor().clone();
             async move {
                 let mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID);
-                Ok(mapper.map_stream(completions.await?).boxed())
+                Ok(stream_in_background(
+                    mapper.map_stream(completions.await?).boxed(),
+                    executor,
+                ))
             }
             .boxed()
         } else {
@@ -668,9 +672,13 @@ impl LanguageModel for OpenAiLanguageModel {
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
             let completions = self.stream_completion(request, extra_headers, cx);
+            let executor = cx.background_executor().clone();
             async move {
                 let mapper = OpenAiEventMapper::new();
-                Ok(mapper.map_stream(completions.await?).boxed())
+                Ok(stream_in_background(
+                    mapper.map_stream(completions.await?).boxed(),
+                    executor,
+                ))
             }
             .boxed()
         }
