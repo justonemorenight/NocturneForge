@@ -420,6 +420,7 @@ fn test_edit_events(cx: &mut gpui::App) {
                     operation,
                     is_local: true,
                 } => buffer1_ops.lock().push(operation),
+                BufferEvent::TransactionUndone { .. } | BufferEvent::TransactionRedone { .. } => {}
                 event => buffer_1_events.lock().push(event),
             })
             .detach();
