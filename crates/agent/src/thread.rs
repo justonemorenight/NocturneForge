@@ -9103,7 +9103,7 @@ mod tests {
         model.send_completion_stream_error(
             &initial_request,
             LanguageModelCompletionError::from_provider_response(
-                "test".into(),
+                "test".to_string().into(),
                 None,
                 None,
                 "prompt too large".to_string(),
@@ -9137,7 +9137,7 @@ mod tests {
         model.send_completion_stream_error(
             &retry_request,
             LanguageModelCompletionError::from_provider_response(
-                "test".into(),
+                "test".to_string().into(),
                 None,
                 None,
                 "prompt too large".to_string(),
@@ -9360,7 +9360,7 @@ mod tests {
         model.send_completion_stream_error(
             &oversized_request,
             LanguageModelCompletionError::from_provider_response(
-                "test".into(),
+                "test".to_string().into(),
                 None,
                 None,
                 "prompt too large".to_string(),

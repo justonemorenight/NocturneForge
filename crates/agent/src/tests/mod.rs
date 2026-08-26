@@ -3471,12 +3471,16 @@ async fn test_prompt_too_large_marks_token_usage_exceeded(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
 
-    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::from_http_status(
-        LanguageModelProviderName::new("test"),
-        http_client::StatusCode::PAYLOAD_TOO_LARGE,
-        "prompt too large".to_string(),
-        None,
-    ));
+    fake_model.send_last_completion_stream_error(
+        LanguageModelCompletionError::from_provider_response(
+            LanguageModelProviderName::new("test"),
+            None,
+            None,
+            "prompt too large".to_string(),
+            None,
+            language_model::ProviderErrorCategory::PromptTooLarge { tokens: None },
+        ),
+    );
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
