@@ -45,9 +45,8 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
     LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
     LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
-    LanguageModelToolSchemaFormat, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
-    ProviderErrorCategory, Role, SelectedModel, Speed, StopReason, TokenUsage,
-    ZED_CLOUD_PROVIDER_ID,
+    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role,
+    SelectedModel, Speed, StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -4791,17 +4790,49 @@ impl Thread {
         let model = self
             .model()
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+        let sandboxing_enabled = self.sandboxing_enabled(cx);
         let tools = if let Some(turn) = self.running_turn.as_ref() {
             turn.tools
                 .iter()
-                .filter_map(|(tool_name, tool)| {
+                .map(|(tool_name, tool)| {
                     log::trace!("Including tool: {}", tool_name);
-                    Some(LanguageModelRequestTool::function(
+                    let mut description = tool.description().to_string();
+                    let mut schema = tool.input_schema();
+                    // TEMPORARY (sandboxing feature flag): with the flag off,
+                    // the fetch and create_directory descriptions/schemas must
+                    // not advertise sandbox-dependent behavior (host grants,
+                    // out-of-project creation via the `reason` field), since
+                    // the corresponding runtime paths are disabled. Restore
+                    // the pre-sandboxing model-facing surface here rather than
+                    // forking the tools; delete this when the flag is removed
+                    // again.
+                    if !sandboxing_enabled {
+                        if tool_name.as_ref() == FetchTool::NAME {
+                            description =
+                                "Fetches a URL and returns the content as Markdown.".to_string();
+                        } else if tool_name.as_ref() == CreateDirectoryTool::NAME {
+                            description = "Creates a new directory at the specified path within \
+                                the project. Returns confirmation that the directory was \
+                                created.\n\nThis tool creates a directory and all necessary \
+                                parent directories. It should be used whenever you need to \
+                                create new directories within the project.\nThe only supported \
+                                path outside the project is `~/.agents/skills` or a descendant, \
+                                for global agent skills."
+                                .to_string();
+                            if let Some(properties) = schema
+                                .get_mut("properties")
+                                .and_then(|value| value.as_object_mut())
+                            {
+                                properties.remove("reason");
+                            }
+                        }
+                    }
+                    LanguageModelRequestTool::function(
                         tool_name.to_string(),
-                        tool.description().to_string(),
-                        tool.input_schema(model.tool_input_format()).log_err()?,
+                        description,
+                        schema,
                         tool.supports_input_streaming(),
-                    ))
+                    )
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -6601,8 +6632,8 @@ where
     ) -> SharedString;
 
     /// Returns the JSON schema that describes the tool's input.
-    fn input_schema(format: LanguageModelToolSchemaFormat) -> Schema {
-        language_model::tool_schema::root_schema_for::<Self::Input>(format)
+    fn input_schema() -> Schema {
+        language_model::tool_schema::root_schema_for::<Self::Input>()
     }
 
     /// Returns whether the tool supports streaming of tool use parameters.
@@ -6680,7 +6711,7 @@ pub trait AnyAgentTool {
     fn description(&self) -> SharedString;
     fn kind(&self) -> acp::ToolKind;
     fn initial_title(&self, input: serde_json::Value, _cx: &mut App) -> SharedString;
-    fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> Result<serde_json::Value>;
+    fn input_schema(&self) -> serde_json::Value;
     fn supports_input_streaming(&self) -> bool {
         false
     }
@@ -6733,10 +6764,10 @@ where
         self.0.initial_title(parsed_input, _cx)
     }
 
-    fn input_schema(&self, format: LanguageModelToolSchemaFormat) -> Result<serde_json::Value> {
-        let mut json = serde_json::to_value(T::input_schema(format))?;
-        language_model::tool_schema::adapt_schema_to_format(&mut json, format)?;
-        Ok(json)
+    fn input_schema(&self) -> serde_json::Value {
+        let mut schema = T::input_schema().to_value();
+        language_model::tool_schema::normalize_tool_schema(&mut schema);
+        schema
     }
 
     fn supports_provider(&self, provider: &LanguageModelProviderId) -> bool {

@@ -10,8 +10,7 @@ use copilot_chat::responses as copilot_responses;
 use copilot_chat::{
     ChatLocation, ChatMessage, ChatMessageContent, ChatMessagePart, CopilotChat,
     CopilotChatConfiguration, Function, FunctionContent, ImageUrl, Model as CopilotChatModel,
-    ModelVendor, Request as CopilotChatRequest, ResponseEvent, Tool, ToolCall, ToolCallContent,
-    ToolChoice,
+    Request as CopilotChatRequest, ResponseEvent, Tool, ToolCall, ToolCallContent, ToolChoice,
 };
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -24,9 +23,8 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelCostInfo, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, ProviderErrorCategory, ProviderSettingsView, RateLimiter,
-    Role, StopReason, TokenUsage,
+    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
+    ProviderErrorCategory, ProviderSettingsView, RateLimiter, Role, StopReason, TokenUsage,
 };
 use settings::SettingsStore;
 use ui::prelude::*;
@@ -276,17 +274,6 @@ impl LanguageModel for CopilotChatLanguageModel {
                 }
             })
             .collect()
-    }
-
-    fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
-        match self.model.vendor() {
-            ModelVendor::OpenAI | ModelVendor::Anthropic => {
-                LanguageModelToolSchemaFormat::JsonSchema
-            }
-            ModelVendor::Google | ModelVendor::XAI | ModelVendor::Unknown => {
-                LanguageModelToolSchemaFormat::JsonSchemaSubset
-            }
-        }
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
