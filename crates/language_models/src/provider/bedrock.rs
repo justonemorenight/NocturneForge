@@ -46,9 +46,9 @@ use language_model::{
     LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, ProviderErrorCategory, ProviderSettingsView, RateLimiter,
-    Role, SubPageProviderSettings, TokenUsage, env_var,
+    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
+    ProviderErrorCategory, ProviderSettingsView, RateLimiter, Role, SubPageProviderSettings,
+    TokenUsage, env_var,
 };
 use open_ai::responses::Request as OpenAiResponseRequest;
 use schemars::JsonSchema;
@@ -1435,10 +1435,6 @@ impl LanguageModel for BedrockMantleModel {
 
     fn supports_tools(&self) -> bool {
         self.model.supports_tools()
-    }
-
-    fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
-        LanguageModelToolSchemaFormat::JsonSchemaSubset
     }
 
     fn supports_images(&self) -> bool {
