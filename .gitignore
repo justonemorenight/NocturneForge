@@ -60,3 +60,10 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+
+# repowise API keys (local)
+.repowise/.env
+
+# Local agent/editor configuration
+.codex/
+.agents/

@@ -50,7 +50,14 @@ shift $((OPTIND-1))
 
 # Get release channel
 pushd crates/zed
-channel=$(<RELEASE_CHANNEL)
+channel="${ZED_BUNDLE_CHANNEL:-$(<RELEASE_CHANNEL)}"
+case "$channel" in
+    dev|nightly|preview|stable) ;;
+    *)
+        echo "Unsupported bundle channel: $channel" >&2
+        exit 1
+        ;;
+esac
 export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
@@ -87,22 +94,32 @@ script/generate-licenses
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
+if [[ "${ZED_BUNDLE_SKIP_BUILD:-0}" != "1" ]]; then
+    cargo build ${build_flag} --package zed --package cli --target $target_triple
+    # Build remote_server in separate invocation to prevent feature unification from other crates
+    # from influencing dynamic libraries required by it.
+    cargo build ${build_flag} --package remote_server --target $target_triple
+else
+    echo "Skipping compilation (ZED_BUNDLE_SKIP_BUILD=1)"
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
-cp Cargo.toml Cargo.toml.backup
-sed \
-    -i.backup \
-    "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
-    Cargo.toml
+manifest_backup="Cargo.toml.bundle-backup"
+cp Cargo.toml "$manifest_backup"
+restore_bundle_manifest() {
+    mv "$manifest_backup" Cargo.toml
+}
+trap restore_bundle_manifest EXIT
+# Keep the default Dev metadata distinct while promoting the selected channel
+# to the cargo-bundle table name.
+perl -0pi -e 's/^\[package\.metadata\.bundle\]$/[package.metadata.bundle-dev]/m' Cargo.toml
+perl -0pi -e "s/^\\[package\\.metadata\\.bundle-${channel}\\]$/[package.metadata.bundle]/m" Cargo.toml
 
 app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
 
-mv Cargo.toml.backup Cargo.toml
+restore_bundle_manifest
+trap - EXIT
 popd
 echo "Bundled ${app_path}"
 
