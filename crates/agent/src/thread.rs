@@ -4,8 +4,8 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
+    UpdatePlanTool, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -18,9 +18,9 @@ use crate::sandboxing::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
-    AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
-    ChatGptSubagentRolesSettings, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT,
-    builtin_profiles,
+    AgentAutonomy, AgentExecutionStrategy, AgentProfileId, AgentProfileSettings, AgentSettings,
+    AutoCompactThreshold, COMPACTION_PROMPT, ChatGptSubagentRolesSettings,
+    SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -76,7 +76,7 @@ const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+pub const MAX_SUBAGENT_DEPTH: u8 = 2;
 const CHATGPT_SUBSCRIPTION_PROVIDER_ID: &str = "openai-subscribed";
 
 /// A role used by native ChatGPT Subscription subagents.
@@ -477,6 +477,8 @@ impl UserMessage {
         const MERGE_CONFLICT_TAG: &str = "<merge_conflicts>";
         const OPEN_SKILLS_TAG: &str =
             "<skills>\nThe user has attached the following agent skills:\n";
+        const OPEN_MCP_TAG: &str =
+            "<mcp_servers>\nThe user has explicitly mentioned the following MCP context servers:\n";
 
         let mut file_context = OPEN_FILES_TAG.to_string();
         let mut directory_context = OPEN_DIRECTORIES_TAG.to_string();
@@ -489,6 +491,7 @@ impl UserMessage {
         let mut diffs_context = OPEN_DIFFS_TAG.to_string();
         let mut merge_conflict_context = MERGE_CONFLICT_TAG.to_string();
         let mut skills_context = OPEN_SKILLS_TAG.to_string();
+        let mut mcp_context = OPEN_MCP_TAG.to_string();
 
         for chunk in &*self.content {
             let chunk = match chunk {
@@ -610,6 +613,13 @@ impl UserMessage {
                             let label = format!("{} ({})", name, source);
                             write!(&mut skills_context, "\nSkill: {}\n{}\n", label, content).ok();
                         }
+                        MentionUri::ContextServer { server_id } => {
+                            write!(
+                                &mut mcp_context,
+                                "\n- Server: {server_id}\n  Server ID: mcp:{server_id}:\n",
+                            )
+                            .ok();
+                        }
                     }
 
                     language_model::MessageContent::Text(uri.as_link().to_string())
@@ -696,6 +706,13 @@ impl UserMessage {
             message
                 .content
                 .push(language_model::MessageContent::Text(merge_conflict_context));
+        }
+
+        if mcp_context.len() > OPEN_MCP_TAG.len() {
+            mcp_context.push_str("</mcp_servers>\n");
+            message
+                .content
+                .push(language_model::MessageContent::Text(mcp_context));
         }
 
         if message.content.len() > len_before_context {
@@ -906,6 +923,8 @@ pub trait SubagentHandle {
     /// The current number of entries in the thread.
     /// Useful for knowing where the next turn will begin
     fn num_entries(&self, cx: &App) -> usize;
+    /// Token usage accumulated by the subagent's current session.
+    fn used_tokens(&self, cx: &App) -> Option<u64>;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 }
@@ -921,10 +940,14 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
+    /// Creates a subagent thread. When `tool_filter` is `Some`, the subagent
+    /// is restricted to the named tools (validated against the spawner's
+    /// available tools); when `None`, it inherits the spawner's full tool set.
     fn create_subagent(
         &self,
         label: String,
         role: Option<SubagentRole>,
+        tool_filter: Option<Vec<SharedString>>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
 
@@ -1402,6 +1425,28 @@ impl From<&ThreadModel> for Option<DbLanguageModel> {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePlan {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub entries: Vec<NativePlanEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePlanEntry {
+    pub step: String,
+    pub status: NativePlanStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -1434,6 +1479,10 @@ pub struct Thread {
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
     profile_id: AgentProfileId,
+    execution_strategy: AgentExecutionStrategy,
+    autonomy: AgentAutonomy,
+    plan: Option<NativePlan>,
+    proposed_plan: Option<NativePlan>,
     /// Whether `profile_id` was downgraded to `minimal` at thread start because
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
@@ -1462,6 +1511,11 @@ pub struct Thread {
     /// already-granted permissions skip the approval prompt.
     /// Never persisted — lives and dies with this thread.
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+    /// Tool allowlist the spawner restricted this subagent to via the
+    /// `spawn_agent` tool's `tools` parameter. `None` means unrestricted.
+    /// Snapshot at creation: it does not follow later changes to the
+    /// spawner's tools. Persisted so restored sessions keep the filter.
+    tool_filter: Option<HashSet<SharedString>>,
 }
 
 impl Thread {
@@ -1592,6 +1646,10 @@ impl Thread {
             },
             context_server_registry,
             profile_id,
+            execution_strategy: AgentExecutionStrategy::default(),
+            autonomy: AgentAutonomy::default(),
+            plan: None,
+            proposed_plan: None,
             profile_downgraded_for_restricted_workspace,
             project_context,
             templates,
@@ -1611,6 +1669,7 @@ impl Thread {
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            tool_filter: None,
         }
     }
 
@@ -1625,6 +1684,8 @@ impl Thread {
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
         self.profile_id = parent.profile_id.clone();
+        self.execution_strategy = parent.execution_strategy;
+        self.autonomy = parent.autonomy;
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1972,6 +2033,10 @@ impl Thread {
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
             profile_id,
+            execution_strategy: db_thread.execution_strategy,
+            autonomy: db_thread.autonomy,
+            plan: db_thread.plan,
+            proposed_plan: db_thread.proposed_plan,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
             templates,
@@ -1997,6 +2062,9 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
             ))),
+            tool_filter: db_thread
+                .tool_filter
+                .map(|tools| tools.into_iter().collect()),
         }
     }
 
@@ -2081,6 +2149,10 @@ impl Thread {
             request_token_usage: self.request_token_usage.clone(),
             model: (&self.model).into(),
             profile: Some(self.profile_id.clone()),
+            execution_strategy: self.execution_strategy,
+            autonomy: self.autonomy,
+            plan: self.plan.clone(),
+            proposed_plan: self.proposed_plan.clone(),
             subagent_context: self.subagent_context.clone(),
             speed: self.speed,
             thinking_enabled: self.thinking_enabled,
@@ -2094,6 +2166,11 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            tool_filter: self.tool_filter.as_ref().map(|tool_filter| {
+                let mut tools = tool_filter.iter().cloned().collect::<Vec<_>>();
+                tools.sort();
+                tools
+            }),
         };
 
         cx.background_spawn(async move {
@@ -2343,6 +2420,7 @@ impl Thread {
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
+        self.add_tool(UpdatePlanTool::new(cx.weak_entity()));
 
         self.add_tool(DiagnosticsTool::new(
             self.project.clone(),
@@ -2391,6 +2469,80 @@ impl Thread {
 
     pub fn profile(&self) -> &AgentProfileId {
         &self.profile_id
+    }
+
+    pub fn execution_strategy(&self) -> AgentExecutionStrategy {
+        self.execution_strategy
+    }
+
+    pub fn autonomy(&self) -> AgentAutonomy {
+        self.autonomy
+    }
+
+    pub fn plan(&self) -> Option<&NativePlan> {
+        self.plan.as_ref()
+    }
+
+    pub fn proposed_plan(&self) -> Option<&NativePlan> {
+        self.proposed_plan.as_ref()
+    }
+
+    pub fn propose_plan(&mut self, plan: NativePlan, cx: &mut Context<Self>) -> Result<()> {
+        validate_native_plan(&plan)?;
+        self.proposed_plan = (!plan.entries.is_empty()).then_some(plan);
+        self.updated_at = Utc::now();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn accept_proposed_plan(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(plan) = self.proposed_plan.take() else {
+            return false;
+        };
+        self.plan = Some(plan);
+        if self.execution_strategy == AgentExecutionStrategy::Plan {
+            self.execution_strategy = AgentExecutionStrategy::Direct;
+        }
+        self.updated_at = Utc::now();
+        cx.notify();
+        true
+    }
+
+    pub fn dismiss_proposed_plan(&mut self, cx: &mut Context<Self>) {
+        if self.proposed_plan.take().is_some() {
+            self.updated_at = Utc::now();
+            cx.notify();
+        }
+    }
+
+    pub fn update_plan(&mut self, plan: NativePlan, cx: &mut Context<Self>) -> Result<()> {
+        validate_native_plan(&plan)?;
+        self.plan = (!plan.entries.is_empty()).then_some(plan);
+        self.updated_at = Utc::now();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
+        if self.plan.take().is_some() {
+            self.updated_at = Utc::now();
+            cx.notify();
+        }
+    }
+
+    pub fn set_execution_policy(
+        &mut self,
+        strategy: AgentExecutionStrategy,
+        autonomy: AgentAutonomy,
+        cx: &mut Context<Self>,
+    ) {
+        if self.execution_strategy == strategy && self.autonomy == autonomy {
+            return;
+        }
+        self.execution_strategy = strategy;
+        self.autonomy = autonomy;
+        self.updated_at = Utc::now();
+        cx.notify();
     }
 
     /// Whether this thread's profile was downgraded to `minimal` at thread start
@@ -2744,7 +2896,7 @@ impl Thread {
             .forced_compaction_target_ix()
             .map(|request_end_ix| {
                 let target = CompactionTarget::new(&self.messages, request_end_ix)?;
-                let operation = self.compaction_operation(&target, cx)?;
+                let operation = self.compaction_operation(cx)?;
                 anyhow::Ok((target, operation))
             })
             .transpose()?
@@ -3427,7 +3579,7 @@ impl Thread {
             }
 
             let target = CompactionTarget::new(&this.messages, insertion_ix)?;
-            let operation = this.compaction_operation(&target, cx)?;
+            let operation = this.compaction_operation(cx)?;
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
@@ -3479,7 +3631,7 @@ impl Thread {
                     )
                 })?;
             let target = CompactionTarget::new(&this.messages, insertion_ix)?;
-            let operation = this.compaction_operation(&target, cx)?;
+            let operation = this.compaction_operation(cx)?;
             this.current_request_token_usage = TokenUsage::default();
             if this.pending_compaction_telemetry.is_none() {
                 this.pending_compaction_telemetry =
@@ -3515,61 +3667,16 @@ impl Thread {
             acp_thread::ContextCompactionStatus::InProgress,
         );
 
-        let result = match operation {
-            CompactionOperation::ProviderNative {
-                model,
-                request,
-                fallback_model,
-            } => {
-                let is_chatgpt_subscription =
-                    model.provider_id().0.as_ref() == CHATGPT_SUBSCRIPTION_PROVIDER_ID;
-                match Self::run_native_compaction(this, cancellation_rx.clone(), model, request, cx)
-                    .await
-                {
-                    Ok(result) => Ok(result),
-                    Err(native_error) => {
-                        if is_chatgpt_subscription {
-                            log::warn!(
-                                "Provider-native compaction failed; summary fallback suppressed provider=chatgpt-subscription error_class=native_failure"
-                            );
-                            Err(native_error)
-                        } else {
-                            log::warn!(
-                                "Provider-native compaction failed; falling back to summary: \
-                                 {native_error:#}"
-                            );
-                            Self::run_atomic_summary_compaction(
-                                this,
-                                event_stream,
-                                &compaction_id,
-                                cancellation_rx.clone(),
-                                fallback_model,
-                                &target,
-                                cx,
-                            )
-                            .await
-                            .map_err(|fallback_error| {
-                                fallback_error.context(format!(
-                                    "Provider-native compaction also failed: {native_error:#}"
-                                ))
-                            })
-                        }
-                    }
-                }
-            }
-            CompactionOperation::Summary { model } => {
-                Self::run_atomic_summary_compaction(
-                    this,
-                    event_stream,
-                    &compaction_id,
-                    cancellation_rx.clone(),
-                    model,
-                    &target,
-                    cx,
-                )
-                .await
-            }
-        };
+        let result = Self::run_atomic_summary_compaction(
+            this,
+            event_stream,
+            &compaction_id,
+            cancellation_rx.clone(),
+            operation.model,
+            &target,
+            cx,
+        )
+        .await;
 
         let compaction = match result {
             Ok(Some(compaction)) => compaction,
@@ -3617,29 +3724,6 @@ impl Thread {
             acp_thread::ContextCompactionStatus::Completed,
         );
         Ok(ControlFlow::Continue(()))
-    }
-
-    async fn run_native_compaction(
-        this: &WeakEntity<Self>,
-        mut cancellation_rx: watch::Receiver<bool>,
-        model: Arc<dyn LanguageModel>,
-        request: LanguageModelRequest,
-        cx: &mut AsyncApp,
-    ) -> Result<Option<CompactionInfo>> {
-        let result = futures::select! {
-            result = model.compact(request, cx).fuse() => result,
-            _ = cancellation_rx.changed().fuse() => {
-                if *cancellation_rx.borrow() {
-                    return Ok(None);
-                }
-                return Err(anyhow!("Compaction cancellation channel changed unexpectedly"));
-            }
-        }?;
-
-        this.update(cx, |this, _| {
-            this.accumulate_token_usage(result.usage);
-        })?;
-        Ok(Some(CompactionInfo::ProviderContext(result.context)))
     }
 
     async fn run_atomic_summary_compaction(
@@ -4640,7 +4724,8 @@ impl Thread {
             // Models that can't run with thinking disabled ignore the
             // toggle state, which may be stale from a previously selected
             // model that could.
-            thinking_allowed: self.thinking_enabled || !model.supports_disabling_thinking(),
+            thinking_allowed: self.thinking_enabled
+                || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
             thinking_effort: self.thinking_effort.clone(),
             speed: self.speed(),
             compact_at_tokens: None,
@@ -4656,7 +4741,7 @@ impl Thread {
         Ok(request)
     }
 
-    fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+    pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -4688,6 +4773,10 @@ impl Thread {
                 } else {
                     tool_name.as_ref()
                 };
+
+                if profile_tool_name == UpdatePlanTool::NAME && self.parent_thread_id().is_some() {
+                    return None;
+                }
 
                 if tool.supports_provider(&model.provider_id())
                     && profile.is_tool_enabled(profile_tool_name)
@@ -4753,6 +4842,12 @@ impl Thread {
             }
         }
 
+        // A subagent spawned with a `tools` allowlist only ever sees those
+        // tools, regardless of what its profile would otherwise enable.
+        if let Some(tool_filter) = &self.tool_filter {
+            tools.retain(|tool_name, _| tool_filter.contains(tool_name));
+        }
+
         tools
     }
 
@@ -4771,6 +4866,12 @@ impl Thread {
         self.running_turn
             .as_ref()
             .is_some_and(|turn| turn.tools.contains_key(name))
+    }
+
+    /// Restricts this thread to the given tool allowlist (or lifts the
+    /// restriction when `None`). See [`Thread::tool_filter`].
+    pub(crate) fn set_tool_filter(&mut self, tool_filter: Option<HashSet<SharedString>>) {
+        self.tool_filter = tool_filter;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4950,6 +5051,10 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if let Some(strategy_prompt) = self.execution_strategy.system_prompt() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(strategy_prompt);
+        }
         if let Some(role) = self.subagent_role() {
             system_prompt.push_str("\n\n## Subagent role\n");
             system_prompt.push_str(role.system_instruction());
@@ -5263,61 +5368,11 @@ impl Thread {
             .or_else(|| self.model().cloned())
     }
 
-    fn compaction_operation(
-        &self,
-        target: &CompactionTarget,
-        cx: &App,
-    ) -> Result<CompactionOperation> {
-        let target_ix = target.resolve(&self.messages)?;
-        if let Some(model) = self
-            .model()
-            .filter(|model| model.supports_explicit_compaction())
-            .cloned()
-        {
-            let fallback_model = self
-                .compaction_model(cx)
-                .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-            let request = self.build_provider_compaction_request(target_ix, &model, cx);
-            if let Some(request) = prepare_provider_compaction_request(request, model.as_ref())? {
-                return Ok(CompactionOperation::ProviderNative {
-                    model,
-                    request,
-                    fallback_model,
-                });
-            }
-
-            log::warn!(
-                "Provider-native compaction input exceeds the model budget after trimming; \
-                 using bounded summary compaction"
-            );
-            return Ok(CompactionOperation::Summary {
-                model: fallback_model,
-            });
-        }
-
+    fn compaction_operation(&self, cx: &App) -> Result<CompactionOperation> {
         let model = self
             .compaction_model(cx)
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-        Ok(CompactionOperation::Summary { model })
-    }
-
-    fn build_provider_compaction_request(
-        &self,
-        insertion_ix: usize,
-        model: &Arc<dyn LanguageModel>,
-        cx: &App,
-    ) -> LanguageModelRequest {
-        LanguageModelRequest {
-            thread_id: Some(self.id.to_string()),
-            prompt_id: Some(self.prompt_id.to_string()),
-            intent: Some(CompletionIntent::ThreadContextSummarization),
-            temperature: AgentSettings::temperature_for_model(model, cx),
-            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
-            thinking_allowed: self.thinking_enabled || !model.supports_disabling_thinking(),
-            thinking_effort: self.thinking_effort.clone(),
-            speed: self.speed(),
-            ..Default::default()
-        }
+        Ok(CompactionOperation { model })
     }
 
     fn build_summary_compaction_request(
@@ -5529,6 +5584,26 @@ impl Thread {
             }),
         }
     }
+}
+
+fn validate_native_plan(plan: &NativePlan) -> Result<()> {
+    if plan
+        .entries
+        .iter()
+        .any(|entry| entry.step.trim().is_empty())
+    {
+        anyhow::bail!("plan steps must not be empty");
+    }
+    if plan
+        .entries
+        .iter()
+        .filter(|entry| entry.status == NativePlanStatus::InProgress)
+        .count()
+        > 1
+    {
+        anyhow::bail!("a plan may have at most one in-progress step");
+    }
+    Ok(())
 }
 
 fn total_input_tokens(usage: language_model::TokenUsage) -> u64 {
@@ -5759,22 +5834,13 @@ impl CompactionMode {
     }
 }
 
-enum CompactionOperation {
-    ProviderNative {
-        model: Arc<dyn LanguageModel>,
-        request: LanguageModelRequest,
-        fallback_model: Arc<dyn LanguageModel>,
-    },
-    Summary {
-        model: Arc<dyn LanguageModel>,
-    },
+struct CompactionOperation {
+    model: Arc<dyn LanguageModel>,
 }
 
 impl CompactionOperation {
     fn model(&self) -> &Arc<dyn LanguageModel> {
-        match self {
-            Self::ProviderNative { model, .. } | Self::Summary { model } => model,
-        }
+        &self.model
     }
 }
 
@@ -5797,67 +5863,10 @@ fn compaction_request_byte_budget(model: &dyn LanguageModel) -> usize {
     usize::try_from(byte_budget).unwrap_or(usize::MAX)
 }
 
-fn prepare_provider_compaction_request(
-    mut request: LanguageModelRequest,
-    model: &dyn LanguageModel,
-) -> Result<Option<LanguageModelRequest>> {
-    for message in &mut request.messages {
-        for content in &mut message.content {
-            if let MessageContent::ToolResult(tool_result) = content {
-                tool_result.output = None;
-            }
-        }
-    }
-
-    let byte_budget = compaction_request_byte_budget(model);
-    if serialized_request_len(&request)? <= byte_budget {
-        return Ok(Some(request));
-    }
-
-    let mut truncated_oversized_output = false;
-    for message in &mut request.messages {
-        for content in &mut message.content {
-            let MessageContent::ToolResult(tool_result) = content else {
-                continue;
-            };
-            let byte_count = tool_output_byte_len(tool_result);
-            if byte_count > COMPACTION_TOOL_OUTPUT_INLINE_BYTE_LIMIT {
-                tool_result.content = vec![tool_output_truncation_marker(byte_count)];
-                tool_result.output = None;
-                truncated_oversized_output = true;
-            }
-        }
-    }
-    if truncated_oversized_output && serialized_request_len(&request)? <= byte_budget {
-        return Ok(Some(request));
-    }
-
-    let mut removed_historical_tool_output = false;
-    for message in &mut request.messages {
-        for content in &mut message.content {
-            let MessageContent::ToolResult(tool_result) = content else {
-                continue;
-            };
-            let replacement = vec![tool_output_truncation_marker(tool_output_byte_len(
-                tool_result,
-            ))];
-            if tool_result.content != replacement {
-                tool_result.content = replacement;
-                removed_historical_tool_output = true;
-            }
-        }
-    }
-    if removed_historical_tool_output && serialized_request_len(&request)? <= byte_budget {
-        return Ok(Some(request));
-    }
-
-    Ok(None)
-}
-
 fn serialized_request_len(request: &LanguageModelRequest) -> Result<usize> {
     serde_json::to_vec(request)
         .map(|request| request.len())
-        .context("failed to size provider-native compaction request")
+        .context("failed to size language model request")
 }
 
 fn estimate_request_tokens(
@@ -5909,11 +5918,6 @@ fn estimate_request_tokens(
     )
 }
 
-fn tool_output_byte_len(tool_result: &LanguageModelToolResult) -> usize {
-    // `output` is replay/debug metadata and never reaches the model.
-    tool_output_content_byte_len(tool_result)
-}
-
 fn tool_output_content_byte_len(tool_result: &LanguageModelToolResult) -> usize {
     tool_result
         .content
@@ -5930,10 +5934,6 @@ fn tool_output_truncation_marker_text(byte_count: usize) -> Arc<str> {
         "[Tool output truncated from {byte_count} bytes. The complete output remains in the thread transcript; call the tool again with a narrower query or range to inspect more.]"
     )
     .into()
-}
-
-fn tool_output_truncation_marker(byte_count: usize) -> LanguageModelToolResultContent {
-    LanguageModelToolResultContent::Text(tool_output_truncation_marker_text(byte_count))
 }
 
 fn truncate_tool_output_text(text: &Arc<str>, byte_budget: usize) -> Arc<str> {
@@ -8122,6 +8122,36 @@ mod tests {
     use language_model::LanguageModelToolUseId;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use serde_json::json;
+
+    #[test]
+    fn native_plan_validation_rejects_empty_steps() {
+        let plan = NativePlan {
+            explanation: None,
+            entries: vec![NativePlanEntry {
+                step: "   ".to_string(),
+                status: NativePlanStatus::Pending,
+            }],
+        };
+        assert!(validate_native_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn native_plan_validation_allows_only_one_in_progress_step() {
+        let plan = NativePlan {
+            explanation: None,
+            entries: vec![
+                NativePlanEntry {
+                    step: "First".to_string(),
+                    status: NativePlanStatus::InProgress,
+                },
+                NativePlanEntry {
+                    step: "Second".to_string(),
+                    status: NativePlanStatus::InProgress,
+                },
+            ],
+        };
+        assert!(validate_native_plan(&plan).is_err());
+    }
     use std::sync::Arc;
 
     #[test]
@@ -9001,6 +9031,7 @@ mod tests {
     ) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_explicit_compaction(true);
         let old_user_message_id = ClientUserMessageId::new();
         let new_user_message_id = ClientUserMessageId::new();
 
@@ -9079,6 +9110,7 @@ mod tests {
     ) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_explicit_compaction(true);
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -9169,9 +9201,12 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_manual_compact_forces_summary(cx: &mut TestAppContext) {
+    async fn test_manual_compact_uses_summary_for_explicit_compaction_model(
+        cx: &mut TestAppContext,
+    ) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_explicit_compaction(true);
         // A context window below the minimum and no recorded token usage would
         // both disable *automatic* compaction. Manual compaction forces it anyway.
         model.set_max_token_count(MIN_COMPACTION_CONTEXT_WINDOW - 1);
@@ -10524,6 +10559,11 @@ mod tests {
                 thread.set_thinking_enabled(true, cx);
                 thread.set_thinking_effort(Some("high".to_string()), cx);
                 thread.set_profile(AgentProfileId("custom-profile".into()), cx);
+                thread.set_execution_policy(
+                    AgentExecutionStrategy::Orchestrate,
+                    AgentAutonomy::Supervised,
+                    cx,
+                );
             });
         });
 
@@ -10535,6 +10575,11 @@ mod tests {
             assert!(sub.thinking_enabled());
             assert_eq!(sub.thinking_effort().map(|s| s.as_str()), Some("high"));
             assert_eq!(sub.profile(), &AgentProfileId("custom-profile".into()));
+            assert_eq!(
+                sub.execution_strategy(),
+                AgentExecutionStrategy::Orchestrate
+            );
+            assert_eq!(sub.autonomy(), AgentAutonomy::Supervised);
         });
     }
 

@@ -9,9 +9,12 @@ use futures::{FutureExt, channel::mpsc, future::BoxFuture, stream::BoxStream, st
 use gpui::{App, AsyncApp, Entity, Task};
 use http_client::Result;
 use parking_lot::Mutex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
+    },
 };
 
 #[derive(Clone)]
@@ -116,8 +119,10 @@ pub struct FakeLanguageModel {
     forbid_requests: AtomicBool,
     supports_thinking: AtomicBool,
     supports_disabling_thinking: AtomicBool,
+    supports_disabling_thinking_by_effort: Mutex<HashMap<String, bool>>,
     supports_streaming_tools: AtomicBool,
     supports_images: AtomicBool,
+    supports_explicit_compaction: AtomicBool,
     supports_server_side_compaction: AtomicBool,
     max_token_count: AtomicU64,
     max_output_tokens: AtomicU64,
@@ -134,8 +139,10 @@ impl Default for FakeLanguageModel {
             forbid_requests: AtomicBool::new(false),
             supports_thinking: AtomicBool::new(false),
             supports_disabling_thinking: AtomicBool::new(true),
+            supports_disabling_thinking_by_effort: Mutex::new(HashMap::new()),
             supports_streaming_tools: AtomicBool::new(false),
             supports_images: AtomicBool::new(false),
+            supports_explicit_compaction: AtomicBool::new(false),
             supports_server_side_compaction: AtomicBool::new(false),
             max_token_count: AtomicU64::new(1_000_000),
             max_output_tokens: AtomicU64::new(0),
@@ -175,12 +182,22 @@ impl FakeLanguageModel {
         self.supports_disabling_thinking.store(supports, SeqCst);
     }
 
+    pub fn set_supports_disabling_thinking_at_effort(&self, effort: &str, supports: bool) {
+        self.supports_disabling_thinking_by_effort
+            .lock()
+            .insert(effort.to_string(), supports);
+    }
+
     pub fn set_supports_streaming_tools(&self, supports: bool) {
         self.supports_streaming_tools.store(supports, SeqCst);
     }
 
     pub fn set_supports_images(&self, supports: bool) {
         self.supports_images.store(supports, SeqCst);
+    }
+
+    pub fn set_supports_explicit_compaction(&self, supports: bool) {
+        self.supports_explicit_compaction.store(supports, SeqCst);
     }
 
     pub fn set_supports_server_side_compaction(&self, supports: bool) {
@@ -305,6 +322,10 @@ impl LanguageModel for FakeLanguageModel {
         self.supports_images.load(SeqCst)
     }
 
+    fn supports_explicit_compaction(&self) -> bool {
+        self.supports_explicit_compaction.load(SeqCst)
+    }
+
     fn supports_server_side_compaction(&self) -> bool {
         self.supports_server_side_compaction.load(SeqCst)
     }
@@ -315,6 +336,17 @@ impl LanguageModel for FakeLanguageModel {
 
     fn supports_disabling_thinking(&self) -> bool {
         self.supports_disabling_thinking.load(SeqCst)
+    }
+
+    fn supports_disabling_thinking_at_effort(&self, effort: Option<&str>) -> bool {
+        effort
+            .and_then(|effort| {
+                self.supports_disabling_thinking_by_effort
+                    .lock()
+                    .get(effort)
+                    .copied()
+            })
+            .unwrap_or_else(|| self.supports_disabling_thinking())
     }
 
     fn supports_streaming_tools(&self) -> bool {

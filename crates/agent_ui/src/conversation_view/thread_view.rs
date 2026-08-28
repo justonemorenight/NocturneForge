@@ -10,14 +10,15 @@ use agent_client_protocol::schema::v1 as acp;
 use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
-    DelegatedTaskGroup, DelegatedTaskProgress, DelegatedTaskResult, Elicitation,
-    ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
+    DelegatedTaskGroup, DelegatedTaskProgress, DelegatedTaskResult, DelegatedTaskToolActivity,
+    Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
     SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, TodoProgress,
     decode_path_escapes,
 };
 use agent::{
-    SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
-    SkillLoadingIssuesUpdated, SubagentRole, ThreadSandbox, VerifiedSandboxStatus,
+    NativePlan, NativePlanStatus, SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue,
+    SkillLoadingIssueKind, SkillLoadingIssuesUpdated, SubagentRole, ThreadSandbox,
+    VerifiedSandboxStatus,
 };
 use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
@@ -58,6 +59,101 @@ use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 const STICKY_PROMPT_PREVIEW_CHARS: usize = 240;
+const MAX_DELEGATED_TASK_RECENT_TOOLS: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentActivityStatus {
+    Pending,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl AgentActivityStatus {
+    fn from_tool_call_status(status: &ToolCallStatus) -> Self {
+        match status {
+            ToolCallStatus::Pending => Self::Pending,
+            ToolCallStatus::InProgress => Self::Running,
+            ToolCallStatus::WaitingForConfirmation { .. } => Self::Waiting,
+            ToolCallStatus::Completed => Self::Completed,
+            ToolCallStatus::Failed | ToolCallStatus::Rejected => Self::Failed,
+            ToolCallStatus::Canceled => Self::Canceled,
+        }
+    }
+
+    fn from_external_status(status: &str) -> Self {
+        if delegated_task_status_is_complete(status) {
+            Self::Completed
+        } else if delegated_task_status_is_failed(status) {
+            if matches!(status, "canceled" | "cancelled") {
+                Self::Canceled
+            } else {
+                Self::Failed
+            }
+        } else if status == "pending" {
+            Self::Pending
+        } else {
+            Self::Running
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Running | Self::Waiting)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Running => "Running",
+            Self::Waiting => "Needs input",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentActivityItem {
+    entry_ix: usize,
+    session_id: Option<acp::SessionId>,
+    name: SharedString,
+    harness: &'static str,
+    status: AgentActivityStatus,
+    model: Option<SharedString>,
+    role: Option<SharedString>,
+    task: Option<SharedString>,
+    current_tool: Option<DelegatedTaskToolActivity>,
+    last_intent: Option<SharedString>,
+    tool_count: Option<u64>,
+    requests: Option<u64>,
+    tokens: Option<u64>,
+    token_budget: Option<u64>,
+}
+
+fn delegated_task_status_is_complete(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "complete" | "done" | "success" | "succeeded"
+    )
+}
+
+fn delegated_task_status_is_running(status: &str) -> bool {
+    matches!(status, "pending" | "running" | "in_progress" | "active")
+}
+
+fn delegated_task_status_is_failed(status: &str) -> bool {
+    matches!(status, "failed" | "error" | "canceled" | "cancelled")
+}
+
+fn delegated_task_activity_label(activity: &DelegatedTaskToolActivity) -> String {
+    activity.arguments.as_ref().map_or_else(
+        || activity.name.clone(),
+        |arguments| format!("{}  {arguments}", activity.name),
+    )
+}
 
 fn apply_delegated_task_progress(group: &mut DelegatedTaskGroup, progress: DelegatedTaskProgress) {
     let Some(task) = group
@@ -82,6 +178,8 @@ fn apply_delegated_task_progress(group: &mut DelegatedTaskGroup, progress: Deleg
         tool_count: None,
         requests: None,
         tokens: None,
+        current_tool: None,
+        last_intent: None,
         recent_tools: Vec::new(),
     });
     result.status = progress.status;
@@ -96,6 +194,12 @@ fn apply_delegated_task_progress(group: &mut DelegatedTaskGroup, progress: Deleg
     }
     if progress.tokens.is_some() {
         result.tokens = progress.tokens;
+    }
+    if progress.current_tool.is_some() || !delegated_task_status_is_running(&result.status) {
+        result.current_tool = progress.current_tool;
+    }
+    if progress.last_intent.is_some() {
+        result.last_intent = progress.last_intent;
     }
     if !progress.recent_tools.is_empty() {
         result.recent_tools = progress.recent_tools;
@@ -638,6 +742,7 @@ pub struct ThreadView {
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
+    pub execution_strategy_selector: Option<Entity<ExecutionStrategySelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
     pub thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
@@ -659,6 +764,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     large_diff_review_prompt: bool,
     full_diff_review_opted_in: bool,
+    agent_activity_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
@@ -926,6 +1032,7 @@ impl ThreadView {
         mode_selector: Option<Entity<ModeSelector>>,
         model_selector: Option<Entity<ModelSelectorPopover>>,
         profile_selector: Option<Entity<ProfileSelector>>,
+        execution_strategy_selector: Option<Entity<ExecutionStrategySelector>>,
         list_state: ListState,
         session_capabilities: SharedSessionCapabilities,
         resumed_without_history: bool,
@@ -1143,6 +1250,7 @@ impl ThreadView {
             mode_selector,
             model_selector,
             profile_selector,
+            execution_strategy_selector,
             list_state,
             session_capabilities,
             resumed_without_history,
@@ -1163,6 +1271,7 @@ impl ThreadView {
             edits_expanded: false,
             large_diff_review_prompt: false,
             full_diff_review_opted_in: false,
+            agent_activity_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
@@ -3246,17 +3355,567 @@ impl ThreadView {
         editor_bg_color.blend(active_color.opacity(0.3))
     }
 
+    fn agent_activity_items(&self, cx: &App) -> Vec<AgentActivityItem> {
+        if self.is_subagent() {
+            return Vec::new();
+        }
+
+        let entries = self.thread.read(cx).entries();
+        let mut items = Vec::new();
+        let mut session_positions = HashMap::default();
+
+        for (entry_ix, entry) in entries.iter().enumerate() {
+            let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                continue;
+            };
+
+            if let Some(group) = tool_call
+                .delegated_task_group(cx)
+                .map(|group| self.enriched_delegated_task_group(entry_ix, group, cx))
+            {
+                for task in group.tasks {
+                    let acp_thread::DelegatedTask {
+                        name,
+                        agent,
+                        model,
+                        task,
+                        result,
+                    } = task;
+                    let result = result.as_ref();
+                    let status = result.map_or_else(
+                        || AgentActivityStatus::from_tool_call_status(&tool_call.status),
+                        |result| AgentActivityStatus::from_external_status(&result.status),
+                    );
+                    items.push(AgentActivityItem {
+                        entry_ix,
+                        session_id: None,
+                        name: name.into(),
+                        harness: "ACP",
+                        status,
+                        model: model.map(Into::into),
+                        role: (!agent.is_empty()).then(|| agent.into()),
+                        task: (!task.is_empty()).then(|| task.into()),
+                        current_tool: result.and_then(|result| result.current_tool.clone()),
+                        last_intent: result
+                            .and_then(|result| result.last_intent.clone())
+                            .map(Into::into),
+                        tool_count: result.and_then(|result| result.tool_count),
+                        requests: result.and_then(|result| result.requests),
+                        tokens: result.and_then(|result| result.tokens),
+                        token_budget: None,
+                    });
+                }
+                continue;
+            }
+
+            let batch_session_ids = self
+                .thread
+                .read(cx)
+                .subagent_sessions_for_tool_call(&tool_call.id)
+                .to_vec();
+            if !batch_session_ids.is_empty() {
+                for (index, session_id) in batch_session_ids.into_iter().enumerate() {
+                    let subagent_view = self
+                        .server_view
+                        .upgrade()
+                        .and_then(|server_view| server_view.read(cx).thread_view(&session_id));
+                    let subagent_thread = subagent_view
+                        .as_ref()
+                        .map(|view| view.read(cx).thread.clone());
+                    let native_thread = subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).as_native_thread(cx));
+                    let name = subagent_thread
+                        .as_ref()
+                        .and_then(|thread| thread.read(cx).title())
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or_else(|| format!("Subagent {}", index + 1).into());
+                    let model = native_thread
+                        .as_ref()
+                        .and_then(|thread| thread.read(cx).model().map(|model| model.name().0));
+                    let (tool_count, requests, tokens) = subagent_thread
+                        .as_ref()
+                        .map(|thread| {
+                            let thread = thread.read(cx);
+                            (
+                                u64::try_from(
+                                    thread
+                                        .entries()
+                                        .iter()
+                                        .filter(|entry| {
+                                            matches!(entry, AgentThreadEntry::ToolCall(_))
+                                        })
+                                        .count(),
+                                )
+                                .ok(),
+                                u64::try_from(
+                                    thread
+                                        .entries()
+                                        .iter()
+                                        .filter(|entry| {
+                                            matches!(entry, AgentThreadEntry::UserMessage(_))
+                                        })
+                                        .count(),
+                                )
+                                .ok(),
+                                thread.token_usage().map(|usage| usage.used_tokens),
+                            )
+                        })
+                        .unwrap_or_default();
+                    items.push(AgentActivityItem {
+                        entry_ix,
+                        session_id: Some(session_id),
+                        name,
+                        harness: "Native",
+                        status: AgentActivityStatus::from_tool_call_status(&tool_call.status),
+                        model,
+                        role: None,
+                        task: None,
+                        current_tool: None,
+                        last_intent: None,
+                        tool_count,
+                        requests,
+                        tokens,
+                        token_budget: None,
+                    });
+                }
+                continue;
+            }
+
+            if tool_call.tool_name.as_deref() == Some("spawn_agent")
+                && let Some(results) = tool_call
+                    .raw_output
+                    .as_ref()
+                    .and_then(|output| output.as_array().cloned())
+            {
+                for result in results {
+                    let Some(session_id) = result
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let name = result
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Subagent")
+                        .to_owned();
+                    items.push(AgentActivityItem {
+                        entry_ix,
+                        session_id: Some(session_id.into()),
+                        name: name.into(),
+                        harness: "Native",
+                        status: AgentActivityStatus::from_tool_call_status(&tool_call.status),
+                        model: None,
+                        role: None,
+                        task: None,
+                        current_tool: None,
+                        last_intent: None,
+                        tool_count: None,
+                        requests: None,
+                        tokens: None,
+                        token_budget: None,
+                    });
+                }
+                continue;
+            }
+
+            let Some(session_id) = tool_call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone())
+            else {
+                continue;
+            };
+
+            let subagent_view = self
+                .server_view
+                .upgrade()
+                .and_then(|server_view| server_view.read(cx).thread_view(&session_id));
+            let subagent_thread = subagent_view
+                .as_ref()
+                .map(|view| view.read(cx).thread.clone());
+            let native_thread = subagent_view
+                .as_ref()
+                .and_then(|view| view.read(cx).as_native_thread(cx));
+
+            let mut status = AgentActivityStatus::from_tool_call_status(&tool_call.status);
+            if self
+                .conversation
+                .read(cx)
+                .pending_tool_call_for_session(&session_id, cx)
+                .is_some()
+            {
+                status = AgentActivityStatus::Waiting;
+            }
+
+            let name = subagent_thread
+                .as_ref()
+                .and_then(|thread| thread.read(cx).title())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| {
+                    let label = tool_call.label.read(cx).source().to_string();
+                    if label.is_empty() {
+                        "Subagent".into()
+                    } else {
+                        label.into()
+                    }
+                });
+
+            let model = native_thread
+                .as_ref()
+                .and_then(|thread| thread.read(cx).model().map(|model| model.name().0))
+                .or_else(|| {
+                    subagent_view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).current_model_id(cx))
+                        .map(Into::into)
+                });
+            let role = native_thread
+                .as_ref()
+                .and_then(|thread| thread.read(cx).subagent_role())
+                .map(|role| match role {
+                    SubagentRole::Explorer => SharedString::from("Explorer"),
+                    SubagentRole::FlowReader => SharedString::from("Flow reader"),
+                    SubagentRole::CodingWorker => SharedString::from("Coding worker"),
+                })
+                .or_else(|| {
+                    tool_call
+                        .raw_input
+                        .as_ref()
+                        .and_then(|input| input.get("agent_type"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|role| SharedString::from(role.to_owned()))
+                });
+            let task = tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.is_empty())
+                .map(|message| SharedString::from(message.to_owned()));
+            let token_budget = tool_call
+                .raw_input
+                .as_ref()
+                .and_then(|input| input.get("token_budget"))
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    tool_call
+                        .raw_input
+                        .as_ref()
+                        .and_then(|input| input.get("tasks"))
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|tasks| {
+                            (tasks.len() == 1)
+                                .then(|| tasks.first())
+                                .flatten()
+                                .and_then(|task| task.get("token_budget"))
+                                .and_then(serde_json::Value::as_u64)
+                        })
+                });
+
+            let (current_tool, tool_count, requests, tokens) = subagent_thread
+                .as_ref()
+                .map(|thread| {
+                    let thread = thread.read(cx);
+                    let current_tool = thread.entries().iter().rev().find_map(|entry| {
+                        let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                            return None;
+                        };
+                        if !matches!(
+                            tool_call.status,
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::InProgress
+                                | ToolCallStatus::WaitingForConfirmation { .. }
+                        ) {
+                            return None;
+                        }
+                        let name = tool_call.tool_name.as_ref().map_or_else(
+                            || tool_call.label.read(cx).source().to_string(),
+                            ToString::to_string,
+                        );
+                        (!name.is_empty()).then_some(DelegatedTaskToolActivity {
+                            name,
+                            arguments: None,
+                        })
+                    });
+                    let tool_count = u64::try_from(
+                        thread
+                            .entries()
+                            .iter()
+                            .filter(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                            .count(),
+                    )
+                    .ok();
+                    let requests = u64::try_from(
+                        thread
+                            .entries()
+                            .iter()
+                            .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                            .count(),
+                    )
+                    .ok();
+                    let tokens = thread.token_usage().map(|usage| usage.used_tokens);
+                    (current_tool, tool_count, requests, tokens)
+                })
+                .unwrap_or_default();
+
+            let item = AgentActivityItem {
+                entry_ix,
+                session_id: Some(session_id.clone()),
+                name,
+                harness: if native_thread.is_some() {
+                    "Native"
+                } else {
+                    "ACP"
+                },
+                status,
+                model,
+                role,
+                task,
+                current_tool,
+                last_intent: None,
+                tool_count,
+                requests,
+                tokens,
+                token_budget,
+            };
+
+            if let Some(position) = session_positions.get(&session_id).copied() {
+                items[position] = item;
+            } else {
+                session_positions.insert(session_id, items.len());
+                items.push(item);
+            }
+        }
+
+        items
+    }
+
+    fn render_agent_activity_status(&self, status: AgentActivityStatus) -> AnyElement {
+        if matches!(
+            status,
+            AgentActivityStatus::Pending | AgentActivityStatus::Running
+        ) {
+            SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element()
+        } else {
+            let (icon, color) = match status {
+                AgentActivityStatus::Waiting => (IconName::Circle, Color::Warning),
+                AgentActivityStatus::Completed => (IconName::Check, Color::Success),
+                AgentActivityStatus::Failed => (IconName::Close, Color::Error),
+                AgentActivityStatus::Canceled => (IconName::Circle, Color::Muted),
+                AgentActivityStatus::Pending | AgentActivityStatus::Running => {
+                    (IconName::Circle, Color::Muted)
+                }
+            };
+            Icon::new(icon)
+                .size(IconSize::XSmall)
+                .color(color)
+                .into_any_element()
+        }
+    }
+
+    fn render_agent_activity(
+        &self,
+        items: &[AgentActivityItem],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let active_count = items.iter().filter(|item| item.status.is_active()).count();
+        let waiting_count = items
+            .iter()
+            .filter(|item| item.status == AgentActivityStatus::Waiting)
+            .count();
+        let summary = if waiting_count > 0 {
+            format!("{active_count} active · {waiting_count} need input")
+        } else if active_count > 0 {
+            format!("{active_count} active")
+        } else {
+            format!("{} finished", items.len())
+        };
+        let expanded = self.agent_activity_expanded;
+
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .id("agent-activity-summary")
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .py_1()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Icon::new(IconName::ForwardArrowUp)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("Agents").size(LabelSize::Small))
+                    .child(
+                        Label::new(items.len().to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(Label::new(summary).size(LabelSize::XSmall).color(
+                        if waiting_count > 0 {
+                            Color::Warning
+                        } else {
+                            Color::Muted
+                        },
+                    ))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agent_activity_expanded = !this.agent_activity_expanded;
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    v_flex()
+                        .id("agent-activity-list")
+                        .max_h_56()
+                        .overflow_y_scroll()
+                        .children(items.iter().cloned().enumerate().map(|(index, item)| {
+                            let is_last = index + 1 == items.len();
+                            let target_session_id = item.session_id.clone();
+                            let entry_ix = item.entry_ix;
+                            let status = item.status;
+                            let status_label = status.label();
+                            let name = item.name.clone();
+                            let task_tooltip = item.task.clone();
+                            let metadata = [
+                                Some(item.harness.to_owned()),
+                                item.role.as_ref().map(ToString::to_string),
+                                item.model.as_ref().map(ToString::to_string),
+                                item.tool_count.map(|count| format!("{count} tools")),
+                                item.requests.map(|count| format!("{count} requests")),
+                                item.tokens.map(|tokens| {
+                                    format!("{} tokens", crate::humanize_token_count(tokens))
+                                }),
+                                item.token_budget.map(|budget| {
+                                    format!("budget {}", crate::humanize_token_count(budget))
+                                }),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join("  ·  ");
+                            let current_activity = item.current_tool.as_ref().map(|activity| {
+                                format!("Current: {}", delegated_task_activity_label(activity))
+                            });
+                            let detail = current_activity
+                                .or_else(|| item.last_intent.as_ref().map(ToString::to_string))
+                                .or_else(|| item.task.as_ref().map(ToString::to_string));
+
+                            v_flex()
+                                .id(("agent-activity-item", index))
+                                .w_full()
+                                .min_w_0()
+                                .px_2()
+                                .py_1p5()
+                                .gap_0p5()
+                                .cursor_pointer()
+                                .when(!is_last, |this| {
+                                    this.border_b_1().border_color(cx.theme().colors().border)
+                                })
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1p5()
+                                        .child(self.render_agent_activity_status(status))
+                                        .child(
+                                            Label::new(name.clone())
+                                                .size(LabelSize::Small)
+                                                .truncate(),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            Label::new(status_label).size(LabelSize::XSmall).color(
+                                                if status == AgentActivityStatus::Waiting {
+                                                    Color::Warning
+                                                } else {
+                                                    Color::Muted
+                                                },
+                                            ),
+                                        ),
+                                )
+                                .when(!metadata.is_empty(), |this| {
+                                    this.child(
+                                        Label::new(metadata)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                })
+                                .when_some(detail, |this, detail| {
+                                    this.child(
+                                        Label::new(detail)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                })
+                                .when_some(task_tooltip, |this, task| {
+                                    this.tooltip(Tooltip::text(task))
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(session_id) = target_session_id.clone() {
+                                        let server_view = this.server_view.clone();
+                                        window.defer(cx, move |window, cx| {
+                                            server_view
+                                                .update(cx, |server_view, cx| {
+                                                    server_view
+                                                        .navigate_to_thread(session_id, window, cx);
+                                                })
+                                                .ok();
+                                        });
+                                    } else {
+                                        this.list_state.scroll_to(ListOffset {
+                                            item_ix: entry_ix,
+                                            offset_in_item: px(0.),
+                                        });
+                                        cx.notify();
+                                    }
+                                }))
+                        })),
+                )
+            })
+    }
+
     pub fn render_activity_bar(
         &self,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        let agent_activity = self.agent_activity_items(cx);
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let diff_load = action_log.read(cx).diff_load(cx);
         let plan = thread.plan();
+        let native_plan = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).plan().cloned());
+        let native_proposed_plan = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).proposed_plan().cloned());
+        let has_plan = !plan.is_empty() || native_plan.is_some() || native_proposed_plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
 
         let awaiting_permission = self
@@ -3265,9 +3924,10 @@ impl ThreadView {
         let has_awaiting_permission = awaiting_permission.is_some();
 
         if changed_buffers.is_empty()
-            && plan.is_empty()
+            && !has_plan
             && queue_is_empty
             && !has_awaiting_permission
+            && agent_activity.is_empty()
         {
             return None;
         }
@@ -3314,7 +3974,18 @@ impl ThreadView {
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
-                            && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
+                            && (!agent_activity.is_empty()
+                                || has_plan
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
+                    .when(!agent_activity.is_empty(), |this| {
+                        this.child(self.render_agent_activity(&agent_activity, cx))
+                    })
+                    .when(
+                        !agent_activity.is_empty()
+                            && (has_plan || !changed_buffers.is_empty() || !queue_is_empty),
                         |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                     )
                     .when(!plan.is_empty(), |this| {
@@ -3323,7 +3994,19 @@ impl ThreadView {
                                 parent.child(self.render_plan_entries(plan, window, cx))
                             })
                     })
-                    .when(!plan.is_empty() && !changed_buffers.is_empty(), |this| {
+                    .when_some(native_plan.as_ref(), |this, native_plan| {
+                        this.child(self.render_native_plan_summary(native_plan, cx))
+                            .when(plan_expanded, |parent| {
+                                parent.child(self.render_native_plan_entries(native_plan, cx))
+                            })
+                    })
+                    .when_some(native_proposed_plan.as_ref(), |this, proposed| {
+                        this.child(self.render_native_proposed_plan(proposed, cx))
+                            .when(plan_expanded, |parent| {
+                                parent.child(self.render_native_plan_entries(proposed, cx))
+                            })
+                    })
+                    .when(has_plan && !changed_buffers.is_empty(), |this| {
                         this.child(Divider::horizontal().color(DividerColor::Border))
                     })
                     .when(
@@ -3354,7 +4037,7 @@ impl ThreadView {
                         },
                     )
                     .when(!queue_is_empty, |this| {
-                        this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
+                        this.when(has_plan || !changed_buffers.is_empty(), |this| {
                             this.child(Divider::horizontal().color(DividerColor::Border))
                         })
                         .child(self.render_message_queue_summary(window, cx))
@@ -4026,6 +4709,150 @@ impl ThreadView {
         self.message_queue.clear();
         self.sync_queue_flag_to_native_thread(cx);
         cx.notify();
+    }
+
+    fn render_native_plan_summary(&self, plan: &NativePlan, cx: &Context<Self>) -> AnyElement {
+        let completed = plan
+            .entries
+            .iter()
+            .filter(|entry| entry.status == NativePlanStatus::Completed)
+            .count();
+        let status = if completed == plan.entries.len() {
+            "All Done".to_string()
+        } else if completed == 0 {
+            format!("{} Tasks", plan.entries.len())
+        } else {
+            format!("{completed}/{}", plan.entries.len())
+        };
+
+        h_flex()
+            .id("native_plan_summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .when(self.plan_expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(Disclosure::new(
+                "native_plan_disclosure",
+                self.plan_expanded,
+            ))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .justify_between()
+                    .child(
+                        Label::new("Plan")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(status)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .mr_1(),
+                    ),
+            )
+            .child(
+                IconButton::new("dismiss-native-plan", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .shape(ui::IconButtonShape::Square)
+                    .tooltip(Tooltip::text("Clear Plan"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| thread.clear_plan(cx));
+                        }
+                        cx.stop_propagation();
+                    })),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.plan_expanded = !this.plan_expanded;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_native_plan_entries(&self, plan: &NativePlan, cx: &Context<Self>) -> AnyElement {
+        v_flex()
+            .id("native_plan_items_list")
+            .max_h_40()
+            .overflow_y_scroll()
+            .children(plan.entries.iter().enumerate().map(|(index, entry)| {
+                let icon = match entry.status {
+                    NativePlanStatus::InProgress => Icon::new(IconName::TodoProgress)
+                        .size(IconSize::Small)
+                        .color(Color::Accent)
+                        .with_rotate_animation(2)
+                        .into_any_element(),
+                    NativePlanStatus::Completed => Icon::new(IconName::TodoComplete)
+                        .size(IconSize::Small)
+                        .color(Color::Success)
+                        .into_any_element(),
+                    NativePlanStatus::Pending => Icon::new(IconName::TodoPending)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                };
+                h_flex()
+                    .id(("native_plan_entry", index))
+                    .py_1()
+                    .px_2()
+                    .gap_1p5()
+                    .min_w_0()
+                    .when(index < plan.entries.len() - 1, |this| {
+                        this.border_b_1().border_color(cx.theme().colors().border)
+                    })
+                    .child(icon)
+                    .child(Label::new(entry.step.clone()).size(LabelSize::Small).color(
+                        if entry.status == NativePlanStatus::Completed {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        },
+                    ))
+                    .tooltip(Tooltip::text(entry.step.clone()))
+            }))
+            .into_any_element()
+    }
+
+    fn render_native_proposed_plan(&self, plan: &NativePlan, cx: &Context<Self>) -> AnyElement {
+        h_flex()
+            .id("native_proposed_plan")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .child(Disclosure::new(
+                "native_proposed_plan_disclosure",
+                self.plan_expanded,
+            ))
+            .child(
+                Label::new(format!("Suggested plan ({} tasks)", plan.entries.len()))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("accept-native-plan", "Use plan")
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| {
+                                thread.accept_proposed_plan(cx);
+                            });
+                        }
+                    })),
+            )
+            .child(
+                Button::new("dismiss-native-proposed-plan", "Dismiss")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| thread.dismiss_proposed_plan(cx));
+                        }
+                    })),
+            )
+            .into_any_element()
     }
 
     fn render_plan_summary(
@@ -4868,6 +5695,7 @@ impl ThreadView {
                                     .gap_1()
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
+                                    .children(self.execution_strategy_selector.clone())
                                     .children(self.render_chatgpt_account_picker(cx))
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
@@ -5667,35 +6495,40 @@ impl ThreadView {
             return None;
         }
 
-        // A toggle would be dishonest for models that always think: only
-        // offer the effort selector.
-        if !model.supports_disabling_thinking() {
-            let effort_levels = model.supported_effort_levels();
+        let effort_levels = model.supported_effort_levels();
+        let selected_effort = thread.thinking_effort().cloned();
+        let supports_disabling_thinking =
+            model.supports_disabling_thinking_at_effort(selected_effort.as_deref());
+        let supports_disabling_thinking_at_any_effort = supports_disabling_thinking
+            || effort_levels.iter().any(|effort_level| {
+                model.supports_disabling_thinking_at_effort(Some(effort_level.value.as_ref()))
+            });
+
+        // A toggle would be dishonest for models that always think at every
+        // effort level: only offer the effort selector.
+        if !supports_disabling_thinking_at_any_effort {
             if effort_levels.is_empty() {
                 return None;
             }
             return Some(
-                self.render_effort_selector(
-                    effort_levels,
-                    thread.thinking_effort().cloned(),
-                    true,
-                    cx,
-                )
-                .into_any_element(),
+                self.render_effort_selector(effort_levels, selected_effort, true, cx)
+                    .into_any_element(),
             );
         }
 
-        let thinking = thread.thinking_enabled();
+        let thinking = thread.thinking_enabled() || !supports_disabling_thinking;
 
-        let (tooltip_label, icon, color) = if thinking {
+        let (tooltip_label, icon, color) = if !supports_disabling_thinking {
+            (None, IconName::ThinkingMode, Color::Accent)
+        } else if thinking {
             (
-                "Disable Thinking Mode",
+                Some("Disable Thinking Mode"),
                 IconName::ThinkingMode,
                 Color::Muted,
             )
         } else {
             (
-                "Enable Thinking Mode",
+                Some("Enable Thinking Mode"),
                 IconName::ThinkingModeOff,
                 Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
             )
@@ -5706,10 +6539,24 @@ impl ThreadView {
         let thinking_toggle = IconButton::new("thinking-mode", icon)
             .icon_size(IconSize::Small)
             .icon_color(color)
-            .tooltip(move |_, cx| {
-                Tooltip::for_action_in(tooltip_label, &ToggleThinkingMode, &focus_handle, cx)
-            })
-            .on_click(cx.listener(move |this, _, _window, cx| {
+            .map(|this| {
+                if let Some(tooltip_label) = tooltip_label {
+                    this.tooltip(move |_, cx| {
+                        Tooltip::for_action_in(
+                            tooltip_label,
+                            &ToggleThinkingMode,
+                            &focus_handle,
+                            cx,
+                        )
+                    })
+                } else {
+                    this.tooltip(Tooltip::text(
+                        "Thinking is always on at this effort level. Select a lower effort level to make it optional.",
+                    ))
+                }
+            });
+        let thinking_toggle = if supports_disabling_thinking {
+            thinking_toggle.on_click(cx.listener(move |this, _, _window, cx| {
                 if let Some(thread) = this.as_native_thread(cx) {
                     thread.update(cx, |thread, cx| {
                         let enable_thinking = !thread.thinking_enabled();
@@ -5735,23 +6582,21 @@ impl ThreadView {
                         });
                     });
                 }
-            }));
+            }))
+        } else {
+            thinking_toggle.cursor_style(CursorStyle::Arrow)
+        };
 
-        if model.supported_effort_levels().is_empty() {
+        if effort_levels.is_empty() {
             return Some(thinking_toggle.into_any_element());
         }
 
-        if !model.supported_effort_levels().is_empty() && !thinking {
+        if !thinking {
             return Some(thinking_toggle.into_any_element());
         }
 
         let left_btn = thinking_toggle;
-        let right_btn = self.render_effort_selector(
-            model.supported_effort_levels(),
-            thread.thinking_effort().cloned(),
-            false,
-            cx,
-        );
+        let right_btn = self.render_effort_selector(effort_levels, selected_effort, false, cx);
 
         Some(
             SplitButton::new(left_btn, right_btn.into_any_element())
@@ -5837,7 +6682,7 @@ impl ThreadView {
                     .child(
                         Icon::new(IconName::ThinkingMode)
                             .size(IconSize::Small)
-                            .color(label_color),
+                            .color(Color::Accent),
                     )
                     .child(Label::new(label).size(LabelSize::Small).color(label_color))
                     .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
@@ -9207,17 +10052,14 @@ impl ThreadView {
             .filter(|task| {
                 task.result
                     .as_ref()
-                    .is_some_and(|result| result.status == "completed")
+                    .is_some_and(|result| delegated_task_status_is_complete(&result.status))
             })
             .count();
         let total = group.tasks.len();
         let is_running = group.tasks.iter().any(|task| {
-            task.result.as_ref().is_some_and(|result| {
-                matches!(
-                    result.status.as_str(),
-                    "pending" | "running" | "in_progress"
-                )
-            })
+            task.result
+                .as_ref()
+                .is_some_and(|result| delegated_task_status_is_running(&result.status))
         }) || (completed < total
             && matches!(
                 tool_call.status,
@@ -9342,6 +10184,18 @@ impl ThreadView {
                         .join("  ·  ");
                         let preview = result.and_then(|result| result.preview.clone());
                         let output_uri = result.and_then(|result| result.output_uri.clone());
+                        let current_tool = result.and_then(|result| result.current_tool.clone());
+                        let last_intent = result.and_then(|result| result.last_intent.clone());
+                        let recent_tools = result
+                            .map(|result| {
+                                result
+                                    .recent_tools
+                                    .iter()
+                                    .take(MAX_DELEGATED_TASK_RECENT_TOOLS)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
 
                         v_flex()
                             .id(format!("delegated-task-{entry_ix}-{task_index}"))
@@ -9356,18 +10210,18 @@ impl ThreadView {
                                 h_flex()
                                     .gap_2()
                                     .child(
-                                        Icon::new(if status == "completed" {
+                                        Icon::new(if delegated_task_status_is_complete(status) {
                                             IconName::Check
-                                        } else if status == "failed" {
+                                        } else if delegated_task_status_is_failed(status) {
                                             IconName::Close
                                         } else {
                                             IconName::Circle
                                         })
                                         .size(IconSize::XSmall)
                                         .color(
-                                            if status == "completed" {
+                                            if delegated_task_status_is_complete(status) {
                                                 Color::Success
-                                            } else if status == "failed" {
+                                            } else if delegated_task_status_is_failed(status) {
                                                 Color::Error
                                             } else {
                                                 Color::Muted
@@ -9386,20 +10240,69 @@ impl ThreadView {
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             )
+                            .when_some(current_tool, |this, activity| {
+                                this.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .gap_1p5()
+                                        .child(
+                                            Icon::new(IconName::ToolHammer)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Accent),
+                                        )
+                                        .child(
+                                            Label::new(format!(
+                                                "Current: {}",
+                                                delegated_task_activity_label(&activity)
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .truncate(),
+                                        ),
+                                )
+                            })
                             .when(is_expanded, |this| {
                                 this.child(div().text_sm().child(task.task))
-                                    .when_some(
-                                        result
-                                            .filter(|result| !result.recent_tools.is_empty())
-                                            .map(|result| result.recent_tools.join("  ·  ")),
-                                        |this, recent_tools| {
-                                            this.child(
-                                                Label::new(format!("Recent tools: {recent_tools}"))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                            )
-                                        },
-                                    )
+                                    .when_some(last_intent, |this, last_intent| {
+                                        this.child(
+                                            Label::new(format!("Intent: {last_intent}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                                    .when(!recent_tools.is_empty(), |this| {
+                                        this.child(
+                                            v_flex()
+                                                .mt_1()
+                                                .gap_0p5()
+                                                .child(
+                                                    Label::new("Recent activity")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .children(recent_tools.into_iter().map(
+                                                    |activity| {
+                                                        h_flex()
+                                                            .min_w_0()
+                                                            .gap_1p5()
+                                                            .child(
+                                                                Icon::new(IconName::ToolHammer)
+                                                                    .size(IconSize::XSmall)
+                                                                    .color(Color::Muted),
+                                                            )
+                                                            .child(
+                                                                Label::new(
+                                                                    delegated_task_activity_label(
+                                                                        &activity,
+                                                                    ),
+                                                                )
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted)
+                                                                .truncate(),
+                                                            )
+                                                    },
+                                                )),
+                                        )
+                                    })
                                     .when_some(preview, |this, preview| {
                                         this.child(
                                             v_flex()
@@ -11829,6 +12732,36 @@ impl ThreadView {
             "Spawning Agent…".into()
         };
 
+        let activity_detail: Option<SharedString> = thread.as_ref().map(|thread| {
+            let thread = thread.read(cx);
+            let events = thread.entries().len();
+            let model = thread_view
+                .and_then(|view| view.read(cx).as_native_thread(cx))
+                .and_then(|thread| {
+                    thread
+                        .read(cx)
+                        .model()
+                        .map(|model| model.name().0.to_string())
+                });
+            let role = thread_view
+                .and_then(|view| view.read(cx).as_native_thread(cx))
+                .and_then(|thread| thread.read(cx).subagent_role())
+                .map(|role| match role {
+                    SubagentRole::Explorer => "Explorer",
+                    SubagentRole::FlowReader => "Flow reader",
+                    SubagentRole::CodingWorker => "Coding worker",
+                });
+            let status = AgentActivityStatus::from_tool_call_status(&tool_call.status).label();
+            match (model, role) {
+                (Some(model), Some(role)) => {
+                    format!("{status} · {model} · {role} · {events} events").into()
+                }
+                (Some(model), None) => format!("{status} · {model} · {events} events").into(),
+                (None, Some(role)) => format!("{status} · {role} · {events} events").into(),
+                (None, None) => format!("{status} · {events} events").into(),
+            }
+        });
+
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
@@ -11939,6 +12872,14 @@ impl ThreadView {
                                         )
                                     }),
                             )
+                            .when_some(activity_detail, |this, detail| {
+                                this.child(
+                                    Label::new(detail)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                )
+                            })
                             .when(!has_no_title_or_canceled && !is_pending_tool_call, |this| {
                                 this.tooltip(move |_, cx| {
                                     Tooltip::with_meta(
@@ -13300,7 +14241,11 @@ impl ThreadView {
             let Some(model) = thread_ref.model() else {
                 return;
             };
-            if !model.supports_thinking() || !thread_ref.thinking_enabled() {
+            let thinking_enabled = thread_ref.thinking_enabled()
+                || !model.supports_disabling_thinking_at_effort(
+                    thread_ref.thinking_effort().map(String::as_str),
+                );
+            if !model.supports_thinking() || !thinking_enabled {
                 return;
             }
             let effort_levels = model.supported_effort_levels();
@@ -13512,9 +14457,11 @@ impl Render for ThreadView {
                 }
                 if let Some(thread) = this.as_native_thread(cx) {
                     thread.update(cx, |thread, cx| {
-                        let model_allows_disabling = thread
-                            .model()
-                            .is_none_or(|model| model.supports_disabling_thinking());
+                        let model_allows_disabling = thread.model().is_none_or(|model| {
+                            model.supports_disabling_thinking_at_effort(
+                                thread.thinking_effort().map(String::as_str),
+                            )
+                        });
                         if model_allows_disabling {
                             thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
                         }
@@ -13835,6 +14782,7 @@ pub(crate) fn open_link(
             MentionUri::TerminalSelection { .. } => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
+            MentionUri::ContextServer { .. } => {}
             MentionUri::Rule { name, .. } => {
                 crate::ui::open_migrated_rule(workspace, &name, window, cx);
             }
@@ -13941,7 +14889,21 @@ mod tests {
                 tool_count: Some(7),
                 requests: Some(2),
                 tokens: Some(12_345),
-                recent_tools: vec!["read".to_owned(), "search".to_owned()],
+                current_tool: Some(DelegatedTaskToolActivity {
+                    name: "read".to_owned(),
+                    arguments: Some("crates/agent_ui".to_owned()),
+                }),
+                last_intent: Some("Inspect Agent UI".to_owned()),
+                recent_tools: vec![
+                    DelegatedTaskToolActivity {
+                        name: "read".to_owned(),
+                        arguments: Some("crates/acp_thread".to_owned()),
+                    },
+                    DelegatedTaskToolActivity {
+                        name: "search".to_owned(),
+                        arguments: None,
+                    },
+                ],
                 recent_output: Some("Mapping packages".to_owned()),
             },
         );
@@ -13961,8 +14923,138 @@ mod tests {
         assert_eq!(result.tool_count, Some(7));
         assert_eq!(result.requests, Some(2));
         assert_eq!(result.tokens, Some(12_345));
-        assert_eq!(result.recent_tools, ["read", "search"]);
+        assert_eq!(
+            result.current_tool,
+            Some(DelegatedTaskToolActivity {
+                name: "read".to_owned(),
+                arguments: Some("crates/agent_ui".to_owned()),
+            })
+        );
+        assert_eq!(result.last_intent.as_deref(), Some("Inspect Agent UI"));
+        assert_eq!(
+            result.recent_tools,
+            [
+                DelegatedTaskToolActivity {
+                    name: "read".to_owned(),
+                    arguments: Some("crates/acp_thread".to_owned()),
+                },
+                DelegatedTaskToolActivity {
+                    name: "search".to_owned(),
+                    arguments: None,
+                },
+            ]
+        );
         assert_eq!(result.preview.as_deref(), Some("Mapping packages"));
+    }
+
+    #[test]
+    fn completed_omp_progress_clears_stale_current_tool() {
+        let mut group = DelegatedTaskGroup {
+            context: "Explore the repository".to_owned(),
+            tasks: vec![acp_thread::DelegatedTask {
+                name: "CodebaseScout".to_owned(),
+                agent: "scout".to_owned(),
+                model: None,
+                task: "Map the codebase".to_owned(),
+                result: None,
+            }],
+        };
+
+        apply_delegated_task_progress(
+            &mut group,
+            DelegatedTaskProgress {
+                name: "CodebaseScout".to_owned(),
+                status: "running".to_owned(),
+                model: None,
+                duration: None,
+                tool_count: None,
+                requests: None,
+                tokens: None,
+                current_tool: Some(DelegatedTaskToolActivity {
+                    name: "read".to_owned(),
+                    arguments: None,
+                }),
+                last_intent: None,
+                recent_tools: Vec::new(),
+                recent_output: None,
+            },
+        );
+        apply_delegated_task_progress(
+            &mut group,
+            DelegatedTaskProgress {
+                name: "CodebaseScout".to_owned(),
+                status: "completed".to_owned(),
+                model: None,
+                duration: Some("2m 4s".to_owned()),
+                tool_count: None,
+                requests: None,
+                tokens: None,
+                current_tool: None,
+                last_intent: None,
+                recent_tools: Vec::new(),
+                recent_output: None,
+            },
+        );
+
+        let Some(result) = group.tasks.first().and_then(|task| task.result.as_ref()) else {
+            panic!("expected result");
+        };
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.current_tool, None);
+    }
+
+    #[test]
+    fn normalizes_external_delegated_task_statuses() {
+        for status in ["completed", "complete", "done", "success", "succeeded"] {
+            assert!(delegated_task_status_is_complete(status));
+            assert_eq!(
+                AgentActivityStatus::from_external_status(status),
+                AgentActivityStatus::Completed
+            );
+        }
+        for status in ["pending", "running", "in_progress", "active"] {
+            assert!(delegated_task_status_is_running(status));
+            assert!(AgentActivityStatus::from_external_status(status).is_active());
+        }
+        for status in ["failed", "error", "canceled", "cancelled"] {
+            assert!(delegated_task_status_is_failed(status));
+        }
+        assert_eq!(
+            AgentActivityStatus::from_external_status("failed"),
+            AgentActivityStatus::Failed
+        );
+        assert_eq!(
+            AgentActivityStatus::from_external_status("cancelled"),
+            AgentActivityStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn maps_native_tool_call_statuses_to_agent_activity() {
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Pending),
+            AgentActivityStatus::Pending
+        );
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::InProgress),
+            AgentActivityStatus::Running
+        );
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Completed),
+            AgentActivityStatus::Completed
+        );
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Failed),
+            AgentActivityStatus::Failed
+        );
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Rejected),
+            AgentActivityStatus::Failed
+        );
+        assert_eq!(
+            AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Canceled),
+            AgentActivityStatus::Canceled
+        );
     }
 
     #[test]

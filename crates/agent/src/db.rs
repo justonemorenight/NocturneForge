@@ -1,7 +1,7 @@
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentProfileId;
+use agent_settings::{AgentAutonomy, AgentExecutionStrategy, AgentProfileId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
@@ -67,6 +67,16 @@ pub struct DbThread {
     pub model: Option<DbLanguageModel>,
     #[serde(default)]
     pub profile: Option<AgentProfileId>,
+    /// How this thread executes work. Missing fields retain the pre-policy
+    /// direct/manual behavior when loading older thread blobs.
+    #[serde(default)]
+    pub execution_strategy: AgentExecutionStrategy,
+    #[serde(default)]
+    pub autonomy: AgentAutonomy,
+    #[serde(default)]
+    pub plan: Option<crate::NativePlan>,
+    #[serde(default)]
+    pub proposed_plan: Option<crate::NativePlan>,
     #[serde(default)]
     pub subagent_context: Option<crate::SubagentContext>,
     #[serde(default)]
@@ -86,6 +96,11 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    /// Tool allowlist the spawner restricted this subagent thread to via the
+    /// `spawn_agent` tool's `tools` parameter. Persisted so a restored
+    /// subagent session keeps its original filter.
+    #[serde(default)]
+    pub tool_filter: Option<Vec<SharedString>>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -157,6 +172,10 @@ impl SharedThread {
             request_token_usage: Default::default(),
             model: self.model,
             profile: None,
+            execution_strategy: AgentExecutionStrategy::default(),
+            autonomy: AgentAutonomy::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -165,6 +184,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            tool_filter: None,
         }
     }
 
@@ -374,6 +394,10 @@ impl DbThread {
             request_token_usage,
             model: thread.model,
             profile: thread.profile,
+            execution_strategy: AgentExecutionStrategy::default(),
+            autonomy: AgentAutonomy::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -382,6 +406,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            tool_filter: None,
         })
     }
 }
@@ -845,6 +870,10 @@ mod tests {
             request_token_usage: HashMap::default(),
             model: None,
             profile: None,
+            execution_strategy: AgentExecutionStrategy::default(),
+            autonomy: AgentAutonomy::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -853,6 +882,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            tool_filter: None,
         }
     }
 
@@ -941,6 +971,19 @@ mod tests {
     }
 
     #[test]
+    fn execution_policy_defaults_when_loading_legacy_thread_blob() {
+        let mut value = serde_json::to_value(make_thread("legacy", Utc::now()))
+            .expect("thread should serialize");
+        let object = value.as_object_mut().expect("thread should be an object");
+        object.remove("execution_strategy");
+        object.remove("autonomy");
+        let thread: DbThread =
+            serde_json::from_value(value).expect("legacy thread should deserialize");
+        assert_eq!(thread.execution_strategy, AgentExecutionStrategy::Direct);
+        assert_eq!(thread.autonomy, AgentAutonomy::Manual);
+    }
+
+    #[test]
     fn test_draft_prompt_defaults_to_none() {
         let json = r#"{
             "title": "Old Thread",
@@ -1021,6 +1064,48 @@ mod tests {
             .unwrap()
             .expect("thread should exist");
         assert_eq!(loaded.sandbox_grants, grants);
+    }
+
+    #[test]
+    fn test_tool_filter_default_when_absent() {
+        let json = r#"{
+            "title": "Old Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let db_thread: DbThread = serde_json::from_str(json).expect("Failed to deserialize");
+
+        assert!(
+            db_thread.tool_filter.is_none(),
+            "Legacy threads without tool_filter should default to unrestricted"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tool_filter_roundtrip_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let thread_id = session_id("tool-filter-thread");
+        let mut thread = make_thread(
+            "Tool Filter Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        thread.tool_filter = Some(vec!["grep".into(), "read_file".into()]);
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+        assert_eq!(
+            loaded.tool_filter,
+            Some(vec!["grep".into(), "read_file".into()])
+        );
     }
 
     #[gpui::test]

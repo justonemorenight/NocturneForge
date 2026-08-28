@@ -1,6 +1,7 @@
 mod connection;
 mod diff;
 mod mention;
+pub mod session_client_state_store;
 mod terminal;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
@@ -25,7 +26,7 @@ use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{
-    AgentLocation, Project,
+    AgentId, AgentLocation, Project,
     git_store::{GitStoreCheckpoint, GitStoreEvent, RepositoryEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -897,7 +898,9 @@ pub struct DelegatedTaskResult {
     pub tool_count: Option<u64>,
     pub requests: Option<u64>,
     pub tokens: Option<u64>,
-    pub recent_tools: Vec<String>,
+    pub current_tool: Option<DelegatedTaskToolActivity>,
+    pub last_intent: Option<String>,
+    pub recent_tools: Vec<DelegatedTaskToolActivity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -909,8 +912,16 @@ pub struct DelegatedTaskProgress {
     pub tool_count: Option<u64>,
     pub requests: Option<u64>,
     pub tokens: Option<u64>,
-    pub recent_tools: Vec<String>,
+    pub current_tool: Option<DelegatedTaskToolActivity>,
+    pub last_intent: Option<String>,
+    pub recent_tools: Vec<DelegatedTaskToolActivity>,
     pub recent_output: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegatedTaskToolActivity {
+    pub name: String,
+    pub arguments: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1443,20 +1454,22 @@ fn parse_delegated_task_progress(value: &serde_json::Value) -> Option<DelegatedT
         .get("durationMs")
         .and_then(serde_json::Value::as_u64)
         .map(format_duration_ms);
+    let current_tool = value
+        .get("currentTool")
+        .and_then(serde_json::Value::as_str)
+        .map(|name| DelegatedTaskToolActivity {
+            name: name.to_owned(),
+            arguments: value
+                .get("currentToolArgs")
+                .and_then(delegated_task_activity_arguments),
+        });
     let recent_tools = value
         .get("recentTools")
         .and_then(serde_json::Value::as_array)
         .map(|tools| {
             tools
                 .iter()
-                .filter_map(|tool| {
-                    tool.as_str().map(ToOwned::to_owned).or_else(|| {
-                        tool.as_object()?
-                            .get("name")?
-                            .as_str()
-                            .map(ToOwned::to_owned)
-                    })
-                })
+                .filter_map(parse_delegated_task_activity)
                 .collect()
         })
         .unwrap_or_default();
@@ -1479,9 +1492,60 @@ fn parse_delegated_task_progress(value: &serde_json::Value) -> Option<DelegatedT
         tool_count: value.get("toolCount").and_then(serde_json::Value::as_u64),
         requests: value.get("requests").and_then(serde_json::Value::as_u64),
         tokens: value.get("tokens").and_then(serde_json::Value::as_u64),
+        current_tool,
+        last_intent: value
+            .get("lastIntent")
+            .or_else(|| value.get("intent"))
+            .and_then(delegated_task_activity_arguments),
         recent_tools,
         recent_output,
     })
+}
+
+fn parse_delegated_task_activity(value: &serde_json::Value) -> Option<DelegatedTaskToolActivity> {
+    if let Some(name) = value.as_str() {
+        return Some(DelegatedTaskToolActivity {
+            name: name.to_owned(),
+            arguments: None,
+        });
+    }
+
+    let value = value.as_object()?;
+    let name = value
+        .get("tool")
+        .or_else(|| value.get("name"))?
+        .as_str()?
+        .to_owned();
+    let arguments = value
+        .get("args")
+        .or_else(|| value.get("arguments"))
+        .and_then(delegated_task_activity_arguments);
+    Some(DelegatedTaskToolActivity { name, arguments })
+}
+
+fn delegated_task_activity_arguments(value: &serde_json::Value) -> Option<String> {
+    const MAX_ARGUMENT_CHARS: usize = 1_000;
+
+    let text = match value {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut characters = text.chars();
+    let truncated = characters
+        .by_ref()
+        .take(MAX_ARGUMENT_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        Some(format!("{truncated}…"))
+    } else {
+        Some(truncated)
+    }
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -1550,6 +1614,8 @@ fn parse_delegated_task_results(text: &str) -> Vec<(String, DelegatedTaskResult)
                 tool_count: None,
                 requests: None,
                 tokens: None,
+                current_tool: None,
+                last_intent: None,
                 recent_tools: Vec::new(),
             },
         ));
@@ -2564,6 +2630,8 @@ pub struct AcpThread {
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
+    /// Session IDs emitted by a batch spawn_agent call, keyed by its tool call.
+    subagent_sessions_by_tool: HashMap<acp::ToolCallId, Vec<acp::SessionId>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     pending_terminal_references_logged: HashSet<acp::TerminalId>,
     had_error: bool,
@@ -2803,6 +2871,7 @@ impl AcpThread {
             _observe_prompt_capabilities: task,
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
+            subagent_sessions_by_tool: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             pending_terminal_references_logged: HashSet::default(),
             had_error: false,
@@ -2884,6 +2953,20 @@ impl AcpThread {
         if self.active_draft_prompt_snapshot_provider == Some(provider_id) {
             self.active_draft_prompt_snapshot_provider =
                 self.draft_prompt_snapshot_providers.keys().next().copied();
+        }
+    }
+
+    pub fn persist_client_state_draft_prompt(
+        &self,
+        agent_id: AgentId,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        let session_id = self.session_id.clone();
+        let draft_prompt = self.draft_prompt.clone().unwrap_or_default();
+        if draft_prompt.is_empty() {
+            session_client_state_store::delete(agent_id, session_id, cx)
+        } else {
+            session_client_state_store::write_draft_prompt(agent_id, session_id, draft_prompt, cx)
         }
     }
 
@@ -3807,7 +3890,34 @@ impl AcpThread {
     }
 
     pub fn subagent_spawned(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
+        if let Some(tool_call) = self.entries.iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call)
+                if tool_call.tool_name.as_deref() == Some("spawn_agent")
+                    && matches!(
+                        tool_call.status,
+                        ToolCallStatus::Pending | ToolCallStatus::InProgress
+                    ) =>
+            {
+                Some(tool_call.id.clone())
+            }
+            _ => None,
+        }) {
+            self.subagent_sessions_by_tool
+                .entry(tool_call)
+                .or_default()
+                .push(session_id.clone());
+        }
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+    }
+
+    pub fn subagent_sessions_for_tool_call(
+        &self,
+        tool_call_id: &acp::ToolCallId,
+    ) -> &[acp::SessionId] {
+        self.subagent_sessions_by_tool
+            .get(tool_call_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
@@ -4636,6 +4746,8 @@ impl AcpThread {
         let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
         let git_store = self.project.read(cx).git_store().clone();
         let enable_checkpoints = AgentSettings::get_global(cx).enable_checkpoints;
+
+        self.set_draft_prompt(None, cx);
 
         let client_user_message_ids = self.connection.client_user_message_ids(cx);
         let client_id = client_user_message_ids
@@ -6285,7 +6397,23 @@ mod tests {
                         "toolCount": 7,
                         "requests": 2,
                         "tokens": 12_345,
-                        "recentTools": ["read", { "name": "search" }],
+                        "currentTool": "read",
+                        "currentToolArgs": {
+                            "path": "crates/acp_thread/src/acp_thread.rs",
+                            "line": 1434
+                        },
+                        "lastIntent": "Map ACP task progress",
+                        "recentTools": [
+                            "read",
+                            {
+                                "tool": "search",
+                                "args": "DelegatedTaskProgress"
+                            },
+                            {
+                                "name": "list",
+                                "arguments": ["crates/acp_thread", "crates/agent_ui"]
+                            }
+                        ],
                         "recentOutput": ["Inspecting workspace", "Mapping packages"]
                     }]
                 }
@@ -6306,11 +6434,61 @@ mod tests {
         assert_eq!(progress[1].tool_count, Some(7));
         assert_eq!(progress[1].requests, Some(2));
         assert_eq!(progress[1].tokens, Some(12_345));
-        assert_eq!(progress[1].recent_tools, ["read", "search"]);
+        let Some(current_tool) = &progress[1].current_tool else {
+            panic!("expected current tool");
+        };
+        assert_eq!(current_tool.name, "read");
+        let Some(current_tool_arguments) = current_tool.arguments.as_deref() else {
+            panic!("expected current tool arguments");
+        };
+        let Ok(current_tool_arguments) =
+            serde_json::from_str::<serde_json::Value>(current_tool_arguments)
+        else {
+            panic!("expected JSON current tool arguments");
+        };
+        assert_eq!(
+            current_tool_arguments,
+            json!({
+                "path": "crates/acp_thread/src/acp_thread.rs",
+                "line": 1434
+            })
+        );
+        assert_eq!(
+            progress[1].last_intent.as_deref(),
+            Some("Map ACP task progress")
+        );
+        assert_eq!(
+            progress[1].recent_tools,
+            [
+                DelegatedTaskToolActivity {
+                    name: "read".to_owned(),
+                    arguments: None,
+                },
+                DelegatedTaskToolActivity {
+                    name: "search".to_owned(),
+                    arguments: Some("DelegatedTaskProgress".to_owned()),
+                },
+                DelegatedTaskToolActivity {
+                    name: "list".to_owned(),
+                    arguments: Some(r#"["crates/acp_thread","crates/agent_ui"]"#.to_owned()),
+                },
+            ]
+        );
         assert_eq!(
             progress[1].recent_output.as_deref(),
             Some("Inspecting workspace\nMapping packages")
         );
+    }
+
+    #[test]
+    fn truncates_large_omp_delegated_task_arguments_on_character_boundaries() {
+        let arguments = format!("{}{}", "é".repeat(1_000), "tail");
+        let parsed = delegated_task_activity_arguments(&json!(arguments));
+        let Some(parsed) = parsed else {
+            panic!("expected parsed arguments");
+        };
+        assert_eq!(parsed.chars().count(), 1_001);
+        assert!(parsed.ends_with('…'));
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod spawn_agent_tool;
 mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
+mod update_plan_tool;
 mod web_search_tool;
 mod write_file_tool;
 
@@ -96,6 +97,7 @@ pub use symbol_locator::*;
 
 pub use terminal_tool::*;
 pub use tool_permissions::*;
+pub use update_plan_tool::*;
 pub use web_search_tool::*;
 pub use write_file_tool::*;
 
@@ -219,6 +221,7 @@ tools! {
     TerminalTool,
     WebSearchTool,
     WriteFileTool,
+    UpdatePlanTool,
 }
 
 /// Some built-in tools are gated behind a feature flag and only become usable

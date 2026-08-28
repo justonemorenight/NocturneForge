@@ -2,11 +2,16 @@ use acp_thread::{Elicitation, ElicitationEntryId, ElicitationStatus};
 use agent_client_protocol::schema::v1 as acp;
 use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
-use editor::Editor;
+use editor::{Editor, EditorElement, EditorStyle};
 use futures::channel::oneshot;
-use gpui::{AnyElement, App, Div, Empty, Entity, Hsla, SharedString, Window, div};
+use gpui::{
+    AnyElement, App, Div, Empty, Entity, Hsla, SharedString, TextStyle, Window, div, relative,
+    transparent_black,
+};
+use settings::Settings as _;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use theme_settings::ThemeSettings;
 use ui::{
     Button, Checkbox, Color, Icon, IconName, IconSize, Indicator, Label, LabelSize, ToggleState,
     prelude::*,
@@ -26,15 +31,22 @@ enum ElicitationFieldState {
     MultiSelect(HashSet<String>),
 }
 
+struct ElicitationOptionEditors {
+    label: Entity<Editor>,
+    description: Option<Entity<Editor>>,
+}
+
 pub(crate) struct ElicitationFormState {
     fields: HashMap<String, ElicitationFieldState>,
     field_errors: HashMap<String, SharedString>,
+    option_editors: HashMap<(String, String), ElicitationOptionEditors>,
 }
 
 impl ElicitationFormState {
     pub(crate) fn new(schema: &acp::ElicitationSchema, window: &mut Window, cx: &mut App) -> Self {
         let required = schema.required.as_deref().unwrap_or_default();
         let mut fields = HashMap::default();
+        let mut option_editors = HashMap::default();
 
         for (name, property) in &schema.properties {
             let is_required = required.iter().any(|required| required == name);
@@ -95,11 +107,29 @@ impl ElicitationFormState {
                 _ => continue,
             };
             fields.insert(name.clone(), field);
+
+            let options = match property {
+                acp::ElicitationPropertySchema::String(schema) => single_select_options(schema),
+                acp::ElicitationPropertySchema::Array(schema) => multi_select_options(schema),
+                _ => Vec::new(),
+            };
+            for option in options {
+                option_editors.insert(
+                    (name.clone(), option.value.clone()),
+                    ElicitationOptionEditors {
+                        label: selectable_option_editor(option.label, window, cx),
+                        description: option
+                            .description
+                            .map(|description| selectable_option_editor(description, window, cx)),
+                    },
+                );
+            }
         }
 
         Self {
             fields,
             field_errors: HashMap::default(),
+            option_editors,
         }
     }
 
@@ -489,6 +519,40 @@ mod tests {
     }
 
     #[gpui::test]
+    fn form_state_keeps_full_option_text_in_selectable_editors(cx: &mut TestAppContext) {
+        crate::conversation_view::tests::init_test(cx);
+
+        cx.add_window(|window, cx| {
+            let label = "Use the subscription account with the longest available context window";
+            let description = "Keep the existing ACP session context and let the agent continue its current plan before starting another task.";
+            let schema = acp::ElicitationSchema::new().property(
+                "execution_mode",
+                acp::StringPropertySchema::new().one_of(vec![
+                    acp::EnumOption::new("continue", label).description(description),
+                ]),
+                true,
+            );
+
+            let form_state = ElicitationFormState::new(&schema, window, cx);
+            let editors = form_state
+                .option_editors
+                .get(&("execution_mode".to_string(), "continue".to_string()))
+                .expect("option text editors should be created");
+
+            assert!(editors.label.read(cx).read_only(cx));
+            assert_eq!(editors.label.read(cx).text(cx), label);
+            let description_editor = editors
+                .description
+                .as_ref()
+                .expect("description editor should be created");
+            assert!(description_editor.read(cx).read_only(cx));
+            assert_eq!(description_editor.read(cx).text(cx), description);
+
+            Editor::single_line(window, cx)
+        });
+    }
+
+    #[gpui::test]
     fn form_state_preserves_string_whitespace(cx: &mut TestAppContext) {
         crate::conversation_view::tests::init_test(cx);
 
@@ -864,6 +928,23 @@ fn preview_form_schema() -> acp::ElicitationSchema {
                 .default_value(true),
             false,
         )
+}
+
+fn selectable_option_editor(
+    text: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::auto_height_unbounded(1, window, cx);
+        editor.set_text(text, window, cx);
+        editor.set_read_only(true);
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+        editor.set_show_gutter(false, cx);
+        editor.disable_scrollbars_and_minimap(window, cx);
+        editor.set_offset_content(false, cx);
+        editor
+    })
 }
 
 fn single_select_options(schema: &acp::StringPropertySchema) -> Vec<ElicitationOption> {
@@ -1380,7 +1461,15 @@ impl<'a> ElicitationCard<'a> {
                                 cx,
                             );
                         })
-                        .child(div().child(Checkbox::new(checkbox_id, checkbox_state)))
+                        .child(
+                            div()
+                                .size(Checkbox::container_size())
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Checkbox::new(checkbox_id, checkbox_state)),
+                        )
                         .child(
                             v_flex()
                                 .gap_0p5()
@@ -1466,6 +1555,7 @@ impl<'a> ElicitationCard<'a> {
                                 self.handlers.on_multi_select_change.clone();
                             let elicitation_id = self.elicitation.id.clone();
                             let field_name = field_name.to_string();
+                            let option_field_name = field_name.clone();
                             let value = option.value.clone();
                             let checkbox_id = format!(
                                 "elicitation-multi-{}-{field_name}-{}",
@@ -1496,8 +1586,20 @@ impl<'a> ElicitationCard<'a> {
                                         cx,
                                     );
                                 })
-                                .child(div().child(Checkbox::new(checkbox_id, checkbox_state)))
-                                .child(Self::render_option_content(option))
+                                .child(
+                                    div()
+                                        .size(Checkbox::container_size())
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Checkbox::new(checkbox_id, checkbox_state)),
+                                )
+                                .child(self.render_option_content(
+                                    option_field_name.as_str(),
+                                    option,
+                                    cx,
+                                ))
                         }))
                         .into_any_element()
                 }
@@ -1539,6 +1641,7 @@ impl<'a> ElicitationCard<'a> {
                 let control_background = Self::option_control_background(cx);
                 let elicitation_id = elicitation_id.clone();
                 let field_name = field_name.clone();
+                let option_field_name = field_name.clone();
                 let on_single_select_change = on_single_select_change.clone();
 
                 h_flex()
@@ -1575,24 +1678,71 @@ impl<'a> ElicitationCard<'a> {
                                 control_background,
                             )),
                     )
-                    .child(Self::render_option_content(option))
+                    .child(self.render_option_content(option_field_name.as_str(), option, cx))
             }))
             .into_any_element()
     }
 
-    fn render_option_content(option: ElicitationOption) -> Div {
+    fn render_option_content(&self, field_name: &str, option: ElicitationOption, cx: &App) -> Div {
+        let editors = self.form_state.and_then(|state| {
+            state
+                .option_editors
+                .get(&(field_name.to_string(), option.value.clone()))
+        });
+
         v_flex()
             .min_w_0()
             .flex_1()
             .gap_0p5()
-            .child(Label::new(option.label).size(LabelSize::Small).truncate())
+            .child(match editors {
+                Some(editors) => Self::render_selectable_option_text(
+                    &editors.label,
+                    cx.theme().colors().text,
+                    cx,
+                )
+                .into_any_element(),
+                None => Label::new(option.label)
+                    .size(LabelSize::Small)
+                    .into_any_element(),
+            })
             .when_some(option.description, |this, description| {
                 this.child(
-                    Label::new(description)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    match editors.and_then(|editors| editors.description.as_ref()) {
+                        Some(editor) => {
+                            Self::render_selectable_option_text(editor, Color::Muted.color(cx), cx)
+                                .into_any_element()
+                        }
+                        None => Label::new(description)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element(),
+                    },
                 )
             })
+    }
+
+    fn render_selectable_option_text(editor: &Entity<Editor>, color: Hsla, cx: &App) -> Div {
+        let settings = ThemeSettings::get_global(cx);
+        let text_style = TextStyle {
+            color,
+            font_family: settings.ui_font.family.clone(),
+            font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_size: TextSize::Small.rems(cx).into(),
+            font_weight: settings.ui_font.weight,
+            line_height: relative(1.3),
+            ..TextStyle::default()
+        };
+
+        div().w_full().child(EditorElement::new(
+            editor,
+            EditorStyle {
+                background: transparent_black(),
+                local_player: cx.theme().players().local(),
+                text: text_style,
+                ..EditorStyle::default()
+            },
+        ))
     }
 
     fn option_row_background(is_selected: bool, cx: &App) -> Hsla {

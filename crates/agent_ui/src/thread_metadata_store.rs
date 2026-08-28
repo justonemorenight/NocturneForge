@@ -1279,8 +1279,12 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
-        let is_draft = thread_ref.is_draft_thread();
         let existing_thread = self.entry(thread_id);
+        let is_draft = if existing_thread.is_some_and(|thread| !thread.is_draft()) {
+            false
+        } else {
+            thread_ref.is_draft_thread()
+        };
 
         // Draft session IDs may change on reload, so let's not save them until they're valid
         let session_id = if is_draft {
@@ -1891,6 +1895,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            tool_filter: None,
         }
     }
 

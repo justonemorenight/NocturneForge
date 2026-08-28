@@ -180,6 +180,10 @@ impl MentionSet {
             MentionUri::Selection { abs_path: None, .. } => Task::ready(Err(anyhow!(
                 "Untitled buffer selection mentions are not supported for paste"
             ))),
+            MentionUri::ContextServer { .. } => Task::ready(Ok(Mention::Text {
+                content: String::new(),
+                tracked_buffers: Vec::new(),
+            })),
             MentionUri::PastedImage { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. }
@@ -368,6 +372,10 @@ impl MentionSet {
                 debug_panic!("unexpected rule URI");
                 Task::ready(Err(anyhow!("unexpected rule URI")))
             }
+            MentionUri::ContextServer { .. } => Task::ready(Ok(Mention::Text {
+                content: String::new(),
+                tracked_buffers: Vec::new(),
+            })),
         };
         let task = cx
             .spawn(async move |_, _| task.await.map_err(|e| e.to_string()))

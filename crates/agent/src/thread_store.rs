@@ -160,6 +160,10 @@ mod tests {
             request_token_usage: HashMap::default(),
             model: None,
             profile: None,
+            execution_strategy: agent_settings::AgentExecutionStrategy::default(),
+            autonomy: agent_settings::AgentAutonomy::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -168,6 +172,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            tool_filter: None,
         }
     }
 

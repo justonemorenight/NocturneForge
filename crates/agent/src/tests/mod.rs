@@ -175,6 +175,10 @@ impl SubagentHandle for FakeSubagentHandle {
         unimplemented!()
     }
 
+    fn used_tokens(&self, _cx: &App) -> Option<u64> {
+        None
+    }
+
     fn send(&self, _message: String, cx: &AsyncApp) -> Task<Result<String>> {
         let task = self.send_task.clone();
         cx.background_spawn(async move { Ok(task.await) })
@@ -231,6 +235,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         _label: String,
         _role: Option<crate::SubagentRole>,
+        _tool_filter: Option<Vec<SharedString>>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
@@ -277,6 +282,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         &self,
         _label: String,
         _role: Option<crate::SubagentRole>,
+        _tool_filter: Option<Vec<SharedString>>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -535,6 +541,22 @@ async fn test_thinking_allowed_when_model_cannot_disable_thinking(cx: &mut TestA
     // ...but a model that always thinks ignores the stale toggle state.
     fake_model.set_supports_disabling_thinking(false);
     thread.update(cx, |thread, cx| {
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert!(request.thinking_allowed);
+    });
+
+    // A model-level capability can be overridden by the selected effort.
+    fake_model.set_supports_disabling_thinking_at_effort("high", true);
+    thread.update(cx, |thread, cx| {
+        thread.set_thinking_effort(Some("high".to_string()), cx);
+        let request = thread
+            .build_completion_request(CompletionIntent::UserPrompt, cx)
+            .unwrap();
+        assert!(!request.thinking_allowed);
+
+        thread.set_thinking_effort(Some("max".to_string()), cx);
         let request = thread
             .build_completion_request(CompletionIntent::UserPrompt, cx)
             .unwrap();
@@ -5440,6 +5462,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5523,6 +5547,367 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     );
 }
 
+/// Sorted tool names of the most recent pending completion request.
+fn pending_completion_tool_names(model: &FakeLanguageModel) -> Vec<String> {
+    let mut tool_names = model
+        .pending_completions()
+        .last()
+        .expect("a completion request should be pending")
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    tool_names.sort();
+    tool_names
+}
+
+#[gpui::test]
+async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // Spawn a subagent restricted to a read-only tool allowlist.
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_tool_input = SpawnAgentToolInput {
+        label: "search task".to_string(),
+        message: "search the codebase".to_string(),
+        agent_type: None,
+        session_id: None,
+        tools: Some(vec!["read_file".to_string(), "grep".to_string()]),
+        tasks: None,
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        subagent_tool_use,
+    ));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .expect("subagent thread should be running")
+            .clone()
+    });
+
+    // The only pending completion is the subagent's; it should carry exactly
+    // the allowlisted tools.
+    assert_eq!(
+        pending_completion_tool_names(&model),
+        vec!["grep".to_string(), "read_file".to_string()],
+        "subagent should only see the allowlisted tools"
+    );
+
+    // Subagent responds; parent completes its turn.
+    model.send_last_completion_stream_text_chunk("search results");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("Response");
+    model.end_last_completion_stream();
+    send.await.unwrap();
+
+    // Resuming the session keeps the original filter even when the follow-up
+    // spawn call passes a different `tools` list.
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Follow up", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("resuming subagent");
+    let resume_tool_input = SpawnAgentToolInput {
+        label: "follow-up task".to_string(),
+        message: "keep searching".to_string(),
+        agent_type: None,
+        session_id: Some(subagent_session_id.clone()),
+        tools: Some(vec!["terminal".to_string()]),
+        tasks: None,
+    };
+    let resume_tool_use = LanguageModelToolUse {
+        id: "subagent_2".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&resume_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&resume_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(resume_tool_use));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    assert_eq!(
+        pending_completion_tool_names(&model),
+        vec!["grep".to_string(), "read_file".to_string()],
+        "resumed subagent should keep its original tool filter"
+    );
+
+    model.send_last_completion_stream_text_chunk("follow-up results");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("Second response");
+    model.end_last_completion_stream();
+    send2.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_tool_input = SpawnAgentToolInput {
+        label: "reasoning task".to_string(),
+        message: "analyze this".to_string(),
+        agent_type: None,
+        session_id: None,
+        tools: Some(vec![]),
+        tasks: None,
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        subagent_tool_use,
+    ));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, cx| {
+        assert!(
+            !thread.running_subagent_ids(cx).is_empty(),
+            "subagent thread should be running"
+        );
+    });
+    assert!(
+        pending_completion_tool_names(&model).is_empty(),
+        "subagent spawned with an empty allowlist should see no tools"
+    );
+
+    // Subagent responds; parent completes its turn.
+    model.send_last_completion_stream_text_chunk("analysis");
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("Response");
+    model.end_last_completion_stream();
+    send.await.unwrap();
+}
+
+#[gpui::test]
+async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_tool_input = SpawnAgentToolInput {
+        label: "search task".to_string(),
+        message: "search the codebase".to_string(),
+        agent_type: None,
+        session_id: None,
+        tools: Some(vec!["read_file".to_string(), "not_a_real_tool".to_string()]),
+        tasks: None,
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        subagent_tool_use,
+    ));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    // No subagent session should have been created.
+    thread.read_with(cx, |thread, cx| {
+        assert!(
+            thread.running_subagent_ids(cx).is_empty(),
+            "no subagent should be running after an invalid `tools` allowlist"
+        );
+    });
+
+    // The parent model receives the validation error as the tool result.
+    let request = model
+        .pending_completions()
+        .last()
+        .expect("parent should have a pending completion")
+        .clone();
+    let has_error_result = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            MessageContent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .any(|result| {
+            result.is_error
+                && result.content.iter().any(|content| match content {
+                    language_model::LanguageModelToolResultContent::Text(text) => {
+                        text.contains("Unknown tool") && text.contains("not_a_real_tool")
+                    }
+                    _ => false,
+                })
+        });
+    assert!(
+        has_error_result,
+        "parent model should receive the `tools` validation error as the tool result"
+    );
+
+    model.send_last_completion_stream_text_chunk("Response");
+    model.end_last_completion_stream();
+    send.await.unwrap();
+}
+
 #[gpui::test]
 async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppContext) {
     init_test(cx);
@@ -5577,6 +5962,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5727,6 +6114,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         message: "subagent task prompt".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5859,6 +6248,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the first task".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5923,6 +6314,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         message: "do the follow-up task".to_string(),
         agent_type: None,
         session_id: Some(subagent_session_id.clone()),
+        tools: None,
+        tasks: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6513,6 +6906,8 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
         message: "subagent task prompt".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6648,6 +7043,8 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         message: "subagent task prompt".to_string(),
         agent_type: None,
         session_id: None,
+        tools: None,
+        tasks: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

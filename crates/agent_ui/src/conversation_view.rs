@@ -76,6 +76,7 @@ use zed_actions::agent::{Chat, ToggleModelSelector};
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
+use crate::ExecutionStrategySelector;
 use crate::ModeSelector;
 use crate::ModelSelectorPopover;
 use crate::agent_connection_store::{
@@ -1424,6 +1425,10 @@ impl ConversationView {
 
         let profile_selector: Option<Rc<agent::NativeAgentConnection>> =
             connection.clone().downcast();
+        let execution_strategy_selector = profile_selector
+            .as_ref()
+            .and_then(|native_connection| native_connection.thread(&session_id, cx))
+            .map(|native_thread| cx.new(|cx| ExecutionStrategySelector::new(native_thread, cx)));
         let profile_selector = profile_selector
             .and_then(|native_connection| native_connection.thread(&session_id, cx))
             .map(|native_thread| {
@@ -1474,6 +1479,7 @@ impl ConversationView {
                 mode_selector,
                 model_selector,
                 profile_selector,
+                execution_strategy_selector,
                 list_state,
                 session_capabilities,
                 resumed_without_history,
@@ -1909,8 +1915,26 @@ impl ConversationView {
                 cx.notify();
             }
             AcpThreadEvent::PromptUpdated => {
-                if !is_subagent && thread.read(cx).is_draft_thread() {
-                    self.schedule_draft_prompt_persist(cx);
+                if !is_subagent {
+                    let is_draft_thread = ThreadMetadataStore::try_global(cx)
+                        .and_then(|store| {
+                            store
+                                .read(cx)
+                                .entry(self.thread_id)
+                                .map(|metadata| metadata.is_draft())
+                        })
+                        .unwrap_or_else(|| thread.read(cx).is_draft_thread());
+                    let is_native_thread = thread
+                        .read(cx)
+                        .connection()
+                        .clone()
+                        .downcast::<agent::NativeAgentConnection>()
+                        .is_some();
+                    if is_draft_thread {
+                        self.schedule_draft_prompt_persist(cx);
+                    } else if !is_native_thread {
+                        self.schedule_acp_session_client_state_persist(cx);
+                    }
                 }
                 cx.notify();
             }
@@ -2066,6 +2090,42 @@ impl ConversationView {
                 persist.await.log_err();
             }
         }
+    }
+
+    fn schedule_acp_session_client_state_persist(&mut self, cx: &mut Context<Self>) {
+        let agent_id = self.connection_key.id();
+        let thread_id = self.thread_id;
+        self.draft_prompt_persist_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(DRAFT_PROMPT_PERSIST_DEBOUNCE)
+                .await;
+            let persist = this.update(cx, |this, cx| {
+                let thread = this.root_thread(cx)?;
+                let thread = thread.read(cx);
+                let is_draft_thread = ThreadMetadataStore::try_global(cx)
+                    .and_then(|store| {
+                        store
+                            .read(cx)
+                            .entry(thread_id)
+                            .map(|metadata| metadata.is_draft())
+                    })
+                    .unwrap_or_else(|| thread.is_draft_thread());
+                if is_draft_thread
+                    || thread
+                        .connection()
+                        .clone()
+                        .downcast::<agent::NativeAgentConnection>()
+                        .is_some()
+                {
+                    return None;
+                }
+
+                Some(thread.persist_client_state_draft_prompt(agent_id.clone(), cx))
+            });
+            if let Ok(Some(persist)) = persist {
+                persist.await.log_err();
+            }
+        }));
     }
 
     fn authenticate(

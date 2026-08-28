@@ -1,4 +1,5 @@
 mod agent_profile;
+mod execution_policy;
 mod user_agents_md;
 mod user_agents_template;
 
@@ -33,6 +34,7 @@ use util::ResultExt as _;
 pub const DEFAULT_TERMINAL_OUTPUT_LIMIT: u64 = 16 * 1024;
 
 pub use crate::agent_profile::*;
+pub use crate::execution_policy::*;
 pub use crate::user_agents_md::{UserAgentsMd, UserAgentsMdState, init as init_user_agents_md};
 pub use crate::user_agents_template::{
     AGENTS_MD_PARTIAL_NAME, AGENTS_TEMPLATE_FILE_NAME, DEFAULT_AGENTS_TEMPLATE,
