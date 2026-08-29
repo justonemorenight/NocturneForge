@@ -7,6 +7,7 @@ use futures::FutureExt as _;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
 use language_model::{LanguageModelImage, LanguageModelImageExt, LanguageModelToolResultContent};
 use project::context_server_store::{ContextServerStatus, ContextServerStore};
+use std::any::Any;
 use std::sync::Arc;
 use util::{ResultExt, markdown::MarkdownEscaped};
 
@@ -475,6 +476,10 @@ impl AnyAgentTool for ContextServerTool {
         _cx: &mut App,
     ) -> Result<()> {
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

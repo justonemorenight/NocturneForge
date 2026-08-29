@@ -1429,7 +1429,7 @@ fn collect_delegated_task_progress(
         }
         serde_json::Value::Object(values) => {
             for (key, value) in values {
-                if matches!(key.as_str(), "jobs" | "progress")
+                if matches!(key.as_str(), "jobs" | "progress" | "peers" | "tasks")
                     && let Some(entries) = value.as_array()
                 {
                     output.extend(entries.iter().filter_map(parse_delegated_task_progress));
@@ -1446,10 +1446,16 @@ fn parse_delegated_task_progress(value: &serde_json::Value) -> Option<DelegatedT
     let value = value.as_object()?;
     let name = value
         .get("id")
-        .or_else(|| value.get("name"))?
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("peer"))
+        .or_else(|| value.get("agent"))?
         .as_str()?
         .to_owned();
-    let status = value.get("status")?.as_str()?.to_owned();
+    let status = value
+        .get("status")
+        .or_else(|| value.get("state"))?
+        .as_str()?
+        .to_owned();
     let duration = value
         .get("durationMs")
         .and_then(serde_json::Value::as_u64)
@@ -6415,6 +6421,10 @@ mod tests {
                             }
                         ],
                         "recentOutput": ["Inspecting workspace", "Mapping packages"]
+                    }],
+                    "peers": [{
+                        "peer": "IntegrationUI",
+                        "state": "idle"
                     }]
                 }
             }
@@ -6422,7 +6432,7 @@ mod tests {
         let mut progress = Vec::new();
         collect_delegated_task_progress(&output, &mut progress);
 
-        assert_eq!(progress.len(), 2);
+        assert_eq!(progress.len(), 3);
         assert_eq!(progress[0].name, "CodebaseScout");
         assert_eq!(progress[0].status, "pending");
         assert_eq!(progress[1].status, "running");
@@ -6478,6 +6488,8 @@ mod tests {
             progress[1].recent_output.as_deref(),
             Some("Inspecting workspace\nMapping packages")
         );
+        assert_eq!(progress[2].name, "IntegrationUI");
+        assert_eq!(progress[2].status, "idle");
     }
 
     #[test]

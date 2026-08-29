@@ -1887,6 +1887,10 @@ mod tests {
             request_token_usage: Default::default(),
             model: None,
             profile: None,
+            execution_strategy: Default::default(),
+            autonomy: Default::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -1896,6 +1900,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             tool_filter: None,
+            orchestration_run: None,
         }
     }
 

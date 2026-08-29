@@ -669,7 +669,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         let icon_path = uri.icon_path(cx);
         let crease_text: SharedString = uri.name().into();
 
-        let label = CodeLabel::plain(server.server_id.clone(), None);
+        let label = CodeLabel::plain(server.server_id, None);
 
         Some(Completion {
             replace_range: source_range.clone(),

@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use settings::{
     LanguageModelSelection, Settings, SettingsStore, ToolPermissionMode, update_settings_file,
 };
+use std::any::Any;
 use std::fmt::Write;
 use std::{cell::RefCell, ops::ControlFlow};
 use std::{
@@ -1516,6 +1517,8 @@ pub struct Thread {
     /// Snapshot at creation: it does not follow later changes to the
     /// spawner's tools. Persisted so restored sessions keep the filter.
     tool_filter: Option<HashSet<SharedString>>,
+    orchestration_run: Option<agent_orchestration::RunHandle>,
+    persisted_orchestration_run: Option<agent_orchestration::PersistedRun>,
 }
 
 impl Thread {
@@ -1670,6 +1673,8 @@ impl Thread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
             tool_filter: None,
+            orchestration_run: None,
+            persisted_orchestration_run: None,
         }
     }
 
@@ -2058,6 +2063,10 @@ impl Thread {
             }),
             running_subagents: Vec::new(),
             inherits_parent_model_settings,
+            orchestration_run: None,
+            persisted_orchestration_run: db_thread
+                .orchestration_run
+                .map(agent_orchestration::PersistedRun::for_resume),
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
@@ -2171,6 +2180,11 @@ impl Thread {
                 tools.sort();
                 tools
             }),
+            orchestration_run: self
+                .orchestration_run
+                .as_ref()
+                .map(|run| run.snapshot())
+                .or_else(|| self.persisted_orchestration_run.clone()),
         };
 
         cx.background_spawn(async move {
@@ -2441,7 +2455,7 @@ impl Thread {
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
-            self.add_tool(SpawnAgentTool::new(environment.clone()));
+            self.add_tool(SpawnAgentTool::new(environment.clone(), cx.weak_entity()));
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -2453,6 +2467,11 @@ impl Thread {
         self.add_tool(ListAgentsAndModelsTool::new(environment));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn remove_tool(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
         debug_assert!(
             !self.tools.contains_key(T::NAME),
@@ -2462,25 +2481,20 @@ impl Thread {
         self.tools.insert(T::NAME.into(), tool.erase());
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn remove_tool(&mut self, name: &str) -> bool {
-        self.tools.remove(name).is_some()
+    pub fn execution_strategy(&self) -> AgentExecutionStrategy {
+        self.execution_strategy
     }
 
     pub fn profile(&self) -> &AgentProfileId {
         &self.profile_id
     }
 
-    pub fn execution_strategy(&self) -> AgentExecutionStrategy {
-        self.execution_strategy
+    pub fn plan(&self) -> Option<&NativePlan> {
+        self.plan.as_ref()
     }
 
     pub fn autonomy(&self) -> AgentAutonomy {
         self.autonomy
-    }
-
-    pub fn plan(&self) -> Option<&NativePlan> {
-        self.plan.as_ref()
     }
 
     pub fn proposed_plan(&self) -> Option<&NativePlan> {
@@ -2490,6 +2504,14 @@ impl Thread {
     pub fn propose_plan(&mut self, plan: NativePlan, cx: &mut Context<Self>) -> Result<()> {
         validate_native_plan(&plan)?;
         self.proposed_plan = (!plan.entries.is_empty()).then_some(plan);
+        self.updated_at = Utc::now();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn update_plan(&mut self, plan: NativePlan, cx: &mut Context<Self>) -> Result<()> {
+        validate_native_plan(&plan)?;
+        self.plan = (!plan.entries.is_empty()).then_some(plan);
         self.updated_at = Utc::now();
         cx.notify();
         Ok(())
@@ -2515,19 +2537,100 @@ impl Thread {
         }
     }
 
-    pub fn update_plan(&mut self, plan: NativePlan, cx: &mut Context<Self>) -> Result<()> {
-        validate_native_plan(&plan)?;
-        self.plan = (!plan.entries.is_empty()).then_some(plan);
-        self.updated_at = Utc::now();
-        cx.notify();
-        Ok(())
-    }
-
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
         if self.plan.take().is_some() {
             self.updated_at = Utc::now();
             cx.notify();
         }
+    }
+
+    pub fn orchestration_run(&self) -> Option<&agent_orchestration::RunHandle> {
+        self.orchestration_run.as_ref()
+    }
+
+    pub fn set_orchestration_run(
+        &mut self,
+        run: agent_orchestration::RunHandle,
+        cx: &mut Context<Self>,
+    ) {
+        self.orchestration_run = Some(run);
+        self.updated_at = Utc::now();
+        cx.notify();
+    }
+
+    pub fn approve_orchestration_run(&mut self, cx: &mut Context<Self>) -> Result<bool> {
+        let Some(run) = self.orchestration_run.clone() else {
+            return Ok(false);
+        };
+        if run.state() != agent_orchestration::RunState::Proposed {
+            return Ok(false);
+        }
+        run.approve()?;
+        self.persisted_orchestration_run = Some(run.snapshot());
+        self.updated_at = Utc::now();
+        cx.notify();
+        Ok(true)
+    }
+
+    pub fn persisted_orchestration_run(&self) -> Option<&agent_orchestration::PersistedRun> {
+        self.persisted_orchestration_run.as_ref()
+    }
+
+    pub fn set_persisted_orchestration_run(
+        &mut self,
+        run: Option<agent_orchestration::PersistedRun>,
+        cx: &mut Context<Self>,
+    ) {
+        self.persisted_orchestration_run = run;
+        self.updated_at = Utc::now();
+        cx.notify();
+    }
+
+    pub fn cancel_orchestration_run(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(run) = self.orchestration_run.clone() else {
+            return false;
+        };
+        if run.state().is_terminal() {
+            return false;
+        }
+        run.cancel(agent_orchestration::CancellationReason::UserRequested);
+        self.persisted_orchestration_run = Some(run.snapshot());
+        self.updated_at = Utc::now();
+        cx.notify();
+        true
+    }
+
+    /// Resumes a persisted orchestration run that was interrupted, if the
+    /// spawn_agent tool is available. Returns true when a run was resumed.
+    pub fn resume_orchestration_run(&mut self, cx: &mut Context<Self>) -> Task<Result<bool>> {
+        let Some(persisted) = self.persisted_orchestration_run.clone() else {
+            return Task::ready(Ok(false));
+        };
+        if persisted.state.is_terminal() {
+            return Task::ready(Ok(false));
+        }
+        let Some(tool) = self.tools.get("spawn_agent").cloned() else {
+            return Task::ready(Ok(false));
+        };
+        let Some(spawn_tool) = tool.as_any().downcast_ref::<Arc<SpawnAgentTool>>().cloned() else {
+            return Task::ready(Ok(false));
+        };
+        let (events_tx, _events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let event_stream = ToolCallEventStream::new(
+            "resume_orchestration".into(),
+            ThreadEventStream(events_tx),
+            Some(self.project.read(cx).fs().clone()),
+            cancellation_rx,
+            self.sandbox_grants.clone(),
+            Some(cx.weak_entity()),
+        );
+        cx.spawn(async move |_this, cx| {
+            spawn_tool
+                .resume_orchestration_run(persisted, event_stream, cx)
+                .await?;
+            Ok(true)
+        })
     }
 
     pub fn set_execution_policy(
@@ -2606,6 +2709,12 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if let Some(run) = self.orchestration_run.clone()
+            && !run.state().is_terminal()
+        {
+            run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
+            self.persisted_orchestration_run = Some(run.snapshot());
+        }
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
@@ -6595,6 +6704,8 @@ pub trait AnyAgentTool {
         event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Result<()>;
+    /// Returns a reference to the concrete tool for downcasting.
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<T> AnyAgentTool for Erased<Arc<T>>
@@ -6630,10 +6741,6 @@ where
 
     fn supports_provider(&self, provider: &LanguageModelProviderId) -> bool {
         T::supports_provider(provider)
-    }
-
-    fn allow_in_restricted_mode(&self) -> bool {
-        T::allow_in_restricted_mode()
     }
 
     fn run(
@@ -6678,6 +6785,10 @@ where
         let input = serde_json::from_value(input)?;
         let output = serde_json::from_value(output)?;
         self.0.replay(input, output, event_stream, cx)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.0
     }
 }
 

@@ -8377,7 +8377,7 @@ mod tests {
         };
         let connection = StubAgentConnection::new()
             .with_supports_load_session(true)
-            .with_agent_id(agent_id.clone())
+            .with_agent_id(agent_id)
             .with_telemetry_id("loadable-stub".into());
 
         open_thread_with_custom_connection(&panel, connection.clone(), &mut cx);
@@ -11312,6 +11312,10 @@ mod tests {
             request_token_usage: HashMap::default(),
             model: None,
             profile: None,
+            execution_strategy: Default::default(),
+            autonomy: Default::default(),
+            plan: None,
+            proposed_plan: None,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -11321,6 +11325,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
             tool_filter: None,
+            orchestration_run: None,
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));

@@ -66,6 +66,8 @@ enum AgentActivityStatus {
     Pending,
     Running,
     Waiting,
+    Blocked,
+    Stopped,
     Completed,
     Failed,
     Canceled,
@@ -84,18 +86,48 @@ impl AgentActivityStatus {
     }
 
     fn from_external_status(status: &str) -> Self {
-        if delegated_task_status_is_complete(status) {
+        let s = status.trim().to_ascii_lowercase();
+        if delegated_task_status_is_complete(&s) || matches!(s.as_str(), "yielded" | "success") {
             Self::Completed
-        } else if delegated_task_status_is_failed(status) {
-            if matches!(status, "canceled" | "cancelled") {
+        } else if delegated_task_status_is_failed(&s) || matches!(s.as_str(), "aborted") {
+            if matches!(s.as_str(), "canceled" | "cancelled") {
                 Self::Canceled
             } else {
                 Self::Failed
             }
-        } else if status == "pending" {
+        } else if matches!(s.as_str(), "pending") {
             Self::Pending
-        } else {
+        } else if matches!(s.as_str(), "running" | "in_progress" | "active") {
             Self::Running
+        } else if matches!(
+            s.as_str(),
+            "waiting" | "need_input" | "waiting_for_confirmation"
+        ) {
+            Self::Waiting
+        } else if matches!(
+            s.as_str(),
+            "idle" | "parked" | "settled" | "disposed" | "stopped"
+        ) {
+            Self::Stopped
+        } else {
+            Self::Stopped
+        }
+    }
+
+    fn from_orchestration_state(state: agent_orchestration::TaskState) -> Self {
+        match state {
+            agent_orchestration::TaskState::Pending
+            | agent_orchestration::TaskState::WaitingDependency => Self::Pending,
+            agent_orchestration::TaskState::Blocked => Self::Blocked,
+            agent_orchestration::TaskState::Parked => Self::Stopped,
+            agent_orchestration::TaskState::Running
+            | agent_orchestration::TaskState::Verifying
+            | agent_orchestration::TaskState::Repairing
+            | agent_orchestration::TaskState::Retrying => Self::Running,
+            agent_orchestration::TaskState::Completed => Self::Completed,
+            agent_orchestration::TaskState::Failed => Self::Failed,
+            agent_orchestration::TaskState::Cancelled => Self::Canceled,
+            agent_orchestration::TaskState::Interrupted => Self::Stopped,
         }
     }
 
@@ -108,6 +140,8 @@ impl AgentActivityStatus {
             Self::Pending => "Pending",
             Self::Running => "Running",
             Self::Waiting => "Needs input",
+            Self::Blocked => "Blocked",
+            Self::Stopped => "Stopped",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Canceled => "Canceled",
@@ -131,6 +165,7 @@ struct AgentActivityItem {
     requests: Option<u64>,
     tokens: Option<u64>,
     token_budget: Option<u64>,
+    tool_call_budget: Option<u64>,
 }
 
 fn delegated_task_status_is_complete(status: &str) -> bool {
@@ -182,7 +217,27 @@ fn apply_delegated_task_progress(group: &mut DelegatedTaskGroup, progress: Deleg
         last_intent: None,
         recent_tools: Vec::new(),
     });
-    result.status = progress.status;
+
+    let prior_status = result.status.to_ascii_lowercase();
+    let prior_is_terminal = delegated_task_status_is_complete(&prior_status)
+        || delegated_task_status_is_failed(&prior_status)
+        || matches!(
+            prior_status.as_str(),
+            "stopped" | "idle" | "parked" | "settled" | "disposed"
+        );
+    let new_status = progress.status.to_ascii_lowercase();
+    let new_is_terminal = delegated_task_status_is_complete(&new_status)
+        || delegated_task_status_is_failed(&new_status)
+        || matches!(
+            new_status.as_str(),
+            "stopped" | "idle" | "parked" | "settled" | "disposed"
+        );
+
+    // Terminal states cannot be overwritten by non-terminal progress snapshots
+    if !prior_is_terminal || new_is_terminal {
+        result.status = progress.status;
+    }
+
     if progress.duration.is_some() {
         result.duration = progress.duration;
     }
@@ -3382,10 +3437,28 @@ impl ThreadView {
                         result,
                     } = task;
                     let result = result.as_ref();
-                    let status = result.map_or_else(
+                    let mut status = result.map_or_else(
                         || AgentActivityStatus::from_tool_call_status(&tool_call.status),
                         |result| AgentActivityStatus::from_external_status(&result.status),
                     );
+                    match tool_call.status {
+                        ToolCallStatus::Completed => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Stopped;
+                            }
+                        }
+                        ToolCallStatus::Failed | ToolCallStatus::Rejected => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Failed;
+                            }
+                        }
+                        ToolCallStatus::Canceled => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Canceled;
+                            }
+                        }
+                        _ => {}
+                    }
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: None,
@@ -3403,6 +3476,7 @@ impl ThreadView {
                         requests: result.and_then(|result| result.requests),
                         tokens: result.and_then(|result| result.tokens),
                         token_budget: None,
+                        tool_call_budget: None,
                     });
                 }
                 continue;
@@ -3430,9 +3504,12 @@ impl ThreadView {
                         .and_then(|thread| thread.read(cx).title())
                         .filter(|title| !title.is_empty())
                         .unwrap_or_else(|| format!("Subagent {}", index + 1).into());
-                    let model = native_thread
+                    let mut model = native_thread
                         .as_ref()
                         .and_then(|thread| thread.read(cx).model().map(|model| model.name().0));
+                    let mut token_budget = None;
+                    let mut tool_call_budget = None;
+                    let mut current_tool = None;
                     let (tool_count, requests, tokens) = subagent_thread
                         .as_ref()
                         .map(|thread| {
@@ -3462,21 +3539,111 @@ impl ThreadView {
                             )
                         })
                         .unwrap_or_default();
+                    let orchestration_status = self
+                        .as_native_thread(cx)
+                        .and_then(|thread| {
+                            let thread = thread.read(cx);
+                            let status = thread
+                                .orchestration_run()
+                                .and_then(|run| run.task_status_by_session_id(&session_id))
+                                .or_else(|| {
+                                    thread.persisted_orchestration_run().and_then(|run| {
+                                        run.task_statuses
+                                            .iter()
+                                            .find(|status| {
+                                                status.active_session_id.as_ref()
+                                                    == Some(&session_id)
+                                            })
+                                            .cloned()
+                                    })
+                                })?;
+                            let task = thread
+                                .orchestration_run()
+                                .and_then(|run| {
+                                    run.plan()
+                                        .tasks
+                                        .iter()
+                                        .find(|task| task.id == status.task_id)
+                                        .cloned()
+                                })
+                                .or_else(|| {
+                                    thread.persisted_orchestration_run().and_then(|run| {
+                                        run.plan
+                                            .tasks
+                                            .iter()
+                                            .find(|task| task.id == status.task_id)
+                                            .cloned()
+                                    })
+                                });
+                            Some((status, task))
+                        })
+                        .map(|(status, task)| {
+                            (
+                                AgentActivityStatus::from_orchestration_state(status.state),
+                                status,
+                                task,
+                            )
+                        });
+                    let (status, task_status, orchestration_task) = orchestration_status
+                        .map(|(status, task_status, task)| (Some(status), Some(task_status), task))
+                        .unwrap_or((None, None, None));
+                    if let Some(task) = orchestration_task {
+                        model = task
+                            .model_override
+                            .clone()
+                            .map(SharedString::from)
+                            .or(model);
+                        token_budget = task.token_budget;
+                        tool_call_budget = task.tool_call_budget;
+                    }
+                    if let Some(task_status) = task_status {
+                        current_tool = task_status
+                            .current_tool
+                            .map(|tool| DelegatedTaskToolActivity {
+                                name: tool,
+                                arguments: None,
+                            })
+                            .or(current_tool);
+                    }
+                    let status = status.unwrap_or_else(|| {
+                        let mut status =
+                            AgentActivityStatus::from_tool_call_status(&tool_call.status);
+                        match tool_call.status {
+                            ToolCallStatus::Completed => {
+                                if status == AgentActivityStatus::Running {
+                                    status = AgentActivityStatus::Stopped;
+                                }
+                            }
+                            ToolCallStatus::Failed | ToolCallStatus::Rejected => {
+                                if status == AgentActivityStatus::Running {
+                                    status = AgentActivityStatus::Failed;
+                                }
+                            }
+                            ToolCallStatus::Canceled => {
+                                if status == AgentActivityStatus::Running {
+                                    status = AgentActivityStatus::Canceled;
+                                }
+                            }
+                            _ => {}
+                        }
+                        status
+                    });
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: Some(session_id),
                         name,
                         harness: "Native",
-                        status: AgentActivityStatus::from_tool_call_status(&tool_call.status),
+                        status,
                         model,
                         role: None,
                         task: None,
-                        current_tool: None,
+                        current_tool,
                         last_intent: None,
                         tool_count,
                         requests,
                         tokens,
-                        token_budget: None,
+                        token_budget,
+                        tool_call_budget,
                     });
                 }
                 continue;
@@ -3501,12 +3668,31 @@ impl ThreadView {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("Subagent")
                         .to_owned();
+                    let mut status = AgentActivityStatus::from_tool_call_status(&tool_call.status);
+                    match tool_call.status {
+                        ToolCallStatus::Completed => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Stopped;
+                            }
+                        }
+                        ToolCallStatus::Failed | ToolCallStatus::Rejected => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Failed;
+                            }
+                        }
+                        ToolCallStatus::Canceled => {
+                            if status == AgentActivityStatus::Running {
+                                status = AgentActivityStatus::Canceled;
+                            }
+                        }
+                        _ => {}
+                    }
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: Some(session_id.into()),
                         name: name.into(),
                         harness: "Native",
-                        status: AgentActivityStatus::from_tool_call_status(&tool_call.status),
+                        status,
                         model: None,
                         role: None,
                         task: None,
@@ -3516,6 +3702,7 @@ impl ThreadView {
                         requests: None,
                         tokens: None,
                         token_budget: None,
+                        tool_call_budget: None,
                     });
                 }
                 continue;
@@ -3680,6 +3867,7 @@ impl ThreadView {
                 requests,
                 tokens,
                 token_budget,
+                tool_call_budget: None,
             };
 
             if let Some(position) = session_positions.get(&session_id).copied() {
@@ -3704,6 +3892,8 @@ impl ThreadView {
         } else {
             let (icon, color) = match status {
                 AgentActivityStatus::Waiting => (IconName::Circle, Color::Warning),
+                AgentActivityStatus::Blocked => (IconName::Stop, Color::Warning),
+                AgentActivityStatus::Stopped => (IconName::Stop, Color::Muted),
                 AgentActivityStatus::Completed => (IconName::Check, Color::Success),
                 AgentActivityStatus::Failed => (IconName::Close, Color::Error),
                 AgentActivityStatus::Canceled => (IconName::Circle, Color::Muted),
@@ -3808,6 +3998,9 @@ impl ThreadView {
                                 item.token_budget.map(|budget| {
                                     format!("budget {}", crate::humanize_token_count(budget))
                                 }),
+                                item.tool_call_budget.map(|budget| {
+                                    format!("budget {budget} tool calls")
+                                }),
                             ]
                             .into_iter()
                             .flatten()
@@ -3838,11 +4031,7 @@ impl ThreadView {
                                         .min_w_0()
                                         .gap_1p5()
                                         .child(self.render_agent_activity_status(status))
-                                        .child(
-                                            Label::new(name.clone())
-                                                .size(LabelSize::Small)
-                                                .truncate(),
-                                        )
+                                        .child(Label::new(name).size(LabelSize::Small).truncate())
                                         .child(div().flex_1())
                                         .child(
                                             Label::new(status_label).size(LabelSize::XSmall).color(
@@ -3869,6 +4058,9 @@ impl ThreadView {
                                             .color(Color::Muted)
                                             .truncate(),
                                     )
+                                })
+                                .when(status == AgentActivityStatus::Stopped && task_tooltip.is_none(), |this| {
+                                    this.tooltip(Tooltip::text("Agent stopped/idle without verified completion contract"))
                                 })
                                 .when_some(task_tooltip, |this, task| {
                                     this.tooltip(Tooltip::text(task))
@@ -3897,6 +4089,127 @@ impl ThreadView {
             })
     }
 
+    fn render_orchestration_proposal(
+        &self,
+        run: &agent_orchestration::RunHandle,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let task_count = run.plan().tasks.len();
+        let task_summary = run
+            .plan()
+            .tasks
+            .iter()
+            .map(|task| task.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        h_flex()
+            .id("orchestration-runtime-proposal")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
+            .child(
+                Label::new(format!("Orchestration plan ({task_count} tasks)"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("approve-orchestration-runtime", "Run plan")
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx)
+                            && let Err(error) =
+                                thread.update(cx, |thread, cx| thread.approve_orchestration_run(cx))
+                        {
+                            log::error!("failed to approve orchestration run: {error}");
+                        }
+                    })),
+            )
+            .child(
+                Button::new("cancel-orchestration-runtime", "Cancel")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| {
+                                thread.cancel_orchestration_run(cx);
+                            });
+                        }
+                    })),
+            )
+            .tooltip(Tooltip::text(task_summary))
+            .into_any_element()
+    }
+
+    /// Renders a resume bar for a persisted orchestration run that was left
+    /// interrupted (e.g. the app closed mid-run). Resume continues the saved
+    /// plan without re-approval; cancel discards the persisted run.
+    fn render_orchestration_resume(
+        &self,
+        persisted: &agent_orchestration::PersistedRun,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let task_count = persisted.plan.tasks.len();
+        let task_summary = persisted
+            .plan
+            .tasks
+            .iter()
+            .map(|task| task.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        h_flex()
+            .id("orchestration-runtime-resume")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
+            .child(
+                Label::new(format!(
+                    "Interrupted orchestration run ({task_count} tasks)"
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("resume-orchestration-runtime", "Resume")
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            let task =
+                                thread.update(cx, |thread, cx| thread.resume_orchestration_run(cx));
+                            cx.spawn(async move |_this, _cx| match task.await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    log::error!("no interrupted orchestration run to resume");
+                                }
+                                Err(error) => {
+                                    log::error!("failed to resume orchestration run: {error}");
+                                }
+                            })
+                            .detach();
+                        }
+                    })),
+            )
+            .child(
+                Button::new("discard-orchestration-runtime", "Cancel")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| {
+                                thread.set_persisted_orchestration_run(None, cx);
+                            });
+                        }
+                    })),
+            )
+            .tooltip(Tooltip::text(task_summary))
+            .into_any_element()
+    }
+
     pub fn render_activity_bar(
         &self,
         window: &mut Window,
@@ -3915,6 +4228,15 @@ impl ThreadView {
         let native_proposed_plan = self
             .as_native_thread(cx)
             .and_then(|thread| thread.read(cx).proposed_plan().cloned());
+        let orchestration_proposal = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+            .filter(|run| run.state() == agent_orchestration::RunState::Proposed);
+        let orchestration_persisted = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).persisted_orchestration_run().cloned())
+            .filter(|run| !run.state.is_terminal())
+            .filter(|_| orchestration_proposal.is_none());
         let has_plan = !plan.is_empty() || native_plan.is_some() || native_proposed_plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
 
@@ -3928,6 +4250,8 @@ impl ThreadView {
             && queue_is_empty
             && !has_awaiting_permission
             && agent_activity.is_empty()
+            && orchestration_proposal.is_none()
+            && orchestration_persisted.is_none()
         {
             return None;
         }
@@ -3972,6 +4296,20 @@ impl ThreadView {
                         ])
                     })
                     .when_some(awaiting_permission, |this, element| this.child(element))
+                    .when_some(orchestration_proposal.as_ref(), |this, run| {
+                        this.child(self.render_orchestration_proposal(run, cx))
+                    })
+                    .when_some(orchestration_persisted.as_ref(), |this, run| {
+                        this.child(self.render_orchestration_resume(run, cx))
+                    })
+                    .when(
+                        (orchestration_proposal.is_some() || orchestration_persisted.is_some())
+                            && (!agent_activity.is_empty()
+                                || has_plan
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
                     .when(
                         has_awaiting_permission
                             && (!agent_activity.is_empty()
@@ -15005,19 +15343,36 @@ mod tests {
 
     #[test]
     fn normalizes_external_delegated_task_statuses() {
-        for status in ["completed", "complete", "done", "success", "succeeded"] {
-            assert!(delegated_task_status_is_complete(status));
+        for status in [
+            "completed",
+            "complete",
+            "done",
+            "success",
+            "succeeded",
+            "yielded",
+        ] {
             assert_eq!(
                 AgentActivityStatus::from_external_status(status),
                 AgentActivityStatus::Completed
             );
+            assert!(!AgentActivityStatus::from_external_status(status).is_active());
         }
         for status in ["pending", "running", "in_progress", "active"] {
-            assert!(delegated_task_status_is_running(status));
             assert!(AgentActivityStatus::from_external_status(status).is_active());
         }
-        for status in ["failed", "error", "canceled", "cancelled"] {
-            assert!(delegated_task_status_is_failed(status));
+        for status in ["idle", "parked", "settled", "disposed", "stopped"] {
+            assert_eq!(
+                AgentActivityStatus::from_external_status(status),
+                AgentActivityStatus::Stopped
+            );
+            assert!(!AgentActivityStatus::from_external_status(status).is_active());
+        }
+        for status in ["failed", "error", "canceled", "cancelled", "aborted"] {
+            assert!(
+                delegated_task_status_is_failed(status)
+                    || matches!(status, "aborted" | "canceled" | "cancelled")
+            );
+            assert!(!AgentActivityStatus::from_external_status(status).is_active());
         }
         assert_eq!(
             AgentActivityStatus::from_external_status("failed"),
@@ -15027,6 +15382,58 @@ mod tests {
             AgentActivityStatus::from_external_status("cancelled"),
             AgentActivityStatus::Canceled
         );
+    }
+
+    #[test]
+    fn terminal_state_precedence_preserves_terminal_status() {
+        let mut group = DelegatedTaskGroup {
+            context: "Explore".to_owned(),
+            tasks: vec![acp_thread::DelegatedTask {
+                name: "Scout".to_owned(),
+                agent: "scout".to_owned(),
+                model: None,
+                task: "task".to_owned(),
+                result: None,
+            }],
+        };
+
+        apply_delegated_task_progress(
+            &mut group,
+            DelegatedTaskProgress {
+                name: "Scout".to_owned(),
+                status: "completed".to_owned(),
+                model: None,
+                duration: None,
+                tool_count: None,
+                requests: None,
+                tokens: None,
+                current_tool: None,
+                last_intent: None,
+                recent_tools: Vec::new(),
+                recent_output: None,
+            },
+        );
+
+        // Stale snapshot reporting "running" should not clobber terminal completed
+        apply_delegated_task_progress(
+            &mut group,
+            DelegatedTaskProgress {
+                name: "Scout".to_owned(),
+                status: "running".to_owned(),
+                model: None,
+                duration: None,
+                tool_count: None,
+                requests: None,
+                tokens: None,
+                current_tool: None,
+                last_intent: None,
+                recent_tools: Vec::new(),
+                recent_output: None,
+            },
+        );
+
+        let result = group.tasks[0].result.as_ref().unwrap();
+        assert_eq!(result.status, "completed");
     }
 
     #[test]
@@ -15054,6 +15461,54 @@ mod tests {
         assert_eq!(
             AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Canceled),
             AgentActivityStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn blocked_orchestration_tasks_are_not_active() {
+        let status =
+            AgentActivityStatus::from_orchestration_state(agent_orchestration::TaskState::Blocked);
+        assert_eq!(status, AgentActivityStatus::Blocked);
+        assert!(!status.is_active());
+    }
+
+    #[test]
+    fn orchestration_plan_budgets_surface_in_activity_item() {
+        let mut task = agent_orchestration::OrchestrationTask::new(
+            agent_orchestration::TaskId::new("task-1"),
+            "Refactor",
+            "Refactor the module",
+        )
+        .with_token_budget(50_000);
+        task.tool_call_budget = Some(10);
+        task.objective = Some("Refactor the module".to_owned());
+
+        let item = AgentActivityItem {
+            entry_ix: 0,
+            session_id: None,
+            name: "Subagent 1".into(),
+            harness: "Native",
+            status: AgentActivityStatus::Running,
+            model: None,
+            role: None,
+            task: None,
+            current_tool: Some(DelegatedTaskToolActivity {
+                name: task.objective.clone().unwrap(),
+                arguments: None,
+            }),
+            last_intent: None,
+            tool_count: None,
+            requests: None,
+            tokens: Some(1_000),
+            token_budget: task.token_budget,
+            tool_call_budget: task.tool_call_budget,
+        };
+
+        assert_eq!(item.token_budget, Some(50_000));
+        assert_eq!(item.tool_call_budget, Some(10));
+        assert_eq!(
+            item.current_tool.as_ref().map(|tool| tool.name.as_str()),
+            Some("Refactor the module")
         );
     }
 
