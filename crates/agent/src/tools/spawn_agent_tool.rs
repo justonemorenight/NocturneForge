@@ -1,7 +1,7 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
-use futures::future::join_all;
+use futures::future::LocalBoxFuture;
 use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -10,7 +10,195 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{AgentTool, SubagentRole, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, SubagentRole, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use agent_orchestration::{VERIFICATION_END, VERIFICATION_START};
+
+fn task_execution_prompt(task: &agent_orchestration::OrchestrationTask) -> String {
+    if task.acceptance_criteria.is_empty()
+        && task.expected_output.is_none()
+        && !task.evidence_required
+    {
+        return task.description.clone();
+    }
+
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected_output = task.expected_output.as_deref().unwrap_or("Not specified");
+    format!(
+        "{}\n\nAcceptance criteria:\n{}\n\nExpected output: {}\n\nAt the end of your response, include a JSON verification claim between `{VERIFICATION_START}` and `{VERIFICATION_END}`. Use this exact shape:\n{{\"criteria\":[{{\"criterion\":\"copy each criterion exactly\",\"passed\":true,\"evidence\":\"specific evidence\"}}],\"expected_output_satisfied\":true,\"citations\":[\"path/to/file.rs:123\"]}}\nDo not claim a criterion passed without concrete evidence.",
+        task.description, criteria, expected_output
+    )
+}
+
+fn verify_task_output(
+    task: &agent_orchestration::OrchestrationTask,
+    output: &str,
+) -> agent_orchestration::VerificationResult {
+    agent_orchestration::VerificationRunner.verify(task, output)
+}
+
+struct SubagentRuntimeExecutor {
+    environment: Rc<dyn ThreadEnvironment>,
+    app: gpui::AsyncApp,
+    event_stream: ToolCallEventStream,
+    roles_map: Arc<
+        parking_lot::RwLock<
+            collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
+        >,
+    >,
+}
+
+impl SubagentRuntimeExecutor {
+    pub(crate) fn new(
+        environment: Rc<dyn ThreadEnvironment>,
+        app: gpui::AsyncApp,
+        event_stream: ToolCallEventStream,
+        roles_map: Arc<
+            parking_lot::RwLock<
+                collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
+            >,
+        >,
+    ) -> Self {
+        Self {
+            environment,
+            app,
+            event_stream,
+            roles_map,
+        }
+    }
+}
+
+impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
+    fn execute(
+        &self,
+        context: agent_orchestration::TaskExecutionContext,
+    ) -> LocalBoxFuture<'static, Result<agent_orchestration::TaskExecutionOutput>> {
+        let env = self.environment.clone();
+        let app = self.app.clone();
+        let event_stream = self.event_stream.clone();
+        let reporter = context.reporter.clone();
+        let task = context.task;
+        let role = self.roles_map.read().get(&task.id).cloned().flatten();
+        let existing_session = context.existing_session_id;
+
+        Box::pin(async move {
+            if context.cancellation_token.is_cancelled() || event_stream.was_cancelled_by_user() {
+                anyhow::bail!("task execution cancelled");
+            }
+
+            let subagent = app.update(|cx| {
+                let subagent = if let Some(session_id) = existing_session {
+                    env.resume_subagent(session_id, cx)
+                } else {
+                    let tool_filter = task
+                        .tools
+                        .clone()
+                        .map(|tools| tools.into_iter().map(SharedString::from).collect());
+                    env.create_subagent(task.label.clone(), role, tool_filter, cx)
+                }?;
+                event_stream.subagent_spawned(subagent.id());
+                anyhow::Ok(subagent)
+            })?;
+
+            let session_id = subagent.id();
+            if let Err(exceeded) = reporter.report_tool_call_started("subagent") {
+                anyhow::bail!("{exceeded}");
+            }
+            let tokens_before = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
+            let output = subagent.send(task_execution_prompt(&task), &app).await?;
+            reporter.report_tool_call_finished();
+
+            let tokens_after = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
+            let tokens_used = tokens_after.saturating_sub(tokens_before);
+            if let Err(exceeded) = reporter.report_tokens(tokens_used) {
+                anyhow::bail!("{exceeded}");
+            }
+
+            let artifact = agent_orchestration::Artifact::new(
+                task.id.clone(),
+                format!("Output for {}", task.label),
+                agent_orchestration::ArtifactKind::Text,
+                output.clone(),
+            );
+
+            Ok(agent_orchestration::TaskExecutionOutput {
+                session_id: Some(session_id),
+                output,
+                tokens_used: Some(tokens_used),
+                artifacts: vec![artifact],
+            })
+        })
+    }
+
+    fn verify(
+        &self,
+        task: &agent_orchestration::OrchestrationTask,
+        output: &agent_orchestration::TaskExecutionOutput,
+    ) -> LocalBoxFuture<'static, Result<agent_orchestration::VerificationResult>> {
+        let task = task.clone();
+        let output = output.clone();
+        Box::pin(async move { Ok(verify_task_output(&task, &output.output)) })
+    }
+
+    fn repair(
+        &self,
+        task: &agent_orchestration::OrchestrationTask,
+        feedback: &str,
+        context: agent_orchestration::TaskExecutionContext,
+    ) -> LocalBoxFuture<'static, Result<agent_orchestration::TaskExecutionOutput>> {
+        let env = self.environment.clone();
+        let app = self.app.clone();
+        let reporter = context.reporter.clone();
+        let task = task.clone();
+        let feedback = feedback.to_string();
+        let session_id = context.existing_session_id;
+
+        Box::pin(async move {
+            let Some(session_id) = session_id else {
+                anyhow::bail!("cannot repair without an existing session");
+            };
+
+            let subagent = app.update({
+                let session_id = session_id.clone();
+                move |cx| env.resume_subagent(session_id, cx)
+            })?;
+            let repair_message = format!(
+                "{}\n\nVerification feedback for task `{}`:\n\n{}\n\nPlease address the feedback and return a corrected result with a new structured verification claim.",
+                task_execution_prompt(&task),
+                task.label,
+                feedback
+            );
+            if let Err(exceeded) = reporter.report_tool_call_started("subagent") {
+                anyhow::bail!("{exceeded}");
+            }
+            let tokens_before = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
+            let output = subagent.send(repair_message, &app).await?;
+            reporter.report_tool_call_finished();
+            let tokens_after = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
+            let tokens_used = tokens_after.saturating_sub(tokens_before);
+            if let Err(exceeded) = reporter.report_tokens(tokens_used) {
+                anyhow::bail!("{exceeded}");
+            }
+            let artifact = agent_orchestration::Artifact::new(
+                task.id.clone(),
+                format!("Repaired output for {}", task.label),
+                agent_orchestration::ArtifactKind::Text,
+                output.clone(),
+            );
+
+            Ok(agent_orchestration::TaskExecutionOutput {
+                session_id: Some(session_id),
+                output,
+                tokens_used: Some(tokens_used),
+                artifacts: vec![artifact],
+            })
+        })
+    }
+}
 
 const MAX_PARALLEL_SUBAGENTS: usize = 4;
 const MAX_SUBAGENT_RETRIES: u8 = 2;
@@ -88,8 +276,28 @@ pub struct SpawnAgentTask {
     /// Optional hard budget for the task's cumulative token usage.
     #[serde(default)]
     pub token_budget: Option<u64>,
+    /// Criteria required for this task's output to be considered verified.
+    #[serde(default)]
+    pub acceptance_criteria: Option<Vec<String>>,
+    /// Expected format or structure of the task output.
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    /// Whether this task requires citation evidence in its output.
+    #[serde(default)]
+    pub evidence_required: Option<bool>,
+    /// Execution timeout in seconds for this task.
+    #[serde(default)]
+    pub time_budget_secs: Option<u64>,
+    /// Optional hard budget for tool calls in this task.
+    #[serde(default)]
+    pub tool_call_budget: Option<u64>,
+    /// Stated high-level objective for this task.
+    #[serde(default)]
+    pub objective: Option<String>,
+    /// Bounded write scope / affected file patterns.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
-
 fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
 where
     D: Deserializer<'de>,
@@ -178,6 +386,12 @@ pub enum SpawnAgentToolOutput {
     BatchSuccess {
         results: Vec<SpawnAgentBatchResult>,
     },
+    PlanProposed {
+        run_id: String,
+        plan: Box<agent_orchestration::OrchestrationPlan>,
+        strategy: agent_settings::AgentExecutionStrategy,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +426,20 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
             SpawnAgentToolOutput::BatchSuccess { results } => serde_json::to_string(&results)
                 .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
                 .into(),
+            SpawnAgentToolOutput::PlanProposed {
+                run_id,
+                plan,
+                strategy,
+                reason,
+            } => serde_json::to_string(&serde_json::json!({
+                "run_id": run_id,
+                "status": "awaiting_approval",
+                "plan": plan,
+                "strategy": strategy,
+                "reason": reason,
+            }))
+            .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+            .into(),
         }
     }
 }
@@ -219,12 +447,391 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
 /// Tool that spawns an agent thread to work on a task.
 pub struct SpawnAgentTool {
     environment: Rc<dyn ThreadEnvironment>,
+    thread: gpui::WeakEntity<Thread>,
 }
 
 impl SpawnAgentTool {
-    pub fn new(environment: Rc<dyn ThreadEnvironment>) -> Self {
-        Self { environment }
+    pub fn new(environment: Rc<dyn ThreadEnvironment>, thread: gpui::WeakEntity<Thread>) -> Self {
+        Self {
+            environment,
+            thread,
+        }
     }
+
+    /// Resumes a previously persisted orchestration run that was interrupted.
+    /// The scheduler starts immediately with an `Interrupted` state; unlike a
+    /// fresh proposal, no approval is required.
+    pub(crate) async fn resume_orchestration_run(
+        &self,
+        persisted: agent_orchestration::PersistedRun,
+        event_stream: ToolCallEventStream,
+        cx: &mut gpui::AsyncApp,
+    ) -> Result<agent_orchestration::RunHandle> {
+        let mut runtime_config = agent_orchestration::RuntimeConfig::default();
+        runtime_config.scheduler.max_parallel_tasks = MAX_PARALLEL_SUBAGENTS;
+        runtime_config.foreground_executor = Some(cx.foreground_executor().clone());
+        runtime_config.scheduler.background_executor = Some(cx.background_executor().clone());
+
+        let executor = Rc::new(SubagentRuntimeExecutor::new(
+            self.environment.clone(),
+            cx.clone(),
+            event_stream,
+            Arc::new(parking_lot::RwLock::new(collections::HashMap::default())),
+        ));
+
+        let (run_handle, completion_rx) =
+            agent_orchestration::OrchestrationRuntime::resume(persisted, executor, runtime_config)?;
+
+        cx.update(|cx| {
+            if let Some(parent) = self.thread.upgrade() {
+                parent.update(cx, |parent, cx| {
+                    parent.set_orchestration_run(run_handle.clone(), cx);
+                });
+            }
+        });
+
+        let runtime_events = run_handle.subscribe_live();
+        cx.foreground_executor()
+            .spawn({
+                let app = cx.clone();
+                let thread = self.thread.clone();
+                async move {
+                    while let Ok(event) = runtime_events.receiver.recv().await {
+                        app.update(|cx| {
+                            if let Some(parent) = thread.upgrade() {
+                                parent.update(cx, |_, cx| cx.notify());
+                            }
+                        });
+                        if matches!(
+                            event.event,
+                            agent_orchestration::RuntimeEvent::RunStateChanged { state, .. }
+                                if state.is_terminal()
+                        ) {
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+
+        let completion_handle = run_handle.clone();
+        cx.foreground_executor()
+            .spawn({
+                let app = cx.clone();
+                let thread = self.thread.clone();
+                async move {
+                    let _ = completion_rx.await;
+                    let snapshot = completion_handle.snapshot();
+                    app.update(|cx| {
+                        if let Some(parent) = thread.upgrade() {
+                            parent.update(cx, |parent, cx| {
+                                parent.set_persisted_orchestration_run(Some(snapshot), cx);
+                            });
+                        }
+                    });
+                }
+            })
+            .detach();
+
+        Ok(run_handle)
+    }
+}
+
+async fn run_batch_tasks(
+    environment: Rc<dyn ThreadEnvironment>,
+    thread: gpui::WeakEntity<Thread>,
+    tasks: Vec<SpawnAgentTask>,
+    event_stream: ToolCallEventStream,
+    cx: &mut gpui::AsyncApp,
+) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
+    if tasks.is_empty() {
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: "tasks must contain at least one subagent task".to_string(),
+            session_info: None,
+        });
+    }
+    let pending = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let task_id = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("task-{}", index + 1));
+            (task_id, task)
+        })
+        .collect::<Vec<_>>();
+    validate_task_graph(&pending).map_err(|error| SpawnAgentToolOutput::Error {
+        session_id: None,
+        error: error.to_string(),
+        session_info: None,
+    })?;
+
+    let (strategy, autonomy) = cx
+        .update(|cx| {
+            thread.upgrade().map(|t| {
+                let t = t.read(cx);
+                (t.execution_strategy(), t.autonomy())
+            })
+        })
+        .unwrap_or((
+            agent_settings::AgentExecutionStrategy::Direct,
+            agent_settings::AgentAutonomy::default(),
+        ));
+
+    let prompt = pending
+        .iter()
+        .map(|(task_id, task)| {
+            let mut message = task.message.clone();
+            if !task.depends_on.is_empty() {
+                message.push_str(&format!("\n[depends on: {}]", task.depends_on.join(", ")));
+            }
+            format!("[{task_id}] {message}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let (strategy, disposition) = match strategy {
+        agent_settings::AgentExecutionStrategy::Auto => {
+            let decision = agent_orchestration::OrchestrationPlanner::resolve_auto(
+                &prompt,
+                pending.len(),
+                autonomy,
+            );
+            match decision.strategy {
+                // Auto resolving to direct execution runs the batch immediately
+                // through the runtime without a proposal.
+                agent_settings::AgentExecutionStrategy::Direct => (
+                    decision.strategy,
+                    agent_orchestration::RuntimeLaunchDisposition::Approved,
+                ),
+                // Auto resolving to orchestration or planning always proposes the
+                // plan first, regardless of autonomy, and waits for approval.
+                strategy @ (agent_settings::AgentExecutionStrategy::Orchestrate
+                | agent_settings::AgentExecutionStrategy::Plan) => (
+                    strategy,
+                    agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
+                ),
+                agent_settings::AgentExecutionStrategy::Auto => unreachable!(),
+            }
+        }
+        agent_settings::AgentExecutionStrategy::Direct => (
+            strategy,
+            agent_orchestration::RuntimeLaunchDisposition::Approved,
+        ),
+        agent_settings::AgentExecutionStrategy::Orchestrate => match autonomy {
+            agent_settings::AgentAutonomy::Autonomous => (
+                strategy,
+                agent_orchestration::RuntimeLaunchDisposition::Approved,
+            ),
+            agent_settings::AgentAutonomy::Manual | agent_settings::AgentAutonomy::Supervised => (
+                strategy,
+                agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
+            ),
+        },
+        // Plan is always a user checkpoint. Approval is the explicit
+        // transition from a proposed checklist to execution.
+        agent_settings::AgentExecutionStrategy::Plan => (
+            strategy,
+            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
+        ),
+    };
+
+    let policy = agent_settings::AgentExecutionPolicy { strategy, autonomy };
+
+    let mut roles_map = collections::HashMap::default();
+    let orchestration_tasks = pending
+        .iter()
+        .map(|(task_id, task)| {
+            let id = agent_orchestration::TaskId::new(task_id);
+            roles_map.insert(id.clone(), task.agent_type);
+            let mut orchestration_task = agent_orchestration::OrchestrationTask::new(
+                id,
+                task.label.clone(),
+                task.message.clone(),
+            );
+            orchestration_task.tools = task.tools.clone();
+            orchestration_task.depends_on = task
+                .depends_on
+                .iter()
+                .map(agent_orchestration::TaskId::new)
+                .collect();
+            orchestration_task.max_retries = Some(task.max_retries);
+            orchestration_task.token_budget = task.token_budget;
+            if let Some(criteria) = &task.acceptance_criteria {
+                orchestration_task.acceptance_criteria = criteria.clone();
+            }
+            orchestration_task.expected_output = task.expected_output.clone();
+            orchestration_task.evidence_required = task.evidence_required.unwrap_or(false);
+            orchestration_task.time_budget_secs = task.time_budget_secs;
+            orchestration_task.tool_call_budget = task.tool_call_budget;
+            orchestration_task.objective = task.objective.clone();
+            orchestration_task.scope = task.scope.clone();
+            orchestration_task
+        })
+        .collect();
+
+    let plan =
+        agent_orchestration::OrchestrationPlan::new("Parallel delegation", orchestration_tasks);
+
+    let mut runtime_config = agent_orchestration::RuntimeConfig::default();
+    runtime_config.scheduler.max_parallel_tasks = MAX_PARALLEL_SUBAGENTS;
+    runtime_config.foreground_executor = Some(cx.foreground_executor().clone());
+    runtime_config.scheduler.background_executor = Some(cx.background_executor().clone());
+
+    let executor = Rc::new(SubagentRuntimeExecutor::new(
+        environment.clone(),
+        cx.clone(),
+        event_stream.clone(),
+        Arc::new(parking_lot::RwLock::new(roles_map)),
+    ));
+
+    let (run_handle, completion_rx) =
+        agent_orchestration::OrchestrationRuntime::start_with_disposition(
+            plan,
+            policy,
+            disposition,
+            executor,
+            runtime_config,
+        )
+        .map_err(|error| SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: error.to_string(),
+            session_info: None,
+        })?;
+
+    cx.update(|cx| {
+        if let Some(parent) = thread.upgrade() {
+            parent.update(cx, |parent, cx| {
+                parent.set_orchestration_run(run_handle.clone(), cx);
+            });
+        }
+    });
+
+    let runtime_events = run_handle.subscribe_live();
+    cx.foreground_executor()
+        .spawn({
+            let app = cx.clone();
+            let thread = thread.clone();
+            async move {
+                while let Ok(event) = runtime_events.receiver.recv().await {
+                    app.update(|cx| {
+                        if let Some(parent) = thread.upgrade() {
+                            parent.update(cx, |_, cx| cx.notify());
+                        }
+                    });
+                    if matches!(
+                        event.event,
+                        agent_orchestration::RuntimeEvent::RunStateChanged { state, .. }
+                            if state.is_terminal()
+                    ) {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+
+    if disposition == agent_orchestration::RuntimeLaunchDisposition::AwaitApproval {
+        // Keep the tool future alive while the detached runtime waits for the
+        // approval action so the parent turn receives the real batch result.
+        let proposal = run_handle.snapshot();
+        cx.update(|cx| {
+            if let Some(parent) = thread.upgrade() {
+                parent.update(cx, |parent, cx| {
+                    parent.set_persisted_orchestration_run(Some(proposal), cx);
+                });
+            }
+        });
+    }
+
+    let completion_result = completion_rx.await;
+
+    let snapshot = run_handle.snapshot();
+    cx.update(|cx| {
+        if let Some(parent) = thread.upgrade() {
+            parent.update(cx, |parent, cx| {
+                parent.set_persisted_orchestration_run(Some(snapshot), cx);
+            });
+        }
+    });
+
+    if event_stream.was_cancelled_by_user()
+        || matches!(
+            completion_result,
+            Ok(Ok(agent_orchestration::RunState::Cancelled))
+        )
+    {
+        run_handle.cancel(agent_orchestration::CancellationReason::UserRequested);
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: "parallel orchestration cancelled".to_string(),
+            session_info: None,
+        });
+    }
+    if let Err(error) = completion_result {
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: error.to_string(),
+            session_info: None,
+        });
+    }
+    if let Ok(Err(error)) = completion_result {
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: error.to_string(),
+            session_info: None,
+        });
+    }
+
+    let mut batch = Vec::new();
+    let mut last_error = None;
+    let mut last_session_id = None;
+    for (task_id, task) in pending {
+        let id = agent_orchestration::TaskId::new(&task_id);
+        let Some(status) = run_handle.task_status(&id) else {
+            continue;
+        };
+        if status.state == agent_orchestration::TaskState::Completed {
+            if let Some(session_id) = status.active_session_id {
+                batch.push(SpawnAgentBatchResult {
+                    task_id,
+                    session_id,
+                    label: task.label,
+                    output: status.latest_output.unwrap_or_default(),
+                });
+            }
+        } else if status.state == agent_orchestration::TaskState::Failed {
+            last_error = status
+                .latest_error
+                .or(Some(format!("Task `{task_id}` failed")));
+            last_session_id = status.active_session_id;
+        }
+    }
+    if let Some(error) = last_error {
+        let completed_summary = batch
+            .iter()
+            .map(|result| result.task_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: last_session_id,
+            error: format!("{error}; completed: [{completed_summary}]"),
+            session_info: None,
+        });
+    }
+    let raw_output = serde_json::to_value(&batch).map_err(|error| SpawnAgentToolOutput::Error {
+        session_id: None,
+        error: format!("Failed to serialize batch output: {error}"),
+        session_info: None,
+    })?;
+    event_stream.update_fields(
+        acp::ToolCallUpdateFields::new()
+            .title("Parallel agents completed")
+            .raw_output(raw_output),
+    );
+    Ok(SpawnAgentToolOutput::BatchSuccess { results: batch })
 }
 
 impl AgentTool for SpawnAgentTool {
@@ -269,184 +876,14 @@ impl AgentTool for SpawnAgentTool {
                 })?;
 
             if let Some(tasks) = input.tasks {
-                if tasks.is_empty() {
-                    return Err(SpawnAgentToolOutput::Error {
-                        session_id: None,
-                        error: "tasks must contain at least one subagent task".to_string(),
-                        session_info: None,
-                    });
-                }
-                let mut pending = tasks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, task)| {
-                        let task_id = task
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("task-{}", index + 1));
-                        (task_id, task)
-                    })
-                    .collect::<Vec<_>>();
-                validate_task_graph(&pending).map_err(|error| SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: error.to_string(),
-                    session_info: None,
-                })?;
-
-                let mut completed = HashSet::new();
-                let mut batch = Vec::with_capacity(pending.len());
-                while !pending.is_empty() {
-                    if event_stream.was_cancelled_by_user() {
-                        return Err(SpawnAgentToolOutput::Error {
-                            session_id: None,
-                            error: "parallel orchestration cancelled".to_string(),
-                            session_info: None,
-                        });
-                    }
-                    let (ready, blocked): (Vec<_>, Vec<_>) =
-                        pending.into_iter().partition(|(_, task)| {
-                            task.depends_on
-                                .iter()
-                                .all(|dependency| completed.contains(dependency))
-                        });
-                    if ready.is_empty() {
-                        return Err(SpawnAgentToolOutput::Error {
-                            session_id: None,
-                            error: "task dependency graph contains a cycle".to_string(),
-                            session_info: None,
-                        });
-                    }
-                    let (ready, deferred) = if ready.len() > MAX_PARALLEL_SUBAGENTS {
-                        let mut ready = ready;
-                        let deferred = ready.split_off(MAX_PARALLEL_SUBAGENTS);
-                        (ready, deferred)
-                    } else {
-                        (ready, Vec::new())
-                    };
-                    pending = blocked.into_iter().chain(deferred).collect();
-                    let spawned = cx
-                        .update(|cx| {
-                            ready
-                                .into_iter()
-                                .map(|(task_id, task)| {
-                                    let tool_filter = task.tools.map(|tools| {
-                                        tools.into_iter().map(SharedString::from).collect()
-                                    });
-                                    let subagent = self.environment.create_subagent(
-                                        task.label.clone(),
-                                        task.agent_type,
-                                        tool_filter,
-                                        cx,
-                                    )?;
-                                    event_stream.subagent_spawned(subagent.id());
-                                    anyhow::Ok((
-                                        task_id,
-                                        task.label,
-                                        task.message,
-                                        task.max_retries,
-                                        task.token_budget,
-                                        subagent,
-                                    ))
-                                })
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .map_err(|error| SpawnAgentToolOutput::Error {
-                            session_id: None,
-                            error: error.to_string(),
-                            session_info: None,
-                        })?;
-                    let results = join_all(spawned.into_iter().map(
-                        |(task_id, label, message, max_retries, token_budget, subagent)| {
-                            let app = cx.clone();
-                            async move {
-                                let session_id = subagent.id();
-                                let initial_entries = app
-                                    .update(|cx| subagent.num_entries(cx));
-                                let mut attempts = 0;
-                                let output = loop {
-                                    match subagent.send(message.clone(), &app).await {
-                                        Ok(output) => {
-                                            if let Some(budget) = token_budget {
-                                                let exceeded = app
-                                                    .update(|cx| subagent.used_tokens(cx))
-                                                    .is_some_and(|used| used > budget);
-                                                if exceeded {
-                                                    break Err(anyhow::anyhow!(
-                                                        "token budget of {budget} was exceeded"
-                                                    ));
-                                                }
-                                            }
-                                            break Ok(output);
-                                        }
-                                        Err(error) => {
-                                            let retry_safe = app
-                                                .update(|cx| subagent.num_entries(cx) == initial_entries);
-                                            if retry_safe && attempts < max_retries {
-                                                attempts += 1;
-                                            } else {
-                                                break Err(error);
-                                            }
-                                        }
-                                    }
-                                };
-                                (task_id, label, session_id, output)
-                            }
-                        },
-                    ))
-                    .await;
-                    if event_stream.was_cancelled_by_user() {
-                        return Err(SpawnAgentToolOutput::Error {
-                            session_id: None,
-                            error: "parallel orchestration cancelled".to_string(),
-                            session_info: None,
-                        });
-                    }
-                    for (task_id, label, session_id, output) in results {
-                        match output {
-                            Ok(output) => {
-                                completed.insert(task_id.clone());
-                                batch.push(SpawnAgentBatchResult {
-                                    task_id,
-                                    session_id,
-                                    label,
-                                    output,
-                                });
-                            }
-                            Err(error) => {
-                                let completed_summary = batch
-                                    .iter()
-                                    .map(|result| result.task_id.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let skipped_count = pending.len();
-                                return Err(SpawnAgentToolOutput::Error {
-                                    session_id: Some(session_id),
-                                    error: format!(
-                                        "{label}: {error}; completed: [{}]; skipped: {skipped_count}",
-                                        completed_summary
-                                    ),
-                                    session_info: None,
-                                });
-                            }
-                        }
-                    }
-                }
-                let raw_output = match serde_json::to_value(&batch) {
-                    Ok(raw_output) => raw_output,
-                    Err(error) => {
-                        return Err(SpawnAgentToolOutput::Error {
-                            session_id: None,
-                            error: format!("Failed to serialize batch output: {error}"),
-                            session_info: None,
-                        });
-                    }
-                };
-                event_stream.update_fields(
-                    acp::ToolCallUpdateFields::new()
-                        .title("Parallel agents completed")
-                        .raw_output(raw_output),
-                );
-                return Ok(SpawnAgentToolOutput::BatchSuccess { results: batch });
+                return run_batch_tasks(
+                    self.environment.clone(),
+                    self.thread.clone(),
+                    tasks,
+                    event_stream,
+                    cx,
+                )
+                .await;
             }
 
             let (subagent, mut session_info) = cx.update(|cx| {
@@ -556,6 +993,23 @@ impl AgentTool for SpawnAgentTool {
                 serde_json::to_string(&results)
                     .unwrap_or_else(|error| format!("Failed to serialize batch output: {error}"))
                     .into(),
+                None,
+            ),
+            SpawnAgentToolOutput::PlanProposed {
+                run_id,
+                plan,
+                strategy,
+                reason,
+            } => (
+                serde_json::to_string(&serde_json::json!({
+                    "run_id": run_id,
+                    "status": "awaiting_approval",
+                    "plan": plan,
+                    "strategy": strategy,
+                    "reason": reason,
+                }))
+                .unwrap_or_else(|error| format!("Failed to serialize plan proposal: {error}"))
+                .into(),
                 None,
             ),
         };
@@ -680,6 +1134,13 @@ mod tests {
                     depends_on: vec!["two".to_string()],
                     max_retries: 0,
                     token_budget: None,
+                    acceptance_criteria: None,
+                    expected_output: None,
+                    evidence_required: None,
+                    time_budget_secs: None,
+                    tool_call_budget: None,
+                    objective: None,
+                    scope: None,
                 },
             ),
             (
@@ -693,6 +1154,13 @@ mod tests {
                     depends_on: vec!["one".to_string()],
                     max_retries: 0,
                     token_budget: None,
+                    acceptance_criteria: None,
+                    expected_output: None,
+                    evidence_required: None,
+                    time_budget_secs: None,
+                    tool_call_budget: None,
+                    objective: None,
+                    scope: None,
                 },
             ),
         ];
@@ -712,6 +1180,13 @@ mod tests {
                 depends_on: Vec::new(),
                 max_retries: MAX_SUBAGENT_RETRIES + 1,
                 token_budget: None,
+                acceptance_criteria: None,
+                expected_output: None,
+                evidence_required: None,
+                time_budget_secs: None,
+                tool_call_budget: None,
+                objective: None,
+                scope: None,
             },
         )];
         assert!(validate_task_graph(&tasks).is_err());
@@ -730,8 +1205,115 @@ mod tests {
                 depends_on: Vec::new(),
                 max_retries: 0,
                 token_budget: Some(0),
+                acceptance_criteria: None,
+                expected_output: None,
+                evidence_required: None,
+                time_budget_secs: None,
+                tool_call_budget: None,
+                objective: None,
+                scope: None,
             },
         )];
         assert!(validate_task_graph(&tasks).is_err());
+    }
+    #[test]
+    fn test_batch_orchestration_plan_graph_waves() {
+        let t1 = SpawnAgentTask {
+            id: Some("task-1".to_string()),
+            label: "Search codebase".to_string(),
+            message: "Find usages".to_string(),
+            agent_type: Some(SubagentRole::Explorer),
+            tools: None,
+            depends_on: Vec::new(),
+            max_retries: 1,
+            token_budget: Some(1000),
+            acceptance_criteria: None,
+            expected_output: None,
+            evidence_required: None,
+            time_budget_secs: None,
+            tool_call_budget: None,
+            objective: None,
+            scope: None,
+        };
+        let t2 = SpawnAgentTask {
+            id: Some("task-2".to_string()),
+            label: "Implement changes".to_string(),
+            message: "Apply refactor".to_string(),
+            agent_type: Some(SubagentRole::CodingWorker),
+            tools: None,
+            depends_on: vec!["task-1".to_string()],
+            max_retries: 1,
+            token_budget: Some(2000),
+            acceptance_criteria: None,
+            expected_output: None,
+            evidence_required: None,
+            time_budget_secs: None,
+            tool_call_budget: None,
+            objective: None,
+            scope: None,
+        };
+        let pending = vec![("task-1".to_string(), t1), ("task-2".to_string(), t2)];
+        assert!(validate_task_graph(&pending).is_ok());
+
+        let orch_tasks = pending
+            .into_iter()
+            .map(|(task_id, task)| {
+                let mut orch =
+                    agent_orchestration::OrchestrationTask::new(task_id, task.label, task.message);
+                orch.depends_on = task
+                    .depends_on
+                    .into_iter()
+                    .map(agent_orchestration::TaskId::new)
+                    .collect();
+                orch
+            })
+            .collect();
+
+        let plan = agent_orchestration::OrchestrationPlan::new("Test Plan", orch_tasks);
+        let graph = agent_orchestration::PlanGraph::new(plan).expect("valid graph");
+        assert_eq!(graph.waves().len(), 2);
+        assert_eq!(
+            graph.waves()[0],
+            vec![agent_orchestration::TaskId::new("task-1")]
+        );
+        assert_eq!(
+            graph.waves()[1],
+            vec![agent_orchestration::TaskId::new("task-2")]
+        );
+    }
+
+    #[test]
+    fn structured_verification_requires_every_criterion_and_evidence() {
+        let mut task = agent_orchestration::OrchestrationTask::new("task", "Task", "Do work");
+        task.acceptance_criteria = vec!["tests pass".to_string(), "diff reviewed".to_string()];
+        task.expected_output = Some("Summary with evidence".to_string());
+        task.evidence_required = true;
+
+        let incomplete = format!(
+            "Done\n{VERIFICATION_START}{{\"criteria\":[{{\"criterion\":\"tests pass\",\"passed\":true,\"evidence\":\"cargo test passed\"}}],\"expected_output_satisfied\":true,\"citations\":[\"src/main.rs:12\"]}}{VERIFICATION_END}"
+        );
+        assert!(!verify_task_output(&task, &incomplete).passed);
+
+        let complete = format!(
+            "Done\n{VERIFICATION_START}{{\"criteria\":[{{\"criterion\":\"tests pass\",\"passed\":true,\"evidence\":\"cargo test passed\"}},{{\"criterion\":\"diff reviewed\",\"passed\":true,\"evidence\":\"reviewed src/main.rs\"}}],\"expected_output_satisfied\":true,\"citations\":[\"src/main.rs:12\"]}}{VERIFICATION_END}"
+        );
+        let result = verify_task_output(&task, &complete);
+        assert!(result.passed);
+        assert_eq!(
+            result.verdict,
+            agent_orchestration::VerificationVerdict::Claimed
+        );
+    }
+
+    #[test]
+    fn structured_verification_rejects_invalid_citations() {
+        let mut task = agent_orchestration::OrchestrationTask::new("task", "Task", "Do work");
+        task.evidence_required = true;
+        let output = format!(
+            "Done\n{VERIFICATION_START}{{\"criteria\":[],\"expected_output_satisfied\":true,\"citations\":[\"src/main.rs\"]}}{VERIFICATION_END}"
+        );
+        let result = verify_task_output(&task, &output);
+        assert!(!result.passed);
+        assert_eq!(result.citations_valid, Some(false));
     }
 }

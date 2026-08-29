@@ -101,6 +101,8 @@ pub struct DbThread {
     /// subagent session keeps its original filter.
     #[serde(default)]
     pub tool_filter: Option<Vec<SharedString>>,
+    #[serde(default)]
+    pub orchestration_run: Option<agent_orchestration::PersistedRun>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -185,6 +187,7 @@ impl SharedThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
+            orchestration_run: None,
         }
     }
 
@@ -402,6 +405,7 @@ impl DbThread {
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
+            orchestration_run: None,
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
@@ -883,6 +887,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
+            orchestration_run: None,
         }
     }
 
@@ -1256,6 +1261,52 @@ mod tests {
         assert_eq!(context.parent_thread_id, parent_id);
         assert_eq!(context.depth, 2);
         assert_eq!(context.role, Some(crate::SubagentRole::FlowReader));
+    }
+    #[gpui::test]
+    async fn test_orchestration_run_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let thread_id = session_id("orchestrated-thread");
+
+        let mut thread = make_thread(
+            "Orchestrated Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+
+        let task = agent_orchestration::OrchestrationTask::new("t1", "Task 1", "desc 1");
+        let plan = agent_orchestration::OrchestrationPlan::new("Orch Plan", vec![task]);
+        let status = agent_orchestration::TaskStatus::new(agent_orchestration::TaskId::new("t1"));
+
+        let persisted_run = agent_orchestration::PersistedRun::new(
+            agent_orchestration::RunId::new(),
+            plan,
+            agent_orchestration::RunState::Completed,
+            agent_settings::AgentExecutionPolicy::default(),
+            vec![status],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        thread.orchestration_run = Some(persisted_run.clone());
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+
+        let loaded_run = loaded
+            .orchestration_run
+            .expect("orchestration_run should be restored");
+        assert_eq!(loaded_run.run_id, persisted_run.run_id);
+        assert_eq!(loaded_run.state, agent_orchestration::RunState::Completed);
+        assert_eq!(loaded_run.plan.title, "Orch Plan");
+        assert_eq!(loaded_run.task_statuses.len(), 1);
     }
 
     #[gpui::test]
