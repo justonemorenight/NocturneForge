@@ -108,6 +108,8 @@ actions!(
         Cancel,
         /// Expands the commit message editor.
         ExpandCommitEditor,
+        /// Toggles the visibility of the commit message editor.
+        ToggleCommitEditor,
         /// Toggles whether the commit message editor fills all the available
         /// vertical space within the git panel.
         ToggleFillCommitEditor,
