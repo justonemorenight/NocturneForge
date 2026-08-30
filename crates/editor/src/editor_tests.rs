@@ -39864,6 +39864,32 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_public_snapshot(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(Point::new(0, 0));
+        let key = test_hunk_key_with_anchor("src/main.rs", anchor);
+        add_test_comment(editor, key, "Handle this error", cx);
+
+        let comments = editor.take_review_comments(cx);
+        assert_eq!(
+            comments,
+            vec![DiffReviewComment {
+                file_path: "src/main.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                comment: "Handle this error".to_string(),
+                selected_text: String::new(),
+            }]
+        );
+        assert_eq!(editor.total_review_comment_count(), 0);
+    });
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -331,6 +331,15 @@ pub(super) struct StoredReviewComment {
     pub(super) is_editing: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffReviewComment {
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub comment: String,
+    pub selected_text: String,
+}
+
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
 pub(super) struct DiffReviewOverlay {
     pub(super) anchor_range: Range<Anchor>,
@@ -2883,6 +2892,42 @@ impl Editor {
                 // Display mode: no action buttons for now (edit/delete not yet implemented)
                 gpui::Empty.into_any_element()
             })
+    }
+
+    pub fn take_review_comments(&mut self, cx: &mut Context<Self>) -> Vec<DiffReviewComment> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.dismiss_all_diff_review_overlays(cx);
+        let stored_comments = std::mem::take(&mut self.stored_review_comments);
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+
+        stored_comments
+            .into_iter()
+            .flat_map(|(hunk, comments)| {
+                comments.into_iter().map({
+                    let snapshot = snapshot.clone();
+                    move |comment| {
+                        let range = comment.range.to_point(&snapshot);
+                        let start_line = snapshot
+                            .point_to_buffer_point(range.start)
+                            .map_or(range.start.row, |(_, point)| point.row)
+                            .saturating_add(1);
+                        let end_line = snapshot
+                            .point_to_buffer_point(range.end)
+                            .map_or(range.end.row, |(_, point)| point.row)
+                            .saturating_add(1);
+                        DiffReviewComment {
+                            file_path: hunk.file_path.to_string(),
+                            start_line,
+                            end_line,
+                            comment: comment.comment,
+                            selected_text: snapshot.text_for_range(range).collect::<String>(),
+                        }
+                    }
+                })
+            })
+            .collect()
     }
 
     fn get_permalink_to_line(&self, cx: &mut Context<Self>) -> Task<Result<url::Url>> {
