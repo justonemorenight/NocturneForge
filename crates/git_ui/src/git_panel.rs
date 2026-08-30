@@ -2175,6 +2175,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let path_style = self.project.read(cx).path_style(cx);
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
@@ -2226,6 +2229,9 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let (repo_path, is_directory) = match list_entry {
@@ -2278,6 +2284,9 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let (repo_path, is_directory) = match list_entry {
@@ -2494,6 +2503,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let entries = self
             .change_entries_by_path()
             .filter(|status_entry| !status_entry.status.is_created())
@@ -2539,6 +2551,9 @@ impl GitPanel {
     }
 
     fn clean_all(&mut self, _: &TrashUntrackedFiles, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let workspace = self.workspace.clone();
         let Some(active_repo) = self.active_repository.clone() else {
             return;
@@ -2715,10 +2730,16 @@ impl GitPanel {
     }
 
     pub fn stage_all(&mut self, _: &StageAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         self.change_all_files_stage(true, cx);
     }
 
     pub fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         self.change_all_files_stage(false, cx);
     }
 
@@ -2862,6 +2883,9 @@ impl GitPanel {
     }
 
     pub fn stash_pop(&mut self, _: &StashPop, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -2885,6 +2909,9 @@ impl GitPanel {
     }
 
     pub fn stash_apply(&mut self, _: &StashApply, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -2908,6 +2935,9 @@ impl GitPanel {
     }
 
     pub fn stash_all(&mut self, _: &StashAll, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -3002,6 +3032,9 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(selected_index) = self.selected_entry else {
             return;
         };
@@ -3018,6 +3051,9 @@ impl GitPanel {
     }
 
     fn stage_range(&mut self, _: &git::StageRange, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(index) = self.selected_entry else {
             return;
         };
@@ -3026,6 +3062,9 @@ impl GitPanel {
     }
 
     fn stage_selected(&mut self, _: &git::StageFile, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(selected_entry) = self.get_selected_entry() else {
             return;
         };
@@ -3043,6 +3082,9 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(selected_entry) = self.get_selected_entry() else {
             return;
         };
@@ -3427,6 +3469,7 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_commit_editor(cx);
         self.generate_commit_message(cx);
     }
 
@@ -6220,6 +6263,7 @@ impl GitPanel {
             )
             .disabled(!can_commit || has_commit_model_configuration_error)
             .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.show_commit_editor(cx);
                 this.generate_commit_message(cx);
             }));
 
@@ -6535,6 +6579,14 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn show_commit_editor(&mut self, cx: &mut Context<Self>) {
+        if self.commit_editor_collapsed {
+            self.commit_editor_collapsed = false;
+            self.serialize(cx);
+            cx.notify();
+        }
+    }
+
     fn expand_commit_editor(
         &mut self,
         _: &ExpandCommitEditor,
@@ -6817,6 +6869,7 @@ impl GitPanel {
 
             IconButton::new("toggle-commit-editor", icon)
                 .icon_size(IconSize::Small)
+                .aria_label(label)
                 .tooltip(move |_window, cx| {
                     Tooltip::for_action_in(label, &git::ToggleCommitEditor, &focus_handle, cx)
                 })
@@ -7125,6 +7178,7 @@ impl GitPanel {
                         .child(
                             IconButton::new("git-graph-button", IconName::GitGraph)
                                 .icon_size(IconSize::Small)
+                                .aria_label("Toggle Git Graph")
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
                                         "Toggle Git Graph",
@@ -8241,24 +8295,34 @@ impl GitPanel {
         } else {
             "Discard Changes"
         };
+        let has_write_access = self.has_write_access(cx);
+        let resolved_conflict = self.is_resolved_conflict(ix, cx);
         let context_menu = ContextMenu::build(window, cx, |context_menu, _, _| {
             let is_created = entry.status.is_created();
             context_menu
                 .context(self.focus_handle.clone())
-                .action(stage_title, ToggleStaged.boxed_clone())
-                .action(restore_title, git::RestoreFile::default().boxed_clone())
-                .action("Stash File", StashFile.boxed_clone())
+                .action_disabled_when(
+                    !has_write_access || resolved_conflict,
+                    stage_title,
+                    ToggleStaged.boxed_clone(),
+                )
+                .action_disabled_when(
+                    !has_write_access,
+                    restore_title,
+                    git::RestoreFile::default().boxed_clone(),
+                )
+                .action_disabled_when(!has_write_access, "Stash File", StashFile.boxed_clone())
                 .separator()
                 .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
                 .action("Staged Changes", ViewStagedChanges.boxed_clone())
                 .separator()
                 .action_disabled_when(
-                    !is_created,
+                    !has_write_access || !is_created,
                     "Add to .gitignore",
                     git::AddToGitignore.boxed_clone(),
                 )
                 .action_disabled_when(
-                    !is_created,
+                    !has_write_access || !is_created,
                     "Add to .git/info/exclude",
                     git::AddToGitInfoExclude.boxed_clone(),
                 )
@@ -13684,6 +13748,11 @@ mod tests {
                 EditorMode::AutoHeight { .. }
             ));
 
+            panel.show_commit_editor(cx);
+            assert!(!panel.commit_editor_collapsed);
+            assert!(!panel.commit_editor_expanded);
+
+            panel.toggle_commit_editor(&ToggleCommitEditor, window, cx);
             panel.toggle_fill_commit_editor(&ToggleFillCommitEditor, window, cx);
             assert!(!panel.commit_editor_collapsed);
             assert!(panel.commit_editor_expanded);
