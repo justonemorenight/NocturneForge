@@ -40,8 +40,8 @@ use git::status::{DiffStat, StageStatus};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll,
-    ViewFile, parse_git_remote_url,
+    StashAll, StashApply, StashPop, ToggleCommitEditor, ToggleFillCommitEditor,
+    TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
@@ -403,6 +403,13 @@ pub fn register(workspace: &mut Workspace) {
             });
         }
     });
+    workspace.register_action(|workspace, _: &ToggleCommitEditor, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.toggle_commit_editor(&Default::default(), window, cx)
+            });
+        }
+    });
     workspace.register_action(|workspace, _: &git::Init, window, cx| {
         if let Some(panel) = workspace.panel::<GitPanel>(cx) {
             panel.update(cx, |panel, cx| panel.git_init(window, cx));
@@ -426,6 +433,8 @@ pub enum Event {
 struct SerializedGitPanel {
     #[serde(default)]
     signoff_enabled: bool,
+    #[serde(default)]
+    commit_editor_collapsed: bool,
     #[serde(default)]
     commit_messages: BTreeMap<String, SerializedCommitMessage>,
 }
@@ -1004,6 +1013,7 @@ pub struct GitPanel {
     pub(crate) commit_editor: Entity<Editor>,
     /// Whether the commit editor should fill the vertical height of the panel.
     commit_editor_expanded: bool,
+    commit_editor_collapsed: bool,
     conflicted_count: usize,
     conflicted_staged_count: usize,
     add_coauthors: bool,
@@ -1149,6 +1159,9 @@ impl GitPanel {
         let signoff_enabled = serialized_panel
             .as_ref()
             .is_some_and(|panel| panel.signoff_enabled);
+        let commit_editor_collapsed = serialized_panel
+            .as_ref()
+            .is_some_and(|panel| panel.commit_editor_collapsed);
         let active_work_directory_abs_path = active_repository.as_ref().map(|repository| {
             repository
                 .read(cx)
@@ -1305,6 +1318,7 @@ impl GitPanel {
                 active_repository,
                 commit_editor,
                 commit_editor_expanded: false,
+                commit_editor_collapsed,
                 conflicted_count: 0,
                 conflicted_staged_count: 0,
                 add_coauthors: true,
@@ -1475,6 +1489,7 @@ impl GitPanel {
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let signoff_enabled = self.signoff_enabled;
+        let commit_editor_collapsed = self.commit_editor_collapsed;
         let commit_messages = self.serialized_commit_messages(cx);
         let kvp = KeyValueStore::global(cx);
 
@@ -1501,6 +1516,7 @@ impl GitPanel {
                         serialization_key,
                         serde_json::to_string(&SerializedGitPanel {
                             signoff_enabled,
+                            commit_editor_collapsed,
                             commit_messages,
                         })?,
                     )
@@ -6414,6 +6430,8 @@ impl GitPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_collapsed = self.commit_editor_collapsed;
+        self.commit_editor_collapsed = false;
         self.commit_editor_expanded = !self.commit_editor_expanded;
         self.commit_editor.update(cx, |editor, _cx| {
             if self.commit_editor_expanded {
@@ -6430,6 +6448,33 @@ impl GitPanel {
             }
         });
 
+        if was_collapsed {
+            self.serialize(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_commit_editor(
+        &mut self,
+        _: &ToggleCommitEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_editor_collapsed = !self.commit_editor_collapsed;
+        let editor_was_focused = self.commit_editor.focus_handle(cx).is_focused(window);
+        if self.commit_editor_collapsed && self.commit_editor_expanded {
+            self.commit_editor_expanded = false;
+            self.commit_editor.update(cx, |editor, _cx| {
+                editor.set_mode(EditorMode::AutoHeight {
+                    min_lines: MAX_PANEL_EDITOR_LINES,
+                    max_lines: Some(MAX_PANEL_EDITOR_LINES),
+                });
+            });
+        }
+        if self.commit_editor_collapsed && editor_was_focused {
+            self.focus_handle.focus(window, cx);
+        }
+        self.serialize(cx);
         cx.notify();
     }
 
@@ -6705,95 +6750,123 @@ impl GitPanel {
                     }))
             });
 
+        let commit_editor_toggle = {
+            let (icon, label) = if self.commit_editor_collapsed {
+                (IconName::ChevronRight, "Show Commit Editor")
+            } else {
+                (IconName::ChevronDown, "Hide Commit Editor")
+            };
+            let focus_handle = self.focus_handle.clone();
+
+            IconButton::new("toggle-commit-editor", icon)
+                .icon_size(IconSize::Small)
+                .tooltip(move |_window, cx| {
+                    Tooltip::for_action_in(label, &git::ToggleCommitEditor, &focus_handle, cx)
+                })
+                .on_click(cx.listener(|_, _, window, cx| {
+                    window.dispatch_action(git::ToggleCommitEditor.boxed_clone(), cx)
+                }))
+        };
+
+        let commit_footer = h_flex()
+            .id("commit-footer")
+            .w_full()
+            .p_1p5()
+            .border_t_1()
+            .when(editor_is_long && !self.commit_editor_collapsed, |el| {
+                el.border_color(cx.theme().colors().border_variant)
+            })
+            .justify_between()
+            .child(
+                h_flex().gap_0p5().child(commit_editor_toggle).child(
+                    self.render_generate_commit_message_button(cx)
+                        .unwrap_or_else(|| div().into_any_element()),
+                ),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .children(enable_coauthors)
+                    .child(self.render_commit_button(cx)),
+            );
+
         let footer = v_flex()
-            .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
+            .when(
+                self.commit_editor_expanded && !self.commit_editor_collapsed,
+                |this| this.flex_1().min_h_0(),
+            )
             .child(PanelRepoFooter::new(
                 display_name,
                 branch,
                 head_commit,
                 Some(git_panel),
             ))
-            .when(title_exceeds_limit, |this| {
+            .when(
+                title_exceeds_limit && !self.commit_editor_collapsed,
+                |this| {
+                    this.child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(cx.theme().status().warning_border)
+                            .bg(cx.theme().status().warning_background.opacity(0.5))
+                            .child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Label::new(format!(
+                                    "Commit message title exceeds {max_title_length}-character limit."
+                                ))
+                                .size(LabelSize::Small),
+                            ),
+                    )
+                },
+            )
+            .when(!self.commit_editor_collapsed, |this| {
                 this.child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
+                    panel_editor_container(window, cx)
+                        .id("commit-editor-container")
+                        .w_full()
+                        .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
                         .border_t_1()
-                        .border_color(cx.theme().status().warning_border)
-                        .bg(cx.theme().status().warning_background.opacity(0.5))
+                        .border_color(if title_exceeds_limit {
+                            cx.theme().status().warning_border
+                        } else {
+                            cx.theme().colors().border
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            window.focus(&this.commit_editor.focus_handle(cx), cx);
+                        }))
                         .child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::XSmall)
-                                .color(Color::Warning),
-                        )
-                        .child(
-                            Label::new(format!(
-                                "Commit message title exceeds {max_title_length}-character limit."
-                            ))
-                            .size(LabelSize::Small),
+                            h_flex()
+                                .size_full()
+                                .child(
+                                    div()
+                                        .pt_2()
+                                        .px_2()
+                                        .h_full()
+                                        .flex_grow_1()
+                                        .cursor_text()
+                                        .on_action(|&zed_actions::editor::MoveUp, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_action(|&zed_actions::editor::MoveDown, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(EditorElement::new(
+                                            &self.commit_editor,
+                                            panel_editor_style,
+                                        )),
+                                )
+                                .child(vertical_buttons),
                         ),
                 )
             })
-            .child(
-                panel_editor_container(window, cx)
-                    .id("commit-editor-container")
-                    .w_full()
-                    .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-                    .border_t_1()
-                    .border_color(if title_exceeds_limit {
-                        cx.theme().status().warning_border
-                    } else {
-                        cx.theme().colors().border
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        window.focus(&this.commit_editor.focus_handle(cx), cx);
-                    }))
-                    .child(
-                        h_flex()
-                            .size_full()
-                            .child(
-                                div()
-                                    .pt_2()
-                                    .px_2()
-                                    .h_full()
-                                    .flex_grow_1()
-                                    .cursor_text()
-                                    .on_action(|&zed_actions::editor::MoveUp, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .on_action(|&zed_actions::editor::MoveDown, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .child(EditorElement::new(
-                                        &self.commit_editor,
-                                        panel_editor_style,
-                                    )),
-                            )
-                            .child(vertical_buttons),
-                    )
-                    .child(
-                        h_flex()
-                            .id("commit-footer")
-                            .w_full()
-                            .p_1p5()
-                            .border_t_1()
-                            .when(editor_is_long, |el| {
-                                el.border_color(cx.theme().colors().border_variant)
-                            })
-                            .justify_between()
-                            .child(
-                                self.render_generate_commit_message_button(cx)
-                                    .unwrap_or_else(|| div().into_any_element()),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .children(enable_coauthors)
-                                    .child(self.render_commit_button(cx)),
-                            ),
-                    ),
-            );
+            .child(commit_footer);
 
         Some(footer)
     }
@@ -9115,6 +9188,7 @@ impl editor::Addon for GitPanelAddon {
 impl Panel for GitPanel {
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
         if self.active_tab == GitPanelTab::Changes
+            && !self.commit_editor_collapsed
             && (self.entries.is_empty() || self.commit_editor_expanded)
         {
             self.commit_editor.focus_handle(cx)
@@ -12178,6 +12252,7 @@ mod tests {
 
             SerializedGitPanel {
                 signoff_enabled: false,
+                commit_editor_collapsed: true,
                 commit_messages: panel.serialized_commit_messages(cx),
             }
         });
@@ -12202,6 +12277,7 @@ mod tests {
         cx.run_until_parked();
 
         restored_panel.read_with(cx, |panel, cx| {
+            assert!(panel.commit_editor_collapsed);
             assert_eq!(panel.commit_message_buffer(cx).read(cx).text(), message_b);
         });
 
@@ -12222,6 +12298,7 @@ mod tests {
 
         let mismatched_serialized_panel = SerializedGitPanel {
             signoff_enabled: false,
+            commit_editor_collapsed: false,
             commit_messages: BTreeMap::from_iter([(
                 path!("/root/other-project").to_string(),
                 SerializedCommitMessage {
@@ -13529,6 +13606,18 @@ mod tests {
                 panel.commit_editor.read(cx).mode().clone(),
                 EditorMode::Full { .. }
             ));
+
+            panel.toggle_commit_editor(&ToggleCommitEditor, window, cx);
+            assert!(panel.commit_editor_collapsed);
+            assert!(!panel.commit_editor_expanded);
+            assert!(matches!(
+                panel.commit_editor.read(cx).mode().clone(),
+                EditorMode::AutoHeight { .. }
+            ));
+
+            panel.toggle_fill_commit_editor(&ToggleFillCommitEditor, window, cx);
+            assert!(!panel.commit_editor_collapsed);
+            assert!(panel.commit_editor_expanded);
 
             panel.toggle_fill_commit_editor(&ToggleFillCommitEditor, window, cx);
             assert!(!panel.commit_editor_expanded);
