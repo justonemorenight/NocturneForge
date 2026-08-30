@@ -61,7 +61,7 @@ use ui::{
 };
 use util::{ResultExt, debug_panic};
 use workspace::{
-    ModalView, Workspace,
+    ModalView, SaveIntent, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
@@ -578,8 +578,9 @@ impl SplitState {
 actions!(
     git_graph,
     [
-        /// Opens the Git Graph Tab.
-        Open,
+        /// Opens the Git Graph tab, or closes it when it is already active.
+        #[action(deprecated_aliases = ["git_graph::Open"])]
+        Toggle,
         /// Focuses the search field.
         FocusSearch,
         /// Focuses the next git graph tab stop.
@@ -1086,27 +1087,12 @@ pub fn init(cx: &mut App) {
 
                     div.on_action({
                         let workspace = workspace.clone();
-                        move |_: &Open, window, cx| {
+                        move |_: &Toggle, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
-                                    let Some(repo) =
-                                        workspace.project().read(cx).active_repository(cx)
-                                    else {
-                                        return;
-                                    };
-                                    let selected_repo_id = repo.read(cx).id;
-
-                                    let git_store =
-                                        workspace.project().read(cx).git_store().clone();
-                                    open_or_reuse_graph(
-                                        workspace,
-                                        selected_repo_id,
-                                        git_store,
-                                        LogSource::All,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
+                                    if !toggle_open_graph(workspace, window, cx) {
+                                        open_active_repository_graph(workspace, None, window, cx);
+                                    }
                                 })
                                 .ok();
                         }
@@ -1115,22 +1101,7 @@ pub fn init(cx: &mut App) {
                         let sha = action.sha.clone();
                         workspace
                             .update(cx, |workspace, cx| {
-                                let Some(repo) = workspace.project().read(cx).active_repository(cx)
-                                else {
-                                    return;
-                                };
-                                let selected_repo_id = repo.read(cx).id;
-
-                                let git_store = workspace.project().read(cx).git_store().clone();
-                                open_or_reuse_graph(
-                                    workspace,
-                                    selected_repo_id,
-                                    git_store,
-                                    LogSource::All,
-                                    Some(sha),
-                                    window,
-                                    cx,
-                                );
+                                open_active_repository_graph(workspace, Some(sha), window, cx);
                             })
                             .ok();
                     })
@@ -1188,6 +1159,55 @@ fn resolve_file_history_target(
         .read(cx)
         .repository_and_path_for_project_path(&project_path, cx)?;
     Some((repo.read(cx).id, LogSource::Path(repo_path)))
+}
+
+fn open_active_repository_graph(
+    workspace: &mut Workspace,
+    sha: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+        return;
+    };
+    let repository_id = repository.read(cx).id;
+    let git_store = workspace.project().read(cx).git_store().clone();
+    open_or_reuse_graph(
+        workspace,
+        repository_id,
+        git_store,
+        LogSource::All,
+        sha,
+        window,
+        cx,
+    );
+}
+
+fn toggle_open_graph(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(graph) = workspace
+        .items_of_type::<GitGraph>(cx)
+        .find(|graph| graph.read(cx).log_source == LogSource::All)
+    else {
+        return false;
+    };
+    let graph_id = graph.entity_id();
+    let Some(pane) = workspace.pane_for_item_id(graph_id) else {
+        return false;
+    };
+    let is_active = pane.read(cx).active_item().map(|item| item.item_id()) == Some(graph_id);
+    if is_active {
+        pane.update(cx, |pane, cx| {
+            pane.close_item_by_id(graph_id, SaveIntent::Skip, window, cx)
+        })
+        .detach_and_log_err(cx);
+    } else {
+        workspace.activate_item(&graph, true, true, window, cx);
+    }
+    true
 }
 
 pub fn open_or_reuse_graph(
@@ -6770,6 +6790,54 @@ mod tests {
 
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.selected_entry_idx, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_open_graph_closes_active_full_graph(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                Some(LogSource::All),
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(toggle_open_graph(workspace, window, cx));
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
+            assert!(!toggle_open_graph(workspace, window, cx));
         });
     }
 

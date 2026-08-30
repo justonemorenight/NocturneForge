@@ -40,7 +40,7 @@ use git::status::{DiffStat, StageStatus};
 use git::{Amend, Commit, Signoff, ToggleStaged, repository::RepoPath, status::FileStatus};
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, ToggleCommitEditor, ToggleFillCommitEditor,
+    StashAll, StashApply, StashFile, StashPop, ToggleCommitEditor, ToggleFillCommitEditor,
     TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
@@ -2926,6 +2926,63 @@ impl GitPanel {
                     cx.notify();
                 })
             }
+        })
+        .detach();
+    }
+
+    fn selected_stash_paths(&self) -> Vec<RepoPath> {
+        let Some(selected_index) = self.selected_entry else {
+            return Vec::new();
+        };
+        let Some(selected_entry) = self.entries.get(selected_index) else {
+            return Vec::new();
+        };
+
+        if let Some(entry) = selected_entry.status_entry() {
+            vec![entry.repo_path.clone()]
+        } else if let GitListEntry::Directory(directory) = selected_entry {
+            self.view_mode
+                .tree_state()
+                .and_then(|state| state.directory_descendants.get(&directory.key))
+                .map(|descendants| {
+                    descendants
+                        .iter()
+                        .map(|entry| entry.repo_path.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn stash_selected(
+        &mut self,
+        _: &StashFile,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_write_access(cx) {
+            return;
+        }
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        let paths = self.selected_stash_paths();
+        if paths.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let stash_task = active_repository
+                .update(cx, |repository, cx| repository.stash_entries(paths, cx))
+                .await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = stash_task {
+                    this.show_error_toast("stash selected changes", error, cx);
+                }
+                cx.notify();
+            })
         })
         .detach();
     }
@@ -7070,13 +7127,14 @@ impl GitPanel {
                                 .icon_size(IconSize::Small)
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
-                                        "Open Git Graph",
-                                        &crate::git_graph::Open,
+                                        "Toggle Git Graph",
+                                        &crate::git_graph::Toggle,
                                         cx,
                                     )
                                 })
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(crate::git_graph::Open.boxed_clone(), cx)
+                                    window
+                                        .dispatch_action(crate::git_graph::Toggle.boxed_clone(), cx)
                                 }),
                         ),
                 ),
@@ -8189,6 +8247,7 @@ impl GitPanel {
                 .context(self.focus_handle.clone())
                 .action(stage_title, ToggleStaged.boxed_clone())
                 .action(restore_title, git::RestoreFile::default().boxed_clone())
+                .action("Stash File", StashFile.boxed_clone())
                 .separator()
                 .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
                 .action("Staged Changes", ViewStagedChanges.boxed_clone())
@@ -8252,6 +8311,11 @@ impl GitPanel {
             context_menu
                 .context(self.focus_handle.clone())
                 .action_disabled_when(!has_write_access, stage_title, ToggleStaged.boxed_clone())
+                .action_disabled_when(
+                    !has_write_access,
+                    "Stash Directory",
+                    StashFile.boxed_clone(),
+                )
                 .separator()
                 .action("Copy Path", CopyPath.boxed_clone())
                 .action("Copy Relative Path", CopyRelativePath.boxed_clone())
@@ -9062,6 +9126,7 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::clean_all))
                     .on_action(cx.listener(Self::generate_commit_message_action))
                     .on_action(cx.listener(Self::stash_all))
+                    .on_action(cx.listener(Self::stash_selected))
                     .on_action(cx.listener(Self::stash_pop))
             })
             .on_action(cx.listener(Self::collapse_selected_entry))
@@ -10340,6 +10405,10 @@ mod tests {
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.selected_entry = Some(directory_index);
+            assert_eq!(
+                panel.selected_stash_paths(),
+                vec![repo_path("src/nested.rs")]
+            );
             panel.copy_relative_path(&CopyRelativePath, window, cx);
         });
         assert_eq!(
