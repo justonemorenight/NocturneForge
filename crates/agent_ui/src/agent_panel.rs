@@ -67,7 +67,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{Editor, MultiBuffer};
+use editor::{DiffReviewComment, Editor, MultiBuffer, actions::SendReviewToAgent};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -659,6 +659,42 @@ pub fn init(cx: &mut App) {
                         );
                     });
                 })
+                .register_action(|workspace, _: &SendReviewToAgent, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+                    let Some(editor) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                    else {
+                        return;
+                    };
+                    let comments = editor.update(cx, |editor, cx| editor.take_review_comments(cx));
+                    if comments.is_empty() {
+                        return;
+                    }
+
+                    let content_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        build_diff_review_comments_prompt(&comments),
+                    ))];
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: content_blocks,
+                                auto_submit: true,
+                            }),
+                            true,
+                            AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
                         let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -835,6 +871,35 @@ pub fn init(cx: &mut App) {
         },
     )
     .detach();
+}
+
+fn build_diff_review_comments_prompt(comments: &[DiffReviewComment]) -> String {
+    let mut prompt = format!(
+        "Address the following {} review comment{} from the current Git diff. Inspect the surrounding code, make the requested changes, and verify the result.\n",
+        comments.len(),
+        if comments.len() == 1 { "" } else { "s" }
+    );
+
+    for (index, comment) in comments.iter().enumerate() {
+        let location = if comment.start_line == comment.end_line {
+            format!("{}:{}", comment.file_path, comment.start_line)
+        } else {
+            format!(
+                "{}:{}-{}",
+                comment.file_path, comment.start_line, comment.end_line
+            )
+        };
+        prompt.push_str(&format!("\n{}. `{location}`\n", index + 1));
+        prompt.push_str(&format!("   Feedback: {}\n", comment.comment));
+        if !comment.selected_text.is_empty() {
+            prompt.push_str("   Selected code:\n");
+            for line in comment.selected_text.lines() {
+                prompt.push_str(&format!("       {line}\n"));
+            }
+        }
+    }
+
+    prompt
 }
 
 fn format_selection_for_terminal(
@@ -7132,6 +7197,32 @@ mod tests {
         assert!(is_known_terminal_agent_command("codex"));
         assert!(!is_known_terminal_agent_command("cargo"));
         assert!(!is_known_terminal_agent_command("internal-agent"));
+    }
+
+    #[test]
+    fn test_build_diff_review_comments_prompt() {
+        let prompt = build_diff_review_comments_prompt(&[
+            DiffReviewComment {
+                file_path: "src/main.rs".to_string(),
+                start_line: 4,
+                end_line: 4,
+                comment: "Handle this error".to_string(),
+                selected_text: "do_work()?;".to_string(),
+            },
+            DiffReviewComment {
+                file_path: "src/lib.rs".to_string(),
+                start_line: 8,
+                end_line: 10,
+                comment: "Add a regression test".to_string(),
+                selected_text: String::new(),
+            },
+        ]);
+
+        assert!(prompt.contains("2 review comments"));
+        assert!(prompt.contains("`src/main.rs:4`"));
+        assert!(prompt.contains("       do_work()?;"));
+        assert!(prompt.contains("`src/lib.rs:8-10`"));
+        assert!(prompt.contains("Feedback: Add a regression test"));
     }
 
     #[test]
