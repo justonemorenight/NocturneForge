@@ -466,6 +466,7 @@ pub struct RepositorySnapshot {
     pub branch_list: Arc<[Branch]>,
     pub branch_list_error: Option<SharedString>,
     pub head_commit: Option<CommitDetails>,
+    pub is_detached_head: bool,
     pub scan_id: u64,
     pub merge: MergeDetails,
     pub remote_origin_url: Option<String>,
@@ -5480,6 +5481,7 @@ impl RepositorySnapshot {
             branch_list: Arc::from([]),
             branch_list_error: None,
             head_commit: None,
+            is_detached_head: false,
             scan_id: 0,
             merge: Default::default(),
             remote_origin_url: None,
@@ -5535,6 +5537,7 @@ impl RepositorySnapshot {
                 .iter()
                 .map(worktree_to_proto)
                 .collect(),
+            is_detached_head: self.is_detached_head,
         }
     }
 
@@ -5622,6 +5625,7 @@ impl RepositorySnapshot {
                 .iter()
                 .map(worktree_to_proto)
                 .collect(),
+            is_detached_head: self.is_detached_head,
         }
     }
 
@@ -9184,11 +9188,15 @@ impl Repository {
             .head_commit_details
             .as_ref()
             .map(proto_to_commit_details);
-        if self.snapshot.branch != new_branch || self.snapshot.head_commit != new_head_commit {
+        if self.snapshot.branch != new_branch
+            || self.snapshot.head_commit != new_head_commit
+            || self.snapshot.is_detached_head != update.is_detached_head
+        {
             cx.emit(RepositoryEvent::HeadChanged)
         }
         self.snapshot.branch = new_branch;
         self.snapshot.head_commit = new_head_commit;
+        self.snapshot.is_detached_head = update.is_detached_head;
 
         if update.is_last_update {
             let new_branch_list: Arc<[Branch]> =
@@ -11167,6 +11175,11 @@ async fn compute_snapshot(
     } = branches;
     let branch = branches.iter().find(|branch| branch.is_head).cloned();
     let branch_list: Arc<[Branch]> = branches.into();
+    let is_detached_head = all_worktrees.iter().any(|worktree| {
+        worktree.path == *work_directory_abs_path
+            && worktree.ref_name.is_none()
+            && !worktree.is_bare
+    });
 
     let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
         .into_iter()
@@ -11180,8 +11193,9 @@ async fn compute_snapshot(
     log::debug!("fetched remotes");
 
     let snapshot = this.update(cx, |this, cx| {
-        let head_changed =
-            branch != this.snapshot.branch || head_commit != this.snapshot.head_commit;
+        let head_changed = branch != this.snapshot.branch
+            || head_commit != this.snapshot.head_commit
+            || is_detached_head != this.snapshot.is_detached_head;
         let branch_list_changed = *branch_list != *this.snapshot.branch_list;
         let branch_list_error_changed = branch_list_error != this.snapshot.branch_list_error;
         let worktrees_changed = *linked_worktrees != *this.snapshot.linked_worktrees;
@@ -11193,6 +11207,7 @@ async fn compute_snapshot(
             branch_list: branch_list.clone(),
             branch_list_error,
             head_commit,
+            is_detached_head,
             remote_origin_url,
             remote_upstream_url,
             linked_worktrees,
