@@ -40380,6 +40380,56 @@ fn test_diff_review_multiline_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_diff_review_selection_stops_at_first_buffer(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let first_buffer = cx.new(|cx| Buffer::local("first one\nfirst two\n", cx));
+    let second_buffer = cx.new(|cx| Buffer::local("second one\nsecond two\n", cx));
+    let first_buffer_id = cx.read(|cx| first_buffer.read(cx).remote_id());
+    let editor = cx.add_window(|window, cx| {
+        let multi_buffer = cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::new(ReadWrite);
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                first_buffer,
+                [Point::new(0, 0)..Point::new(2, 0)],
+                0,
+                cx,
+            );
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(1),
+                second_buffer,
+                [Point::new(0, 0)..Point::new(2, 0)],
+                0,
+                cx,
+            );
+            multi_buffer
+        });
+        Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let last_display_row = editor
+                .snapshot(window, cx)
+                .display_snapshot
+                .max_point()
+                .row();
+            editor.show_diff_review_overlay(DisplayRow(0)..last_display_row, window, cx);
+
+            let snapshot = editor.buffer.read(cx).snapshot(cx);
+            let overlay = editor
+                .diff_review_overlays
+                .first()
+                .expect("review overlay should be created");
+            let selected_buffers = snapshot.range_to_buffer_ranges(overlay.anchor_range.clone());
+            assert_eq!(selected_buffers.len(), 1);
+            assert_eq!(selected_buffers[0].0.remote_id(), first_buffer_id);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_diff_review_drag_state(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

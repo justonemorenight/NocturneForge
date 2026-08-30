@@ -744,15 +744,26 @@ impl Editor {
         let end_point = editor_snapshot
             .display_snapshot
             .display_point_to_point(end.as_display_point(), Bias::Left);
+        let requested_end_row = MultiBufferRow(end_point.row);
+        let requested_line_end =
+            Point::new(end_point.row, buffer_snapshot.line_len(requested_end_row));
+        let Some((selected_buffer, selected_range, _)) = buffer_snapshot
+            .range_to_buffer_ranges(start_point..requested_line_end)
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let selected_buffer_range = selected_buffer.anchor_after(selected_range.start)
+            ..selected_buffer.anchor_before(selected_range.end);
+        let Some(anchor_range) =
+            buffer_snapshot.buffer_anchor_range_to_anchor_range(selected_buffer_range)
+        else {
+            return;
+        };
+        let start_point = anchor_range.start.to_point(&buffer_snapshot);
+        let end_point = anchor_range.end.to_point(&buffer_snapshot);
         let end_multi_buffer_row = MultiBufferRow(end_point.row);
-
-        // Create anchor range for the selected lines (start of first line to end of last line)
-        let line_end = Point::new(
-            end_point.row,
-            buffer_snapshot.line_len(end_multi_buffer_row),
-        );
-        let anchor_range =
-            buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
 
         // Compute the hunk key for this display row
         let file_path = buffer_snapshot
@@ -1205,6 +1216,10 @@ impl Editor {
 
         h_flex()
             .id("diff_review_button")
+            .focusable()
+            .tab_stop(true)
+            .role(gpui::Role::Button)
+            .aria_label("Add review comment")
             .cursor_pointer()
             .w(width - px(1.))
             .h(relative(0.9))
@@ -1219,6 +1234,11 @@ impl Editor {
             })
             .child(Icon::new(IconName::Plus).size(IconSize::Small))
             .tooltip(Tooltip::text("Add Review (drag to select multiple lines)"))
+            .on_click(cx.listener(move |editor, _, window, cx| {
+                if editor.diff_review_drag_state.is_none() {
+                    editor.show_diff_review_overlay(display_row..display_row, window, cx);
+                }
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |editor, _event: &gpui::MouseDownEvent, window, cx| {

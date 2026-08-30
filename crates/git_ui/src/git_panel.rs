@@ -2622,22 +2622,30 @@ impl GitPanel {
     }
 
     fn change_all_files_stage(&mut self, stage: bool, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
         cx.spawn({
             async move |this, cx| {
-                let result = this
-                    .update(cx, |_this, cx| {
-                        active_repository.update(cx, |repo, cx| {
-                            if stage {
-                                repo.stage_all(cx)
-                            } else {
-                                repo.unstage_all(cx)
-                            }
-                        })
-                    })?
-                    .await;
+                let Some(stage_task) = this.update(cx, |this, cx| {
+                    if !this.has_write_access(cx) {
+                        return None;
+                    }
+                    Some(active_repository.update(cx, |repo, cx| {
+                        if stage {
+                            repo.stage_all(cx)
+                        } else {
+                            repo.unstage_all(cx)
+                        }
+                    }))
+                })?
+                else {
+                    return Ok(());
+                };
+                let result = stage_task.await;
 
                 this.update(cx, |this, cx| {
                     if let Err(err) = result {
@@ -3341,6 +3349,9 @@ impl GitPanel {
     }
 
     pub(crate) fn uncommit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
@@ -3352,6 +3363,9 @@ impl GitPanel {
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = maybe!(async {
                 if let Ok(true) = confirmation.await {
+                    if !this.read_with(cx, |this, cx| this.has_write_access(cx))? {
+                        return Ok(None);
+                    }
                     let prior_head = prior_head.await?;
 
                     repo.update(cx, |repo, cx| {
@@ -4428,6 +4442,9 @@ impl GitPanel {
                 let Some(fetch_options) = fetch_options.await else {
                     return Ok(());
                 };
+                if !this.read_with(cx, |this, cx| this.can_push_and_pull(cx))? {
+                    return Ok(());
+                }
                 let fetch = repo.update(cx, |repo, cx| {
                     repo.fetch(fetch_options.clone(), askpass, cx)
                 });
@@ -4467,6 +4484,9 @@ impl GitPanel {
     }
 
     pub(crate) fn git_init(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.has_write_access(cx) {
+            return;
+        }
         let worktrees = self
             .project
             .read(cx)
@@ -4525,15 +4545,21 @@ impl GitPanel {
             };
 
             let Ok(result) = this.update(cx, |this, cx| {
+                if !this.has_write_access(cx) {
+                    return None;
+                }
                 let fallback_branch_name = GitPanelSettings::get_global(cx)
                     .fallback_branch_name
                     .clone();
-                this.project.read(cx).git_init(
+                Some(this.project.read(cx).git_init(
                     worktree.read(cx).abs_path(),
                     fallback_branch_name,
                     cx,
-                )
+                ))
             }) else {
+                return;
+            };
+            let Some(result) = result else {
                 return;
             };
 
@@ -4581,6 +4607,10 @@ impl GitPanel {
                     return Ok(());
                 }
             };
+
+            if !this.read_with(cx, |this, cx| this.can_push_and_pull(cx))? {
+                return Ok(());
+            }
 
             let askpass = this.update_in(cx, |this, window, cx| {
                 this.askpass_delegate(format!("git pull {}", remote.name), window, cx)
@@ -4673,6 +4703,10 @@ impl GitPanel {
                     return Ok(());
                 }
             };
+
+            if !this.read_with(cx, |this, cx| this.can_push_and_pull(cx))? {
+                return Ok(());
+            }
 
             let askpass_delegate = this.update_in(cx, |this, window, cx| {
                 this.askpass_delegate(format!("git push {}", remote.name), window, cx)
@@ -4826,7 +4860,7 @@ impl GitPanel {
     }
 
     fn can_push_and_pull(&self, cx: &App) -> bool {
-        !self.project.read(cx).is_via_collab()
+        !self.project.read(cx).is_via_collab() && self.has_write_access(cx)
     }
 
     fn start_remote_operation(
@@ -6659,7 +6693,7 @@ impl GitPanel {
                     action.as_ref(),
                     &self.focus_handle,
                 ))
-                .disabled(self.entry_count == 0)
+                .disabled(self.entry_count == 0 || !self.has_write_access(cx))
                 .on_click({
                     let git_panel = cx.weak_entity();
                     move |_, _, cx| {
@@ -7129,6 +7163,7 @@ impl GitPanel {
                                     workspace.clone(),
                                     None,
                                     None,
+                                    false,
                                     window,
                                     cx,
                                 );
@@ -7156,6 +7191,7 @@ impl GitPanel {
                             this.child(
                                 IconButton::new("undo", IconName::Undo)
                                     .icon_size(IconSize::Small)
+                                    .disabled(!self.has_write_access(cx))
                                     .tooltip(move |_window, cx| {
                                         Tooltip::with_meta(
                                             "Uncommit",
@@ -7352,6 +7388,7 @@ impl GitPanel {
             self.workspace.clone(),
             None,
             None,
+            false,
             window,
             cx,
         );
@@ -7789,13 +7826,17 @@ impl GitPanel {
                                                 cx.stop_propagation();
                                             }
                                         })
-                                        .on_click(move |_, window, cx| {
+                                        .on_click(move |event, window, cx| {
+                                            let allow_preview = PreviewTabsSettings::get_global(cx)
+                                                .enable_preview_from_git_panel
+                                                && event.click_count() == 1;
                                             CommitView::open(
                                                 sha_for_click.clone(),
                                                 repo.clone(),
                                                 workspace.clone(),
                                                 None,
                                                 None,
+                                                allow_preview,
                                                 window,
                                                 cx,
                                             );
@@ -7909,6 +7950,7 @@ impl GitPanel {
                     Button::new("initialize_repository", "Initialize Repository")
                         .label_size(LabelSize::Small)
                         .style(ButtonStyle::Outlined)
+                        .disabled(!self.has_write_access(cx))
                         .tooltip(Tooltip::for_action_title_in(
                             "git init",
                             &git::Init,

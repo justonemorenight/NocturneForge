@@ -669,14 +669,14 @@ pub fn init(cx: &mut App) {
                     else {
                         return;
                     };
-                    let comments = editor.update(cx, |editor, cx| editor.take_review_comments(cx));
-                    if comments.is_empty() {
+                    if !panel.read(cx).has_open_project(cx) {
                         return;
                     }
+                    let comments = editor.update(cx, |editor, cx| editor.take_review_comments(cx));
+                    let Some(initial_content) = build_diff_review_initial_content(&comments) else {
+                        return;
+                    };
 
-                    let content_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
-                        build_diff_review_comments_prompt(&comments),
-                    ))];
                     workspace.focus_panel::<AgentPanel>(window, cx);
                     panel.update(cx, |panel, cx| {
                         panel.external_thread(
@@ -684,10 +684,7 @@ pub fn init(cx: &mut App) {
                             None,
                             None,
                             None,
-                            Some(AgentInitialContent::ContentBlock {
-                                blocks: content_blocks,
-                                auto_submit: true,
-                            }),
+                            Some(initial_content),
                             true,
                             AgentThreadSource::GitPanel,
                             window,
@@ -900,6 +897,21 @@ fn build_diff_review_comments_prompt(comments: &[DiffReviewComment]) -> String {
     }
 
     prompt
+}
+
+fn build_diff_review_initial_content(
+    comments: &[DiffReviewComment],
+) -> Option<AgentInitialContent> {
+    if comments.is_empty() {
+        return None;
+    }
+
+    Some(AgentInitialContent::ContentBlock {
+        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+            build_diff_review_comments_prompt(comments),
+        ))],
+        auto_submit: true,
+    })
 }
 
 fn format_selection_for_terminal(
@@ -7223,6 +7235,35 @@ mod tests {
         assert!(prompt.contains("       do_work()?;"));
         assert!(prompt.contains("`src/lib.rs:8-10`"));
         assert!(prompt.contains("Feedback: Add a regression test"));
+    }
+
+    #[test]
+    fn test_diff_review_comments_become_auto_submitted_agent_content() {
+        let content = build_diff_review_initial_content(&[DiffReviewComment {
+            file_path: "src/main.rs".to_string(),
+            start_line: 4,
+            end_line: 4,
+            comment: "Handle this error".to_string(),
+            selected_text: "do_work()?;".to_string(),
+        }])
+        .expect("a review comment should produce agent content");
+
+        let AgentInitialContent::ContentBlock {
+            blocks,
+            auto_submit,
+        } = content
+        else {
+            panic!("review comments should use structured content blocks");
+        };
+        assert!(auto_submit);
+        assert_eq!(blocks.len(), 1);
+        let acp::ContentBlock::Text(text) = &blocks[0] else {
+            panic!("review comments should be sent as text");
+        };
+        assert!(text.text.contains("`src/main.rs:4`"));
+        assert!(text.text.contains("Feedback: Handle this error"));
+
+        assert!(build_diff_review_initial_content(&[]).is_none());
     }
 
     #[test]
