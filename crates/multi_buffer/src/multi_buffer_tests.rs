@@ -927,6 +927,45 @@ fn test_ordered_buffer_anchor_ranges_to_anchor_ranges(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_ordered_buffer_anchor_ranges_across_many_excerpt_boundaries(cx: &mut App) {
+    let buffer = cx.new(|cx| Buffer::local((0..128).map(|_| "aaa\n").collect::<String>(), cx));
+    let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer, cx),
+            buffer.clone(),
+            (0..64).map(|index| {
+                let row = index * 2;
+                Point::new(row, 0)..Point::new(row, 3)
+            }),
+            0,
+            cx,
+        );
+    });
+
+    let buffer_snapshot = buffer.read(cx).snapshot();
+    let ranges = (0..64)
+        .map(|index| {
+            let row = index * 2;
+            buffer_snapshot.anchor_before(Point::new(row, 0))
+                ..buffer_snapshot.anchor_after(Point::new(row, 3))
+        })
+        .collect::<Vec<_>>();
+    let snapshot = multibuffer.read(cx).snapshot(cx);
+    let expected = ranges
+        .iter()
+        .cloned()
+        .map(|range| snapshot.buffer_anchor_range_to_anchor_range(range))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        snapshot.ordered_buffer_anchor_ranges_to_anchor_ranges(ranges),
+        expected
+    );
+    assert!(expected.iter().all(Option::is_some));
+}
+
+#[gpui::test]
 fn test_expand_excerpts(cx: &mut App) {
     let buffer = cx.new(|cx| Buffer::local(sample_text(20, 3, 'a'), cx));
     let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));

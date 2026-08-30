@@ -184,6 +184,7 @@ impl CommitView {
         workspace: WeakEntity<Workspace>,
         stash: Option<usize>,
         file_filter: Option<RepoPath>,
+        allow_preview: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -235,7 +236,7 @@ impl CommitView {
                                 commit_view
                                     .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
                             });
-                            if let Some(ix) = ix {
+                            let destination_index = if let Some(ix) = ix {
                                 let existing = pane
                                     .items()
                                     .filter_map(|item| item.downcast::<CommitView>())
@@ -243,17 +244,24 @@ impl CommitView {
                                     .unwrap();
 
                                 pane.remove_item(existing.item_id(), false, false, window, cx);
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    Some(ix),
-                                    window,
-                                    cx,
-                                );
+                                Some(ix)
                             } else {
-                                pane.add_item(Box::new(commit_view), true, true, None, window, cx);
-                            }
+                                None
+                            };
+                            let destination_index = if allow_preview {
+                                pane.replace_preview_item_id(commit_view.entity_id(), window, cx)
+                                    .or(destination_index)
+                            } else {
+                                destination_index
+                            };
+                            pane.add_item(
+                                Box::new(commit_view),
+                                true,
+                                true,
+                                destination_index,
+                                window,
+                                cx,
+                            );
                         })
                     })
                     .log_err()
@@ -1054,11 +1062,8 @@ impl Item for CommitView {
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
-            .color(if params.selected {
-                Color::Default
-            } else {
-                Color::Muted
-            })
+            .color(params.text_color())
+            .when(params.preview, |label| label.italic())
             .into_any_element()
     }
 

@@ -262,6 +262,7 @@ impl ChangedFileEntry {
             workspace.clone(),
             None,
             Some(self.repo_path.clone()),
+            false,
             window,
             cx,
         );
@@ -1188,10 +1189,14 @@ fn toggle_open_graph(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    let Some(graph) = workspace
-        .items_of_type::<GitGraph>(cx)
-        .find(|graph| graph.read(cx).log_source == LogSource::All)
-    else {
+    let Some(active_repository) = workspace.project().read(cx).active_repository(cx) else {
+        return false;
+    };
+    let active_repository_id = active_repository.read(cx).id;
+    let Some(graph) = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
+        let graph = graph.read(cx);
+        graph.repo_id == active_repository_id && graph.log_source == LogSource::All
+    }) else {
         return false;
     };
     let graph_id = graph.entity_id();
@@ -2364,6 +2369,7 @@ impl GitGraph {
             self.workspace.clone(),
             None,
             None,
+            false,
             window,
             cx,
         );
@@ -6838,6 +6844,96 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             assert_eq!(workspace.items_of_type::<GitGraph>(cx).count(), 0);
             assert!(!toggle_open_graph(workspace, window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toggle_open_graph_targets_active_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                "repo_a": { ".git": {}, "a.txt": "a" },
+                "repo_b": { ".git": {}, "b.txt": "b" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let (active_repository, other_repository) = project.read_with(cx, |project, cx| {
+            let active_repository = project
+                .active_repository(cx)
+                .expect("should have an active repository");
+            let other_repository = project
+                .repositories(cx)
+                .values()
+                .find(|repository| repository.read(cx).id != active_repository.read(cx).id)
+                .cloned()
+                .expect("should have a second repository");
+            (active_repository, other_repository)
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let other_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                other_repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                Some(LogSource::All),
+                window,
+                cx,
+            )
+        });
+        let active_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                active_repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                Some(LogSource::All),
+                window,
+                cx,
+            )
+        });
+        let other_graph_id = other_graph.entity_id();
+        active_repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(other_graph), None, true, window, cx);
+            workspace.add_item_to_active_pane(Box::new(active_graph), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let current_repository_id = workspace
+                .project()
+                .read(cx)
+                .active_repository(cx)
+                .expect("active repository should remain selected")
+                .read(cx)
+                .id;
+            let graph_repositories = workspace
+                .items_of_type::<GitGraph>(cx)
+                .map(|graph| (graph.read(cx).repo_id, graph.read(cx).log_source.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(current_repository_id, active_repository.read(cx).id);
+            assert_eq!(graph_repositories.len(), 2, "{graph_repositories:?}");
+            assert!(toggle_open_graph(workspace, window, cx));
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            let remaining = workspace
+                .items_of_type::<GitGraph>(cx)
+                .map(|graph| graph.entity_id())
+                .collect::<Vec<_>>();
+            assert_eq!(remaining, vec![other_graph_id]);
         });
     }
 

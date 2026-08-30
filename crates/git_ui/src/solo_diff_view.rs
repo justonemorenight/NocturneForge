@@ -394,11 +394,8 @@ impl Item for SoloDiffView {
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
-            .color(if params.selected {
-                Color::Default
-            } else {
-                Color::Muted
-            })
+            .color(params.text_color())
+            .when(params.preview, |label| label.italic())
             .into_any_element()
     }
 
