@@ -20,7 +20,7 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition, DockSide,
+    AgentNotificationStyle, ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition, DockSide,
     LanguageModelParameters, LanguageModelSelection, NotifyWhenAgentWaiting,
     PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
@@ -295,6 +295,7 @@ pub struct AgentSettings {
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
 
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
+    pub terminal_notification_style: AgentNotificationStyle,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
     pub single_file_review: bool,
     pub review_control_location: ReviewControlLocation,
@@ -858,6 +859,7 @@ impl Settings for AgentSettings {
                 .collect(),
 
             notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
+            terminal_notification_style: agent.terminal_notification_style.unwrap_or_default(),
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),
             single_file_review: agent.single_file_review.unwrap(),
             review_control_location: agent.review_control_location.unwrap(),

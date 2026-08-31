@@ -1001,6 +1001,7 @@ mod tests {
             default_profile: AgentProfileId::default(),
             profiles: Default::default(),
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
+            terminal_notification_style: settings::AgentNotificationStyle::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::Never,
             single_file_review: false,
             review_control_location: Default::default(),
