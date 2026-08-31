@@ -20,8 +20,8 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    AgentNotificationStyle, ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition, DockSide,
-    LanguageModelParameters, LanguageModelSelection, NotifyWhenAgentWaiting,
+    AgentNotificationStyle, ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition,
+    DockSide, LanguageModelParameters, LanguageModelSelection, NotifyWhenAgentWaiting,
     PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
     update_settings_file, update_settings_file_with_completion,
