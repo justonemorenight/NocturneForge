@@ -67,9 +67,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{
-    DiffReviewComment, Editor, MultiBuffer, ReviewFeedback, actions::SendReviewToAgent,
-};
+use editor::{DiffReviewComment, Editor, MultiBuffer, ReviewFeedback, actions::SendReviewToAgent};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -689,7 +687,8 @@ pub fn init(cx: &mut App) {
                         Ok(false) => {
                             let comments =
                                 editor.update(cx, |editor, cx| editor.take_review_comments(cx));
-                            let Some(initial_content) = build_diff_review_initial_content(&comments)
+                            let Some(initial_content) =
+                                build_diff_review_initial_content(&comments)
                             else {
                                 return;
                             };
