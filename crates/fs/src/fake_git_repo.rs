@@ -347,22 +347,26 @@ impl GitRepository for FakeGitRepository {
         paths: Vec<RepoPath>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
-        let state = self.state.clone();
         let fs = self.fs.clone();
         let repo_dir = self.repository_dir_path.clone();
+        let contents = self.with_state_async(false, move |state| {
+            Ok(paths
+                .into_iter()
+                .filter_map(|path| {
+                    let content = if commit.is_empty() {
+                        state.index_contents.get(&path).cloned()
+                    } else {
+                        state.head_contents.get(&path).cloned()
+                    }?;
+                    Some((path, content))
+                })
+                .collect::<Vec<_>>())
+        });
         async move {
-            let state = state.lock();
-            for path in paths {
-                let content = if commit.is_empty() {
-                    state.index_contents.get(&path).cloned()
-                } else {
-                    state.head_contents.get(&path).cloned()
-                };
-                if let Some(content) = content {
-                    let file_path = repo_dir.join(path.as_ref());
-                    fs.save(&file_path, &content.as_slice().into(), Default::default())
-                        .await?;
-                }
+            for (path, content) in contents.await? {
+                let file_path = repo_dir.join(path.as_std_path());
+                fs.save(&file_path, &content.as_str().into(), Default::default())
+                    .await?;
             }
             Ok(())
         }
