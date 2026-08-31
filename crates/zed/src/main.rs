@@ -1249,6 +1249,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                         workspace.weak_handle(),
                                         None,
                                         None,
+                                        false,
                                         window,
                                         cx,
                                     );
