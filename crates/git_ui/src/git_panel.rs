@@ -6,7 +6,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
-use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
+use crate::project_diff::{DeployBranchDiff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
@@ -106,6 +106,7 @@ use workspace::{
 };
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
+    git::ViewUncommittedChanges,
     git_panel::ToggleFocus,
     workspace::{CopyPath, CopyRelativePath},
 };
@@ -160,9 +161,11 @@ actions!(
         ExpandSelectedEntry,
         /// Collapses the selected entry to hide its children.
         CollapseSelectedEntry,
-        /// View unstaged changes
+        /// Opens unstaged changes.
+        #[action(name = "OpenUnstagedChanges", deprecated_aliases = ["git_panel::ViewUnstagedChanges"])]
         ViewUnstagedChanges,
-        /// View staged changes
+        /// Opens staged changes.
+        #[action(name = "OpenStagedChanges", deprecated_aliases = ["git_panel::ViewStagedChanges"])]
         ViewStagedChanges,
         /// Activates the Changes tab.
         ActivateChangesTab,
@@ -219,30 +222,35 @@ fn git_panel_context_menu(
     ContextMenu::build(window, cx, |context_menu, _, _| {
         context_menu
             .context(focus_handle.clone())
-            .action_disabled_when(!has_unstaged_changes, "Stage All", StageAll.boxed_clone())
-            .action_disabled_when(!has_staged_changes, "Unstage All", UnstageAll.boxed_clone())
+            .action("Open All Changes", ViewUncommittedChanges.boxed_clone())
+            .separator()
             .action_disabled_when(
-                !has_tracked_changes,
-                "Restore All Changes",
-                RestoreTrackedFiles.boxed_clone(),
+                !has_unstaged_changes,
+                "Stage All Changes",
+                StageAll.boxed_clone(),
+            )
+            .action_disabled_when(
+                !has_staged_changes,
+                "Unstage All Changes",
+                UnstageAll.boxed_clone(),
             )
             .separator()
             .action_disabled_when(
                 !(has_new_changes || has_tracked_changes),
-                "Stash All",
+                "Stash All Changes",
                 StashAll.boxed_clone(),
             )
-            .action_disabled_when(!has_stash_items, "Stash Pop", StashPop.boxed_clone())
-            .action("View Stash", zed_actions::git::ViewStash.boxed_clone())
+            .action_disabled_when(!has_stash_items, "Pop Latest Stash", StashPop.boxed_clone())
+            .action("Open Stashes", zed_actions::git::ViewStash.boxed_clone())
             .separator()
             .action_disabled_when(
                 !has_tracked_changes,
-                "Discard Tracked Changes",
+                "Discard All Tracked Changes",
                 RestoreTrackedFiles.boxed_clone(),
             )
             .action_disabled_when(
                 !has_new_changes,
-                "Trash Untracked Files",
+                "Move All Untracked Files to Trash",
                 TrashUntrackedFiles.boxed_clone(),
             )
     })
@@ -6678,9 +6686,19 @@ impl GitPanel {
 
     fn render_git_changes_actions_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, action, stage, tooltip) = if self.primary_changes_action_stages() {
-            ("Stage All", StageAll.boxed_clone(), true, "git add --all")
+            (
+                "Stage All Changes",
+                StageAll.boxed_clone(),
+                true,
+                "Stage All Changes",
+            )
         } else {
-            ("Unstage All", UnstageAll.boxed_clone(), false, "git reset")
+            (
+                "Unstage All Changes",
+                UnstageAll.boxed_clone(),
+                false,
+                "Unstage All Changes",
+            )
         };
 
         SplitButton::new(
@@ -6743,7 +6761,7 @@ impl GitPanel {
                                         .color(Color::Muted),
                                 )
                                 .child(
-                                    Label::new("View Diff")
+                                    Label::new("Open All Changes")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
@@ -6760,13 +6778,13 @@ impl GitPanel {
                                 ),
                         )
                         .tooltip(Tooltip::for_action_title_in(
-                            "View Diff",
-                            &Diff,
+                            "Open All Changes",
+                            &ViewUncommittedChanges,
                             &self.focus_handle,
                         ))
                         .on_click(|_, _, cx| {
                             cx.defer(|cx| {
-                                cx.dispatch_action(&Diff);
+                                cx.dispatch_action(&ViewUncommittedChanges);
                             })
                         }),
                 )
@@ -8244,8 +8262,8 @@ impl GitPanel {
                     Some("All conflicts marked as resolved")
                 } else {
                     match stage_intent {
-                        StageIntent::Stage => Some("Stage All"),
-                        StageIntent::Unstage => Some("Unstage All"),
+                        StageIntent::Stage => Some("Stage All Changes"),
+                        StageIntent::Unstage => Some("Unstage All Changes"),
                         StageIntent::Toggle => None,
                     }
                 };
@@ -8328,12 +8346,12 @@ impl GitPanel {
             Some(repo) => GitPanel::stage_status_for_entry(entry, repo),
             None => entry.status.staging(),
         }) {
-            "Stage File"
+            "Stage Changes"
         } else {
-            "Unstage File"
+            "Unstage Changes"
         };
         let restore_title = if entry.status.is_created() {
-            "Trash File"
+            "Move File to Trash"
         } else {
             "Discard Changes"
         };
@@ -8343,20 +8361,22 @@ impl GitPanel {
             let is_created = entry.status.is_created();
             context_menu
                 .context(self.focus_handle.clone())
+                .action("Open Changes", menu::SecondaryConfirm.boxed_clone())
+                .action("Open File", ViewFile.boxed_clone())
+                .action("Open All Changes", menu::Confirm.boxed_clone())
+                .when(!is_created, |context_menu| {
+                    context_menu.action("Open File History", Box::new(git::FileHistory))
+                })
+                .separator()
                 .action_disabled_when(
                     !has_write_access || resolved_conflict,
                     stage_title,
                     ToggleStaged.boxed_clone(),
                 )
-                .action_disabled_when(
-                    !has_write_access,
-                    restore_title,
-                    git::RestoreFile::default().boxed_clone(),
-                )
-                .action_disabled_when(!has_write_access, "Stash File", StashFile.boxed_clone())
+                .action_disabled_when(!has_write_access, "Stash Changes", StashFile.boxed_clone())
                 .separator()
-                .action("Unstaged Changes", ViewUnstagedChanges.boxed_clone())
-                .action("Staged Changes", ViewStagedChanges.boxed_clone())
+                .action("Open Unstaged Changes", ViewUnstagedChanges.boxed_clone())
+                .action("Open Staged Changes", ViewStagedChanges.boxed_clone())
                 .separator()
                 .action_disabled_when(
                     !has_write_access || !is_created,
@@ -8369,14 +8389,11 @@ impl GitPanel {
                     git::AddToGitInfoExclude.boxed_clone(),
                 )
                 .separator()
-                .action("Open Diff", menu::Confirm.boxed_clone())
-                .action("Open File Diff", menu::SecondaryConfirm.boxed_clone())
-                .action("View File", ViewFile.boxed_clone())
-                .when(!is_created, |context_menu| {
-                    context_menu
-                        .separator()
-                        .action("View File History", Box::new(git::FileHistory))
-                })
+                .action_disabled_when(
+                    !has_write_access,
+                    restore_title,
+                    git::RestoreFile::default().boxed_clone(),
+                )
         });
         self.selected_entry = Some(ix);
         self.set_context_menu(context_menu, position, window, cx);
@@ -12751,7 +12768,7 @@ mod tests {
         })
         .await;
 
-        // Confirm that `Open Diff` still works for the untracked file, updating
+        // Confirm that `Open All Changes` still works for the untracked file, updating
         // the Project Diff's active path.
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_entry = Some(1);

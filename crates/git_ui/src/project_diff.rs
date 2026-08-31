@@ -40,7 +40,8 @@ use zed_actions::git as git_actions;
 actions!(
     git,
     [
-        /// Shows the diff between the working directory and the index.
+        /// Opens all uncommitted changes. Kept as an internal compatibility action.
+        #[action(no_register)]
         Diff,
         /// Adds files to the git staging area.
         Add,
@@ -793,8 +794,6 @@ impl Render for ProjectDiffToolbar {
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let is_multibuffer_empty = project_diff.read(cx).multibuffer(cx).read(cx).is_empty();
 
-        let stage_all_button_width = rems(5.);
-
         h_flex()
             .my_neg_1()
             .py_1()
@@ -818,7 +817,7 @@ impl Render for ProjectDiffToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Previous Hunk",
+                                "Go to Previous Change",
                                 &GoToPreviousHunk,
                                 &focus_handle,
                             ))
@@ -831,7 +830,7 @@ impl Render for ProjectDiffToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Next Hunk",
+                                "Go to Next Change",
                                 &GoToHunk,
                                 &focus_handle,
                             ))
@@ -845,9 +844,9 @@ impl Render for ProjectDiffToolbar {
                 h_group_sm()
                     .when(button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Toggle Staged")
+                            Button::new("stage", "Stage / Unstage")
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
+                                    "Toggle Staging for Selected Changes",
                                     &ToggleStaged,
                                     &focus_handle,
                                 ))
@@ -859,10 +858,10 @@ impl Render for ProjectDiffToolbar {
                     })
                     .when(!button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "Stage Change")
                                 .disabled(!button_states.stage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and Go to Next Hunk",
+                                    "Stage Change and Go to Next Change",
                                     &StageAndNext,
                                     &focus_handle,
                                 ))
@@ -871,10 +870,10 @@ impl Render for ProjectDiffToolbar {
                                 })),
                         )
                         .child(
-                            Button::new("unstage", "Unstage")
+                            Button::new("unstage", "Unstage Change")
                                 .disabled(!button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and Go to Next Hunk",
+                                    "Unstage Change and Go to Next Change",
                                     &UnstageAndNext,
                                     &focus_handle,
                                 ))
@@ -889,8 +888,7 @@ impl Render for ProjectDiffToolbar {
                 button_states.unstage_all && !button_states.stage_all,
                 |this| {
                     this.child(
-                        Button::new("unstage-all", "Unstage All")
-                            .width(stage_all_button_width)
+                        Button::new("unstage-all", "Unstage All Changes")
                             .tooltip(Tooltip::for_action_title_in(
                                 "Unstage All Changes",
                                 &UnstageAll,
@@ -906,8 +904,7 @@ impl Render for ProjectDiffToolbar {
                 !button_states.unstage_all || button_states.stage_all,
                 |this| {
                     this.child(
-                        Button::new("stage-all", "Stage All")
-                            .width(stage_all_button_width)
+                        Button::new("stage-all", "Stage All Changes")
                             .disabled(!button_states.stage_all)
                             .tooltip(Tooltip::for_action_title_in(
                                 "Stage All Changes",

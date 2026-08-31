@@ -10,8 +10,8 @@ use editor::{
 };
 use git::{StageAll, StageAndNext};
 use gpui::{
-    Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+    Action, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
+    Render, SharedString, Subscription, Task, TaskExt, WeakEntity,
 };
 use language::Capability;
 use project::{
@@ -142,7 +142,7 @@ impl DiffHunkDelegate for UnstagedDiffDelegate {
             .child(
                 Button::new(("stage", row as u64), "Stage")
                     .alpha(if status.is_pending() { 0.66 } else { 1.0 })
-                    .tooltip(Tooltip::text("Stage Hunk"))
+                    .tooltip(Tooltip::text("Stage Change"))
                     .on_click({
                         let editor = editor.clone();
                         move |_event, window, cx| {
@@ -158,8 +158,8 @@ impl DiffHunkDelegate for UnstagedDiffDelegate {
                     }),
             )
             .child(
-                Button::new(("restore", row as u64), "Restore")
-                    .tooltip(Tooltip::text("Restore Hunk"))
+                Button::new(("restore", row as u64), "Discard")
+                    .tooltip(Tooltip::text("Discard Change"))
                     .on_click({
                         let editor = editor.clone();
                         let hunk_range = hunk_range_for_restore;
@@ -677,6 +677,29 @@ impl UnstagedDiffToolbar {
     }
 
     fn restore_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Discard all tracked changes?",
+            Some("This action cannot be undone."),
+            &["Discard All Tracked Changes", "Cancel"],
+            cx,
+        );
+        let prompt = cx.background_spawn(prompt);
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if prompt.await? != 0 {
+                    return Ok(());
+                }
+                this.update_in(cx, |this, window, cx| {
+                    this.apply_restore_all(window, cx);
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+    }
+
+    fn apply_restore_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(unstaged_diff) = self.unstaged_diff(cx) else {
             return;
         };
@@ -758,7 +781,7 @@ impl Render for UnstagedDiffToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Previous Hunk",
+                                "Go to Previous Change",
                                 &GoToPreviousHunk,
                                 &focus_handle,
                             ))
@@ -771,7 +794,7 @@ impl Render for UnstagedDiffToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Next Hunk",
+                                "Go to Next Change",
                                 &GoToHunk,
                                 &focus_handle,
                             ))
@@ -785,9 +808,9 @@ impl Render for UnstagedDiffToolbar {
                 h_group_sm()
                     .when(button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "Stage Selected")
                                 .disabled(!button_states.stage)
-                                .tooltip(Tooltip::text("Stage Selected Hunks"))
+                                .tooltip(Tooltip::text("Stage Selected Changes"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.stage_selected_unstaged_hunks(false, window, cx)
                                 })),
@@ -795,10 +818,10 @@ impl Render for UnstagedDiffToolbar {
                     })
                     .when(!button_states.selection, |this| {
                         this.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "Stage Change")
                                 .disabled(!button_states.stage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and Go to Next Hunk",
+                                    "Stage Change and Go to Next Change",
                                     &StageAndNext,
                                     &focus_handle,
                                 ))
@@ -808,9 +831,9 @@ impl Render for UnstagedDiffToolbar {
                         )
                     })
                     .child(
-                        Button::new("restore", "Restore")
+                        Button::new("restore", "Discard Selected")
                             .disabled(!button_states.restore)
-                            .tooltip(Tooltip::text("Restore Selected Hunks"))
+                            .tooltip(Tooltip::text("Discard Selected Changes"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.restore_selected_unstaged_hunks(false, window, cx)
                             })),
@@ -818,8 +841,7 @@ impl Render for UnstagedDiffToolbar {
             )
             .child(Divider::vertical())
             .child(
-                Button::new("stage-all", "Stage All")
-                    .width(rems_from_px(80.))
+                Button::new("stage-all", "Stage All Changes")
                     .disabled(!button_states.stage_all)
                     .tooltip(Tooltip::for_action_title_in(
                         "Stage All Changes",
@@ -830,10 +852,9 @@ impl Render for UnstagedDiffToolbar {
             )
             .child(Divider::vertical())
             .child(
-                Button::new("restore-all", "Restore All")
-                    .width(rems_from_px(80.))
+                Button::new("restore-all", "Discard All Tracked Changes")
                     .disabled(!button_states.restore_all)
-                    .tooltip(Tooltip::text("Restore All Changes"))
+                    .tooltip(Tooltip::text("Discard All Tracked Changes"))
                     .on_click(cx.listener(|this, _, window, cx| this.restore_all(window, cx))),
             )
     }

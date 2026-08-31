@@ -644,12 +644,11 @@ pub(crate) fn render_buffer_header(
         None
     };
 
-    let file_status = multi_buffer
-        .all_diff_hunks_expanded()
+    let is_diff_multibuffer = multi_buffer.all_diff_hunks_expanded();
+    let file_status = is_diff_multibuffer
         .then(|| editor_read.status_for_buffer_id(buffer_id, cx))
         .flatten();
-    let diff_stat = multi_buffer
-        .all_diff_hunks_expanded()
+    let diff_stat = is_diff_multibuffer
         .then(|| multibuffer_snapshot.diff_for_buffer_id(buffer_id))
         .flatten()
         .map(|diff| diff.changed_row_counts())
@@ -836,15 +835,22 @@ pub(crate) fn render_buffer_header(
                                 path_header
                                     .child(
                                         ButtonLike::new("filename-button")
-                                            .when(ItemSettings::get_global(cx).file_icons, |this| {
-                                                let path = std::path::Path::new(filename.as_str());
-                                                let icon = FileIcons::get_icon(path, cx)
-                                                    .unwrap_or_default();
+                                            .when(
+                                                should_show_file_icon(
+                                                    is_diff_multibuffer,
+                                                    ItemSettings::get_global(cx).file_icons,
+                                                ),
+                                                |this| {
+                                                    let path =
+                                                        std::path::Path::new(filename.as_str());
+                                                    let icon = FileIcons::get_icon(path, cx)
+                                                        .unwrap_or_default();
 
-                                                this.child(
-                                                    Icon::from_path(icon).color(Color::Muted),
-                                                )
-                                            })
+                                                    this.child(
+                                                        Icon::from_path(icon).color(Color::Muted),
+                                                    )
+                                                },
+                                            )
                                             .child(
                                                 Label::new(filename)
                                                     .single_line()
@@ -1088,6 +1094,22 @@ pub(crate) fn render_buffer_header(
                 menu.context(menu_context)
             })
         })
+}
+
+fn should_show_file_icon(is_diff_multibuffer: bool, item_file_icons: bool) -> bool {
+    is_diff_multibuffer || item_file_icons
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_show_file_icon;
+
+    #[test]
+    fn diff_multibuffer_headers_keep_file_icons() {
+        assert!(should_show_file_icon(true, false));
+        assert!(should_show_file_icon(true, true));
+        assert!(!should_show_file_icon(false, false));
+    }
 }
 
 pub fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
