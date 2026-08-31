@@ -352,13 +352,20 @@ pub mod git {
             /// Opens the git branch selector.
             #[action(deprecated_aliases = ["branches::OpenRecent"])]
             Branch,
-            /// Shows uncommitted changes across the project.
+            /// Opens all uncommitted changes across the project.
+            #[action(
+                name = "OpenAllChanges",
+                deprecated_aliases = ["git::ViewUncommittedChanges", "git::Diff"]
+            )]
             ViewUncommittedChanges,
-            /// Shows unstaged changes across the project.
+            /// Opens unstaged changes across the project.
+            #[action(name = "OpenUnstagedChanges", deprecated_aliases = ["git::ViewUnstagedChanges"])]
             ViewUnstagedChanges,
-            /// Shows staged changes across the project.
+            /// Opens staged changes across the project.
+            #[action(name = "OpenStagedChanges", deprecated_aliases = ["git::ViewStagedChanges"])]
             ViewStagedChanges,
             /// Opens the git stash selector.
+            #[action(name = "OpenStashes", deprecated_aliases = ["git::ViewStash"])]
             ViewStash,
             /// Opens the git worktree selector.
             Worktree,

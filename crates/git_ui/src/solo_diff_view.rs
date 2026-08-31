@@ -764,7 +764,7 @@ impl Render for SoloDiffGitToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Previous Hunk",
+                                "Go to Previous Change",
                                 &GoToPreviousHunk,
                                 &focus_handle,
                             ))
@@ -777,7 +777,7 @@ impl Render for SoloDiffGitToolbar {
                             .icon_size(IconSize::Small)
                             .disabled(!button_states.prev_next)
                             .tooltip(Tooltip::for_action_title_in(
-                                "Go to Next Hunk",
+                                "Go to Next Change",
                                 &GoToHunk,
                                 &focus_handle,
                             ))
@@ -791,10 +791,10 @@ impl Render for SoloDiffGitToolbar {
                 h_group_sm()
                     .when(button_states.selection, |el| {
                         el.child(
-                            Button::new("stage", "Toggle Staged")
+                            Button::new("stage", "Stage / Unstage")
                                 .disabled(!button_states.stage && !button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
+                                    "Toggle Staging for Selected Changes",
                                     &ToggleStaged,
                                     &focus_handle,
                                 ))
@@ -805,10 +805,10 @@ impl Render for SoloDiffGitToolbar {
                     })
                     .when(!button_states.selection, |el| {
                         el.child(
-                            Button::new("stage", "Stage")
+                            Button::new("stage", "Stage Change")
                                 .disabled(!button_states.stage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and Go to Next Hunk",
+                                    "Stage Change and Go to Next Change",
                                     &StageAndNext,
                                     &focus_handle,
                                 ))
@@ -817,10 +817,10 @@ impl Render for SoloDiffGitToolbar {
                                 })),
                         )
                         .child(
-                            Button::new("unstage", "Unstage")
+                            Button::new("unstage", "Unstage Change")
                                 .disabled(!button_states.unstage)
                                 .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and Go to Next Hunk",
+                                    "Unstage Change and Go to Next Change",
                                     &UnstageAndNext,
                                     &focus_handle,
                                 ))
@@ -830,9 +830,9 @@ impl Render for SoloDiffGitToolbar {
                         )
                     })
                     .child(
-                        Button::new("restore", "Restore")
+                        Button::new("restore", "Discard Change")
                             .tooltip(Tooltip::for_action_title_in(
-                                "Restore selected hunk",
+                                "Discard Selected Change",
                                 &Restore,
                                 &focus_handle,
                             ))
@@ -844,21 +844,19 @@ impl Render for SoloDiffGitToolbar {
             )
             .child(Divider::vertical())
             .child(h_group_sm().child(if button_states.stage_file {
-                Button::new("stage-file", "Stage All")
-                    .width(rems_from_px(80.))
+                Button::new("stage-file", "Stage File")
                     .disabled(!button_states.stage_file)
                     .tooltip(Tooltip::for_action_title_in(
-                        "Stage All",
+                        "Stage File",
                         &StageFile,
                         &focus_handle,
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.stage_file(window, cx)))
             } else {
-                Button::new("unstage-file", "Unstage All")
-                    .width(rems_from_px(80.))
+                Button::new("unstage-file", "Unstage File")
                     .disabled(!button_states.unstage_file)
                     .tooltip(Tooltip::for_action_title_in(
-                        "Unstage All",
+                        "Unstage File",
                         &UnstageFile,
                         &focus_handle,
                     ))

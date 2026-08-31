@@ -3167,7 +3167,7 @@ pub fn render_diff_hunk_controls(
                         let focus_handle = editor.focus_handle(cx);
                         move |_window, cx| {
                             Tooltip::for_action_in(
-                                "Stage Hunk",
+                                "Stage Change",
                                 &::git::ToggleStaged,
                                 &focus_handle,
                                 cx,
@@ -3194,7 +3194,7 @@ pub fn render_diff_hunk_controls(
                         let focus_handle = editor.focus_handle(cx);
                         move |_window, cx| {
                             Tooltip::for_action_in(
-                                "Unstage Hunk",
+                                "Unstage Change",
                                 &::git::ToggleStaged,
                                 &focus_handle,
                                 cx,
@@ -3218,12 +3218,12 @@ pub fn render_diff_hunk_controls(
         })
         .when(show_stage_restore, |el| {
             el.child(
-                Button::new(("restore", row as u64), "Restore")
+                Button::new(("restore", row as u64), "Discard")
                     .tooltip({
                         let focus_handle = editor.focus_handle(cx);
                         move |_window, cx| {
                             Tooltip::for_action_in(
-                                "Restore Hunk",
+                                "Discard Change",
                                 &::git::Restore,
                                 &focus_handle,
                                 cx,
@@ -3254,7 +3254,7 @@ pub fn render_diff_hunk_controls(
                         .tooltip({
                             let focus_handle = editor.focus_handle(cx);
                             move |_window, cx| {
-                                Tooltip::for_action_in("Next Hunk", &GoToHunk, &focus_handle, cx)
+                                Tooltip::for_action_in("Next Change", &GoToHunk, &focus_handle, cx)
                             }
                         })
                         .on_click({
@@ -3286,7 +3286,7 @@ pub fn render_diff_hunk_controls(
                             let focus_handle = editor.focus_handle(cx);
                             move |_window, cx| {
                                 Tooltip::for_action_in(
-                                    "Previous Hunk",
+                                    "Previous Change",
                                     &GoToPreviousHunk,
                                     &focus_handle,
                                     cx,

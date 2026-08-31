@@ -49,11 +49,11 @@ actions!(
         StageAndNext,
         /// Unstages the current hunk and moves to the next one.
         UnstageAndNext,
-        /// Restores the selected hunks to their original state.
-        #[action(deprecated_aliases = ["editor::RevertSelectedHunks"])]
+        /// Discards the selected changes from the working tree.
+        #[action(name = "DiscardSelectedChanges", deprecated_aliases = ["git::Restore", "editor::RevertSelectedHunks"])]
         Restore,
-        /// Restores the selected hunks to their original state and moves to the
-        /// next one.
+        /// Discards the selected changes and moves to the next change.
+        #[action(name = "DiscardAndNext", deprecated_aliases = ["git::RestoreAndNext"])]
         RestoreAndNext,
         // per-file
         /// Shows git blame information for the current file.
@@ -62,6 +62,7 @@ actions!(
         /// Shows the git history for the selected file, folder, or project.
         FileHistory,
         /// Opens the selected file in the editor without a diff view.
+        #[action(name = "OpenFile", deprecated_aliases = ["git::ViewFile"])]
         ViewFile,
         /// Stages the current file.
         StageFile,
@@ -80,7 +81,8 @@ actions!(
         StashPop,
         /// Apply the most recent stash.
         StashApply,
-        /// Restores all tracked files to their last committed state.
+        /// Discards all tracked changes in the repository.
+        #[action(name = "DiscardAllTrackedChanges", deprecated_aliases = ["git::RestoreTrackedFiles"])]
         RestoreTrackedFiles,
         /// Moves all untracked files to trash.
         TrashUntrackedFiles,
@@ -122,6 +124,7 @@ actions!(
         /// Opens all modified files in the editor.
         OpenModifiedFiles,
         /// Opens the current file in a solo diff view.
+        #[action(name = "OpenChanges", deprecated_aliases = ["git::OpenFileDiff"])]
         OpenFileDiff,
         /// Clones a repository.
         Clone,
@@ -147,9 +150,13 @@ pub struct RenameBranch {
     pub branch: Option<String>,
 }
 
-/// Restores a file to its last committed state, discarding local changes.
+/// Discards a file's local changes and restores its last committed state.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
-#[action(namespace = git, deprecated_aliases = ["editor::RevertFile"])]
+#[action(
+    namespace = git,
+    name = "DiscardFileChanges",
+    deprecated_aliases = ["git::RestoreFile", "editor::RevertFile"]
+)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreFile {
     #[serde(default)]
