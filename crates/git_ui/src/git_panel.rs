@@ -2752,10 +2752,21 @@ impl GitPanel {
             return;
         }
         let entries = self
-            .change_entries_by_path()
-            .filter(|status_entry| !status_entry.status.is_created())
-            .cloned()
-            .collect::<Vec<_>>();
+            .selected_entry
+            .and_then(|index| self.directory_descendants(index))
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| !entry.status.is_created())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                self.change_entries_by_path()
+                    .filter(|entry| !entry.status.is_created())
+                    .cloned()
+                    .collect()
+            });
 
         match entries.len() {
             0 => return,
@@ -8721,6 +8732,7 @@ impl GitPanel {
             "Stage Changes"
         };
         let all_created = descendants.iter().all(|entry| entry.status.is_created());
+        let has_tracked_changes = descendants.iter().any(|entry| !entry.status.is_created());
         let has_write_access = self.has_write_access(cx);
 
         let context_menu = ContextMenu::build(window, cx, |context_menu, _, _| {
@@ -8731,6 +8743,11 @@ impl GitPanel {
                     !has_write_access,
                     "Stash Directory",
                     StashFile.boxed_clone(),
+                )
+                .action_disabled_when(
+                    !has_write_access || !has_tracked_changes,
+                    "Discard Tracked Changes",
+                    RestoreTrackedFiles.boxed_clone(),
                 )
                 .separator()
                 .action("Copy Path", CopyPath.boxed_clone())
