@@ -717,7 +717,7 @@ impl MarkdownPreviewView {
             };
             update_settings_file(fs, cx, move |settings, cx| {
                 let size = ThemeSettings::get_global(cx).markdown_preview_font_size(cx) + delta;
-                settings.theme.markdown_preview_font_size =
+                settings.markdown_preview.get_or_insert_default().font_size =
                     Some(f32::from(theme_settings::clamp_font_size(size)).into());
             });
         } else {
@@ -739,7 +739,9 @@ impl MarkdownPreviewView {
                 return;
             };
             update_settings_file(fs, cx, move |settings, _| {
-                settings.theme.markdown_preview_font_size = None;
+                if let Some(markdown_preview) = settings.markdown_preview.as_mut() {
+                    markdown_preview.font_size = None;
+                }
             });
         } else {
             theme_settings::reset_markdown_preview_font_size(cx);
