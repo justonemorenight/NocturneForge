@@ -429,7 +429,7 @@ impl DiffBufferList {
         async move {
             let cx = &mut cx;
             let buffer = project
-                .update(cx, |project, cx| project.open_buffer(project_path, cx))?
+                .update(cx, |project, cx| project.open_buffer(project_path, cx))
                 .await?;
 
             let main_buffer = buffer.clone();
@@ -439,7 +439,7 @@ impl DiffBufferList {
                     let diff = project
                         .update(cx, |project, cx| {
                             project.open_uncommitted_diff(buffer.clone(), cx)
-                        })?
+                        })
                         .await?;
                     (buffer, diff)
                 }
@@ -447,7 +447,7 @@ impl DiffBufferList {
                     let diff = project
                         .update(cx, |project, cx| {
                             project.open_unstaged_diff(buffer.clone(), cx)
-                        })?
+                        })
                         .await?;
                     (buffer, diff)
                 }
@@ -455,7 +455,7 @@ impl DiffBufferList {
                     let (diff, index_buffer) = project
                         .update(cx, |project, cx| {
                             project.open_staged_diff(buffer.clone(), cx)
-                        })?
+                        })
                         .await?;
                     (index_buffer, diff)
                 }
@@ -471,13 +471,13 @@ impl DiffBufferList {
                                 project.git_store().update(cx, |git_store, cx| {
                                     git_store.open_diff_since(oid, buffer.clone(), repo, cx)
                                 })
-                            })?
+                            })
                             .await?
                     } else {
                         project
                             .update(cx, |project, cx| {
                                 project.open_uncommitted_diff(buffer.clone(), cx)
-                            })?
+                            })
                             .await?
                     };
                     (buffer, diff)
@@ -490,7 +490,7 @@ impl DiffBufferList {
                             project.git_store().update(cx, |git_store, cx| {
                                 git_store.open_conflict_set(main_buffer.clone(), cx)
                             })
-                        })?
+                        })
                         .await,
                 )
             } else {

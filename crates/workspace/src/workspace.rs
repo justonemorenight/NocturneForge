@@ -1450,6 +1450,7 @@ pub struct Workspace {
     active_workspace_id: Option<Rc<Cell<EntityId>>>,
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
+    restoring_workspace: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1841,6 +1842,7 @@ impl Workspace {
 
         Workspace {
             weak_self: weak_handle.clone(),
+            restoring_workspace: false,
             zoomed: None,
             zoomed_position: None,
             maximized_pane: None,
