@@ -203,6 +203,65 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
 const MAX_PARALLEL_SUBAGENTS: usize = 4;
 const MAX_SUBAGENT_RETRIES: u8 = 2;
 
+fn batch_launch_policy(
+    configured_strategy: agent_settings::AgentExecutionStrategy,
+    resolved_turn_policy: Option<&agent_orchestration::ResolvedTurnPolicy>,
+    fallback_prompt: &str,
+    task_count: usize,
+    autonomy: agent_settings::AgentAutonomy,
+) -> (
+    agent_settings::AgentExecutionPolicy,
+    agent_orchestration::RuntimeLaunchDisposition,
+) {
+    let strategy = if configured_strategy == agent_settings::AgentExecutionStrategy::Auto {
+        resolved_turn_policy
+            .map(|policy| policy.strategy)
+            .unwrap_or_else(|| {
+                agent_orchestration::OrchestrationPlanner::resolve_auto(
+                    fallback_prompt,
+                    agent_orchestration::AutoPolicyContext {
+                        work_item_count: task_count,
+                        available_tool_count: None,
+                        can_orchestrate: true,
+                    },
+                )
+                .strategy
+            })
+    } else {
+        configured_strategy
+    };
+
+    let disposition = match strategy {
+        agent_settings::AgentExecutionStrategy::Direct => {
+            agent_orchestration::RuntimeLaunchDisposition::Approved
+        }
+        agent_settings::AgentExecutionStrategy::Plan => {
+            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
+        }
+        agent_settings::AgentExecutionStrategy::Orchestrate
+            if configured_strategy == agent_settings::AgentExecutionStrategy::Auto =>
+        {
+            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
+        }
+        agent_settings::AgentExecutionStrategy::Orchestrate => match autonomy {
+            agent_settings::AgentAutonomy::Autonomous => {
+                agent_orchestration::RuntimeLaunchDisposition::Approved
+            }
+            agent_settings::AgentAutonomy::Manual | agent_settings::AgentAutonomy::Supervised => {
+                agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
+            }
+        },
+        agent_settings::AgentExecutionStrategy::Auto => {
+            agent_orchestration::RuntimeLaunchDisposition::Approved
+        }
+    };
+
+    (
+        agent_settings::AgentExecutionPolicy { strategy, autonomy },
+        disposition,
+    )
+}
+
 /// Spawn a sub-agent for a well-scoped task.
 ///
 /// ### Designing delegated subtasks
@@ -568,15 +627,20 @@ async fn run_batch_tasks(
         session_info: None,
     })?;
 
-    let (strategy, autonomy) = cx
+    let (configured_strategy, resolved_turn_policy, autonomy) = cx
         .update(|cx| {
             thread.upgrade().map(|t| {
                 let t = t.read(cx);
-                (t.execution_strategy(), t.autonomy())
+                (
+                    t.execution_strategy(),
+                    t.resolved_turn_policy().cloned(),
+                    t.autonomy(),
+                )
             })
         })
         .unwrap_or((
             agent_settings::AgentExecutionStrategy::Direct,
+            None,
             agent_settings::AgentAutonomy::default(),
         ));
 
@@ -592,53 +656,13 @@ async fn run_batch_tasks(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let (strategy, disposition) = match strategy {
-        agent_settings::AgentExecutionStrategy::Auto => {
-            let decision = agent_orchestration::OrchestrationPlanner::resolve_auto(
-                &prompt,
-                pending.len(),
-                autonomy,
-            );
-            match decision.strategy {
-                // Auto resolving to direct execution runs the batch immediately
-                // through the runtime without a proposal.
-                agent_settings::AgentExecutionStrategy::Direct => (
-                    decision.strategy,
-                    agent_orchestration::RuntimeLaunchDisposition::Approved,
-                ),
-                // Auto resolving to orchestration or planning always proposes the
-                // plan first, regardless of autonomy, and waits for approval.
-                strategy @ (agent_settings::AgentExecutionStrategy::Orchestrate
-                | agent_settings::AgentExecutionStrategy::Plan) => (
-                    strategy,
-                    agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
-                ),
-                agent_settings::AgentExecutionStrategy::Auto => unreachable!(),
-            }
-        }
-        agent_settings::AgentExecutionStrategy::Direct => (
-            strategy,
-            agent_orchestration::RuntimeLaunchDisposition::Approved,
-        ),
-        agent_settings::AgentExecutionStrategy::Orchestrate => match autonomy {
-            agent_settings::AgentAutonomy::Autonomous => (
-                strategy,
-                agent_orchestration::RuntimeLaunchDisposition::Approved,
-            ),
-            agent_settings::AgentAutonomy::Manual | agent_settings::AgentAutonomy::Supervised => (
-                strategy,
-                agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
-            ),
-        },
-        // Plan is always a user checkpoint. Approval is the explicit
-        // transition from a proposed checklist to execution.
-        agent_settings::AgentExecutionStrategy::Plan => (
-            strategy,
-            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
-        ),
-    };
-
-    let policy = agent_settings::AgentExecutionPolicy { strategy, autonomy };
+    let (policy, disposition) = batch_launch_policy(
+        configured_strategy,
+        resolved_turn_policy.as_ref(),
+        &prompt,
+        pending.len(),
+        autonomy,
+    );
 
     let mut roles_map = collections::HashMap::default();
     let orchestration_tasks = pending
@@ -1118,6 +1142,60 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].label, "one");
         assert_eq!(tasks[1].tools, Some(vec!["read_file".to_string()]));
+    }
+
+    #[test]
+    fn batch_uses_the_pre_turn_auto_decision() {
+        let decision = agent_orchestration::AutoPolicyDecision {
+            strategy: agent_settings::AgentExecutionStrategy::Direct,
+            confidence: 0.9,
+            reason: "pre-turn route".to_string(),
+            heuristics: collections::HashMap::default(),
+        };
+        let resolved_turn_policy = agent_orchestration::ResolvedTurnPolicy::automatic(decision);
+        let (policy, disposition) = batch_launch_policy(
+            agent_settings::AgentExecutionStrategy::Auto,
+            Some(&resolved_turn_policy),
+            "Use subagents in parallel for many tasks",
+            8,
+            agent_settings::AgentAutonomy::Autonomous,
+        );
+
+        assert_eq!(
+            policy.strategy,
+            agent_settings::AgentExecutionStrategy::Direct
+        );
+        assert_eq!(
+            disposition,
+            agent_orchestration::RuntimeLaunchDisposition::Approved
+        );
+    }
+
+    #[test]
+    fn auto_orchestration_route_keeps_the_approval_checkpoint() {
+        let decision = agent_orchestration::AutoPolicyDecision {
+            strategy: agent_settings::AgentExecutionStrategy::Orchestrate,
+            confidence: 0.9,
+            reason: "pre-turn route".to_string(),
+            heuristics: collections::HashMap::default(),
+        };
+        let resolved_turn_policy = agent_orchestration::ResolvedTurnPolicy::automatic(decision);
+        let (policy, disposition) = batch_launch_policy(
+            agent_settings::AgentExecutionStrategy::Auto,
+            Some(&resolved_turn_policy),
+            "A batch",
+            4,
+            agent_settings::AgentAutonomy::Autonomous,
+        );
+
+        assert_eq!(
+            policy.strategy,
+            agent_settings::AgentExecutionStrategy::Orchestrate
+        );
+        assert_eq!(
+            disposition,
+            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
+        );
     }
 
     #[test]

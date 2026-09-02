@@ -92,7 +92,16 @@ impl Render for ExecutionStrategySelector {
             AgentExecutionStrategy::Orchestrate => "Orchestrate",
             AgentExecutionStrategy::Auto => "Auto",
         };
-        let tooltip = format!("Execution: {label} · Approval: {autonomy:?}");
+        let tooltip = if let Some(decision) = thread.auto_policy_decision() {
+            format!(
+                "Execution: Auto → {:?} ({:.0}%) · Approval: {autonomy:?}\n{}",
+                decision.strategy,
+                decision.confidence * 100.0,
+                decision.reason
+            )
+        } else {
+            format!("Execution: {label} · Approval: {autonomy:?}")
+        };
         let this = cx.weak_entity();
 
         PopoverMenu::new("execution-strategy-selector")

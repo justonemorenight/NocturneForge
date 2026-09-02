@@ -12,7 +12,7 @@ pub enum AgentExecutionStrategy {
     Plan,
     /// Delegate work according to the thread's orchestration policy.
     Orchestrate,
-    /// Let the agent choose between direct execution and orchestration.
+    /// Route the user turn to a concrete strategy before the first model completion.
     Auto,
 }
 
