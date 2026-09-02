@@ -19,7 +19,10 @@ pub use acp_adapter::{AcpEventAdapter, AcpTaskBridge};
 pub use artifacts::{
     Artifact, ArtifactKind, ArtifactStore, ContextSnapshot, MAX_INLINE_OUTPUT_BYTES, truncate_text,
 };
-pub use auto_policy::{AutoPolicyDecision, AutoPolicyEngine};
+pub use auto_policy::{
+    AgentToolProfile, AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,
+    ResolvedTurnPolicy, TurnPolicySource,
+};
 pub use budget::{
     BudgetExceeded, BudgetUsage, ExecutionBudget, TaskBudgetState, TaskExecutionReporter,
 };
@@ -391,23 +394,27 @@ mod tests {
 
     #[test]
     fn test_auto_policy_engine_heuristics() {
-        let decision_direct =
-            AutoPolicyEngine::evaluate("fix typo in readme", 1, 5, AgentAutonomy::Manual);
+        let context = AutoPolicyContext {
+            work_item_count: 1,
+            available_tool_count: Some(5),
+            can_orchestrate: true,
+        };
+        let decision_direct = AutoPolicyEngine::evaluate("fix typo in readme", context);
         assert_eq!(decision_direct.strategy, AgentExecutionStrategy::Direct);
 
         let decision_plan = AutoPolicyEngine::evaluate(
             "create an architectural RFC and design plan for the new database layer",
-            1,
-            5,
-            AgentAutonomy::Manual,
+            context,
         );
         assert_eq!(decision_plan.strategy, AgentExecutionStrategy::Plan);
 
         let decision_orch = AutoPolicyEngine::evaluate(
             "refactor across all files in parallel: step 1 create models, step 2 update migrations",
-            5,
-            10,
-            AgentAutonomy::Supervised,
+            AutoPolicyContext {
+                work_item_count: 5,
+                available_tool_count: Some(10),
+                can_orchestrate: true,
+            },
         );
         assert_eq!(decision_orch.strategy, AgentExecutionStrategy::Orchestrate);
     }
@@ -735,8 +742,14 @@ mod tests {
 
     #[test]
     fn test_auto_policy_single_step_guardrail_prefers_direct() {
-        let decision =
-            AutoPolicyEngine::evaluate("fix typo in readme", 1, 5, AgentAutonomy::Autonomous);
+        let decision = AutoPolicyEngine::evaluate(
+            "fix typo in readme",
+            AutoPolicyContext {
+                work_item_count: 1,
+                available_tool_count: Some(5),
+                can_orchestrate: true,
+            },
+        );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
         assert!(decision.confidence >= 0.8);
     }

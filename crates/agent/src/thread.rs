@@ -181,6 +181,34 @@ impl SubagentRole {
     }
 }
 
+fn execution_tool_profile_allows(
+    profile: agent_orchestration::AgentToolProfile,
+    tool_name: &str,
+    kind: acp::ToolKind,
+) -> bool {
+    match profile {
+        agent_orchestration::AgentToolProfile::Direct => {
+            !matches!(tool_name, SpawnAgentTool::NAME | CreateThreadTool::NAME)
+        }
+        agent_orchestration::AgentToolProfile::Plan => {
+            matches!(
+                kind,
+                acp::ToolKind::Read
+                    | acp::ToolKind::Search
+                    | acp::ToolKind::Think
+                    | acp::ToolKind::Fetch
+            ) || matches!(
+                tool_name,
+                AskUserTool::NAME
+                    | UpdatePlanTool::NAME
+                    | ListAgentsAndModelsTool::NAME
+                    | crate::SkillTool::NAME
+            )
+        }
+        agent_orchestration::AgentToolProfile::Orchestrate => true,
+    }
+}
+
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
     for character in tool_name.chars() {
@@ -450,6 +478,18 @@ impl UserMessage {
         }
 
         markdown
+    }
+
+    fn routing_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|content| match content {
+                UserMessageContent::Text(text) if !is_skill_envelope(text) => Some(text.as_str()),
+                UserMessageContent::Text(_) => None,
+                UserMessageContent::Mention { .. } | UserMessageContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn to_request(&self) -> LanguageModelRequestMessage {
@@ -1480,6 +1520,10 @@ pub struct Thread {
     pub(crate) context_server_registry: Entity<ContextServerRegistry>,
     profile_id: AgentProfileId,
     execution_strategy: AgentExecutionStrategy,
+    /// Immutable execution and tool contract resolved before the current user
+    /// turn. This is deliberately transient: a new user message must resolve a
+    /// fresh contract against the settings and capabilities available then.
+    resolved_turn_policy: Option<agent_orchestration::ResolvedTurnPolicy>,
     autonomy: AgentAutonomy,
     plan: Option<NativePlan>,
     proposed_plan: Option<NativePlan>,
@@ -1649,6 +1693,7 @@ impl Thread {
             context_server_registry,
             profile_id,
             execution_strategy: AgentExecutionStrategy::default(),
+            resolved_turn_policy: None,
             autonomy: AgentAutonomy::default(),
             plan: None,
             proposed_plan: None,
@@ -2038,6 +2083,7 @@ impl Thread {
             context_server_registry,
             profile_id,
             execution_strategy: db_thread.execution_strategy,
+            resolved_turn_policy: None,
             autonomy: db_thread.autonomy,
             plan: db_thread.plan,
             proposed_plan: db_thread.proposed_plan,
@@ -2484,6 +2530,27 @@ impl Thread {
         self.execution_strategy
     }
 
+    pub fn effective_execution_strategy(&self) -> AgentExecutionStrategy {
+        self.resolved_turn_policy
+            .as_ref()
+            .map(|policy| policy.strategy)
+            .filter(|strategy| *strategy != AgentExecutionStrategy::Auto)
+            .unwrap_or_else(|| match self.execution_strategy {
+                AgentExecutionStrategy::Auto => AgentExecutionStrategy::Direct,
+                strategy => strategy,
+            })
+    }
+
+    pub fn auto_policy_decision(&self) -> Option<&agent_orchestration::AutoPolicyDecision> {
+        self.resolved_turn_policy
+            .as_ref()
+            .and_then(|policy| policy.auto_decision.as_ref())
+    }
+
+    pub fn resolved_turn_policy(&self) -> Option<&agent_orchestration::ResolvedTurnPolicy> {
+        self.resolved_turn_policy.as_ref()
+    }
+
     pub fn profile(&self) -> &AgentProfileId {
         &self.profile_id
     }
@@ -2640,6 +2707,9 @@ impl Thread {
     ) {
         if self.execution_strategy == strategy && self.autonomy == autonomy {
             return;
+        }
+        if self.execution_strategy != strategy && self.running_turn.is_none() {
+            self.resolved_turn_policy = None;
         }
         self.execution_strategy = strategy;
         self.autonomy = autonomy;
@@ -2943,6 +3013,9 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        if self.resolved_turn_policy.is_none() {
+            self.resolve_turn_policy_for_latest_user_message(cx);
+        }
         self.messages.push(Arc::new(Message::Resume));
         cx.notify();
 
@@ -2978,13 +3051,58 @@ impl Thread {
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         let model = self
             .model()
+            .cloned()
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+
+        self.resolve_turn_policy_for_latest_user_message(cx);
 
         log::info!("Thread::send called with model: {}", model.name().0);
         self.advance_prompt_id();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
         self.run_turn(cx)
+    }
+
+    fn resolve_turn_policy_for_latest_user_message(&mut self, cx: &mut Context<Self>) {
+        if self.execution_strategy != AgentExecutionStrategy::Auto {
+            self.resolved_turn_policy = Some(agent_orchestration::ResolvedTurnPolicy::configured(
+                self.execution_strategy,
+            ));
+            cx.notify();
+            return;
+        }
+
+        let Some(Message::User(user_message)) = self.messages.last().map(AsRef::as_ref) else {
+            return;
+        };
+        let prompt = user_message.routing_text();
+        self.resolve_auto_policy(&prompt, cx);
+    }
+
+    fn resolve_auto_policy(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        // Capability detection must use the user's configured tool surface,
+        // not the previous turn's resolved profile. Otherwise one Direct turn
+        // would hide spawn_agent and make every later Auto turn appear unable
+        // to orchestrate.
+        self.resolved_turn_policy = None;
+        let tools = self.enabled_tools(cx);
+        let decision = agent_orchestration::OrchestrationPlanner::resolve_auto(
+            prompt,
+            agent_orchestration::AutoPolicyContext {
+                work_item_count: 0,
+                available_tool_count: Some(tools.len()),
+                can_orchestrate: tools.contains_key(SpawnAgentTool::NAME),
+            },
+        );
+        log::info!(
+            "Auto execution router selected {:?} with confidence {:.2}: {}",
+            decision.strategy,
+            decision.confidence,
+            decision.reason
+        );
+        self.resolved_turn_policy =
+            Some(agent_orchestration::ResolvedTurnPolicy::automatic(decision));
+        cx.notify();
     }
 
     /// Force a manual context compaction regardless of the current token usage
@@ -4988,6 +5106,16 @@ impl Thread {
             tools.retain(|tool_name, _| tool_filter.contains(tool_name));
         }
 
+        if let Some(tool_profile) = self
+            .resolved_turn_policy
+            .as_ref()
+            .map(|policy| policy.tool_profile)
+        {
+            tools.retain(|tool_name, tool| {
+                execution_tool_profile_allows(tool_profile, tool_name, tool.kind())
+            });
+        }
+
         tools
     }
 
@@ -5191,7 +5319,22 @@ impl Thread {
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
-        if let Some(strategy_prompt) = self.execution_strategy.system_prompt() {
+        if self.execution_strategy == AgentExecutionStrategy::Auto
+            && let Some(decision) = self.auto_policy_decision()
+        {
+            let strategy = match decision.strategy {
+                AgentExecutionStrategy::Direct => "Direct",
+                AgentExecutionStrategy::Plan => "Plan",
+                AgentExecutionStrategy::Orchestrate => "Orchestrate",
+                AgentExecutionStrategy::Auto => "Direct",
+            };
+            system_prompt.push_str(&format!(
+                "\n\n## Automatic execution route\nThe runtime selected `{strategy}` for this user turn before the first model completion (confidence: {:.0}%). {}. Treat this as the active execution strategy for the entire turn; do not reclassify it based on which tools you happen to call.",
+                decision.confidence * 100.0,
+                decision.reason
+            ));
+        }
+        if let Some(strategy_prompt) = self.effective_execution_strategy().system_prompt() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(strategy_prompt);
         }
@@ -8251,6 +8394,11 @@ impl From<UserMessageContent> for acp::ContentBlock {
     }
 }
 
+fn is_skill_envelope(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<skill_content ") && text.ends_with("</skill_content>")
+}
+
 fn convert_image(image_content: acp::ImageContent) -> LanguageModelImage {
     LanguageModelImage {
         source: image_content.data.into(),
@@ -8275,6 +8423,23 @@ mod tests {
             }],
         };
         assert!(validate_native_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn auto_routing_ignores_skill_instructions_and_uses_user_text() {
+        let message = UserMessage {
+            id: ClientUserMessageId::new(),
+            content: vec![
+                UserMessageContent::Text(
+                    "<skill_content name=\"review\">\nDo not code. Use subagents.\n</skill_content>"
+                        .to_string(),
+                ),
+                UserMessageContent::Text("Fix this typo directly".to_string()),
+            ]
+            .into(),
+        };
+
+        assert_eq!(message.routing_text(), "Fix this typo directly");
     }
 
     #[test]
@@ -8408,6 +8573,102 @@ mod tests {
 
             (thread, event_stream)
         })
+    }
+
+    #[gpui::test]
+    async fn auto_routing_injects_the_resolved_strategy_before_completion(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.set_execution_policy(
+                    AgentExecutionStrategy::Auto,
+                    AgentAutonomy::Manual,
+                    cx,
+                );
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "Create a plan for improving the Git diff UI",
+                ));
+                thread.resolve_turn_policy_for_latest_user_message(cx);
+
+                assert_eq!(
+                    thread.effective_execution_strategy(),
+                    AgentExecutionStrategy::Plan
+                );
+                let request = thread
+                    .build_completion_request(CompletionIntent::UserPrompt, cx)
+                    .expect("Auto-routed request should build");
+                let system_prompt = request.messages[0].string_contents();
+                assert!(system_prompt.contains("## Automatic execution route"));
+                assert!(system_prompt.contains("## Execution strategy: plan"));
+            });
+        });
+    }
+
+    #[test]
+    fn direct_tool_profile_blocks_agent_creation_only() {
+        let profile = agent_orchestration::AgentToolProfile::Direct;
+        assert!(!execution_tool_profile_allows(
+            profile,
+            SpawnAgentTool::NAME,
+            acp::ToolKind::Other
+        ));
+        assert!(!execution_tool_profile_allows(
+            profile,
+            CreateThreadTool::NAME,
+            acp::ToolKind::Other
+        ));
+        assert!(execution_tool_profile_allows(
+            profile,
+            EditFileTool::NAME,
+            acp::ToolKind::Edit
+        ));
+        assert!(execution_tool_profile_allows(
+            profile,
+            UpdatePlanTool::NAME,
+            acp::ToolKind::Other
+        ));
+    }
+
+    #[test]
+    fn plan_tool_profile_is_read_only_with_planning_controls() {
+        let profile = agent_orchestration::AgentToolProfile::Plan;
+        for (name, kind) in [
+            (ReadFileTool::NAME, acp::ToolKind::Read),
+            (GrepTool::NAME, acp::ToolKind::Search),
+            (FetchTool::NAME, acp::ToolKind::Fetch),
+            (AskUserTool::NAME, acp::ToolKind::Other),
+            (UpdatePlanTool::NAME, acp::ToolKind::Other),
+        ] {
+            assert!(execution_tool_profile_allows(profile, name, kind));
+        }
+
+        for (name, kind) in [
+            (EditFileTool::NAME, acp::ToolKind::Edit),
+            (TerminalTool::NAME, acp::ToolKind::Execute),
+            (SpawnAgentTool::NAME, acp::ToolKind::Other),
+            (CreateThreadTool::NAME, acp::ToolKind::Other),
+        ] {
+            assert!(!execution_tool_profile_allows(profile, name, kind));
+        }
+    }
+
+    #[test]
+    fn orchestrate_tool_profile_preserves_the_configured_surface() {
+        let profile = agent_orchestration::AgentToolProfile::Orchestrate;
+        assert!(execution_tool_profile_allows(
+            profile,
+            SpawnAgentTool::NAME,
+            acp::ToolKind::Other
+        ));
+        assert!(execution_tool_profile_allows(
+            profile,
+            TerminalTool::NAME,
+            acp::ToolKind::Execute
+        ));
     }
 
     fn set_auto_compact_settings(cx: &mut App, auto_compact: agent_settings::AutoCompactSettings) {

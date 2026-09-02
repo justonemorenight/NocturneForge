@@ -1,5 +1,6 @@
-use crate::auto_policy::AutoPolicyDecision;
-use crate::auto_policy::AutoPolicyEngine;
+use crate::auto_policy::{
+    AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,
+};
 use crate::ids::RunId;
 use crate::plan_graph::{OrchestrationPlan, OrchestrationTask};
 use agent_settings::{AgentAutonomy, AgentExecutionPolicy, AgentExecutionStrategy};
@@ -67,13 +68,18 @@ impl PlanProposal {
 pub struct OrchestrationPlanner;
 
 impl OrchestrationPlanner {
-    /// Resolves `Auto` strategy to a concrete strategy and launch disposition.
-    pub fn resolve_auto(
+    /// Resolves `Auto` to a concrete strategy using the crate's default policy.
+    pub fn resolve_auto(prompt: &str, context: AutoPolicyContext) -> AutoPolicyDecision {
+        AutoPolicyEngine::evaluate(prompt, context)
+    }
+
+    /// Resolves `Auto` with a caller-provided module policy.
+    pub fn resolve_auto_with_config(
         prompt: &str,
-        task_count: usize,
-        autonomy: AgentAutonomy,
+        context: AutoPolicyContext,
+        config: &AutoPolicyConfig,
     ) -> AutoPolicyDecision {
-        AutoPolicyEngine::evaluate(prompt, task_count, 0, autonomy)
+        AutoPolicyEngine::evaluate_with_config(prompt, context, config)
     }
 
     /// Creates a plan from already-decomposed tasks, preserving task metadata.
@@ -128,8 +134,14 @@ mod tests {
 
     #[test]
     fn resolve_auto_directs_single_step_requests() {
-        let decision =
-            OrchestrationPlanner::resolve_auto("fix typo in the readme", 1, AgentAutonomy::Manual);
+        let decision = OrchestrationPlanner::resolve_auto(
+            "fix typo in the readme",
+            AutoPolicyContext {
+                work_item_count: 1,
+                available_tool_count: Some(5),
+                can_orchestrate: true,
+            },
+        );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
         assert!(decision.confidence >= 0.8);
     }
@@ -138,8 +150,11 @@ mod tests {
     fn resolve_auto_orchestrates_multi_file_requests() {
         let decision = OrchestrationPlanner::resolve_auto(
             "refactor across all files in parallel with subagents",
-            5,
-            AgentAutonomy::Manual,
+            AutoPolicyContext {
+                work_item_count: 5,
+                available_tool_count: Some(10),
+                can_orchestrate: true,
+            },
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
     }
