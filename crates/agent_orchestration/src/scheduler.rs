@@ -360,12 +360,19 @@ impl Scheduler {
                     task_token.reason(),
                     Some(crate::cancellation::CancellationReason::Timeout)
                 ) {
+                    let reporter_usage = reporter.usage();
                     let error = exec_result
                         .err()
                         .map(|error| error.to_string())
                         .unwrap_or_else(|| "task timed out".to_string());
-                    self.task_registry
-                        .fail_attempt(&task_id, attempt, error.clone(), false);
+                    self.task_registry.fail_attempt_with_usage(
+                        &task_id,
+                        attempt,
+                        error.clone(),
+                        false,
+                        reporter_usage,
+                        None,
+                    );
                     self.event_stream.emit(RuntimeEvent::TaskFailed {
                         run_id: self.run_id.clone(),
                         task_id,
@@ -422,20 +429,37 @@ impl Scheduler {
                         .status(&task_id)
                         .map(|status| status.budget_state)
                         .unwrap_or_default();
+                    self.event_stream.emit(RuntimeEvent::TaskBudgetUpdated {
+                        run_id: self.run_id.clone(),
+                        task_id: task_id.clone(),
+                        tokens_used: cumulative_usage.tokens_used,
+                        tool_calls_used: cumulative_usage.tool_calls_used,
+                    });
                     if let Some(budget) = task.token_budget
                         && cumulative_usage.tokens_used > budget
                     {
-                        self.task_registry.stop_for_budget(
-                            &task_id,
-                            BudgetExceeded::TokenBudgetExceeded {
-                                budget,
-                                used: cumulative_usage.tokens_used,
-                            },
-                        );
+                        let exceeded = BudgetExceeded::TokenBudgetExceeded {
+                            budget,
+                            used: cumulative_usage.tokens_used,
+                        };
                         let error = format!(
                             "token budget of {budget} was exceeded (used {})",
                             cumulative_usage.tokens_used
                         );
+                        self.task_registry.complete_attempt(
+                            &task_id,
+                            attempt,
+                            Some(truncate_text(
+                                output.output.clone(),
+                                MAX_INLINE_OUTPUT_BYTES,
+                            )),
+                            Some(tokens),
+                            Some(VerificationResult::fail(
+                                error.clone(),
+                                exceeded.error_class(),
+                            )),
+                        );
+                        self.task_registry.stop_for_budget(&task_id, exceeded);
                         self.event_stream.emit(RuntimeEvent::TaskFailed {
                             run_id: self.run_id.clone(),
                             task_id: task_id.clone(),
@@ -448,17 +472,28 @@ impl Scheduler {
                     if let Some(budget) = task.tool_call_budget
                         && cumulative_usage.tool_calls_used > budget
                     {
-                        self.task_registry.stop_for_budget(
-                            &task_id,
-                            BudgetExceeded::ToolCallBudgetExceeded {
-                                budget,
-                                used: cumulative_usage.tool_calls_used,
-                            },
-                        );
+                        let exceeded = BudgetExceeded::ToolCallBudgetExceeded {
+                            budget,
+                            used: cumulative_usage.tool_calls_used,
+                        };
                         let error = format!(
                             "tool call budget of {budget} was exceeded (used {})",
                             cumulative_usage.tool_calls_used
                         );
+                        self.task_registry.complete_attempt(
+                            &task_id,
+                            attempt,
+                            Some(truncate_text(
+                                output.output.clone(),
+                                MAX_INLINE_OUTPUT_BYTES,
+                            )),
+                            Some(tokens),
+                            Some(VerificationResult::fail(
+                                error.clone(),
+                                exceeded.error_class(),
+                            )),
+                        );
+                        self.task_registry.stop_for_budget(&task_id, exceeded);
                         self.event_stream.emit(RuntimeEvent::TaskFailed {
                             run_id: self.run_id.clone(),
                             task_id: task_id.clone(),
@@ -483,6 +518,7 @@ impl Scheduler {
                         });
 
                         let mut verified_output = output;
+                        let mut attempt_tokens = tokens;
                         let mut verification = self
                             .executor
                             .verify(&task, &verified_output)
@@ -519,9 +555,12 @@ impl Scheduler {
                                 self.executor.repair(&task, &feedback, context).await
                             {
                                 let repaired_usage = reporter.usage();
-                                let additional_tokens = repaired_usage
-                                    .tokens_used
-                                    .saturating_sub(reporter_usage.tokens_used);
+                                let additional_tokens =
+                                    repaired_output.tokens_used.unwrap_or(0).max(
+                                        repaired_usage
+                                            .tokens_used
+                                            .saturating_sub(reporter_usage.tokens_used),
+                                    );
                                 let additional_tool_calls = repaired_usage
                                     .tool_calls
                                     .saturating_sub(reporter_usage.tool_calls);
@@ -530,6 +569,15 @@ impl Scheduler {
                                     additional_tokens,
                                     additional_tool_calls,
                                 );
+                                attempt_tokens = attempt_tokens.saturating_add(additional_tokens);
+                                if let Some(status) = self.task_registry.status(&task_id) {
+                                    self.event_stream.emit(RuntimeEvent::TaskBudgetUpdated {
+                                        run_id: self.run_id.clone(),
+                                        task_id: task_id.clone(),
+                                        tokens_used: status.budget_state.tokens_used,
+                                        tool_calls_used: status.budget_state.tool_calls_used,
+                                    });
+                                }
                                 verification = self
                                     .executor
                                     .verify(&task, &repaired_output)
@@ -552,16 +600,28 @@ impl Scheduler {
 
                         if let Some(status) = self.task_registry.status(&task_id) {
                             let usage = status.budget_state;
-                            if task
-                                .token_budget
-                                .is_some_and(|budget| usage.tokens_used > budget)
-                                || task
-                                    .tool_call_budget
-                                    .is_some_and(|budget| usage.tool_calls_used > budget)
+                            let stopped_reason = if let Some(budget) = task.token_budget
+                                && usage.tokens_used > budget
                             {
-                                self.task_registry.set_state(&task_id, TaskState::Failed);
+                                Some(BudgetExceeded::TokenBudgetExceeded {
+                                    budget,
+                                    used: usage.tokens_used,
+                                })
+                            } else if let Some(budget) = task.tool_call_budget
+                                && usage.tool_calls_used > budget
+                            {
+                                Some(BudgetExceeded::ToolCallBudgetExceeded {
+                                    budget,
+                                    used: usage.tool_calls_used,
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(stopped_reason) = stopped_reason {
+                                let error = stopped_reason.message();
+                                self.task_registry.stop_for_budget(&task_id, stopped_reason);
                                 verification = VerificationResult::fail(
-                                    "task budget exceeded during verification or repair",
+                                    error,
                                     crate::verification::ErrorClass::TokenBudgetExceeded,
                                 );
                             }
@@ -569,7 +629,7 @@ impl Scheduler {
 
                         if verification.passed {
                             let duration_ms = task_start.elapsed().as_millis() as u64;
-                            let verified_tokens = verified_output.tokens_used.unwrap_or(tokens);
+                            let verified_tokens = attempt_tokens;
                             let verified_output =
                                 truncate_text(verified_output.output, MAX_INLINE_OUTPUT_BYTES);
                             self.task_registry.complete_attempt(
@@ -608,7 +668,7 @@ impl Scheduler {
                             &task_id,
                             attempt,
                             Some(failed_output),
-                            Some(verified_output.tokens_used.unwrap_or(tokens)),
+                            Some(attempt_tokens),
                             Some(verification),
                         );
                         if !should_retry {
@@ -664,35 +724,48 @@ impl Scheduler {
                 Err(error) => {
                     let error_str = error.to_string();
                     let error_class = VerificationPolicy::classify_error(&error_str);
+                    let reporter_usage = reporter.usage();
+                    let previous_usage = self
+                        .task_registry
+                        .status(&task_id)
+                        .map(|status| status.budget_state)
+                        .unwrap_or_default();
                     // Budget-exceeded errors (mid-flight reporter failures) must
                     // record a typed stop reason and never be retried.
-                    if matches!(
+                    let stopped_reason = if matches!(
                         error_class,
                         crate::verification::ErrorClass::TokenBudgetExceeded
                     ) {
-                        let reporter_usage = reporter.usage();
                         if let Some(budget) = task.token_budget
-                            && reporter_usage.tokens_used > budget
+                            && previous_usage
+                                .tokens_used
+                                .saturating_add(reporter_usage.tokens_used)
+                                > budget
                         {
-                            self.task_registry.stop_for_budget(
-                                &task_id,
-                                BudgetExceeded::TokenBudgetExceeded {
-                                    budget,
-                                    used: reporter_usage.tokens_used,
-                                },
-                            );
+                            Some(BudgetExceeded::TokenBudgetExceeded {
+                                budget,
+                                used: previous_usage
+                                    .tokens_used
+                                    .saturating_add(reporter_usage.tokens_used),
+                            })
                         } else if let Some(budget) = task.tool_call_budget
-                            && reporter_usage.tool_calls > budget
+                            && previous_usage
+                                .tool_calls_used
+                                .saturating_add(reporter_usage.tool_calls)
+                                > budget
                         {
-                            self.task_registry.stop_for_budget(
-                                &task_id,
-                                BudgetExceeded::ToolCallBudgetExceeded {
-                                    budget,
-                                    used: reporter_usage.tool_calls,
-                                },
-                            );
+                            Some(BudgetExceeded::ToolCallBudgetExceeded {
+                                budget,
+                                used: previous_usage
+                                    .tool_calls_used
+                                    .saturating_add(reporter_usage.tool_calls),
+                            })
+                        } else {
+                            None
                         }
-                    }
+                    } else {
+                        None
+                    };
 
                     let should_retry = self.config.verification_policy.should_retry(
                         attempt,
@@ -700,11 +773,13 @@ impl Scheduler {
                         task.max_retries,
                     );
 
-                    self.task_registry.fail_attempt(
+                    self.task_registry.fail_attempt_with_usage(
                         &task_id,
                         attempt,
                         error_str.clone(),
                         should_retry,
+                        reporter_usage,
+                        stopped_reason,
                     );
                     self.event_stream.emit(RuntimeEvent::TaskFailed {
                         run_id: self.run_id.clone(),

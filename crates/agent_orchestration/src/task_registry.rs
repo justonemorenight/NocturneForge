@@ -1,4 +1,4 @@
-use crate::budget::BudgetExceeded;
+use crate::budget::{BudgetExceeded, BudgetUsage};
 use crate::ids::TaskId;
 use crate::state::{TaskAttempt, TaskState, TaskStatus};
 use crate::verification::VerificationResult;
@@ -17,6 +17,20 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    fn update_lifecycle(status: &mut TaskStatus, state: TaskState) {
+        status.state = state;
+        status.phase = match state {
+            TaskState::Running => Some("running".to_string()),
+            TaskState::Verifying => Some("verifying".to_string()),
+            TaskState::Repairing => Some("repairing".to_string()),
+            TaskState::Retrying => Some("retrying".to_string()),
+            _ => None,
+        };
+        if state != TaskState::Running {
+            status.current_tool = None;
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::default())),
@@ -63,7 +77,7 @@ impl TaskRegistry {
     pub fn set_state(&self, task_id: &TaskId, state: TaskState) {
         let mut statuses = self.statuses.write();
         if let Some(status) = statuses.get_mut(task_id) {
-            status.state = state;
+            Self::update_lifecycle(status, state);
             status.updated_at = Utc::now();
         }
     }
@@ -81,7 +95,7 @@ impl TaskRegistry {
         };
 
         if let Some(status) = statuses.get_mut(task_id) {
-            status.state = TaskState::Running;
+            Self::update_lifecycle(status, TaskState::Running);
             status.current_attempt = attempt_index;
             status.total_attempts = attempt_index;
             self.replace_active_session(status, session_id);
@@ -149,24 +163,45 @@ impl TaskRegistry {
             status.latest_verification = verification.clone();
             status.updated_at = Utc::now();
 
-            if let Some(ver) = verification {
+            let state = if let Some(ver) = verification {
                 if ver.passed {
-                    status.state = TaskState::Completed;
+                    TaskState::Completed
                 } else if ver.repairable {
-                    status.state = TaskState::Repairing;
+                    TaskState::Repairing
                 } else if ver.retryable {
-                    status.state = TaskState::Retrying;
+                    TaskState::Retrying
                 } else {
-                    status.state = TaskState::Failed;
+                    TaskState::Failed
                 }
             } else {
-                status.state = TaskState::Completed;
-            }
+                TaskState::Completed
+            };
+            Self::update_lifecycle(status, state);
         }
     }
 
     /// Records failure on an execution attempt.
     pub fn fail_attempt(&self, task_id: &TaskId, attempt: u32, error: String, retryable: bool) {
+        self.fail_attempt_with_usage(
+            task_id,
+            attempt,
+            error,
+            retryable,
+            BudgetUsage::default(),
+            None,
+        );
+    }
+
+    /// Records failure together with attempt-local usage and an optional typed budget stop.
+    pub fn fail_attempt_with_usage(
+        &self,
+        task_id: &TaskId,
+        attempt: u32,
+        error: String,
+        retryable: bool,
+        usage: BudgetUsage,
+        stopped_reason: Option<BudgetExceeded>,
+    ) {
         let mut statuses = self.statuses.write();
         let mut attempts = self.attempts.write();
 
@@ -174,17 +209,31 @@ impl TaskRegistry {
             if let Some(record) = list.iter_mut().find(|a| a.attempt_index == attempt) {
                 record.finished_at = Some(Utc::now());
                 record.error = Some(error.clone());
+                record.tokens_used = Some(usage.tokens_used);
             }
         }
 
         if let Some(status) = statuses.get_mut(task_id) {
+            status.tokens_used = status.tokens_used.saturating_add(usage.tokens_used);
+            status.budget_state.tokens_used = status
+                .budget_state
+                .tokens_used
+                .saturating_add(usage.tokens_used);
+            status.budget_state.tool_calls_used = status
+                .budget_state
+                .tool_calls_used
+                .saturating_add(usage.tool_calls);
+            if stopped_reason.is_some() {
+                status.budget_state.stopped_reason = stopped_reason;
+            }
             status.latest_error = Some(error);
             status.updated_at = Utc::now();
-            if retryable {
-                status.state = TaskState::Retrying;
+            let state = if retryable {
+                TaskState::Retrying
             } else {
-                status.state = TaskState::Failed;
-            }
+                TaskState::Failed
+            };
+            Self::update_lifecycle(status, state);
         }
     }
 
@@ -233,7 +282,7 @@ impl TaskRegistry {
         let mut statuses = self.statuses.write();
         if let Some(status) = statuses.get_mut(task_id) {
             status.budget_state.stopped_reason = Some(reason);
-            status.state = TaskState::Failed;
+            Self::update_lifecycle(status, TaskState::Failed);
             status.updated_at = Utc::now();
         }
     }

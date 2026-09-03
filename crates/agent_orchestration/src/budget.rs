@@ -10,10 +10,11 @@ use std::sync::Arc;
 /// one view of the task's budgets.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionBudget {
-    /// Cumulative token ceiling for the task across all attempts.
+    /// Cumulative provider-reported token ceiling across all attempts, including
+    /// input, output, cache-read, and cache-creation tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
-    /// Ceiling on the number of tool calls the task may make.
+    /// Ceiling on tool calls reported by the task executor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_budget: Option<u64>,
     /// Wall-clock ceiling in seconds for a single attempt.

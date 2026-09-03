@@ -175,7 +175,7 @@ impl SubagentHandle for FakeSubagentHandle {
         unimplemented!()
     }
 
-    fn used_tokens(&self, _cx: &App) -> Option<u64> {
+    fn cumulative_token_usage(&self, _cx: &App) -> Option<TokenUsage> {
         None
     }
 
