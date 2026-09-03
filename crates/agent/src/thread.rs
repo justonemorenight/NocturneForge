@@ -963,8 +963,8 @@ pub trait SubagentHandle {
     /// The current number of entries in the thread.
     /// Useful for knowing where the next turn will begin
     fn num_entries(&self, cx: &App) -> usize;
-    /// Token usage accumulated by the subagent's current session.
-    fn used_tokens(&self, cx: &App) -> Option<u64>;
+    /// Provider-reported usage accumulated across the subagent session.
+    fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage>;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 }

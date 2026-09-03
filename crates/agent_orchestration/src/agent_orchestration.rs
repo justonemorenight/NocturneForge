@@ -857,10 +857,77 @@ mod tests {
             });
         let status = status.expect("task status present");
         assert_eq!(status.state, TaskState::Failed);
-        assert!(
-            status.budget_state.stopped_reason.is_some(),
-            "budget stop reason recorded"
+        assert_eq!(status.tokens_used, 200);
+        assert_eq!(status.budget_state.tokens_used, 200);
+        assert_eq!(status.phase, None);
+        assert_eq!(status.current_tool, None);
+        assert_eq!(
+            status.budget_state.stopped_reason,
+            Some(BudgetExceeded::TokenBudgetExceeded {
+                budget: 100,
+                used: 200,
+            })
         );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.task_attempts[0].1[0].tokens_used, Some(200));
+        assert_eq!(
+            snapshot.task_attempts[0].1[0].output.as_deref(),
+            Some("done")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_midflight_token_budget_failure_persists_usage(cx: &mut gpui::TestAppContext) {
+        let mut task = OrchestrationTask::new("task-token", "Token Task", "desc");
+        task.max_retries = Some(3);
+        task.token_budget = Some(100);
+        let plan = OrchestrationPlan::new("Token Budget", vec![task]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        struct ReportingExecutor;
+        impl TaskExecutor for ReportingExecutor {
+            fn execute(
+                &self,
+                context: TaskExecutionContext,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
+            {
+                Box::pin(async move {
+                    context.reporter.report_tokens(200)?;
+                    Ok(TaskExecutionOutput::new("unreachable"))
+                })
+            }
+        }
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, Rc::new(ReportingExecutor), config)
+                .expect("start run");
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Failed
+        );
+        let status = handle
+            .task_status(&TaskId::new("task-token"))
+            .expect("task status present");
+        assert_eq!(status.state, TaskState::Failed);
+        assert_eq!(status.tokens_used, 200);
+        assert_eq!(status.budget_state.tokens_used, 200);
+        assert_eq!(status.phase, None);
+        assert_eq!(
+            status.budget_state.stopped_reason,
+            Some(BudgetExceeded::TokenBudgetExceeded {
+                budget: 100,
+                used: 200,
+            })
+        );
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.task_attempts[0].1[0].tokens_used, Some(200));
+        assert!(snapshot.task_attempts[0].1[0].output.is_none());
     }
 
     #[gpui::test]
@@ -909,9 +976,12 @@ mod tests {
             .or_else(|| handle.task_statuses().into_iter().next());
         let status = status.expect("task status present");
         assert_eq!(status.state, TaskState::Failed);
-        assert!(
-            status.budget_state.stopped_reason.is_some(),
-            "budget stop reason recorded"
+        assert_eq!(status.budget_state.tool_calls_used, 3);
+        assert_eq!(status.phase, None);
+        assert_eq!(status.current_tool, None);
+        assert_eq!(
+            status.budget_state.stopped_reason,
+            Some(BudgetExceeded::ToolCallBudgetExceeded { budget: 2, used: 3 })
         );
     }
 
@@ -944,5 +1014,89 @@ mod tests {
         let status = status.expect("task status present");
         assert_eq!(status.state, TaskState::Completed);
         assert!(status.budget_state.stopped_reason.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_repair_usage_is_included_in_attempt_total(cx: &mut gpui::TestAppContext) {
+        let mut task = OrchestrationTask::new("task-repair", "Repair Task", "desc");
+        task.acceptance_criteria = vec!["result is valid".to_string()];
+        task.token_budget = Some(1_000);
+        let plan = OrchestrationPlan::new("Repair Budget", vec![task]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        struct RepairExecutor {
+            verification_count: AtomicUsize,
+        }
+
+        impl TaskExecutor for RepairExecutor {
+            fn execute(
+                &self,
+                _context: TaskExecutionContext,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
+            {
+                Box::pin(
+                    async move { Ok(TaskExecutionOutput::new("initial").with_tokens_used(100)) },
+                )
+            }
+
+            fn verify(
+                &self,
+                _task: &OrchestrationTask,
+                _output: &TaskExecutionOutput,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<VerificationResult>>
+            {
+                let verification_count = self.verification_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if verification_count == 0 {
+                        Ok(VerificationResult::fail(
+                            "repair required",
+                            ErrorClass::VerificationAssertionFailure,
+                        ))
+                    } else {
+                        Ok(VerificationResult::pass())
+                    }
+                })
+            }
+
+            fn repair(
+                &self,
+                _task: &OrchestrationTask,
+                _feedback: &str,
+                _context: TaskExecutionContext,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
+            {
+                Box::pin(
+                    async move { Ok(TaskExecutionOutput::new("repaired").with_tokens_used(150)) },
+                )
+            }
+        }
+
+        let executor = Rc::new(RepairExecutor {
+            verification_count: AtomicUsize::new(0),
+        });
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start run");
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        let status = handle
+            .task_status(&TaskId::new("task-repair"))
+            .expect("task status present");
+        assert_eq!(status.tokens_used, 250);
+        assert_eq!(status.budget_state.tokens_used, 250);
+        assert_eq!(status.phase, None);
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.task_attempts[0].1[0].tokens_used, Some(250));
+        assert_eq!(
+            snapshot.task_attempts[0].1[0].output.as_deref(),
+            Some("repaired")
+        );
     }
 }

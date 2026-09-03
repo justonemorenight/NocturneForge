@@ -13,6 +13,17 @@ use std::sync::Arc;
 use crate::{AgentTool, SubagentRole, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use agent_orchestration::{VERIFICATION_END, VERIFICATION_START};
 
+fn cumulative_token_delta(
+    before: Option<language_model::TokenUsage>,
+    after: Option<language_model::TokenUsage>,
+) -> u64 {
+    let before = before.unwrap_or_default();
+    let Some(after) = after else {
+        return 0;
+    };
+    after.total_tokens().saturating_sub(before.total_tokens())
+}
+
 fn task_execution_prompt(task: &agent_orchestration::OrchestrationTask) -> String {
     if task.acceptance_criteria.is_empty()
         && task.expected_output.is_none()
@@ -108,15 +119,19 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             if let Err(exceeded) = reporter.report_tool_call_started("subagent") {
                 anyhow::bail!("{exceeded}");
             }
-            let tokens_before = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
-            let output = subagent.send(task_execution_prompt(&task), &app).await?;
+            let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
+            let send_result = subagent.send(task_execution_prompt(&task), &app).await;
             reporter.report_tool_call_finished();
 
-            let tokens_after = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
-            let tokens_used = tokens_after.saturating_sub(tokens_before);
-            if let Err(exceeded) = reporter.report_tokens(tokens_used) {
-                anyhow::bail!("{exceeded}");
-            }
+            let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
+            let tokens_used = cumulative_token_delta(usage_before, usage_after);
+            let output = match send_result {
+                Ok(output) => output,
+                Err(error) => {
+                    reporter.report_tokens(tokens_used)?;
+                    return Err(error);
+                }
+            };
 
             let artifact = agent_orchestration::Artifact::new(
                 task.id.clone(),
@@ -175,14 +190,18 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             if let Err(exceeded) = reporter.report_tool_call_started("subagent") {
                 anyhow::bail!("{exceeded}");
             }
-            let tokens_before = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
-            let output = subagent.send(repair_message, &app).await?;
+            let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
+            let send_result = subagent.send(repair_message, &app).await;
             reporter.report_tool_call_finished();
-            let tokens_after = app.update(|cx| subagent.used_tokens(cx)).unwrap_or(0);
-            let tokens_used = tokens_after.saturating_sub(tokens_before);
-            if let Err(exceeded) = reporter.report_tokens(tokens_used) {
-                anyhow::bail!("{exceeded}");
-            }
+            let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
+            let tokens_used = cumulative_token_delta(usage_before, usage_after);
+            let output = match send_result {
+                Ok(output) => output,
+                Err(error) => {
+                    reporter.report_tokens(tokens_used)?;
+                    return Err(error);
+                }
+            };
             let artifact = agent_orchestration::Artifact::new(
                 task.id.clone(),
                 format!("Repaired output for {}", task.label),
@@ -286,6 +305,11 @@ fn batch_launch_policy(
 /// - By default a subagent inherits all of your tools. Pass `tools` to restrict it to an allowlist — for example read-only tools like ["read_file", "grep", "find_path"] for a search task, or an empty list for a pure reasoning task over content in the message.
 /// - A scoped allowlist keeps focused subtasks from performing side effects you did not intend.
 ///
+/// ### Budgeting batch tasks
+/// - Omit `token_budget` unless the task needs a strict total-usage ceiling.
+/// - `token_budget` includes all provider-reported input, output, and cache tokens across every attempt; it is commonly much larger than the desired response length.
+/// - `tool_call_budget` counts executor-visible delegation calls. It does not currently count tools invoked inside a native subagent session.
+///
 /// ### Output
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
@@ -332,7 +356,8 @@ pub struct SpawnAgentTask {
     /// Number of times to retry this task after a failed request.
     #[serde(default)]
     pub max_retries: u8,
-    /// Optional hard budget for the task's cumulative token usage.
+    /// Optional hard budget for cumulative provider-reported tokens across all
+    /// task attempts, including input, output, and cache tokens.
     #[serde(default)]
     pub token_budget: Option<u64>,
     /// Criteria required for this task's output to be considered verified.
@@ -347,7 +372,8 @@ pub struct SpawnAgentTask {
     /// Execution timeout in seconds for this task.
     #[serde(default)]
     pub time_budget_secs: Option<u64>,
-    /// Optional hard budget for tool calls in this task.
+    /// Optional hard budget for executor-visible tool calls. Native subagent
+    /// execution currently counts each delegated subagent turn as one call.
     #[serde(default)]
     pub tool_call_budget: Option<u64>,
     /// Stated high-level objective for this task.
@@ -1057,6 +1083,26 @@ impl AgentTool for SpawnAgentTool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cumulative_token_delta_uses_all_provider_reported_tokens() {
+        let before = language_model::TokenUsage {
+            input_tokens: 40_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 2_000,
+            cache_read_input_tokens: 80_000,
+        };
+        let after = language_model::TokenUsage {
+            input_tokens: 90_000,
+            output_tokens: 4_500,
+            cache_creation_input_tokens: 5_000,
+            cache_read_input_tokens: 200_000,
+        };
+
+        assert_eq!(cumulative_token_delta(Some(before), Some(after)), 176_500);
+        assert_eq!(cumulative_token_delta(None, Some(after)), 299_500);
+        assert_eq!(cumulative_token_delta(Some(after), None), 0);
+    }
 
     #[test]
     fn deserializes_blank_session_id_as_absent() {

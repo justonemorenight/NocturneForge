@@ -3549,11 +3549,8 @@ impl SubagentHandle for NativeSubagentHandle {
         self.acp_thread.read(cx).entries().len()
     }
 
-    fn used_tokens(&self, cx: &App) -> Option<u64> {
-        self.acp_thread
-            .read(cx)
-            .token_usage()
-            .map(|usage| usage.used_tokens)
+    fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage> {
+        Some(self.subagent_thread.read(cx).cumulative_token_usage())
     }
 
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {

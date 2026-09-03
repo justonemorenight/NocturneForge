@@ -30,7 +30,8 @@ pub struct OrchestrationTask {
     /// Override for maximum retries on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u8>,
-    /// Cumulative token budget for this task.
+    /// Cumulative provider-reported token ceiling across all attempts, including
+    /// input, output, and cache tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
     /// Execution timeout in seconds.
@@ -48,7 +49,7 @@ pub struct OrchestrationTask {
     /// Whether task output must include valid file citations (evidence).
     #[serde(default)]
     pub evidence_required: bool,
-    /// Hard budget on maximum tool calls allowed for this task.
+    /// Hard budget on tool calls reported by the task executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_budget: Option<u64>,
     /// Stated high-level objective for this task.
