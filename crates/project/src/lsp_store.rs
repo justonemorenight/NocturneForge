@@ -4210,6 +4210,7 @@ pub struct BufferLspData {
 struct LspKey {
     request_type: TypeId,
     server_queried: Option<LanguageServerId>,
+    sender_id: proto::PeerId,
 }
 
 impl BufferLspData {
@@ -9812,6 +9813,7 @@ impl LspStore {
                 Self::deduplicate_range_based_lsp_requests::<InlayHints>(
                     &lsp_store,
                     server_id,
+                    sender_id,
                     lsp_request_id,
                     &inlay_hints,
                     query_start..query_end,
@@ -9846,6 +9848,7 @@ impl LspStore {
                     let key = LspKey {
                         request_type: TypeId::of::<GetDocumentDiagnostics>(),
                         server_queried: server_id,
+                        sender_id,
                     };
                     if <GetDocumentDiagnostics as LspCommand>::ProtoRequest::stop_previous_requests(
                     ) {
@@ -13835,6 +13838,7 @@ impl LspStore {
     async fn deduplicate_range_based_lsp_requests<T>(
         lsp_store: &Entity<Self>,
         server_id: Option<LanguageServerId>,
+        sender_id: proto::PeerId,
         lsp_request_id: LspRequestId,
         proto_request: &T::ProtoRequest,
         range: Range<Anchor>,
@@ -13864,6 +13868,7 @@ impl LspStore {
                     let key = LspKey {
                         request_type: TypeId::of::<T>(),
                         server_queried: server_id,
+                        sender_id,
                     };
                     let previous_request = lsp_data
                         .chunk_lsp_requests
@@ -13909,6 +13914,7 @@ impl LspStore {
         let key = LspKey {
             request_type: TypeId::of::<T>(),
             server_queried: for_server_id,
+            sender_id,
         };
         lsp_store.update(cx, |lsp_store, cx| {
             let request_task = match for_server_id {
@@ -13966,6 +13972,7 @@ impl LspStore {
                                     .collect::<HashMap<_, _>>();
                                 match client.send_lsp_response::<T::ProtoRequest>(
                                     project_id,
+                                    sender_id,
                                     lsp_request_id,
                                     response,
                                 ) {
@@ -14005,6 +14012,7 @@ impl LspStore {
         let key = LspKey {
             request_type: TypeId::of::<T>(),
             server_queried: server_id,
+            sender_id,
         };
         if T::ProtoRequest::stop_previous_requests() {
             if let Some(lsp_requests) = lsp_data.lsp_requests.get_mut(&key) {
@@ -14035,6 +14043,7 @@ impl LspStore {
                             .collect::<HashMap<_, _>>();
                         if let Err(e) = client.send_lsp_response::<T::ProtoRequest>(
                             project_id,
+                            sender_id,
                             lsp_request_id,
                             response,
                         ) {
