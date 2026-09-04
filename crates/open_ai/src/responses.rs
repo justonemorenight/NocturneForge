@@ -454,6 +454,8 @@ pub enum CustomToolGrammarSyntax {
 pub struct ResponseError {
     #[serde(default)]
     pub code: Option<String>,
+    #[serde(default, rename = "type")]
+    pub error_type: Option<String>,
     pub message: String,
     #[serde(default)]
     pub param: Option<Value>,
@@ -475,6 +477,8 @@ pub struct GenericStreamErrorPayload {
 struct PartialResponseError {
     #[serde(default)]
     code: Option<String>,
+    #[serde(default, rename = "type")]
+    error_type: Option<String>,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
@@ -486,6 +490,7 @@ impl GenericStreamErrorPayload {
         let nested = self.error.unwrap_or_default();
         ResponseError {
             code: self.top_level.code.or(nested.code),
+            error_type: self.top_level.error_type.or(nested.error_type),
             message: self
                 .top_level
                 .message

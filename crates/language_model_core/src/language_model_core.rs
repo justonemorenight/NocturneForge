@@ -374,6 +374,37 @@ impl LanguageModelCompletionError {
         }
     }
 
+    /// Whether retrying the same request after a delay may succeed.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::ProviderRejection {
+                status,
+                retry_after,
+                category,
+                ..
+            } => {
+                *category != ProviderErrorCategory::PaymentRequired
+                    && (status.is_some_and(is_retryable_provider_status)
+                        || matches!(
+                            category,
+                            ProviderErrorCategory::RateLimit
+                                | ProviderErrorCategory::Overloaded
+                                | ProviderErrorCategory::Timeout
+                                | ProviderErrorCategory::InternalServer
+                        )
+                        || retry_after.is_some())
+            }
+            Self::ApiReadResponseError { .. } | Self::HttpSend { .. } => true,
+            Self::DataRetentionConsentRequired { .. }
+            | Self::NoApiKey { .. }
+            | Self::SerializeRequest { .. }
+            | Self::BuildRequestBody { .. }
+            | Self::DeserializeResponse { .. }
+            | Self::StreamEndedUnexpectedly { .. }
+            | Self::Other(_) => false,
+        }
+    }
+
     /// Returns the delay before a retry attempt, honoring a provider-supplied
     /// delay before falling back to exponential backoff from five to forty
     /// seconds.
@@ -392,15 +423,16 @@ impl LanguageModelCompletionError {
                 retry_after,
                 category,
                 ..
-            } if status.is_some_and(is_retryable_provider_status)
-                || matches!(
-                    category,
-                    ProviderErrorCategory::RateLimit
-                        | ProviderErrorCategory::Overloaded
-                        | ProviderErrorCategory::Timeout
-                        | ProviderErrorCategory::InternalServer
-                )
-                || retry_after.is_some() =>
+            } if *category != ProviderErrorCategory::PaymentRequired
+                && (status.is_some_and(is_retryable_provider_status)
+                    || matches!(
+                        category,
+                        ProviderErrorCategory::RateLimit
+                            | ProviderErrorCategory::Overloaded
+                            | ProviderErrorCategory::Timeout
+                            | ProviderErrorCategory::InternalServer
+                    )
+                    || retry_after.is_some()) =>
             {
                 (*retry_after).or_else(|| exponential_backoff(attempt))
             }
