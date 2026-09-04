@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use fs::FakeFs;
+use fs::{FakeFs, Fs};
 use futures::StreamExt;
-use gpui::TestAppContext;
-use language::{CodeLabel, FakeLspAdapter, HighlightId, rust_lang};
-use lsp::Uri;
+use gpui::{Entity, TestAppContext};
+use language::{Buffer, CodeLabel, FakeLspAdapter, HighlightId, LocalFile, rust_lang};
+use lsp::{LanguageServerId, Uri};
 use project::{Project, lsp_store::*};
 use serde_json::json;
 use util::path;
@@ -90,6 +93,57 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
     });
 }
 
+#[gpui::test]
+async fn test_open_buffer_via_lsp_preserves_external_symlink_path(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/shared"),
+        json!({ "pkg": { "def.rs": "pub fn def() {}" } }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/project"),
+        json!({ "src": { "main.rs": "fn main() {}" } }),
+    )
+    .await;
+    fs.create_symlink(
+        path!("/project/pkg").as_ref(),
+        PathBuf::from(path!("/shared/pkg")),
+    )
+    .await
+    .unwrap();
+
+    let (project, server_id) =
+        project_with_rust_server(fs, path!("/project"), path!("/project/src/main.rs"), cx).await;
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_via_lsp(
+                Uri::from_file_path(path!("/project/pkg/def.rs")).unwrap(),
+                server_id,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        buffer_paths(&buffer, cx),
+        (
+            "pkg/def.rs".to_string(),
+            PathBuf::from(path!("/project/pkg/def.rs"))
+        )
+    );
+    assert_eq!(
+        worktree_roots(&project, cx),
+        vec![PathBuf::from(path!("/project"))]
+    );
+}
+
 #[test]
 fn test_glob_literal_prefix() {
     assert_eq!(glob_literal_prefix(Path::new("**/*.js")), Path::new(""));
@@ -157,4 +211,52 @@ fn test_trailing_newline_in_completion_documentation() {
         completion_doc,
         CompletionDocumentation::SingleLine(s) if s == "some value"
     ));
+}
+
+async fn project_with_rust_server(
+    fs: Arc<FakeFs>,
+    root: &str,
+    first_file: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<Project>, LanguageServerId) {
+    let project = Project::test(fs, [root.as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp("Rust", FakeLspAdapter::default());
+
+    project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(first_file, cx)
+        })
+        .await
+        .unwrap();
+    fake_servers.next().await.unwrap();
+    cx.run_until_parked();
+
+    let server_id = project.read_with(cx, |project, cx| {
+        project
+            .lsp_store()
+            .read(cx)
+            .language_server_statuses()
+            .next()
+            .unwrap()
+            .0
+    });
+    (project, server_id)
+}
+
+fn buffer_paths(buffer: &Entity<Buffer>, cx: &TestAppContext) -> (String, PathBuf) {
+    buffer.read_with(cx, |buffer, cx| {
+        let file = File::from_dyn(buffer.file()).unwrap();
+        (file.path.as_unix_str().to_string(), file.abs_path(cx))
+    })
+}
+
+fn worktree_roots(project: &Entity<Project>, cx: &TestAppContext) -> Vec<PathBuf> {
+    project.read_with(cx, |project, cx| {
+        project
+            .worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect()
+    })
 }
