@@ -1,8 +1,11 @@
-use crate::artifacts::{ArtifactStore, MAX_INLINE_OUTPUT_BYTES, truncate_text};
+use crate::artifacts::{
+    ArtifactStore, MAX_DEPENDENCY_ARTIFACTS, MAX_DEPENDENCY_CONTEXT_BYTES,
+    MAX_DEPENDENCY_OUTPUT_BYTES, MAX_INLINE_OUTPUT_BYTES, truncate_text,
+};
 use crate::budget::{BudgetExceeded, ExecutionBudget, TaskExecutionReporter};
 use crate::cancellation::CancellationTree;
 use crate::events::{RuntimeEvent, RuntimeEventStream};
-use crate::executor::{TaskExecutionContext, TaskExecutor};
+use crate::executor::{DependencyInput, TaskExecutionContext, TaskExecutor};
 use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::PlanGraph;
 use crate::state::{RunState, TaskState};
@@ -14,11 +17,13 @@ use futures::stream::{FuturesUnordered, StreamExt as _};
 use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[derive(Clone)]
 pub struct RuntimeControl {
     state: Arc<RwLock<RunState>>,
+    user_paused: Arc<AtomicBool>,
     notifications: async_channel::Sender<()>,
     notification_receiver: async_channel::Receiver<()>,
 }
@@ -26,11 +31,21 @@ pub struct RuntimeControl {
 impl RuntimeControl {
     pub fn new(initial_state: RunState) -> Self {
         let (notifications, notification_receiver) = async_channel::bounded(1);
+        let is_initially_paused = initial_state == RunState::Paused;
         Self {
             state: Arc::new(RwLock::new(initial_state)),
+            user_paused: Arc::new(AtomicBool::new(is_initially_paused)),
             notifications,
             notification_receiver,
         }
+    }
+
+    pub fn is_user_paused(&self) -> bool {
+        self.user_paused.load(Ordering::SeqCst)
+    }
+
+    pub fn set_user_paused(&self, paused: bool) {
+        self.user_paused.store(paused, Ordering::SeqCst);
     }
 
     pub fn state(&self) -> RunState {
@@ -68,6 +83,7 @@ impl RuntimeControl {
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
+    pub acp_workers: crate::worker::AcpWorkerRuntimeConfig,
     /// Maximum number of subagents or tasks running concurrently.
     pub max_parallel_tasks: usize,
     /// Default timeout for individual task executions in seconds.
@@ -85,6 +101,7 @@ fn default_max_concurrency() -> usize {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            acp_workers: crate::worker::AcpWorkerRuntimeConfig::default(),
             max_parallel_tasks: default_max_concurrency(),
             task_timeout_secs: None,
             verification_policy: VerificationPolicy::default(),
@@ -143,6 +160,7 @@ impl Scheduler {
     ) -> Self {
         for task in &plan_graph.plan().tasks {
             task_registry.register_task(task.id.clone());
+            task_registry.set_target(&task.id, task.target.clone());
         }
 
         Self {
@@ -208,8 +226,12 @@ impl Scheduler {
             let failed = self.task_registry.failed_tasks();
             let cancelled = self.task_registry.cancelled_tasks();
             let in_progress = self.task_registry.in_progress_tasks();
+            let awaiting_apply = self.task_registry.awaiting_apply_tasks();
+            let parked = self.task_registry.parked_tasks();
             let mut scheduled_or_in_progress = in_progress.clone();
             scheduled_or_in_progress.extend(in_flight_task_ids.iter().cloned());
+            scheduled_or_in_progress.extend(awaiting_apply.iter().cloned());
+            scheduled_or_in_progress.extend(parked.iter().cloned());
 
             let mut failed_or_cancelled = failed.clone();
             failed_or_cancelled.extend(cancelled.clone());
@@ -240,6 +262,31 @@ impl Scheduler {
             );
 
             if ready.is_empty() && in_flight.is_empty() {
+                if !awaiting_apply.is_empty() {
+                    if self.control.state() == RunState::Running {
+                        if self.control.transition(RunState::AwaitingApply)? {
+                            self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                                run_id: self.run_id.clone(),
+                                state: RunState::AwaitingApply,
+                            });
+                        }
+                    }
+                    smol::future::yield_now().await;
+                    continue;
+                }
+
+                if !parked.is_empty() {
+                    if self.control.state() == RunState::Running
+                        && self.control.transition(RunState::Paused)?
+                    {
+                        self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                            run_id: self.run_id.clone(),
+                            state: RunState::Paused,
+                        });
+                    }
+                    continue;
+                }
+
                 if !matches!(self.control.transition(RunState::Failed), Ok(true)) {
                     return Ok(self.control.state());
                 }
@@ -291,6 +338,101 @@ impl Scheduler {
         }
     }
 
+    fn dependency_inputs_for(
+        &self,
+        task: &crate::plan_graph::OrchestrationTask,
+    ) -> Vec<DependencyInput> {
+        let mut remaining_bytes = MAX_DEPENDENCY_CONTEXT_BYTES;
+        let mut inputs = Vec::new();
+
+        for dependency_id in &task.depends_on {
+            if remaining_bytes == 0 {
+                break;
+            }
+            let output = self
+                .task_registry
+                .status(dependency_id)
+                .and_then(|status| status.latest_output)
+                .map(|output| {
+                    let output =
+                        truncate_text(output, MAX_DEPENDENCY_OUTPUT_BYTES.min(remaining_bytes));
+                    remaining_bytes = remaining_bytes.saturating_sub(output.len());
+                    output
+                });
+
+            let mut artifacts = Vec::new();
+            for mut artifact in self
+                .artifact_store
+                .for_task(dependency_id)
+                .into_iter()
+                .take(MAX_DEPENDENCY_ARTIFACTS)
+            {
+                if remaining_bytes == 0 {
+                    break;
+                }
+                artifact.data = truncate_text(artifact.data, remaining_bytes);
+                remaining_bytes = remaining_bytes.saturating_sub(artifact.data.len());
+                artifacts.push(artifact);
+            }
+
+            if output.is_some() || !artifacts.is_empty() {
+                inputs.push(DependencyInput {
+                    task_id: dependency_id.clone(),
+                    output,
+                    artifacts,
+                });
+            }
+        }
+
+        inputs
+    }
+
+    async fn cleanup_terminal_worktree(&self, task_id: &TaskId, attempt: u32) {
+        let Some(status) = self.task_registry.status(task_id) else {
+            return;
+        };
+        if crate::worktree_isolation::IsolatedWorktree::should_retain(status.wait_reason.as_ref()) {
+            log::info!(
+                "retaining managed worktree for task '{}' due to structured wait reason: {:?}",
+                task_id,
+                status.wait_reason
+            );
+            return;
+        }
+        let Some(mut metadata) = status.worker_metadata else {
+            return;
+        };
+        let Some(path) = metadata.worktree_path.clone() else {
+            return;
+        };
+        let result = async {
+            let worktree = crate::worktree_isolation::IsolatedWorktree::reopen_managed(
+                path.into(),
+                &self.run_id,
+                task_id,
+                attempt,
+            )
+            .await?;
+            worktree.cleanup(true).await
+        }
+        .await;
+        if let Err(error) = result {
+            log::warn!(
+                "failed to clean managed worktree for terminal task '{}': {error}",
+                task_id
+            );
+        } else {
+            metadata.worktree_path = None;
+            self.task_registry
+                .set_worker_metadata(task_id, metadata.clone());
+            self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                metadata,
+            });
+        }
+    }
+
     async fn execute_task_workflow(&self, task_id: TaskId) {
         let Some(task) = self.plan_graph.task(&task_id).cloned() else {
             return;
@@ -306,8 +448,32 @@ impl Scheduler {
 
         loop {
             attempt = attempt.saturating_add(1);
-            let task_start = Instant::now();
+            let now = || {
+                self.config
+                    .background_executor
+                    .as_ref()
+                    .map(|executor| executor.now())
+                    .unwrap_or_else(Instant::now)
+            };
+            let task_start = now();
+            let elapsed = || now().saturating_duration_since(task_start);
             let correlation_id = CorrelationId::new();
+            let previous_worker_metadata = self
+                .task_registry
+                .status(&task_id)
+                .and_then(|status| status.worker_metadata);
+
+            let mut worker_metadata = crate::worker::WorkerMetadata::new(task.target.clone());
+            worker_metadata.model = task.model_override.clone();
+            worker_metadata.mode = task.mode.clone();
+            worker_metadata.workspace_policy = task.workspace_policy.clone();
+            self.task_registry
+                .set_worker_metadata(&task_id, worker_metadata.clone());
+            self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                metadata: worker_metadata,
+            });
 
             self.task_registry
                 .start_attempt(&task_id, session_id.clone());
@@ -329,7 +495,9 @@ impl Scheduler {
                 task.model_override.clone().map(Into::into),
                 budget.clone(),
                 Some(self.event_stream.clone()),
-            );
+            )
+            .with_task_registry(self.task_registry.clone())
+            .for_attempt(attempt);
             if let Some(model) = task.model_override.clone() {
                 self.task_registry.set_model(&task_id, &model);
                 reporter.report_model_assigned(model);
@@ -342,6 +510,10 @@ impl Scheduler {
                 cancellation_token: task_token.clone(),
                 correlation_id,
                 existing_session_id: session_id.clone(),
+                previous_worker_metadata,
+                dependency_inputs: self.dependency_inputs_for(&task),
+                worker_config: self.config.acp_workers.clone(),
+                background_executor: self.config.background_executor.clone(),
                 run_id: self.run_id.clone(),
                 budget,
                 reporter: reporter.clone(),
@@ -375,27 +547,66 @@ impl Scheduler {
                     );
                     self.event_stream.emit(RuntimeEvent::TaskFailed {
                         run_id: self.run_id.clone(),
-                        task_id,
+                        task_id: task_id.clone(),
                         error,
                         retryable: false,
                     });
+                    self.cleanup_terminal_worktree(&task_id, attempt).await;
                     return;
                 }
                 self.task_registry.set_state(&task_id, TaskState::Cancelled);
                 self.event_stream.emit(RuntimeEvent::TaskCancelled {
                     run_id: self.run_id.clone(),
-                    task_id,
+                    task_id: task_id.clone(),
                     reason: "cancelled during execution".to_string(),
                 });
+                self.cleanup_terminal_worktree(&task_id, attempt).await;
                 return;
             }
 
             match exec_result {
                 Ok(output) => {
+                    if let Some(metadata) = output.worker_metadata.clone() {
+                        self.task_registry
+                            .set_worker_metadata(&task_id, metadata.clone());
+                        self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
+                            run_id: self.run_id.clone(),
+                            task_id: task_id.clone(),
+                            metadata,
+                        });
+                    }
                     session_id = output.session_id.clone();
                     if let Some(session_id) = session_id.clone() {
                         self.task_registry
                             .set_active_session_id(&task_id, session_id);
+                    }
+
+                    if task.workspace_policy.isolation
+                        == crate::worker::WorkspaceIsolation::DedicatedWorktree
+                    {
+                        let managed_worktree_ready =
+                            output.worker_metadata.as_ref().is_some_and(|metadata| {
+                                metadata.worktree_path.is_some()
+                                    && metadata.baseline_commit.is_some()
+                            });
+                        if !managed_worktree_ready {
+                            let error = "isolated write worker completed without a managed worktree descriptor"
+                                .to_string();
+                            self.task_registry.fail_attempt(
+                                &task_id,
+                                attempt,
+                                error.clone(),
+                                false,
+                            );
+                            self.event_stream.emit(RuntimeEvent::TaskFailed {
+                                run_id: self.run_id.clone(),
+                                task_id: task_id.clone(),
+                                error,
+                                retryable: false,
+                            });
+                            self.mark_blocked_dependents(&task_id);
+                            return;
+                        }
                     }
 
                     for artifact in &output.artifacts {
@@ -467,6 +678,7 @@ impl Scheduler {
                             retryable: false,
                         });
                         self.mark_blocked_dependents(&task_id);
+                        self.cleanup_terminal_worktree(&task_id, attempt).await;
                         return;
                     }
                     if let Some(budget) = task.tool_call_budget
@@ -501,6 +713,7 @@ impl Scheduler {
                             retryable: false,
                         });
                         self.mark_blocked_dependents(&task_id);
+                        self.cleanup_terminal_worktree(&task_id, attempt).await;
                         return;
                     }
 
@@ -519,9 +732,20 @@ impl Scheduler {
 
                         let mut verified_output = output;
                         let mut attempt_tokens = tokens;
+                        let remaining_timeout = || {
+                            task.time_budget_secs
+                                .or(self.config.task_timeout_secs)
+                                .map(|seconds| {
+                                    std::time::Duration::from_secs(seconds)
+                                        .saturating_sub(elapsed())
+                                })
+                        };
                         let mut verification = self
-                            .executor
-                            .verify(&task, &verified_output)
+                            .run_controlled(
+                                self.executor.verify(&task, &verified_output),
+                                &task_token,
+                                remaining_timeout(),
+                            )
                             .await
                             .unwrap_or_else(|error| {
                                 VerificationResult::fail(
@@ -536,7 +760,8 @@ impl Scheduler {
                                 result: verification.clone(),
                             });
 
-                        if !verification.passed
+                        if !task_token.is_cancelled()
+                            && !verification.passed
                             && verification.repairable
                             && task.repair_on_failure
                             && self.config.verification_policy.allow_repair_tasks
@@ -551,51 +776,141 @@ impl Scheduler {
                                 task_id: task_id.clone(),
                                 reason: feedback.clone(),
                             });
-                            if let Ok(repaired_output) =
-                                self.executor.repair(&task, &feedback, context).await
+                            let mut repair_context = context;
+                            repair_context.existing_session_id = session_id.clone();
+                            repair_context.previous_worker_metadata =
+                                verified_output.worker_metadata.clone();
+                            match self
+                                .run_controlled(
+                                    self.executor.repair(&task, &feedback, repair_context),
+                                    &task_token,
+                                    remaining_timeout(),
+                                )
+                                .await
                             {
-                                let repaired_usage = reporter.usage();
-                                let additional_tokens =
-                                    repaired_output.tokens_used.unwrap_or(0).max(
-                                        repaired_usage
-                                            .tokens_used
-                                            .saturating_sub(reporter_usage.tokens_used),
+                                Ok(repaired_output) => {
+                                    if let Some(metadata) = repaired_output.worker_metadata.clone()
+                                    {
+                                        self.task_registry
+                                            .set_worker_metadata(&task_id, metadata.clone());
+                                        self.event_stream.emit(
+                                            RuntimeEvent::WorkerMetadataUpdated {
+                                                run_id: self.run_id.clone(),
+                                                task_id: task_id.clone(),
+                                                metadata,
+                                            },
+                                        );
+                                    }
+                                    if let Some(repaired_session_id) =
+                                        repaired_output.session_id.clone()
+                                    {
+                                        session_id = Some(repaired_session_id.clone());
+                                        self.task_registry
+                                            .set_active_session_id(&task_id, repaired_session_id);
+                                    }
+                                    for artifact in &repaired_output.artifacts {
+                                        let artifact = self.artifact_store.record(artifact.clone());
+                                        self.event_stream.emit(RuntimeEvent::ArtifactRecorded {
+                                            run_id: self.run_id.clone(),
+                                            task_id: task_id.clone(),
+                                            artifact,
+                                        });
+                                    }
+                                    let repaired_usage = reporter.usage();
+                                    let additional_tokens =
+                                        repaired_output.tokens_used.unwrap_or(0).max(
+                                            repaired_usage
+                                                .tokens_used
+                                                .saturating_sub(reporter_usage.tokens_used),
+                                        );
+                                    let additional_tool_calls = repaired_usage
+                                        .tool_calls
+                                        .saturating_sub(reporter_usage.tool_calls);
+                                    self.task_registry.update_budget_usage(
+                                        &task_id,
+                                        additional_tokens,
+                                        additional_tool_calls,
                                     );
-                                let additional_tool_calls = repaired_usage
-                                    .tool_calls
-                                    .saturating_sub(reporter_usage.tool_calls);
-                                self.task_registry.update_budget_usage(
-                                    &task_id,
-                                    additional_tokens,
-                                    additional_tool_calls,
-                                );
-                                attempt_tokens = attempt_tokens.saturating_add(additional_tokens);
-                                if let Some(status) = self.task_registry.status(&task_id) {
-                                    self.event_stream.emit(RuntimeEvent::TaskBudgetUpdated {
-                                        run_id: self.run_id.clone(),
-                                        task_id: task_id.clone(),
-                                        tokens_used: status.budget_state.tokens_used,
-                                        tool_calls_used: status.budget_state.tool_calls_used,
-                                    });
-                                }
-                                verification = self
-                                    .executor
-                                    .verify(&task, &repaired_output)
-                                    .await
-                                    .unwrap_or_else(|error| {
-                                        VerificationResult::fail(
-                                            format!("repaired output verification failed: {error}"),
-                                            crate::verification::ErrorClass::FatalError,
+                                    attempt_tokens =
+                                        attempt_tokens.saturating_add(additional_tokens);
+                                    if let Some(status) = self.task_registry.status(&task_id) {
+                                        self.event_stream.emit(RuntimeEvent::TaskBudgetUpdated {
+                                            run_id: self.run_id.clone(),
+                                            task_id: task_id.clone(),
+                                            tokens_used: status.budget_state.tokens_used,
+                                            tool_calls_used: status.budget_state.tool_calls_used,
+                                        });
+                                    }
+                                    verification = self
+                                        .run_controlled(
+                                            self.executor.verify(&task, &repaired_output),
+                                            &task_token,
+                                            remaining_timeout(),
                                         )
-                                    });
-                                verified_output = repaired_output;
-                                self.event_stream
-                                    .emit(RuntimeEvent::TaskVerificationResult {
-                                        run_id: self.run_id.clone(),
-                                        task_id: task_id.clone(),
-                                        result: verification.clone(),
-                                    });
+                                        .await
+                                        .unwrap_or_else(|error| {
+                                            VerificationResult::fail(
+                                                format!(
+                                                    "repaired output verification failed: {error}"
+                                                ),
+                                                crate::verification::ErrorClass::FatalError,
+                                            )
+                                        });
+                                    verified_output = repaired_output;
+                                    self.event_stream
+                                        .emit(RuntimeEvent::TaskVerificationResult {
+                                            run_id: self.run_id.clone(),
+                                            task_id: task_id.clone(),
+                                            result: verification.clone(),
+                                        });
+                                }
+                                Err(error) => {
+                                    verification = VerificationResult::fail(
+                                        format!("repair failed: {error}"),
+                                        crate::verification::ErrorClass::FatalError,
+                                    );
+                                    self.event_stream
+                                        .emit(RuntimeEvent::TaskVerificationResult {
+                                            run_id: self.run_id.clone(),
+                                            task_id: task_id.clone(),
+                                            result: verification.clone(),
+                                        });
+                                }
                             }
+                        }
+
+                        if task_token.is_cancelled() {
+                            if matches!(
+                                task_token.reason(),
+                                Some(crate::cancellation::CancellationReason::Timeout)
+                            ) {
+                                let error =
+                                    "task timed out during verification or repair".to_string();
+                                self.task_registry.fail_attempt_with_usage(
+                                    &task_id,
+                                    attempt,
+                                    error.clone(),
+                                    false,
+                                    reporter.usage(),
+                                    None,
+                                );
+                                self.event_stream.emit(RuntimeEvent::TaskFailed {
+                                    run_id: self.run_id.clone(),
+                                    task_id: task_id.clone(),
+                                    error,
+                                    retryable: false,
+                                });
+                            } else {
+                                self.task_registry.set_state(&task_id, TaskState::Cancelled);
+                                self.event_stream.emit(RuntimeEvent::TaskCancelled {
+                                    run_id: self.run_id.clone(),
+                                    task_id: task_id.clone(),
+                                    reason: "cancelled during verification or repair".to_string(),
+                                });
+                            }
+                            self.mark_blocked_dependents(&task_id);
+                            self.cleanup_terminal_worktree(&task_id, attempt).await;
+                            return;
                         }
 
                         if let Some(status) = self.task_registry.status(&task_id) {
@@ -628,24 +943,42 @@ impl Scheduler {
                         }
 
                         if verification.passed {
-                            let duration_ms = task_start.elapsed().as_millis() as u64;
+                            let duration_ms = elapsed().as_millis() as u64;
                             let verified_tokens = attempt_tokens;
                             let verified_output =
                                 truncate_text(verified_output.output, MAX_INLINE_OUTPUT_BYTES);
-                            self.task_registry.complete_attempt(
+                            let needs_apply = task.workspace_policy.isolation
+                                == crate::worker::WorkspaceIsolation::DedicatedWorktree;
+
+                            self.task_registry.complete_attempt_with_awaiting_apply(
                                 &task_id,
                                 attempt,
                                 Some(verified_output.clone()),
                                 Some(verified_tokens),
                                 Some(verification),
+                                needs_apply,
                             );
-                            self.event_stream.emit(RuntimeEvent::TaskCompleted {
-                                run_id: self.run_id.clone(),
-                                task_id,
-                                output: Some(verified_output),
-                                tokens_used: verified_tokens,
-                                duration_ms,
-                            });
+                            if needs_apply {
+                                let worktree_path = self
+                                    .task_registry
+                                    .status(&task_id)
+                                    .and_then(|status| status.worker_metadata)
+                                    .and_then(|metadata| metadata.worktree_path);
+                                self.event_stream.emit(RuntimeEvent::TaskAwaitingApply {
+                                    run_id: self.run_id.clone(),
+                                    task_id,
+                                    worktree_path,
+                                    patch_id: None,
+                                });
+                            } else {
+                                self.event_stream.emit(RuntimeEvent::TaskCompleted {
+                                    run_id: self.run_id.clone(),
+                                    task_id,
+                                    output: Some(verified_output),
+                                    tokens_used: verified_tokens,
+                                    duration_ms,
+                                });
+                            }
                             return;
                         }
 
@@ -700,24 +1033,43 @@ impl Scheduler {
                         for blocked in self.plan_graph.blocked_by_failure(&task_id) {
                             self.task_registry.set_state(&blocked, TaskState::Blocked);
                         }
+                        self.cleanup_terminal_worktree(&task_id, attempt).await;
                         return;
                     } else {
-                        let duration_ms = task_start.elapsed().as_millis() as u64;
+                        let duration_ms = elapsed().as_millis() as u64;
                         let output = truncate_text(output.output, MAX_INLINE_OUTPUT_BYTES);
-                        self.task_registry.complete_attempt(
+                        let needs_apply = task.workspace_policy.isolation
+                            == crate::worker::WorkspaceIsolation::DedicatedWorktree;
+
+                        self.task_registry.complete_attempt_with_awaiting_apply(
                             &task_id,
                             attempt,
                             Some(output.clone()),
                             Some(tokens),
                             Some(VerificationResult::pass()),
+                            needs_apply,
                         );
-                        self.event_stream.emit(RuntimeEvent::TaskCompleted {
-                            run_id: self.run_id.clone(),
-                            task_id,
-                            output: Some(output),
-                            tokens_used: tokens,
-                            duration_ms,
-                        });
+                        if needs_apply {
+                            let worktree_path = self
+                                .task_registry
+                                .status(&task_id)
+                                .and_then(|status| status.worker_metadata)
+                                .and_then(|metadata| metadata.worktree_path);
+                            self.event_stream.emit(RuntimeEvent::TaskAwaitingApply {
+                                run_id: self.run_id.clone(),
+                                task_id,
+                                worktree_path,
+                                patch_id: None,
+                            });
+                        } else {
+                            self.event_stream.emit(RuntimeEvent::TaskCompleted {
+                                run_id: self.run_id.clone(),
+                                task_id,
+                                output: Some(output),
+                                tokens_used: tokens,
+                                duration_ms,
+                            });
+                        }
                         return;
                     }
                 }
@@ -767,11 +1119,32 @@ impl Scheduler {
                         None
                     };
 
-                    let should_retry = self.config.verification_policy.should_retry(
-                        attempt,
-                        &error_class,
-                        task.max_retries,
-                    );
+                    let external_disconnect = task.target.is_acp()
+                        && error_class == crate::verification::ErrorClass::TransientNetwork;
+                    let live_status = self.task_registry.status(&task_id);
+                    let reconnectable = live_status.as_ref().is_some_and(|status| {
+                        status.worker_metadata.as_ref().is_some_and(|metadata| {
+                            metadata.capabilities.can_resume
+                                || metadata.capabilities.can_load_session
+                        })
+                    });
+                    let disconnected_session = live_status
+                        .as_ref()
+                        .and_then(|status| status.active_session_id.clone());
+                    let should_retry = if external_disconnect {
+                        (disconnected_session.is_none() || reconnectable)
+                            && attempt
+                                <= task
+                                    .max_retries
+                                    .map(u32::from)
+                                    .unwrap_or(self.config.acp_workers.reconnect_attempts)
+                    } else {
+                        self.config.verification_policy.should_retry(
+                            attempt,
+                            &error_class,
+                            task.max_retries,
+                        )
+                    };
 
                     self.task_registry.fail_attempt_with_usage(
                         &task_id,
@@ -788,8 +1161,41 @@ impl Scheduler {
                         retryable: should_retry,
                     });
 
+                    if external_disconnect && disconnected_session.is_some() && !reconnectable {
+                        self.task_registry.set_state(&task_id, TaskState::Parked);
+                        let reason = crate::worker::StructuredWaitReason::AwaitingUserInput {
+                            question: "Worker disconnected and cannot resume. Restart this attempt or cancel the task.".to_string(),
+                        };
+                        self.task_registry
+                            .set_wait_reason(&task_id, Some(reason.clone()));
+                        self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+                            run_id: self.run_id.clone(),
+                            task_id: task_id.clone(),
+                            wait_reason: Some(reason),
+                        });
+                        return;
+                    }
+
                     if should_retry {
-                        let delay = self.config.verification_policy.backoff_duration(attempt);
+                        if let Some(reconnect_session) = disconnected_session {
+                            session_id = Some(reconnect_session);
+                        }
+                        let delay = if external_disconnect {
+                            self.config.acp_workers.reconnect_delay(attempt)
+                        } else {
+                            self.config.verification_policy.backoff_duration(attempt)
+                        };
+                        let reason = crate::worker::StructuredWaitReason::AwaitingRetryBackoff {
+                            next_attempt: attempt.saturating_add(1),
+                            delay_ms: Some(delay.as_millis() as u64),
+                        };
+                        self.task_registry
+                            .set_wait_reason(&task_id, Some(reason.clone()));
+                        self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+                            run_id: self.run_id.clone(),
+                            task_id: task_id.clone(),
+                            wait_reason: Some(reason),
+                        });
                         self.event_stream.emit(RuntimeEvent::TaskRetrying {
                             run_id: self.run_id.clone(),
                             task_id: task_id.clone(),
@@ -809,6 +1215,7 @@ impl Scheduler {
                         for blocked in blocked_tasks {
                             self.task_registry.set_state(&blocked, TaskState::Blocked);
                         }
+                        self.cleanup_terminal_worktree(&task_id, attempt).await;
                         return;
                     }
                 }
@@ -823,6 +1230,23 @@ impl Scheduler {
         timeout_secs: Option<u64>,
     ) -> Result<crate::executor::TaskExecutionOutput> {
         let execution = self.executor.execute(context);
+        self.run_controlled(
+            execution,
+            task_token,
+            timeout_secs.map(std::time::Duration::from_secs),
+        )
+        .await
+    }
+
+    async fn run_controlled<T>(
+        &self,
+        execution: impl std::future::Future<Output = Result<T>>,
+        task_token: &crate::cancellation::CancellationToken,
+        timeout_duration: Option<std::time::Duration>,
+    ) -> Result<T> {
+        if task_token.is_cancelled() {
+            anyhow::bail!("task execution cancelled");
+        }
         let cancellation = task_token.cancelled();
         futures::pin_mut!(execution, cancellation);
         let controlled_execution = async {
@@ -834,7 +1258,7 @@ impl Scheduler {
             }
         };
 
-        let Some(timeout_secs) = timeout_secs else {
+        let Some(timeout_duration) = timeout_duration else {
             return controlled_execution.await;
         };
         let background_executor = self
@@ -842,14 +1266,15 @@ impl Scheduler {
             .background_executor
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("task timeout requires a background executor"))?;
-        let timeout = background_executor.timer(std::time::Duration::from_secs(timeout_secs));
+        let timeout = background_executor.timer(timeout_duration);
         futures::pin_mut!(controlled_execution, timeout);
         match futures::future::select(controlled_execution, timeout).await {
             futures::future::Either::Left((result, _)) => result,
             futures::future::Either::Right(((), _)) => {
                 task_token.cancel(crate::cancellation::CancellationReason::Timeout);
                 Err(anyhow::anyhow!(
-                    "task timed out after {timeout_secs} seconds"
+                    "task timed out after {} seconds",
+                    timeout_duration.as_secs_f64()
                 ))
             }
         }

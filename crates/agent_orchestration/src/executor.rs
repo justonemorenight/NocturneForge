@@ -4,6 +4,7 @@ use crate::cancellation::CancellationToken;
 use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::OrchestrationTask;
 use crate::verification::VerificationResult;
+use crate::worker::WorkerMetadata;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use futures::future::LocalBoxFuture;
@@ -18,12 +19,29 @@ pub struct TaskExecutionContext {
     pub cancellation_token: CancellationToken,
     pub correlation_id: CorrelationId,
     pub existing_session_id: Option<acp::SessionId>,
+    /// Metadata retained from the preceding attempt, used to reconnect a
+    /// worker to the same managed workspace without trusting model output.
+    pub previous_worker_metadata: Option<WorkerMetadata>,
+    /// Bounded, verified outputs from completed dependency tasks. Executors
+    /// pass these to workers so they can reuse prior work without recrawling.
+    pub dependency_inputs: Vec<DependencyInput>,
+    pub worker_config: crate::worker::AcpWorkerRuntimeConfig,
+    pub background_executor: Option<gpui::BackgroundExecutor>,
     /// Run-level identifier for correlation and telemetry.
     pub run_id: RunId,
     /// Budget limits copied from the task definition.
     pub budget: ExecutionBudget,
     /// Telemetry reporter for tool calls, tokens, phases, and progress.
     pub reporter: TaskExecutionReporter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyInput {
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
 }
 
 /// Output produced upon completing a task execution attempt.
@@ -36,6 +54,8 @@ pub struct TaskExecutionOutput {
     pub tokens_used: Option<u64>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_metadata: Option<WorkerMetadata>,
 }
 
 impl TaskExecutionOutput {
@@ -45,6 +65,7 @@ impl TaskExecutionOutput {
             output: output.into(),
             tokens_used: None,
             artifacts: Vec::new(),
+            worker_metadata: None,
         }
     }
 
@@ -60,6 +81,11 @@ impl TaskExecutionOutput {
 
     pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Self {
         self.artifacts = artifacts;
+        self
+    }
+
+    pub fn with_worker_metadata(mut self, metadata: WorkerMetadata) -> Self {
+        self.worker_metadata = Some(metadata);
         self
     }
 }

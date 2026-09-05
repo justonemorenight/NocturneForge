@@ -281,8 +281,9 @@ pub(crate) struct Conversation {
     threads: HashMap<acp::SessionId, Entity<AcpThread>>,
     permission_requests: IndexMap<acp::SessionId, Vec<acp::ToolCallId>>,
     elicitation_requests: IndexMap<acp::SessionId, Vec<ElicitationEntryId>>,
-    subscriptions: Vec<Subscription>,
+    subscriptions: HashMap<acp::SessionId, Subscription>,
     updated_at: Option<Instant>,
+    orchestration_workers: HashSet<acp::SessionId>,
 }
 
 impl Conversation {
@@ -342,8 +343,14 @@ impl Conversation {
                 }
             }
         });
-        self.subscriptions.push(subscription);
+        self.subscriptions.insert(session_id.clone(), subscription);
         self.threads.insert(session_id, thread);
+    }
+
+    fn register_orchestration_worker(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
+        self.orchestration_workers
+            .insert(thread.read(cx).session_id().clone());
+        self.register_thread(thread, cx);
     }
 
     pub fn permission_options_for_tool_call<'a>(
@@ -389,13 +396,32 @@ impl Conversation {
             .iter()
             .filter_map(|(session_id, tool_call_ids)| {
                 let thread = self.threads.get(session_id)?;
-                if thread.read(cx).parent_session_id().is_some() && !tool_call_ids.is_empty() {
+                if (thread.read(cx).parent_session_id().is_some()
+                    || self.orchestration_workers.contains(session_id))
+                    && !tool_call_ids.is_empty()
+                {
                     Some((session_id.clone(), tool_call_ids.len()))
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    pub fn orchestration_worker_label(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<SharedString> {
+        if !self.orchestration_workers.contains(session_id) {
+            return None;
+        }
+        Some(
+            self.threads
+                .get(session_id)
+                .and_then(|thread| thread.read(cx).title())
+                .unwrap_or_else(|| "ACP worker".into()),
+        )
     }
 
     /// Returns the first pending tool call request for exactly `session_id`.
@@ -634,6 +660,69 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
+    pub(crate) fn register_orchestration_worker_thread(
+        &mut self,
+        thread: Entity<AcpThread>,
+        reporter: agent_orchestration::TaskExecutionReporter,
+        retention: std::time::Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation) = self.as_connected().map(|state| state.conversation.clone()) else {
+            return;
+        };
+        let session_id = thread.read(cx).session_id().clone();
+        let thread_entity_id = thread.entity_id();
+        conversation.update(cx, |conversation, cx| {
+            conversation.register_orchestration_worker(thread.clone(), cx)
+        });
+        let view = self.new_thread_view(thread, conversation, false, None, window, cx);
+        if let Some(connected) = self.as_connected_mut() {
+            connected.threads.insert(session_id.clone(), view);
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(retention).await;
+                if reporter.has_live_attempt() {
+                    continue;
+                }
+                let retained = this.update(cx, |this, cx| {
+                    let Some(connected) = this.as_connected_mut() else {
+                        return false;
+                    };
+                    if connected.active_id.as_ref() == Some(&session_id) {
+                        return true;
+                    }
+                    let removed = connected.conversation.update(cx, |conversation, _| {
+                        if conversation
+                            .threads
+                            .get(&session_id)
+                            .is_none_or(|thread| thread.entity_id() != thread_entity_id)
+                        {
+                            return false;
+                        }
+                        conversation.threads.remove(&session_id);
+                        conversation.subscriptions.remove(&session_id);
+                        conversation.orchestration_workers.remove(&session_id);
+                        conversation.permission_requests.shift_remove(&session_id);
+                        conversation.elicitation_requests.shift_remove(&session_id);
+                        true
+                    });
+                    if removed {
+                        connected.threads.remove(&session_id);
+                        cx.notify();
+                    }
+                    false
+                });
+                if !retained.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub fn has_auth_methods(&self) -> bool {
         self.as_connected().map_or(false, |connected| {
             !connected.connection.auth_methods().is_empty()

@@ -379,6 +379,8 @@ struct ClientContext {
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
     session_notification_state: Rc<SessionNotificationState>,
+    read_only: bool,
+    terminal_sandbox_wrap: Option<acp_thread::SandboxWrap>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -500,7 +502,11 @@ pub struct AcpConnection {
     agent_capabilities: acp::AgentCapabilities,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
-    child: Option<Child>,
+    child: RefCell<Option<Child>>,
+    _process_sandbox: Option<sandbox::Sandbox>,
+    worker_process_owned: bool,
+    client_read_only: bool,
+    terminal_sandbox_wrap: Option<acp_thread::SandboxWrap>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -740,6 +746,9 @@ pub async fn connect(
     agent_server_store: WeakEntity<AgentServerStore>,
     default_mode: Option<acp::SessionModeId>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
+    process_sandbox_policy: Option<sandbox::SandboxPolicy>,
+    client_read_only: bool,
+    terminal_sandbox_wrap: Option<acp_thread::SandboxWrap>,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn AgentConnection>> {
     let conn = AcpConnection::stdio(
@@ -749,6 +758,9 @@ pub async fn connect(
         agent_server_store,
         default_mode,
         default_config_options,
+        process_sandbox_policy,
+        client_read_only,
+        terminal_sandbox_wrap,
         cx,
     )
     .await?;
@@ -859,7 +871,7 @@ fn connect_client_future(
         )
 }
 
-fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
+fn client_capabilities_for_agent(agent_id: &AgentId, read_only: bool) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
@@ -872,7 +884,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
     acp::ClientCapabilities::new()
         .fs(acp::FileSystemCapabilities::new()
             .read_text_file(true)
-            .write_text_file(true))
+            .write_text_file(!read_only))
         .terminal(true)
         .auth(acp::AuthCapabilities::new().terminal(true))
         .session(
@@ -906,6 +918,9 @@ impl AcpConnection {
         agent_server_store: WeakEntity<AgentServerStore>,
         default_mode: Option<acp::SessionModeId>,
         default_config_options: HashMap<String, AgentConfigOptionValue>,
+        process_sandbox_policy: Option<sandbox::SandboxPolicy>,
+        client_read_only: bool,
+        terminal_sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
         let root_dir = project.read_with(cx, |project, cx| {
@@ -916,6 +931,10 @@ impl AcpConnection {
                 .cloned()
         });
         let original_command = command.clone();
+        // A worker connection always receives a terminal sandbox wrapper from
+        // the orchestration host. Keep ownership explicit so process cleanup
+        // does not depend on whether a process-level sandbox was configured.
+        let worker_process_owned = terminal_sandbox_wrap.is_some();
         let (path, args, env) = project
             .read_with(cx, |project, cx| {
                 project.remote_client().and_then(|client| {
@@ -954,18 +973,51 @@ impl AcpConnection {
         };
 
         let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
+        let cwd = project.read_with(cx, |project, _cx| {
+            project.is_local().then(|| root_dir.clone()).flatten()
+        });
         let mut child = builder.build_std_command(Some(path.clone()), &args);
         child.envs(env.clone());
-        if let Some(cwd) = project.read_with(cx, |project, _cx| {
-            if project.is_local() {
-                root_dir.as_ref()
-            } else {
-                None
-            }
-        }) {
+        if let Some(cwd) = &cwd {
             child.current_dir(cwd);
         }
-        let mut child = Child::spawn(child, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
+        let mut process_sandbox = process_sandbox_policy
+            .map(sandbox::Sandbox::new)
+            .transpose()
+            .context("failed to initialize ACP worker sandbox")?;
+        if let Some(sandbox) = process_sandbox.as_mut() {
+            let command = sandbox::CommandAndArgs {
+                program: child.get_program().to_string_lossy().into_owned(),
+                args: child
+                    .get_args()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect(),
+                env: env
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                cwd,
+            };
+            let wrapped = sandbox
+                .wrap(&command)
+                .await
+                .context("failed to wrap ACP worker process in sandbox")?;
+            child = std::process::Command::new(&wrapped.program);
+            child.args(&wrapped.args).envs(&wrapped.env);
+            if let Some(cwd) = &wrapped.cwd {
+                child.current_dir(cwd);
+            }
+        }
+        let mut pending_child = PendingAcpProcess(Some(Child::spawn(
+            child,
+            Stdio::piped(),
+            Stdio::piped(),
+            Stdio::piped(),
+        )?));
+        let child = pending_child
+            .0
+            .as_mut()
+            .context("ACP process was not created")?;
 
         let stdout = child.stdout.take().context("Failed to take stdout")?;
         let stdin = child.stdin.take().context("Failed to take stdin")?;
@@ -1087,6 +1139,8 @@ impl AcpConnection {
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             session_notification_state: session_notification_state.clone(),
+            read_only: client_read_only,
+            terminal_sandbox_wrap: terminal_sandbox_wrap.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -1100,7 +1154,7 @@ impl AcpConnection {
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(&agent_id))
+                    .client_capabilities(client_capabilities_for_agent(&agent_id, client_read_only))
                     .client_info(
                         acp::Implementation::new("zed", version)
                             .title(release_channel.map(ToOwned::to_owned)),
@@ -1220,7 +1274,11 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            child: Some(child),
+            child: RefCell::new(pending_child.0.take()),
+            _process_sandbox: process_sandbox,
+            worker_process_owned,
+            client_read_only,
+            terminal_sandbox_wrap,
         })
     }
 
@@ -1258,7 +1316,11 @@ impl AcpConnection {
             request_elicitations,
             defaults,
             claude_config_dir: None,
-            child: None,
+            child: RefCell::new(None),
+            _process_sandbox: None,
+            worker_process_owned: false,
+            client_read_only: false,
+            terminal_sandbox_wrap: None,
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
@@ -1550,6 +1612,8 @@ impl AcpConnection {
             session_list: Rc::new(RefCell::new(self.session_list.clone())),
             request_elicitations: self.request_elicitations.clone(),
             session_notification_state: self.session_notification_state.clone(),
+            read_only: self.client_read_only,
+            terminal_sandbox_wrap: self.terminal_sandbox_wrap.clone(),
         };
         for notification in buffered {
             handle_session_notification(notification, cx, &ctx);
@@ -1804,9 +1868,19 @@ fn emit_load_error_to_all_sessions(
     }
 }
 
+struct PendingAcpProcess(Option<Child>);
+
+impl Drop for PendingAcpProcess {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            child.kill().log_err();
+        }
+    }
+}
+
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
+        if let Some(child) = self.child.get_mut().as_mut() {
             child.kill().log_err();
         }
     }
@@ -1865,6 +1939,19 @@ fn meta_terminal_auth_task(
 }
 
 impl AgentConnection for AcpConnection {
+    fn stop_worker_process(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.worker_process_owned,
+            "refusing to stop a shared ACP connection"
+        );
+        let mut child = self.child.borrow_mut();
+        if let Some(process) = child.as_mut() {
+            process.kill()?;
+        }
+        child.take();
+        Ok(())
+    }
+
     fn agent_id(&self) -> AgentId {
         self.id.clone()
     }
@@ -2864,6 +2951,8 @@ pub mod test_support {
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             session_notification_state: session_notification_state.clone(),
+            read_only: false,
+            terminal_sandbox_wrap: None,
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -3000,6 +3089,39 @@ mod tests {
     use feature_flags::FeatureFlag as _;
     use settings::Settings as _;
 
+    #[test]
+    fn worker_write_paths_reject_escape_and_protected_metadata() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().join("workspace");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".git"))?;
+        std::fs::create_dir(&outside)?;
+        let policy = acp_thread::SandboxWrap {
+            writable_paths: vec![workspace.clone()],
+            protected_paths: vec![workspace.join(".git")],
+            ..Default::default()
+        };
+        assert!(validate_worker_write_path(&workspace.join("new/file.rs"), &policy).is_ok());
+        assert!(validate_worker_write_path(&outside.join("file.rs"), &policy).is_err());
+        assert!(
+            validate_worker_write_path(&workspace.join("../outside/file.rs"), &policy).is_err()
+        );
+        assert!(validate_worker_write_path(&workspace.join(".git/config"), &policy).is_err());
+        assert!(validate_worker_write_path(std::path::Path::new("relative.rs"), &policy).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, workspace.join("escape"))?;
+            std::os::unix::fs::symlink(outside.join("missing"), workspace.join("dangling"))?;
+            assert!(
+                validate_worker_write_path(&workspace.join("escape/file.rs"), &policy).is_err()
+            );
+            assert!(
+                validate_worker_write_path(&workspace.join("dangling/file.rs"), &policy).is_err()
+            );
+        }
+        Ok(())
+    }
+
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             let mut settings_store = SettingsStore::test(cx);
@@ -3014,7 +3136,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         init_feature_flags_test(cx);
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
         let elicitation = capabilities
             .elicitation
             .expect("elicitation should always be advertised");
@@ -3280,7 +3402,7 @@ mod tests {
 
     #[test]
     fn cursor_client_capabilities_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID));
+        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID), false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -3295,7 +3417,7 @@ mod tests {
 
     #[test]
     fn non_cursor_client_capabilities_do_not_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -3305,7 +3427,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_include_boolean_config_options() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
 
         assert!(
             capabilities
@@ -4066,6 +4188,9 @@ mod tests {
             agent_server_store,
             None,
             HashMap::default(),
+            None,
+            false,
+            None,
             &mut async_cx,
         )
         .fuse();
@@ -4258,6 +4383,8 @@ mod tests {
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
             session_notification_state: session_notification_state.clone(),
+            read_only: false,
+            terminal_sandbox_wrap: None,
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -5027,6 +5154,21 @@ fn handle_write_text_file(
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
+    if ctx.read_only {
+        return respond_err(
+            responder,
+            acp::Error::invalid_params()
+                .data("write_text_file is disabled for this read-only ACP worker"),
+        );
+    }
+    if let Some(policy) = &ctx.terminal_sandbox_wrap
+        && let Err(error) = validate_worker_write_path(&args.path, policy)
+    {
+        return respond_err(
+            responder,
+            acp::Error::invalid_params().data(error.to_string()),
+        );
+    }
     let thread = match session_thread(ctx, &args.session_id) {
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
@@ -5054,6 +5196,63 @@ fn handle_write_text_file(
         }
     })
     .detach();
+}
+
+fn validate_worker_write_path(
+    path: &std::path::Path,
+    policy: &acp_thread::SandboxWrap,
+) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "ACP worker writes require an absolute path"
+    );
+    anyhow::ensure!(
+        !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "ACP worker write path cannot contain parent traversal"
+    );
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    let path = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                break resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not a missing file: following it later
+                // could redirect the write outside the approved workspace.
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(ancestor).is_err(),
+                    "ACP worker cannot write through a dangling symlink"
+                );
+                missing.push(ancestor.file_name().context("invalid worker write path")?);
+                ancestor = ancestor
+                    .parent()
+                    .context("worker write path has no existing root")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let writable = policy
+        .writable_paths
+        .iter()
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| path.starts_with(root)));
+    anyhow::ensure!(
+        writable,
+        "ACP worker write is outside its managed workspace"
+    );
+    for protected in &policy.protected_paths {
+        let protected = std::fs::canonicalize(protected)?;
+        anyhow::ensure!(
+            !path.starts_with(protected),
+            "ACP worker cannot write protected workspace metadata"
+        );
+    }
+    Ok(())
 }
 
 fn handle_read_text_file(
@@ -5285,39 +5484,24 @@ fn handle_create_terminal(
         Ok(t) => t,
         Err(e) => return respond_err(responder, e),
     };
-    let project = match thread
-        .read_with(cx, |thread, _cx| thread.project().clone())
-        .map_err(acp::Error::from)
-    {
-        Ok(p) => p,
-        Err(e) => return respond_err(responder, e),
-    };
+    let terminal_sandbox_wrap = ctx.terminal_sandbox_wrap.clone();
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
-            let terminal_entity = acp_thread::create_terminal_entity(
-                args.command.clone(),
-                &args.args,
-                args.env
-                    .into_iter()
-                    .map(|env| (env.name, env.value))
-                    .collect(),
-                args.cwd.clone(),
-                &project,
-                cx,
-            )
-            .await?;
-
-            let terminal_entity = thread.update(cx, |thread, cx| {
-                thread.register_terminal_created(
-                    acp::TerminalId::new(uuid::Uuid::new_v4().to_string()),
-                    format!("{} {}", args.command, args.args.join(" ")),
-                    args.cwd.clone(),
-                    args.output_byte_limit,
-                    terminal_entity,
-                    cx,
-                )
-            })?;
+            let terminal_task = thread
+                .update(cx, |thread, cx| {
+                    thread.create_terminal(
+                        args.command,
+                        args.args,
+                        args.env,
+                        args.cwd,
+                        args.output_byte_limit,
+                        terminal_sandbox_wrap,
+                        cx,
+                    )
+                })
+                .map_err(acp::Error::from)?;
+            let terminal_entity = terminal_task.await?;
             let terminal_id = terminal_entity.read_with(cx, |terminal, _| terminal.id().clone());
             Ok(terminal_id)
         }

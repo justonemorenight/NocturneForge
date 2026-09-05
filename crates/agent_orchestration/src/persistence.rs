@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PERSISTENCE_SCHEMA_VERSION: u32 = 2;
+pub const PERSISTENCE_SCHEMA_VERSION: u32 = 3;
 
 /// A completely serializable, database-safe snapshot of an orchestration run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,14 +157,63 @@ impl PersistedRun {
         )
     }
 
-    /// Prepares a non-terminal snapshot for resume by marking unfinished tasks as interrupted.
-    pub fn for_resume(mut self) -> Self {
-        if !self.state.is_terminal() {
-            self.state = RunState::Interrupted;
+    /// Prepares a non-terminal snapshot for resume by reconciling unfinished tasks.
+    pub fn for_resume(self) -> Self {
+        self.reconcile_on_restart()
+    }
+
+    /// Reconciles task and run states upon restart or reload:
+    /// - Active tasks (Running, Verifying, Repairing, Retrying) lack live execution handles.
+    /// - If worker capabilities allow session resume, tasks are parked awaiting reconnect.
+    /// - Otherwise, tasks are marked Interrupted with an explicit message requiring a restart attempt.
+    /// - Non-terminal runs are set to Interrupted or AwaitingApply.
+    pub fn reconcile_on_restart(mut self) -> Self {
+        if !self.state.is_terminal() && !matches!(self.state, RunState::Proposed | RunState::Paused)
+        {
+            let has_runnable_work = self.task_statuses.iter().any(|status| {
+                !status.state.is_terminal()
+                    && !matches!(status.state, TaskState::AwaitingApply | TaskState::Blocked)
+            });
+            let has_awaiting_apply = self
+                .task_statuses
+                .iter()
+                .any(|status| status.state == TaskState::AwaitingApply);
+            self.state = if !has_runnable_work && has_awaiting_apply {
+                RunState::AwaitingApply
+            } else {
+                RunState::Interrupted
+            };
         }
         for status in &mut self.task_statuses {
-            if !status.state.is_terminal() {
-                status.state = TaskState::Interrupted;
+            if status.state.is_active() {
+                let can_resume = status
+                    .worker_metadata
+                    .as_ref()
+                    .map(|m| m.capabilities.can_resume || m.capabilities.can_load_session)
+                    .unwrap_or(false);
+                if can_resume && status.active_session_id.is_some() {
+                    status.state = TaskState::Parked;
+                    status.wait_reason = Some(
+                        crate::worker::StructuredWaitReason::AwaitingWorkerReconnect {
+                            worker: status.target.clone(),
+                            attempt: status.current_attempt,
+                        },
+                    );
+                } else {
+                    status.state = if status.target.is_acp() {
+                        TaskState::Parked
+                    } else {
+                        TaskState::Interrupted
+                    };
+                    status.latest_error = Some(
+                        "task was running when process terminated; worker does not support resume, restart attempt required"
+                            .to_string(),
+                    );
+                    status.wait_reason = status.target.is_acp().then(|| crate::worker::StructuredWaitReason::AwaitingUserInput {
+                        question: "Worker cannot resume after restart. Restart this attempt or cancel the task.".to_string(),
+                    });
+                }
+                status.updated_at = Utc::now();
             }
         }
         self.updated_at = Utc::now();

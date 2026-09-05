@@ -6,13 +6,42 @@ use crate::ids::{RunId, TaskId};
 use crate::persistence::PersistedRun;
 use crate::plan_graph::{OrchestrationPlan, PlanGraph};
 use crate::scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
-use crate::state::{RunState, TaskStatus};
+use crate::state::{RunState, TaskState, TaskStatus};
 use crate::task_registry::TaskRegistry;
+use crate::worktree_isolation::IsolatedWorktree;
 use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::Utc;
+use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+
+struct PatchOperationGuard {
+    task_id: TaskId,
+    active: Arc<Mutex<HashSet<TaskId>>>,
+}
+
+impl PatchOperationGuard {
+    fn acquire(task_id: &TaskId, active: &Arc<Mutex<HashSet<TaskId>>>) -> Result<Self> {
+        if !active.lock().insert(task_id.clone()) {
+            anyhow::bail!(
+                "a patch operation is already running for task '{}'",
+                task_id
+            );
+        }
+        Ok(Self {
+            task_id: task_id.clone(),
+            active: active.clone(),
+        })
+    }
+}
+
+impl Drop for PatchOperationGuard {
+    fn drop(&mut self) {
+        self.active.lock().remove(&self.task_id);
+    }
+}
 
 /// Global runtime configuration and kill-switch controls.
 #[derive(Clone)]
@@ -25,6 +54,8 @@ pub struct RuntimeConfig {
     pub foreground_executor: Option<gpui::ForegroundExecutor>,
     /// Optional GPUI background executor.
     pub background_executor: Option<gpui::BackgroundExecutor>,
+    /// Feature flag enabling delegation to ACP agents (defaults to false).
+    pub enable_acp_delegation: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -34,6 +65,7 @@ impl Default for RuntimeConfig {
             scheduler: SchedulerConfig::default(),
             foreground_executor: None,
             background_executor: None,
+            enable_acp_delegation: false,
         }
     }
 }
@@ -60,6 +92,7 @@ pub struct RunHandle {
     event_stream: RuntimeEventStream,
     control: RuntimeControl,
     policy: AgentExecutionPolicy,
+    patch_operations: Arc<Mutex<HashSet<TaskId>>>,
 }
 
 impl RunHandle {
@@ -116,10 +149,28 @@ impl RunHandle {
     }
 
     pub fn cancel(&self, reason: CancellationReason) {
-        if !matches!(self.control.transition(RunState::Cancelled), Ok(true)) {
-            return;
+        match self.control.transition(RunState::Cancelled) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!("failed to cancel orchestration run: {error}");
+                return;
+            }
         }
         self.cancellation_tree.cancel_run(reason.clone());
+        for status in self.task_registry.all_statuses() {
+            if !status.state.is_terminal()
+                && !self.patch_operations.lock().contains(&status.task_id)
+            {
+                self.task_registry
+                    .set_state(&status.task_id, TaskState::Cancelled);
+                self.event_stream.emit(RuntimeEvent::TaskCancelled {
+                    run_id: self.run_id.clone(),
+                    task_id: status.task_id,
+                    reason: reason.description().to_string(),
+                });
+            }
+        }
         self.event_stream.emit(RuntimeEvent::RunCancelled {
             run_id: self.run_id.clone(),
             reason: reason.description().to_string(),
@@ -133,11 +184,26 @@ impl RunHandle {
     pub fn cancel_task(&self, task_id: &TaskId, reason: CancellationReason) {
         if self
             .task_status(task_id)
-            .is_some_and(|status| status.state.is_terminal())
+            .is_none_or(|status| status.state.is_terminal())
         {
             return;
         }
         self.cancellation_tree.cancel_task(task_id, reason.clone());
+        if self
+            .task_status(task_id)
+            .is_some_and(|status| !status.state.is_active())
+            && !self.patch_operations.lock().contains(task_id)
+        {
+            self.task_registry.set_state(task_id, TaskState::Cancelled);
+            for blocked in self.plan_graph.blocked_by_failure(task_id) {
+                self.task_registry.set_state(&blocked, TaskState::Blocked);
+            }
+            if self.control.state() == RunState::AwaitingApply {
+                if let Err(error) = self.control.transition(RunState::Running) {
+                    log::warn!("failed to wake scheduler after task cancellation: {error}");
+                }
+            }
+        }
         self.event_stream.emit(RuntimeEvent::TaskCancelled {
             run_id: self.run_id.clone(),
             task_id: task_id.clone(),
@@ -146,27 +212,402 @@ impl RunHandle {
     }
 
     pub fn pause(&self) {
-        if self.control.transition(RunState::Paused).unwrap_or(false) {
-            self.event_stream.emit(RuntimeEvent::RunPaused {
-                run_id: self.run_id.clone(),
-            });
-            self.event_stream.emit(RuntimeEvent::RunStateChanged {
-                run_id: self.run_id.clone(),
-                state: RunState::Paused,
-            });
+        self.control.set_user_paused(true);
+        match self.control.transition(RunState::Paused) {
+            Ok(true) => {
+                self.event_stream.emit(RuntimeEvent::RunPaused {
+                    run_id: self.run_id.clone(),
+                });
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Paused,
+                });
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!("failed to pause orchestration run: {error}"),
         }
     }
 
     pub fn resume(&self) {
-        if self.control.transition(RunState::Running).unwrap_or(false) {
-            self.event_stream.emit(RuntimeEvent::RunResumed {
-                run_id: self.run_id.clone(),
-            });
-            self.event_stream.emit(RuntimeEvent::RunStateChanged {
-                run_id: self.run_id.clone(),
-                state: RunState::Running,
-            });
+        self.control.set_user_paused(false);
+        match self.control.transition(RunState::Running) {
+            Ok(true) => {
+                self.event_stream.emit(RuntimeEvent::RunResumed {
+                    run_id: self.run_id.clone(),
+                });
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Running,
+                });
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!("failed to resume orchestration run: {error}"),
         }
+    }
+
+    pub fn restart_task(&self, task_id: &TaskId) -> Result<bool> {
+        anyhow::ensure!(
+            !self.state().is_terminal(),
+            "cannot restart a task in a terminal run"
+        );
+        if !self.task_registry.restart_parked_task(task_id) {
+            return Ok(false);
+        }
+        self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            wait_reason: None,
+        });
+        if self.control.state() == RunState::Paused {
+            self.resume();
+        }
+        Ok(true)
+    }
+
+    pub async fn retry_cleanup(&self, task_id: &TaskId) -> Result<()> {
+        let status = self
+            .task_registry
+            .status(task_id)
+            .context("worker task not found")?;
+        anyhow::ensure!(
+            status.state.is_terminal(),
+            "worker must be terminal before cleanup"
+        );
+        let _operation = PatchOperationGuard::acquire(task_id, &self.patch_operations)?;
+        let metadata = status
+            .worker_metadata
+            .context("worker has no workspace metadata")?;
+        if let Some(path) = &metadata.worktree_path {
+            if std::path::Path::new(path).exists() {
+                let worktree = IsolatedWorktree::reopen_managed(
+                    path.into(),
+                    &self.run_id,
+                    task_id,
+                    status.current_attempt,
+                )
+                .await?;
+                worktree.cleanup(true).await?;
+            }
+        }
+        self.clear_worktree_metadata(task_id, metadata);
+        Ok(())
+    }
+
+    fn clear_worktree_metadata(
+        &self,
+        task_id: &TaskId,
+        mut metadata: crate::worker::WorkerMetadata,
+    ) {
+        metadata.worktree_path = None;
+        self.task_registry
+            .set_worker_metadata(task_id, metadata.clone());
+        self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            metadata,
+        });
+    }
+
+    /// Returns the unified diff for a task awaiting apply, if an isolated worktree was used.
+    pub async fn review_diff(&self, task_id: &TaskId) -> Result<Option<String>> {
+        let status = self
+            .task_registry
+            .status(task_id)
+            .ok_or_else(|| anyhow::anyhow!("task '{}' not found", task_id))?;
+        let _operation = PatchOperationGuard::acquire(task_id, &self.patch_operations)?;
+
+        let worktree_path = status
+            .worker_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.worktree_path.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("task '{}' has no managed worktree", task_id))?;
+        let worktree = IsolatedWorktree::reopen_managed(
+            std::path::PathBuf::from(worktree_path),
+            &self.run_id,
+            task_id,
+            status.current_attempt,
+        )
+        .await?;
+        Ok(Some(worktree.collect_diff().await?))
+    }
+
+    /// Applies changes from an `AwaitingApply` task into the workspace,
+    /// marking the task `Completed` and resuming the run if it was waiting.
+    pub async fn apply_task(&self, task_id: &TaskId) -> Result<bool> {
+        let Some(status) = self.task_registry.status(task_id) else {
+            anyhow::bail!("task '{}' not found", task_id);
+        };
+        let retrying_conflict = status.state == TaskState::Parked
+            && matches!(
+                &status.wait_reason,
+                Some(crate::worker::StructuredWaitReason::ApplyConflict { .. })
+                    | Some(crate::worker::StructuredWaitReason::WorktreeVerificationFailed { .. })
+                    | Some(
+                        crate::worker::StructuredWaitReason::PostApplyVerificationFailed {
+                            rollback_error: None,
+                            ..
+                        }
+                    )
+            );
+        if status.state != TaskState::AwaitingApply && !retrying_conflict {
+            return Ok(false);
+        }
+        let _operation = PatchOperationGuard::acquire(task_id, &self.patch_operations)?;
+        let worktree_path = status
+            .worker_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.worktree_path.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("task '{}' has no managed worktree to apply", task_id)
+            })?;
+        let worktree = IsolatedWorktree::reopen_managed(
+            std::path::PathBuf::from(worktree_path),
+            &self.run_id,
+            task_id,
+            status.current_attempt,
+        )
+        .await?;
+        let task = self.plan_graph.task(task_id);
+        let allowed_subpaths = task.and_then(|t| t.workspace_policy.allowed_subpaths.as_deref());
+        // Every isolated write gets a lightweight, deterministic baseline
+        // verifier even when a trusted plan builder did not provide a custom
+        // command. Custom commands still take precedence.
+        let verification_cmd = task
+            .and_then(|task| task.verification_command.as_deref())
+            .or_else(|| {
+                task.filter(|task| {
+                    task.workspace_policy.isolation
+                        == crate::worker::WorkspaceIsolation::DedicatedWorktree
+                })
+                .map(|_| "git diff --check")
+            });
+
+        // 1. Tier 2: Worktree verification (scope validation + optional verification command)
+        if let Err(error) = worktree
+            .verify_worktree(verification_cmd, allowed_subpaths)
+            .await
+        {
+            let error = format!("{error:#}");
+            self.task_registry.park_worktree_verification_failed(
+                task_id,
+                error.clone(),
+                worktree_path.clone(),
+            );
+            let wait_reason = crate::worker::StructuredWaitReason::WorktreeVerificationFailed {
+                error: error.clone(),
+                worktree_path: worktree_path.clone(),
+            };
+            self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                wait_reason: Some(wait_reason),
+            });
+            if self.control.state() == RunState::AwaitingApply
+                && self.control.transition(RunState::Paused)?
+            {
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Paused,
+                });
+            }
+            anyhow::bail!(
+                "worktree verification failed; patch was not applied and worktree was retained: {error}"
+            );
+        }
+
+        // 2. Prepare pre-apply snapshot for safe rollback
+        let pre_apply = worktree
+            .prepare_parent_apply(&worktree.repo_path, allowed_subpaths)
+            .await?;
+
+        // 3. Apply changes into parent repository
+        if let Err(error) = worktree
+            .apply_to_parent(&worktree.repo_path, allowed_subpaths)
+            .await
+        {
+            let error = format!("{error:#}");
+            self.task_registry
+                .park_apply_conflict(task_id, error.clone(), worktree_path.clone());
+            let wait_reason = crate::worker::StructuredWaitReason::ApplyConflict {
+                error: error.clone(),
+                worktree_path: worktree_path.clone(),
+            };
+            self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                wait_reason: Some(wait_reason),
+            });
+            if self.control.state() == RunState::AwaitingApply
+                && self.control.transition(RunState::Paused)?
+            {
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Paused,
+                });
+            }
+            anyhow::bail!("worker patch was not applied and its worktree was retained: {error}");
+        }
+
+        // 4. Tier 3: Parent post-apply verification
+        if let Err(error) =
+            IsolatedWorktree::verify_parent(&worktree.repo_path, verification_cmd).await
+        {
+            let error = format!("{error:#}");
+            let rollback_error = if let Err(rollback_error) = pre_apply.rollback().await {
+                log::error!(
+                    "failed to rollback parent checkout after verification failure for task '{}': {rollback_error}",
+                    task_id
+                );
+                Some(format!("{rollback_error:#}"))
+            } else {
+                None
+            };
+            self.task_registry.park_verification_failed(
+                task_id,
+                error.clone(),
+                worktree_path.clone(),
+                rollback_error.clone(),
+            );
+            let wait_reason = crate::worker::StructuredWaitReason::PostApplyVerificationFailed {
+                error: error.clone(),
+                worktree_path: worktree_path.clone(),
+                rollback_error: rollback_error.clone(),
+            };
+            self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                wait_reason: Some(wait_reason),
+            });
+            if self.control.state() == RunState::AwaitingApply
+                && self.control.transition(RunState::Paused)?
+            {
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Paused,
+                });
+            }
+            if let Some(rollback_error) = rollback_error {
+                anyhow::bail!(
+                    "parent post-apply verification failed and rollback did not complete; parent checkout requires inspection ({rollback_error}): {error}"
+                );
+            }
+            anyhow::bail!(
+                "parent post-apply verification failed; parent checkout was rolled back and worktree retained: {error}"
+            );
+        }
+        if !self.task_registry.mark_applied(task_id) {
+            anyhow::bail!(
+                "task '{}' changed state while its patch was being applied",
+                task_id
+            );
+        }
+        let cleanup_error = worktree.cleanup(true).await.err();
+        if cleanup_error.is_none()
+            && let Some(metadata) = status.worker_metadata.clone()
+        {
+            self.clear_worktree_metadata(task_id, metadata);
+        }
+        self.event_stream.emit(RuntimeEvent::TaskCompleted {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            output: self
+                .task_registry
+                .status(task_id)
+                .and_then(|s| s.latest_output),
+            tokens_used: self
+                .task_registry
+                .status(task_id)
+                .map(|s| s.tokens_used)
+                .unwrap_or(0),
+            duration_ms: 0,
+        });
+        if !self.control.is_user_paused()
+            && matches!(
+                self.control.state(),
+                RunState::AwaitingApply | RunState::Paused
+            )
+        {
+            if self.control.transition(RunState::Running)? {
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Running,
+                });
+            }
+        }
+        if let Some(error) = cleanup_error {
+            anyhow::bail!(
+                "task '{}' patch was applied, but its managed worktree could not be removed: {error}",
+                task_id
+            );
+        }
+        Ok(true)
+    }
+
+    /// Rejects changes from an `AwaitingApply` task, marking the task `Cancelled`,
+    /// marking its dependent tasks `Blocked`, and resuming the run if it was waiting.
+    pub async fn reject_task(&self, task_id: &TaskId, reason: Option<String>) -> Result<bool> {
+        let Some(status) = self.task_registry.status(task_id) else {
+            anyhow::bail!("task '{}' not found", task_id);
+        };
+        let parked_conflict = status.state == TaskState::Parked
+            && matches!(
+                &status.wait_reason,
+                Some(crate::worker::StructuredWaitReason::ApplyConflict { .. })
+                    | Some(crate::worker::StructuredWaitReason::WorktreeVerificationFailed { .. })
+                    | Some(crate::worker::StructuredWaitReason::PostApplyVerificationFailed { .. })
+            );
+        if status.state != TaskState::AwaitingApply && !parked_conflict {
+            return Ok(false);
+        }
+        let _operation = PatchOperationGuard::acquire(task_id, &self.patch_operations)?;
+        let worktree_path = status
+            .worker_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.worktree_path.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("task '{}' has no managed worktree to reject", task_id)
+            })?;
+        let worktree = IsolatedWorktree::reopen_managed(
+            std::path::PathBuf::from(worktree_path),
+            &self.run_id,
+            task_id,
+            status.current_attempt,
+        )
+        .await?;
+        worktree.cleanup(true).await?;
+        if let Some(metadata) = status.worker_metadata.clone() {
+            self.clear_worktree_metadata(task_id, metadata);
+        }
+        if !self.task_registry.mark_rejected(task_id, reason.clone()) {
+            anyhow::bail!(
+                "task '{}' changed state while its worktree was being removed",
+                task_id
+            );
+        }
+        let blocked = self.plan_graph.blocked_by_failure(task_id);
+        for blocked_id in blocked {
+            self.task_registry
+                .set_state(&blocked_id, TaskState::Blocked);
+        }
+        self.event_stream.emit(RuntimeEvent::TaskCancelled {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            reason: reason.unwrap_or_else(|| "task output rejected by user".to_string()),
+        });
+        if !self.control.is_user_paused()
+            && matches!(
+                self.control.state(),
+                RunState::AwaitingApply | RunState::Paused
+            )
+        {
+            if self.control.transition(RunState::Running)? {
+                self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                    run_id: self.run_id.clone(),
+                    state: RunState::Running,
+                });
+            }
+        }
+        Ok(true)
     }
 
     pub fn snapshot(&self) -> PersistedRun {
@@ -282,6 +723,7 @@ impl OrchestrationRuntime {
             event_stream,
             control: control.clone(),
             policy,
+            patch_operations: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -337,7 +779,16 @@ impl OrchestrationRuntime {
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
-        for status in persisted.task_statuses {
+        for mut status in persisted.task_statuses {
+            if status.state == TaskState::Parked
+                && matches!(
+                    status.wait_reason,
+                    Some(crate::worker::StructuredWaitReason::AwaitingWorkerReconnect { .. })
+                )
+            {
+                status.state = TaskState::Interrupted;
+                status.wait_reason = None;
+            }
             task_registry.restore_status(status);
         }
         for (task_id, attempts) in persisted.task_attempts {
@@ -370,6 +821,7 @@ impl OrchestrationRuntime {
             event_stream,
             control: control.clone(),
             policy: persisted_policy,
+            patch_operations: Arc::new(Mutex::new(HashSet::new())),
         };
         let (tx, rx) = futures::channel::oneshot::channel();
         let control_clone = control;

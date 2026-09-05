@@ -93,6 +93,9 @@ const MAX_ARTIFACTS: usize = 2_048;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 const MAX_TOTAL_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_INLINE_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_DEPENDENCY_OUTPUT_BYTES: usize = 32 * 1024;
+pub const MAX_DEPENDENCY_ARTIFACTS: usize = 16;
+pub const MAX_DEPENDENCY_CONTEXT_BYTES: usize = 128 * 1024;
 
 pub fn truncate_text(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -100,12 +103,21 @@ pub fn truncate_text(mut text: String, max_bytes: usize) -> String {
     }
 
     let original_bytes = text.len();
-    let mut truncate_at = max_bytes;
+    let suffix = format!("\n\n[truncated from {original_bytes} bytes]");
+    if suffix.len() >= max_bytes {
+        let mut truncate_at = max_bytes;
+        while !suffix.is_char_boundary(truncate_at) {
+            truncate_at = truncate_at.saturating_sub(1);
+        }
+        return suffix[..truncate_at].to_string();
+    }
+
+    let mut truncate_at = max_bytes - suffix.len();
     while !text.is_char_boundary(truncate_at) {
-        truncate_at -= 1;
+        truncate_at = truncate_at.saturating_sub(1);
     }
     text.truncate(truncate_at);
-    text.push_str(&format!("\n\n[truncated from {original_bytes} bytes]"));
+    text.push_str(&suffix);
     text
 }
 
@@ -173,5 +185,20 @@ impl ArtifactStore {
     pub fn clear(&self) {
         let mut list = self.artifacts.write();
         list.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_never_exceeds_the_requested_byte_limit() {
+        let value = "🌙".repeat(100);
+        for limit in 0..128 {
+            let truncated = truncate_text(value.clone(), limit);
+            assert!(truncated.len() <= limit);
+            assert!(truncated.is_char_boundary(truncated.len()));
+        }
     }
 }

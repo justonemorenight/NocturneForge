@@ -1,6 +1,7 @@
 use crate::budget::TaskBudgetState;
 use crate::ids::TaskId;
 use crate::verification::VerificationResult;
+use crate::worker::{StructuredWaitReason, WorkerMetadata, WorkerTarget};
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -25,6 +26,8 @@ pub enum RunState {
     Verifying,
     /// Repair phase addressing verification failures.
     Repairing,
+    /// Verification passed; awaiting review and apply into workspace.
+    AwaitingApply,
     /// Run finished successfully with all tasks completed and verified.
     Completed,
     /// Run halted due to an unrecoverable failure or policy limit.
@@ -57,6 +60,7 @@ impl RunState {
             (Self::Running, Self::Paused) => true,
             (Self::Running, Self::Verifying) => true,
             (Self::Running, Self::Repairing) => true,
+            (Self::Running, Self::AwaitingApply) => true,
             (Self::Running, Self::Completed) => true,
             (Self::Running, Self::Failed) => true,
             (Self::Running, Self::Cancelled) => true,
@@ -64,14 +68,21 @@ impl RunState {
             (Self::Paused, Self::Running) => true,
             (Self::Paused, Self::Cancelled) => true,
             (Self::Verifying, Self::Repairing) => true,
+            (Self::Verifying, Self::AwaitingApply) => true,
             (Self::Verifying, Self::Completed) => true,
             (Self::Verifying, Self::Failed) => true,
             (Self::Verifying, Self::Cancelled) => true,
             (Self::Repairing, Self::Running) => true,
             (Self::Repairing, Self::Verifying) => true,
+            (Self::Repairing, Self::AwaitingApply) => true,
             (Self::Repairing, Self::Completed) => true,
             (Self::Repairing, Self::Failed) => true,
             (Self::Repairing, Self::Cancelled) => true,
+            (Self::AwaitingApply, Self::Running) => true,
+            (Self::AwaitingApply, Self::Completed) => true,
+            (Self::AwaitingApply, Self::Failed) => true,
+            (Self::AwaitingApply, Self::Cancelled) => true,
+            (Self::AwaitingApply, Self::Paused) => true,
             (Self::Interrupted, Self::Approved) => true,
             (Self::Interrupted, Self::Running) => true,
             (Self::Interrupted, Self::Cancelled) => true,
@@ -101,6 +112,8 @@ pub enum TaskState {
     Retrying,
     /// Parked/idle waiting for external event or confirmation.
     Parked,
+    /// Output verified; waiting for review and apply into parent checkout.
+    AwaitingApply,
     /// Completed and verified successfully.
     Completed,
     /// Failed after exhausting allowed retries.
@@ -126,7 +139,11 @@ impl TaskState {
     pub fn is_waiting(&self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::WaitingDependency | Self::Blocked | Self::Parked
+            Self::Pending
+                | Self::WaitingDependency
+                | Self::Blocked
+                | Self::Parked
+                | Self::AwaitingApply
         )
     }
 }
@@ -195,6 +212,15 @@ pub struct TaskStatus {
     /// Rolling budget state: usage counters and stop reason, if stopped.
     #[serde(default)]
     pub budget_state: TaskBudgetState,
+    /// Target worker executing this task.
+    #[serde(default)]
+    pub target: WorkerTarget,
+    /// Metadata about the worker running the current attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_metadata: Option<WorkerMetadata>,
+    /// Structured wait reason when the task is not actively running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<StructuredWaitReason>,
 }
 
 impl TaskStatus {
@@ -214,6 +240,9 @@ impl TaskStatus {
             phase: None,
             current_tool: None,
             budget_state: TaskBudgetState::default(),
+            target: WorkerTarget::Native,
+            worker_metadata: None,
+            wait_reason: None,
         }
     }
 }

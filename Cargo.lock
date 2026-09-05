@@ -436,6 +436,7 @@ dependencies = [
  "release_channel",
  "remote",
  "reqwest_client",
+ "sandbox",
  "serde",
  "serde_json",
  "settings",

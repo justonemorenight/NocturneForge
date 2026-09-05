@@ -31,6 +31,9 @@ pub struct AgentServerDelegate {
     store: Entity<AgentServerStore>,
     new_version_available: Option<watch::Sender<Option<String>>>,
     loading_status: Option<watch::Sender<Option<String>>>,
+    process_sandbox_policy: Option<sandbox::SandboxPolicy>,
+    client_read_only: bool,
+    terminal_sandbox_wrap: Option<acp_thread::SandboxWrap>,
 }
 
 impl AgentServerDelegate {
@@ -43,7 +46,25 @@ impl AgentServerDelegate {
             store,
             new_version_available: new_version_tx,
             loading_status: loading_status_tx,
+            process_sandbox_policy: None,
+            client_read_only: false,
+            terminal_sandbox_wrap: None,
         }
+    }
+
+    pub fn with_process_sandbox_policy(mut self, policy: sandbox::SandboxPolicy) -> Self {
+        self.process_sandbox_policy = Some(policy);
+        self
+    }
+
+    pub fn with_worker_policy(
+        mut self,
+        read_only: bool,
+        terminal_sandbox_wrap: acp_thread::SandboxWrap,
+    ) -> Self {
+        self.client_read_only = read_only;
+        self.terminal_sandbox_wrap = Some(terminal_sandbox_wrap);
+        self
     }
 }
 

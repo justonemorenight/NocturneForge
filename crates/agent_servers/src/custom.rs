@@ -197,6 +197,9 @@ impl AgentServer for CustomAgentServer {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
+        let process_sandbox_policy = delegate.process_sandbox_policy.clone();
+        let client_read_only = delegate.client_read_only;
+        let terminal_sandbox_wrap = delegate.terminal_sandbox_wrap.clone();
         let agent_id = self.agent_id();
         let default_mode = self.default_mode(cx);
         let is_registry_agent = is_registry_agent(agent_id.clone(), cx);
@@ -283,6 +286,9 @@ impl AgentServer for CustomAgentServer {
                 store.clone(),
                 default_mode,
                 default_config_options,
+                process_sandbox_policy,
+                client_read_only,
+                terminal_sandbox_wrap,
                 cx,
             )
             .await?;

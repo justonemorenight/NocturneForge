@@ -5439,6 +5439,11 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     // Ensure empty threads are not saved, even if they get mutated.
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -5448,10 +5453,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5591,6 +5593,11 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -5601,10 +5608,8 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     let subagent_tool_input = SpawnAgentToolInput {
         label: "search task".to_string(),
         message: "search the codebase".to_string(),
-        agent_type: None,
-        session_id: None,
         tools: Some(vec!["read_file".to_string(), "grep".to_string()]),
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5655,10 +5660,9 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     let resume_tool_input = SpawnAgentToolInput {
         label: "follow-up task".to_string(),
         message: "keep searching".to_string(),
-        agent_type: None,
         session_id: Some(subagent_session_id.clone()),
         tools: Some(vec!["terminal".to_string()]),
-        tasks: None,
+        ..Default::default()
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -5731,6 +5735,11 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -5740,10 +5749,8 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
     let subagent_tool_input = SpawnAgentToolInput {
         label: "reasoning task".to_string(),
         message: "analyze this".to_string(),
-        agent_type: None,
-        session_id: None,
         tools: Some(vec![]),
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5824,6 +5831,11 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -5833,10 +5845,8 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
     let subagent_tool_input = SpawnAgentToolInput {
         label: "search task".to_string(),
         message: "search the codebase".to_string(),
-        agent_type: None,
-        session_id: None,
         tools: Some(vec!["read_file".to_string(), "not_a_real_tool".to_string()]),
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5939,6 +5949,11 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     // Ensure empty threads are not saved, even if they get mutated.
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -5948,10 +5963,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6091,6 +6103,11 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     // Ensure empty threads are not saved, even if they get mutated.
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -6100,10 +6117,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6224,6 +6238,11 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -6234,10 +6253,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     let subagent_tool_input = SpawnAgentToolInput {
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6300,10 +6316,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     let resume_tool_input = SpawnAgentToolInput {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
-        agent_type: None,
         session_id: Some(subagent_session_id.clone()),
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6542,6 +6556,11 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
     let deep_subagent_thread = cx.new(|cx| {
         let mut thread = Thread::new_subagent(&deep_parent_thread, None, cx);
         thread.add_default_tools(environment, cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
         thread
     });
 
@@ -6720,6 +6739,11 @@ async fn test_sibling_thread_tools_gated_by_feature_flag(cx: &mut TestAppContext
             cx,
         );
         thread.add_default_tools(environment, cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
         thread
     });
 
@@ -6882,6 +6906,11 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -6892,10 +6921,7 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7019,6 +7045,11 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
 
     thread.update(cx, |thread, cx| {
         thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
     });
     cx.run_until_parked();
 
@@ -7029,10 +7060,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
-        agent_type: None,
-        session_id: None,
-        tools: None,
-        tasks: None,
+        ..Default::default()
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),

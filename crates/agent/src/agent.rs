@@ -1,3 +1,4 @@
+pub mod acp_worker;
 mod db;
 mod legacy_thread;
 mod native_agent_server;
@@ -13,6 +14,7 @@ pub mod tool_guidance;
 mod tool_permissions;
 mod tools;
 
+pub use acp_worker::{AcpWorkerHandle, AcpWorkerHost, resolve_configured_agent};
 use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
@@ -433,6 +435,18 @@ pub trait SiblingThreadHost {
     ) -> Task<Result<SiblingThreadInfo>>;
 
     fn list_available_agents(&self, cx: &mut App) -> Result<AvailableAgents>;
+
+    fn create_orchestration_worker_host(
+        &self,
+        _agent_id: String,
+        _task: agent_orchestration::OrchestrationTask,
+        _context: agent_orchestration::TaskExecutionContext,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn agent_orchestration::WorkerHost>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "External orchestration workers are not supported by this host"
+        )))
+    }
 }
 
 pub struct NativeAgent {
@@ -3507,6 +3521,28 @@ impl ThreadEnvironment for NativeThreadEnvironment {
                 )
             })?;
         host.list_available_agents(cx)
+    }
+
+    fn create_orchestration_worker_host(
+        &self,
+        agent_id: String,
+        task: agent_orchestration::OrchestrationTask,
+        context: agent_orchestration::TaskExecutionContext,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn agent_orchestration::WorkerHost>>> {
+        let host = match self
+            .agent
+            .read_with(cx, |agent, _| agent.sibling_thread_host())
+        {
+            Ok(Some(host)) => host,
+            Ok(None) => {
+                return Task::ready(Err(anyhow!(
+                    "No external-worker host is registered. This usually means the agent panel hasn't been initialized in this workspace."
+                )));
+            }
+            Err(error) => return Task::ready(Err(error)),
+        };
+        host.create_orchestration_worker_host(agent_id, task, context, cx)
     }
 }
 

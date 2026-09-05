@@ -1,5 +1,8 @@
 use crate::events::{RuntimeEvent, RuntimeEventStream};
 use crate::ids::{RunId, TaskId};
+use crate::task_registry::TaskRegistry;
+use crate::worker::WorkerMetadata;
+use agent_client_protocol::schema::v1 as acp;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -102,6 +105,8 @@ pub struct TaskExecutionReporter {
     message: Arc<RwLock<Option<Arc<str>>>>,
     progress_percent: Arc<RwLock<Option<f32>>>,
     event_stream: Option<RuntimeEventStream>,
+    task_registry: Option<TaskRegistry>,
+    attempt: Option<u32>,
 }
 
 const MAX_TELEMETRY_MESSAGE_BYTES: usize = 2_048;
@@ -126,11 +131,42 @@ impl TaskExecutionReporter {
             message: Arc::new(RwLock::new(None)),
             progress_percent: Arc::new(RwLock::new(None)),
             event_stream,
+            task_registry: None,
+            attempt: None,
         }
+    }
+
+    pub fn with_task_registry(mut self, task_registry: TaskRegistry) -> Self {
+        self.task_registry = Some(task_registry);
+        self
+    }
+
+    pub fn for_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    fn is_current(&self) -> bool {
+        let (Some(attempt), Some(registry)) = (self.attempt, &self.task_registry) else {
+            return true;
+        };
+        registry.status(&self.task_id).is_some_and(|status| {
+            status.current_attempt == attempt
+                && matches!(
+                    status.state,
+                    crate::state::TaskState::Running
+                        | crate::state::TaskState::Verifying
+                        | crate::state::TaskState::Repairing
+                )
+        })
     }
 
     pub fn run_id(&self) -> &RunId {
         &self.run_id
+    }
+
+    pub fn has_live_attempt(&self) -> bool {
+        self.is_current()
     }
 
     pub fn task_id(&self) -> &TaskId {
@@ -170,6 +206,9 @@ impl TaskExecutionReporter {
     /// Reports a tool call about to start. Returns `Ok(())` when the call may
     /// proceed, or `Err` when the tool-call budget is already exhausted.
     pub fn report_tool_call_started(&self, tool: impl Into<String>) -> Result<(), BudgetExceeded> {
+        if !self.is_current() {
+            return Ok(());
+        }
         let tool = crate::artifacts::truncate_text(tool.into(), MAX_TOOL_NAME_BYTES);
         {
             let mut usage = self.usage.write();
@@ -182,6 +221,9 @@ impl TaskExecutionReporter {
             }
         }
         self.current_tool.write().replace(tool.clone().into());
+        if let Some(task_registry) = &self.task_registry {
+            task_registry.set_current_tool(&self.task_id, Some(tool.clone()));
+        }
         self.emit(RuntimeEvent::TaskToolCallStarted {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
@@ -192,7 +234,13 @@ impl TaskExecutionReporter {
 
     /// Reports that the current tool call finished.
     pub fn report_tool_call_finished(&self) {
+        if !self.is_current() {
+            return;
+        }
         self.current_tool.write().take();
+        if let Some(task_registry) = &self.task_registry {
+            task_registry.set_current_tool(&self.task_id, None::<String>);
+        }
         self.emit(RuntimeEvent::TaskToolCallFinished {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
@@ -266,8 +314,14 @@ impl TaskExecutionReporter {
     }
 
     pub fn set_phase(&self, phase: &str) {
+        if !self.is_current() {
+            return;
+        }
         let bounded = crate::artifacts::truncate_text(phase.to_string(), 256);
         self.phase.write().replace(bounded.clone().into());
+        if let Some(task_registry) = &self.task_registry {
+            task_registry.set_phase(&self.task_id, bounded.clone());
+        }
         self.emit(RuntimeEvent::TaskPhaseChanged {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
@@ -296,11 +350,38 @@ impl TaskExecutionReporter {
 
     /// Records the model assigned to this task, if not already set.
     pub fn report_model_assigned(&self, model_id: impl Into<Arc<str>>) {
+        if !self.is_current() {
+            return;
+        }
         let model_id = model_id.into();
+        if let Some(task_registry) = &self.task_registry {
+            task_registry.set_model(&self.task_id, model_id.to_string());
+        }
         self.emit(RuntimeEvent::TaskModelAssigned {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
             model_id: model_id.to_string(),
+        });
+    }
+
+    pub fn report_worker_started(
+        &self,
+        session_id: Option<acp::SessionId>,
+        metadata: WorkerMetadata,
+    ) {
+        if !self.is_current() {
+            return;
+        }
+        if let Some(task_registry) = &self.task_registry {
+            task_registry.set_worker_metadata(&self.task_id, metadata.clone());
+            if let Some(session_id) = session_id {
+                task_registry.set_active_session_id(&self.task_id, session_id);
+            }
+        }
+        self.emit(RuntimeEvent::WorkerMetadataUpdated {
+            run_id: self.run_id.clone(),
+            task_id: self.task_id.clone(),
+            metadata,
         });
     }
 
@@ -315,8 +396,89 @@ impl TaskExecutionReporter {
     }
 
     fn emit(&self, event: RuntimeEvent) {
+        if !self.is_current() {
+            return;
+        }
         if let Some(stream) = &self.event_stream {
             stream.emit(event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::TaskState;
+    use crate::worker::WorkerTarget;
+
+    #[test]
+    fn stale_attempt_reporter_does_not_overwrite_live_worker_metadata() {
+        let task_id = TaskId::new("worker");
+        let registry = TaskRegistry::new();
+        registry.register_task(task_id.clone());
+        let attempt = registry.start_attempt(&task_id, None);
+        let reporter = TaskExecutionReporter::new(
+            RunId::new(),
+            task_id.clone(),
+            None,
+            ExecutionBudget::default(),
+            None,
+        )
+        .with_task_registry(registry.clone())
+        .for_attempt(attempt);
+        registry.start_attempt(&task_id, Some(acp::SessionId::new("new-session")));
+        registry.set_phase(&task_id, "new-attempt");
+        reporter.set_phase("stale-attempt");
+        reporter.report_worker_started(
+            Some(acp::SessionId::new("stale-session")),
+            WorkerMetadata::new(WorkerTarget::acp("old-worker")),
+        );
+        let status = registry.status(&task_id).expect("task exists");
+        assert_eq!(status.phase.as_deref(), Some("new-attempt"));
+        assert_eq!(
+            status.active_session_id,
+            Some(acp::SessionId::new("new-session"))
+        );
+        assert!(status.worker_metadata.is_none());
+    }
+
+    #[test]
+    fn reporter_updates_authoritative_live_task_metadata() {
+        let task_id = TaskId::new("worker");
+        let registry = TaskRegistry::new();
+        registry.register_task(task_id.clone());
+        registry.start_attempt(&task_id, None);
+        let reporter = TaskExecutionReporter::new(
+            RunId::new(),
+            task_id.clone(),
+            None,
+            ExecutionBudget::default(),
+            None,
+        )
+        .with_task_registry(registry.clone());
+        let metadata = WorkerMetadata::new(WorkerTarget::acp("omp"));
+
+        reporter.report_worker_started(Some(acp::SessionId::new("session")), metadata.clone());
+        reporter.set_phase("verifying");
+        reporter
+            .report_tool_call_started("read_file")
+            .expect("tool call within budget");
+
+        let status = registry.status(&task_id).expect("registered status");
+        assert_eq!(status.state, TaskState::Running);
+        assert_eq!(
+            status.active_session_id,
+            Some(acp::SessionId::new("session"))
+        );
+        assert_eq!(status.worker_metadata, Some(metadata));
+        assert_eq!(status.phase.as_deref(), Some("verifying"));
+        assert_eq!(status.current_tool.as_deref(), Some("read_file"));
+
+        reporter.report_tool_call_finished();
+        assert!(
+            registry
+                .status(&task_id)
+                .is_some_and(|status| status.current_tool.is_none())
+        );
     }
 }
