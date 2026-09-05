@@ -14,10 +14,13 @@ pub mod scheduler;
 pub mod state;
 pub mod task_registry;
 pub mod verification;
+pub mod worker;
+pub mod worktree_isolation;
 
 pub use acp_adapter::{AcpEventAdapter, AcpTaskBridge};
 pub use artifacts::{
-    Artifact, ArtifactKind, ArtifactStore, ContextSnapshot, MAX_INLINE_OUTPUT_BYTES, truncate_text,
+    Artifact, ArtifactKind, ArtifactStore, ContextSnapshot, MAX_DEPENDENCY_CONTEXT_BYTES,
+    MAX_INLINE_OUTPUT_BYTES, truncate_text,
 };
 pub use auto_policy::{
     AgentToolProfile, AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,
@@ -28,7 +31,9 @@ pub use budget::{
 };
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};
 pub use events::{RuntimeEvent, RuntimeEventStream};
-pub use executor::{MockTaskExecutor, TaskExecutionContext, TaskExecutionOutput, TaskExecutor};
+pub use executor::{
+    DependencyInput, MockTaskExecutor, TaskExecutionContext, TaskExecutionOutput, TaskExecutor,
+};
 pub use ids::{CorrelationId, PlanId, RunId, TaskId};
 pub use persistence::{PERSISTENCE_SCHEMA_VERSION, PersistedRun};
 pub use plan_graph::{GraphValidationError, OrchestrationPlan, OrchestrationTask, PlanGraph};
@@ -41,6 +46,11 @@ pub use verification::{
     ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START, VerificationPolicy,
     VerificationResult, VerificationRunner, VerificationVerdict,
 };
+pub use worker::{
+    AcpWorkerRuntimeConfig, CapabilitySnapshot, StructuredWaitReason, WorkerBroker, WorkerHandle,
+    WorkerHost, WorkerMetadata, WorkerTarget, WorkspaceIsolation, WorkspacePolicy,
+};
+pub use worktree_isolation::{IsolatedWorktree, WorktreeManager, WorktreeOwnershipMarker};
 
 #[cfg(test)]
 mod tests {
@@ -92,6 +102,7 @@ mod tests {
                     output: format!("completed {}", context.task.id),
                     tokens_used: None,
                     artifacts: Vec::new(),
+                    worker_metadata: None,
                 })
             })
         }
@@ -340,6 +351,51 @@ mod tests {
     }
 
     #[test]
+    fn restart_only_accepts_parked_user_decisions_and_detaches_old_session() {
+        let registry = TaskRegistry::new();
+        let task_id = TaskId::new("restart-worker");
+        let session_id = acp::SessionId::new("old-session");
+        let mut status = TaskStatus::new(task_id.clone());
+        status.state = TaskState::Parked;
+        status.active_session_id = Some(session_id.clone());
+        status.wait_reason = Some(StructuredWaitReason::AwaitingUserInput {
+            question: "Restart worker?".into(),
+        });
+        registry.restore_status(status);
+        assert!(registry.restart_parked_task(&task_id));
+        let restarted = registry.status(&task_id).expect("registered task");
+        assert_eq!(restarted.state, TaskState::Pending);
+        assert!(restarted.active_session_id.is_none());
+        assert!(restarted.wait_reason.is_none());
+        assert!(registry.status_by_session_id(&session_id).is_none());
+        assert!(!registry.restart_parked_task(&task_id));
+        registry.set_state(&task_id, TaskState::Blocked);
+        assert!(!registry.restart_parked_task(&task_id));
+    }
+
+    #[test]
+    fn cancelled_apply_conflict_cannot_be_restarted_or_completed() {
+        let registry = TaskRegistry::new();
+        let task_id = TaskId::new("apply-worker");
+        registry.register_task(task_id.clone());
+        registry.set_state(&task_id, TaskState::AwaitingApply);
+        assert!(registry.park_apply_conflict(&task_id, "conflict".into(), "/worktree".into()));
+        assert!(!registry.restart_parked_task(&task_id));
+        registry.set_state(&task_id, TaskState::Cancelled);
+        assert!(!registry.mark_applied(&task_id));
+        assert!(!registry.mark_rejected(&task_id, None));
+        assert!(!registry.park_apply_conflict(
+            &task_id,
+            "late conflict".into(),
+            "/worktree".into()
+        ));
+        assert_eq!(
+            registry.status(&task_id).expect("registered task").state,
+            TaskState::Cancelled
+        );
+    }
+
+    #[test]
     fn test_large_artifacts_are_bounded_and_marked() {
         let store = ArtifactStore::new();
         let artifact = Artifact::new(
@@ -389,7 +445,7 @@ mod tests {
         let resumed = loaded.for_resume();
         assert_eq!(resumed.state, RunState::Interrupted);
         assert_eq!(resumed.task_statuses[0].state, TaskState::Interrupted);
-        assert_eq!(resumed.task_statuses[1].state, TaskState::Interrupted);
+        assert_eq!(resumed.task_statuses[1].state, TaskState::Pending);
     }
 
     #[test]
@@ -566,6 +622,12 @@ mod tests {
         cx.run_until_parked();
         handle.cancel(CancellationReason::UserRequested);
         assert_eq!(
+            handle
+                .task_status(&TaskId::new("task-1"))
+                .map(|status| status.state),
+            Some(TaskState::Cancelled)
+        );
+        assert_eq!(
             completion.await.expect("receive").expect("complete"),
             RunState::Cancelled
         );
@@ -598,6 +660,102 @@ mod tests {
                 .map(|status| status.state),
             Some(TaskState::Failed)
         );
+    }
+
+    #[gpui::test]
+    async fn test_timeout_and_cancel_interrupt_verification_and_repair(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct PendingStageExecutor {
+            repair: bool,
+        }
+        impl TaskExecutor for PendingStageExecutor {
+            fn execute(
+                &self,
+                _context: TaskExecutionContext,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
+            {
+                Box::pin(async { Ok(TaskExecutionOutput::new("initial output")) })
+            }
+            fn verify(
+                &self,
+                _task: &OrchestrationTask,
+                _output: &TaskExecutionOutput,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<VerificationResult>>
+            {
+                let repair = self.repair;
+                Box::pin(async move {
+                    if repair {
+                        Ok(VerificationResult::fail(
+                            "needs repair",
+                            ErrorClass::VerificationAssertionFailure,
+                        ))
+                    } else {
+                        futures::future::pending().await
+                    }
+                })
+            }
+            fn repair(
+                &self,
+                _task: &OrchestrationTask,
+                _feedback: &str,
+                _context: TaskExecutionContext,
+            ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
+            {
+                Box::pin(futures::future::pending())
+            }
+        }
+        for (repair, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut task = OrchestrationTask::new("task", "Task", "verify output");
+            task.acceptance_criteria = vec!["verified".to_string()];
+            task.repair_on_failure = true;
+            let plan = OrchestrationPlan::new("Stage timeout", vec![task]);
+            let policy = AgentExecutionPolicy {
+                strategy: AgentExecutionStrategy::Orchestrate,
+                autonomy: AgentAutonomy::Autonomous,
+            };
+            let mut config = RuntimeConfig::default();
+            config.foreground_executor = Some(cx.foreground_executor().clone());
+            config.scheduler.background_executor = Some(cx.background_executor.clone());
+            config.scheduler.task_timeout_secs = Some(1);
+            config.scheduler.verification_policy.allow_repair_tasks = true;
+            let (handle, completion) = OrchestrationRuntime::start(
+                plan,
+                policy,
+                Rc::new(PendingStageExecutor { repair }),
+                config,
+            )
+            .expect("start run");
+            cx.run_until_parked();
+            assert_eq!(
+                handle
+                    .task_status(&TaskId::new("task"))
+                    .map(|status| status.state),
+                Some(if repair {
+                    TaskState::Repairing
+                } else {
+                    TaskState::Verifying
+                })
+            );
+            if cancel {
+                handle.cancel_task(&TaskId::new("task"), CancellationReason::UserRequested);
+            } else {
+                cx.background_executor
+                    .advance_clock(std::time::Duration::from_secs(2));
+            }
+            let outcome = completion.await.expect("completion").expect("run result");
+            assert_ne!(outcome, RunState::Completed);
+            assert_eq!(
+                handle
+                    .task_status(&TaskId::new("task"))
+                    .map(|status| status.state),
+                Some(if cancel {
+                    TaskState::Cancelled
+                } else {
+                    TaskState::Failed
+                })
+            );
+        }
     }
 
     #[gpui::test]
@@ -686,6 +844,76 @@ mod tests {
             RunState::Completed
         );
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn dependency_outputs_are_bounded_and_forwarded_to_downstream_tasks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let captured = captured.clone();
+            move |context| {
+                if context.task.id.as_str() == "upstream" {
+                    return Ok(
+                        TaskExecutionOutput::new("o".repeat(64 * 1024)).with_artifacts(
+                            (0..20)
+                                .map(|index| {
+                                    Artifact::new(
+                                        context.task.id.clone(),
+                                        format!("artifact-{index}"),
+                                        ArtifactKind::Text,
+                                        "a".repeat(32 * 1024),
+                                    )
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                captured.lock().replace(context.dependency_inputs);
+                Ok(TaskExecutionOutput::new("done"))
+            }
+        }));
+        let upstream = OrchestrationTask::new("upstream", "Upstream", "produce context");
+        let mut downstream = OrchestrationTask::new("downstream", "Downstream", "consume context");
+        downstream.depends_on = vec![upstream.id.clone()];
+        let plan = OrchestrationPlan::new("Context bundle", vec![upstream, downstream]);
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let (_handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        let inputs = captured.lock().take().expect("dependency inputs captured");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].task_id.as_str(), "upstream");
+        assert!(
+            inputs[0]
+                .output
+                .as_ref()
+                .is_some_and(|output| output.len() <= artifacts::MAX_DEPENDENCY_OUTPUT_BYTES)
+        );
+        assert!(inputs[0].artifacts.len() <= artifacts::MAX_DEPENDENCY_ARTIFACTS);
+        let total_bytes = inputs
+            .iter()
+            .map(|input| {
+                input.output.as_ref().map_or(0, String::len)
+                    + input
+                        .artifacts
+                        .iter()
+                        .map(|artifact| artifact.data.len())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert!(total_bytes <= artifacts::MAX_DEPENDENCY_CONTEXT_BYTES);
     }
 
     #[gpui::test]
@@ -1098,5 +1326,967 @@ mod tests {
             snapshot.task_attempts[0].1[0].output.as_deref(),
             Some("repaired")
         );
+    }
+
+    #[test]
+    fn test_worker_target_serialization_and_deserialization() {
+        let native = WorkerTarget::Native;
+        let json = serde_json::to_string(&native).expect("serialize native");
+        assert!(json.contains("native"));
+        let parsed: WorkerTarget = serde_json::from_str(&json).expect("deserialize native");
+        assert_eq!(parsed, WorkerTarget::Native);
+
+        let from_str: WorkerTarget =
+            serde_json::from_str("\"native\"").expect("deserialize string native");
+        assert_eq!(from_str, WorkerTarget::Native);
+
+        let from_omp: WorkerTarget =
+            serde_json::from_str("\"omp\"").expect("deserialize string omp");
+        assert_eq!(
+            from_omp,
+            WorkerTarget::Acp {
+                agent_id: "omp".to_string()
+            }
+        );
+
+        let acp = WorkerTarget::Acp {
+            agent_id: "opencode".to_string(),
+        };
+        let json_acp = serde_json::to_string(&acp).expect("serialize acp");
+        let parsed_acp: WorkerTarget = serde_json::from_str(&json_acp).expect("deserialize acp");
+        assert_eq!(parsed_acp, acp);
+    }
+
+    #[test]
+    fn test_legacy_persisted_run_defaults_to_native_target() {
+        let legacy_json = r#"{
+            "schema_version": 2,
+            "run_id": "run-legacy-1",
+            "plan": {
+                "id": "plan-legacy-1",
+                "title": "Legacy Plan",
+                "tasks": [
+                    {
+                        "id": "task-1",
+                        "label": "Legacy Task",
+                        "description": "A task from an older snapshot",
+                        "depends_on": [],
+                        "acceptance_criteria": [],
+                        "context_paths": [],
+                        "repair_on_failure": true,
+                        "evidence_required": false
+                    }
+                ]
+            },
+            "policy": { "strategy": "direct", "autonomy": "manual" },
+            "state": "completed",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:01:00Z",
+            "task_statuses": [
+                {
+                    "task_id": "task-1",
+                    "state": "completed",
+                    "current_attempt": 1,
+                    "total_attempts": 1,
+                    "tokens_used": 100,
+                    "updated_at": "2026-01-01T00:01:00Z",
+                    "budget_state": { "tokens_used": 100, "tool_calls_used": 1 }
+                }
+            ],
+            "task_attempts": [],
+            "event_log": [],
+            "last_event_seq": 0
+        }"#;
+
+        let run = PersistedRun::from_json(legacy_json).expect("deserialize legacy snapshot");
+        assert_eq!(run.plan.tasks[0].target, WorkerTarget::Native);
+        assert_eq!(run.task_statuses[0].target, WorkerTarget::Native);
+        assert_eq!(
+            run.plan.tasks[0].workspace_policy.isolation,
+            WorkspaceIsolation::SharedParent
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unmanaged_write_output_fails_closed_and_blocks_downstream(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut task_write = OrchestrationTask::new("task-write", "Write task", "Do work");
+        task_write.workspace_policy.isolation = WorkspaceIsolation::DedicatedWorktree;
+
+        let task_downstream =
+            OrchestrationTask::new("task-downstream", "Downstream task", "Review work")
+                .with_depends_on(vec![TaskId::new("task-write")]);
+
+        let plan = OrchestrationPlan::new("Isolated pipeline", vec![task_write, task_downstream]);
+
+        let (write_finished_tx, write_finished_rx) = async_channel::bounded(1);
+        let (downstream_started_tx, downstream_started_rx) = async_channel::bounded(1);
+
+        let executor = Rc::new(MockTaskExecutor::new({
+            let write_finished_tx = write_finished_tx.clone();
+            let downstream_started_tx = downstream_started_tx.clone();
+            move |context| {
+                if context.task.id.as_str() == "task-write" {
+                    let _ = write_finished_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("write done"))
+                } else {
+                    let _ = downstream_started_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("downstream done"))
+                }
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        let write_finished = write_finished_rx.recv();
+        let timeout1 = cx.background_executor.timer(Duration::from_secs(2));
+        futures::pin_mut!(write_finished, timeout1);
+        match futures::future::select(write_finished, timeout1).await {
+            futures::future::Either::Left((res, _)) => {
+                res.expect("write finished");
+            }
+            futures::future::Either::Right(_) => panic!("task-write execution timed out"),
+        }
+
+        // A write executor that does not return a managed worktree must fail
+        // closed instead of exposing a fake Apply action.
+        assert!(downstream_started_rx.try_recv().is_err());
+        let write_status = handle
+            .task_status(&TaskId::new("task-write"))
+            .expect("status");
+        assert_eq!(write_status.state, TaskState::Failed);
+        assert!(
+            write_status
+                .latest_error
+                .as_deref()
+                .is_some_and(|error| error.contains("managed worktree descriptor"))
+        );
+        let downstream_status = handle
+            .task_status(&TaskId::new("task-downstream"))
+            .expect("status");
+        assert_eq!(downstream_status.state, TaskState::Blocked);
+
+        let final_state = completion.await.expect("receive").expect("complete");
+        assert_eq!(final_state, RunState::Failed);
+    }
+
+    #[test]
+    fn test_worker_broker_parameter_validation() {
+        let broker_disabled = WorkerBroker::new(false);
+        let mut acp_task = OrchestrationTask::new("acp-1", "ACP task", "run");
+        acp_task.target = WorkerTarget::Acp {
+            agent_id: "omp".to_string(),
+        };
+
+        // Rejects when feature flag is off
+        let err = broker_disabled.validate_task_parameters(&acp_task);
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("ACP delegation is currently disabled")
+        );
+
+        // When enabled, rejects unknown / unconfigured worker
+        let broker_enabled = WorkerBroker::new(true);
+        let err2 = broker_enabled.validate_task_parameters(&acp_task);
+        assert!(err2.is_err());
+        assert!(
+            err2.unwrap_err()
+                .to_string()
+                .contains("is not configured or available")
+        );
+
+        // Rejects invalid mode on native task
+        let mut native_task = OrchestrationTask::new("native-1", "Native task", "run");
+        native_task.mode = Some("completely_unknown_mode".to_string());
+        let err_native = broker_enabled.validate_task_parameters(&native_task);
+        assert!(err_native.is_err());
+        assert!(
+            err_native
+                .unwrap_err()
+                .to_string()
+                .contains("is not supported for native agent")
+        );
+        native_task.mode = Some("ask".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_err()
+        );
+        native_task.mode = None;
+        native_task.model_override = Some("requested-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cancelled_task_rejects_late_completion_and_failure() {
+        let registry = TaskRegistry::new();
+        let task_id = TaskId::new("cancelled-worker");
+        registry.register_task(task_id.clone());
+        let attempt = registry.start_attempt(&task_id, None);
+        registry.set_state(&task_id, TaskState::Cancelled);
+        registry.complete_attempt(
+            &task_id,
+            attempt,
+            Some("late output".into()),
+            Some(100),
+            None,
+        );
+        registry.fail_attempt(&task_id, attempt, "late error".into(), false);
+        let status = registry.status(&task_id).expect("registered task");
+        assert_eq!(status.state, TaskState::Cancelled);
+        assert!(status.latest_output.is_none());
+        assert_eq!(status.tokens_used, 0);
+    }
+
+    #[test]
+    fn test_late_attempt_completion_discarded() {
+        let registry = TaskRegistry::new();
+        let task_id = TaskId::new("task-corr-1");
+        registry.register_task(task_id.clone());
+
+        // Start attempt 1
+        registry.start_attempt(&task_id, None);
+        assert_eq!(registry.status(&task_id).unwrap().current_attempt, 1);
+
+        // Start attempt 2 (e.g. after retry)
+        registry.start_attempt(&task_id, None);
+        assert_eq!(registry.status(&task_id).unwrap().current_attempt, 2);
+        assert_eq!(registry.status(&task_id).unwrap().state, TaskState::Running);
+
+        // Late completion from attempt 1 arrives!
+        registry.complete_attempt(
+            &task_id,
+            1,
+            Some("late output from attempt 1".to_string()),
+            Some(50),
+            Some(VerificationResult::pass()),
+        );
+
+        // Verify active status was NOT corrupted: state remains Running on attempt 2!
+        let status = registry.status(&task_id).unwrap();
+        assert_eq!(status.current_attempt, 2);
+        assert_eq!(status.state, TaskState::Running);
+        assert_ne!(
+            status.latest_output.as_deref(),
+            Some("late output from attempt 1")
+        );
+
+        // Now attempt 2 completes
+        registry.complete_attempt(
+            &task_id,
+            2,
+            Some("valid output from attempt 2".to_string()),
+            Some(100),
+            Some(VerificationResult::pass()),
+        );
+
+        let status2 = registry.status(&task_id).unwrap();
+        assert_eq!(status2.state, TaskState::Completed);
+        assert_eq!(
+            status2.latest_output.as_deref(),
+            Some("valid output from attempt 2")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_on_restart_clears_active_states() {
+        let run_id = RunId::new();
+        let task1 = OrchestrationTask::new("t1", "T1", "desc");
+        let task2 = OrchestrationTask::new("t2", "T2", "desc");
+        let plan = OrchestrationPlan::new("Plan", vec![task1, task2]);
+
+        let mut s1 = TaskStatus::new(TaskId::new("t1"));
+        s1.state = TaskState::Running;
+        s1.active_session_id = Some(acp::SessionId::new("sess-1"));
+        let mut meta = WorkerMetadata::new(WorkerTarget::acp("omp"));
+        meta.capabilities.can_resume = true;
+        s1.worker_metadata = Some(meta);
+
+        let mut s2 = TaskStatus::new(TaskId::new("t2"));
+        s2.state = TaskState::Running;
+        // Worker does not support resume
+        let mut meta2 = WorkerMetadata::new(WorkerTarget::Native);
+        meta2.capabilities.can_resume = false;
+        s2.worker_metadata = Some(meta2);
+
+        let run = PersistedRun::new(
+            run_id,
+            plan,
+            RunState::Running,
+            AgentExecutionPolicy::default(),
+            vec![s1, s2],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let reconciled = run.reconcile_on_restart();
+        assert_eq!(reconciled.state, RunState::Interrupted);
+
+        // t1 had resume capability -> Parked awaiting reconnect
+        assert_eq!(reconciled.task_statuses[0].state, TaskState::Parked);
+        assert!(matches!(
+            reconciled.task_statuses[0].wait_reason,
+            Some(StructuredWaitReason::AwaitingWorkerReconnect { .. })
+        ));
+
+        // t2 could not resume -> Interrupted requiring restart
+        assert_eq!(reconciled.task_statuses[1].state, TaskState::Interrupted);
+        assert!(
+            reconciled.task_statuses[1]
+                .latest_error
+                .as_ref()
+                .unwrap()
+                .contains("worker does not support resume")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_preserves_approval_and_pause_boundaries() {
+        for state in [RunState::Proposed, RunState::Paused] {
+            let run = PersistedRun::new(
+                RunId::new(),
+                OrchestrationPlan::new("Plan", vec![OrchestrationTask::new("t1", "T1", "desc")]),
+                state,
+                AgentExecutionPolicy::default(),
+                vec![TaskStatus::new(TaskId::new("t1"))],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+
+            assert_eq!(run.reconcile_on_restart().state, state);
+        }
+    }
+
+    #[test]
+    fn test_reconcile_resumes_independent_work_before_waiting_for_apply() {
+        let mut awaiting = TaskStatus::new(TaskId::new("awaiting"));
+        awaiting.state = TaskState::AwaitingApply;
+        let pending = TaskStatus::new(TaskId::new("pending"));
+        let run = PersistedRun::new(
+            RunId::new(),
+            OrchestrationPlan::new(
+                "Plan",
+                vec![
+                    OrchestrationTask::new("awaiting", "Awaiting", "desc"),
+                    OrchestrationTask::new("pending", "Pending", "desc"),
+                ],
+            ),
+            RunState::AwaitingApply,
+            AgentExecutionPolicy::default(),
+            vec![awaiting, pending],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(run.reconcile_on_restart().state, RunState::Interrupted);
+    }
+
+    #[gpui::test]
+    async fn test_unmanaged_write_cannot_be_rejected_as_a_real_patch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut task_write = OrchestrationTask::new("task-write", "Write task", "Do work");
+        task_write.workspace_policy.isolation = WorkspaceIsolation::DedicatedWorktree;
+
+        let task_downstream =
+            OrchestrationTask::new("task-downstream", "Downstream task", "Follow up")
+                .with_depends_on(vec![TaskId::new("task-write")]);
+
+        let plan = OrchestrationPlan::new("Rejection pipeline", vec![task_write, task_downstream]);
+
+        let (write_finished_tx, write_finished_rx) = async_channel::bounded(1);
+        let downstream_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let executor = Rc::new(MockTaskExecutor::new({
+            let write_finished_tx = write_finished_tx.clone();
+            let downstream_started = downstream_started.clone();
+            move |context| {
+                if context.task.id.as_str() == "task-write" {
+                    let _ = write_finished_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("write proposal"))
+                } else {
+                    downstream_started.store(true, Ordering::SeqCst);
+                    Ok(TaskExecutionOutput::new("downstream executed"))
+                }
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        let write_finished = write_finished_rx.recv();
+        let timeout = cx.background_executor.timer(Duration::from_secs(2));
+        futures::pin_mut!(write_finished, timeout);
+        match futures::future::select(write_finished, timeout).await {
+            futures::future::Either::Left((res, _)) => {
+                res.expect("write finished");
+            }
+            futures::future::Either::Right(_) => panic!("write timed out"),
+        }
+
+        // Missing managed-worktree metadata is terminal and cannot be rejected
+        // as though a real isolated patch existed.
+        let status = handle
+            .task_status(&TaskId::new("task-write"))
+            .expect("status");
+        assert_eq!(status.state, TaskState::Failed);
+        assert!(
+            !handle
+                .reject_task(
+                    &TaskId::new("task-write"),
+                    Some("user disliked change".to_string()),
+                )
+                .await
+                .expect("reject")
+        );
+
+        // Verify downstream NEVER executes
+        assert!(!downstream_started.load(Ordering::SeqCst));
+        let final_state = completion.await.expect("receive").expect("completion");
+        assert_eq!(final_state, RunState::Failed);
+
+        let write_status = handle
+            .task_status(&TaskId::new("task-write"))
+            .expect("status");
+        assert_eq!(write_status.state, TaskState::Failed);
+
+        let downstream_status = handle
+            .task_status(&TaskId::new("task-downstream"))
+            .expect("status");
+        assert_eq!(downstream_status.state, TaskState::Blocked);
+    }
+
+    #[gpui::test]
+    async fn test_unmanaged_write_does_not_expose_fake_diff_or_apply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut task_write = OrchestrationTask::new("task-write", "Write task", "Create patch");
+        task_write.workspace_policy.isolation = WorkspaceIsolation::DedicatedWorktree;
+
+        let task_parallel =
+            OrchestrationTask::new("task-parallel", "Read task", "Analyze codebase");
+
+        let task_downstream =
+            OrchestrationTask::new("task-downstream", "Downstream task", "Apply feedback")
+                .with_depends_on(vec![TaskId::new("task-write")]);
+
+        let plan = OrchestrationPlan::new(
+            "Full Acceptance Pipeline",
+            vec![task_write, task_parallel, task_downstream],
+        );
+
+        let (write_tx, write_rx) = async_channel::bounded(1);
+        let (parallel_tx, parallel_rx) = async_channel::bounded(1);
+        let (downstream_tx, downstream_rx) = async_channel::bounded(1);
+
+        let executor = Rc::new(MockTaskExecutor::new({
+            let write_tx = write_tx.clone();
+            let parallel_tx = parallel_tx.clone();
+            let downstream_tx = downstream_tx.clone();
+            move |context| match context.task.id.as_str() {
+                "task-write" => {
+                    let _ = write_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("write proposal ready"))
+                }
+                "task-parallel" => {
+                    let _ = parallel_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("analysis ready"))
+                }
+                "task-downstream" => {
+                    let _ = downstream_tx.try_send(());
+                    Ok(TaskExecutionOutput::new("downstream completed"))
+                }
+                _ => Ok(TaskExecutionOutput::new("done")),
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.max_parallel_tasks = 4;
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        // 1. Parallel and write tasks execute
+        let write_fut = write_rx.recv();
+        let timeout1 = cx.background_executor.timer(Duration::from_secs(2));
+        futures::pin_mut!(write_fut, timeout1);
+        match futures::future::select(write_fut, timeout1).await {
+            futures::future::Either::Left((res, _)) => res.expect("write finished"),
+            futures::future::Either::Right(_) => panic!("write timed out"),
+        }
+
+        let parallel_fut = parallel_rx.recv();
+        let timeout2 = cx.background_executor.timer(Duration::from_secs(2));
+        futures::pin_mut!(parallel_fut, timeout2);
+        match futures::future::select(parallel_fut, timeout2).await {
+            futures::future::Either::Left((res, _)) => res.expect("parallel finished"),
+            futures::future::Either::Right(_) => panic!("parallel timed out"),
+        }
+
+        // 2. task-parallel completed; the isolated write fails closed because
+        // this mock did not create a managed worktree.
+        let parallel_status = handle
+            .task_status(&TaskId::new("task-parallel"))
+            .expect("status");
+        assert_eq!(parallel_status.state, TaskState::Completed);
+
+        let write_status = handle
+            .task_status(&TaskId::new("task-write"))
+            .expect("status");
+        assert_eq!(write_status.state, TaskState::Failed);
+
+        // 3. task-downstream is blocked and never executes.
+        let downstream_status = handle
+            .task_status(&TaskId::new("task-downstream"))
+            .expect("status");
+        assert_eq!(downstream_status.state, TaskState::Blocked);
+        assert!(downstream_rx.try_recv().is_err());
+
+        assert!(
+            handle
+                .review_diff(&TaskId::new("task-write"))
+                .await
+                .expect_err("no fake diff should be available")
+                .to_string()
+                .contains("no managed worktree")
+        );
+
+        let final_state = completion.await.expect("receive").expect("completion");
+        assert_eq!(final_state, RunState::Failed);
+        assert!(
+            handle
+                .task_statuses()
+                .iter()
+                .all(|status| !status.state.is_active())
+        );
+    }
+
+    async fn git(directory: &std::path::Path, arguments: &[&str]) -> anyhow::Result<()> {
+        let output = smol::process::Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn test_apply_task_with_post_apply_verification_failure_rolls_back_and_parks(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let root =
+            std::env::temp_dir().join(format!("test-post-apply-rollback-{}", uuid::Uuid::new_v4()));
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        git(&parent, &["init", "--quiet"]).await.unwrap();
+        std::fs::write(parent.join("hello.txt"), "original parent content\n").unwrap();
+        git(&parent, &["add", "."]).await.unwrap();
+        git(
+            &parent,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(parent.join("hello.txt"), "staged parent content\n").unwrap();
+        git(&parent, &["add", "hello.txt"]).await.unwrap();
+        std::fs::write(parent.join("hello.txt"), "working parent content\n").unwrap();
+        let index_before_apply = std::fs::read(parent.join(".git/index")).unwrap();
+
+        let mut task = OrchestrationTask::new("task-1", "Write task", "edit file");
+        task.workspace_policy = WorkspacePolicy::isolated_worktree();
+        task.verification_command = Some("test ! -f parent_canary.txt".to_string());
+        let plan = OrchestrationPlan::new("Verification Failure", vec![task]);
+
+        let (applied_tx, applied_rx) = async_channel::bounded(1);
+        let parent_clone = parent.clone();
+        let root_clone = root.clone();
+
+        let executor = Rc::new(MockTaskExecutor::new(move |context| {
+            let parent_path = parent_clone.clone();
+            let root_path = root_clone.clone();
+            let applied_tx = applied_tx.clone();
+            smol::block_on(async move {
+                let manager = crate::worktree_isolation::WorktreeManager::new(
+                    &parent_path,
+                    root_path.join("workers"),
+                );
+                let worker = manager
+                    .create_isolated_worktree(&context.run_id, &context.task.id, context.attempt)
+                    .await?;
+
+                std::fs::write(
+                    worker.worktree_path.join("hello.txt"),
+                    "modified by worker\n",
+                )?;
+
+                // Introduce parent_canary.txt only in parent checkout so Tier 2 passes in worktree, but Tier 3 fails in parent
+                std::fs::write(parent_path.join("parent_canary.txt"), "canary\n")?;
+
+                let mut metadata =
+                    crate::worker::WorkerMetadata::new(crate::worker::WorkerTarget::Native);
+                metadata.worktree_path = Some(worker.worktree_path.to_string_lossy().to_string());
+                metadata.baseline_commit = Some(worker.baseline_commit.clone());
+                context
+                    .reporter
+                    .report_worker_started(None, metadata.clone());
+
+                let _ = applied_tx.try_send(worker.worktree_path);
+                Ok(TaskExecutionOutput::new("worker finished").with_worker_metadata(metadata))
+            })
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, _completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        let wt_path = applied_rx.recv().await.expect("worker finished");
+
+        let mut awaiting = false;
+        for _ in 0..20 {
+            if let Some(status) = handle.task_status(&TaskId::new("task-1")) {
+                if status.state == TaskState::AwaitingApply {
+                    awaiting = true;
+                    break;
+                }
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        assert!(awaiting, "task should enter AwaitingApply");
+
+        // Calling apply_task should fail post-apply verification
+        let apply_result = handle.apply_task(&TaskId::new("task-1")).await;
+        assert!(apply_result.is_err());
+        let err = apply_result.unwrap_err().to_string();
+        assert!(err.contains("parent post-apply verification failed"));
+
+        // Parent repo must be rolled back to original content
+        assert_eq!(
+            std::fs::read_to_string(parent.join("hello.txt")).unwrap(),
+            "working parent content\n"
+        );
+        assert_eq!(
+            std::fs::read(parent.join(".git/index")).unwrap(),
+            index_before_apply,
+            "rollback must preserve the parent's staged index state"
+        );
+
+        // Task must be parked with PostApplyVerificationFailed
+        let status = handle.task_status(&TaskId::new("task-1")).unwrap();
+        assert_eq!(status.state, TaskState::Parked);
+        assert!(matches!(
+            status.wait_reason,
+            Some(crate::worker::StructuredWaitReason::PostApplyVerificationFailed { .. })
+        ));
+
+        // Worktree must be retained on disk
+        assert!(
+            wt_path.exists(),
+            "worktree must be retained after verification failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    async fn test_apply_task_with_tier2_worktree_verification_failure_parks_before_apply(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let root =
+            std::env::temp_dir().join(format!("test-tier2-verification-{}", uuid::Uuid::new_v4()));
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        git(&parent, &["init", "--quiet"]).await.unwrap();
+        std::fs::write(parent.join("hello.txt"), "original\n").unwrap();
+        git(&parent, &["add", "."]).await.unwrap();
+        git(
+            &parent,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut task = OrchestrationTask::new("task-1", "Write task", "edit file");
+        task.workspace_policy = WorkspacePolicy::isolated_worktree();
+        task.verification_command = Some("false".to_string());
+        let plan = OrchestrationPlan::new("Tier 2 Failure", vec![task]);
+
+        let (applied_tx, applied_rx) = async_channel::bounded(1);
+        let parent_clone = parent.clone();
+        let root_clone = root.clone();
+
+        let executor = Rc::new(MockTaskExecutor::new(move |context| {
+            let parent_path = parent_clone.clone();
+            let root_path = root_clone.clone();
+            let applied_tx = applied_tx.clone();
+            smol::block_on(async move {
+                let manager = crate::worktree_isolation::WorktreeManager::new(
+                    &parent_path,
+                    root_path.join("workers"),
+                );
+                let worker = manager
+                    .create_isolated_worktree(&context.run_id, &context.task.id, context.attempt)
+                    .await?;
+
+                std::fs::write(worker.worktree_path.join("hello.txt"), "modified\n")?;
+
+                let mut metadata =
+                    crate::worker::WorkerMetadata::new(crate::worker::WorkerTarget::Native);
+                metadata.worktree_path = Some(worker.worktree_path.to_string_lossy().to_string());
+                metadata.baseline_commit = Some(worker.baseline_commit.clone());
+                context
+                    .reporter
+                    .report_worker_started(None, metadata.clone());
+
+                let _ = applied_tx.try_send(worker.worktree_path);
+                Ok(TaskExecutionOutput::new("worker finished").with_worker_metadata(metadata))
+            })
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, _completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        let wt_path = applied_rx.recv().await.expect("worker finished");
+
+        let mut awaiting = false;
+        for _ in 0..20 {
+            if let Some(status) = handle.task_status(&TaskId::new("task-1")) {
+                if status.state == TaskState::AwaitingApply {
+                    awaiting = true;
+                    break;
+                }
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        assert!(awaiting, "task should enter AwaitingApply");
+
+        // Calling apply_task should fail Tier 2 worktree verification
+        let apply_result = handle.apply_task(&TaskId::new("task-1")).await;
+        assert!(apply_result.is_err());
+        let err = apply_result.unwrap_err().to_string();
+        assert!(err.contains("worktree verification failed"));
+
+        // Parent repo must be untouched
+        assert_eq!(
+            std::fs::read_to_string(parent.join("hello.txt")).unwrap(),
+            "original\n"
+        );
+
+        // Tier 2 verification has its own wait reason because no parent patch was applied.
+        let status = handle.task_status(&TaskId::new("task-1")).unwrap();
+        assert_eq!(status.state, TaskState::Parked);
+        assert!(matches!(
+            status.wait_reason,
+            Some(crate::worker::StructuredWaitReason::WorktreeVerificationFailed { .. })
+        ));
+
+        // Worktree must be retained on disk
+        assert!(wt_path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    async fn test_apply_task_respects_manual_pause(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let root =
+            std::env::temp_dir().join(format!("test-manual-pause-apply-{}", uuid::Uuid::new_v4()));
+        let parent = root.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        git(&parent, &["init", "--quiet"]).await.unwrap();
+        std::fs::write(parent.join("hello.txt"), "original\n").unwrap();
+        git(&parent, &["add", "."]).await.unwrap();
+        git(
+            &parent,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .await
+        .unwrap();
+
+        let mut task = OrchestrationTask::new("task-1", "Write task", "edit file");
+        task.workspace_policy = WorkspacePolicy::isolated_worktree();
+        let plan = OrchestrationPlan::new("Manual Pause Test", vec![task]);
+
+        let (applied_tx, applied_rx) = async_channel::bounded(1);
+        let parent_clone = parent.clone();
+        let root_clone = root.clone();
+
+        let executor = Rc::new(MockTaskExecutor::new(move |context| {
+            let parent_path = parent_clone.clone();
+            let root_path = root_clone.clone();
+            let applied_tx = applied_tx.clone();
+            smol::block_on(async move {
+                let manager = crate::worktree_isolation::WorktreeManager::new(
+                    &parent_path,
+                    root_path.join("workers"),
+                );
+                let worker = manager
+                    .create_isolated_worktree(&context.run_id, &context.task.id, context.attempt)
+                    .await?;
+
+                std::fs::write(worker.worktree_path.join("hello.txt"), "modified\n")?;
+
+                let mut metadata =
+                    crate::worker::WorkerMetadata::new(crate::worker::WorkerTarget::Native);
+                metadata.worktree_path = Some(worker.worktree_path.to_string_lossy().to_string());
+                metadata.baseline_commit = Some(worker.baseline_commit.clone());
+                context
+                    .reporter
+                    .report_worker_started(None, metadata.clone());
+
+                let _ = applied_tx.try_send(worker.worktree_path);
+                Ok(TaskExecutionOutput::new("worker finished").with_worker_metadata(metadata))
+            })
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+
+        let _wt_path = applied_rx.recv().await.expect("worker finished");
+
+        let mut awaiting = false;
+        for _ in 0..20 {
+            if let Some(status) = handle.task_status(&TaskId::new("task-1")) {
+                if status.state == TaskState::AwaitingApply {
+                    awaiting = true;
+                    break;
+                }
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        assert!(awaiting, "task should enter AwaitingApply");
+
+        // User manually pauses the run
+        handle.pause();
+        assert_eq!(handle.state(), RunState::Paused);
+
+        // Apply task while manually paused
+        let applied = handle
+            .apply_task(&TaskId::new("task-1"))
+            .await
+            .expect("apply");
+        assert!(applied);
+
+        // Run state MUST remain Paused, not auto-resumed to Running
+        assert_eq!(handle.state(), RunState::Paused);
+
+        // Task itself is completed
+        assert_eq!(
+            handle.task_status(&TaskId::new("task-1")).unwrap().state,
+            TaskState::Completed
+        );
+
+        // Parent repo has modified content
+        assert_eq!(
+            std::fs::read_to_string(parent.join("hello.txt")).unwrap(),
+            "modified\n"
+        );
+
+        // Resuming unpauses to completion
+        handle.resume();
+        let final_state = completion.await.expect("receive").expect("completion");
+        assert_eq!(final_state, RunState::Completed);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

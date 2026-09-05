@@ -435,6 +435,22 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Whether to enable delegating orchestration tasks to external ACP agents.
+    ///
+    /// Default: false
+    pub enable_acp_delegation: Option<bool>,
+    pub orchestration: Option<OrchestrationSettingsContent>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, MergeFrom, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestrationSettingsContent {
+    /// Maximum simultaneous external workers in one orchestration run. Default: 2.
+    pub acp_max_concurrency: Option<usize>,
+    /// Time allowed to connect and initialize an ACP session. Default: 20.
+    pub connection_timeout_seconds: Option<u64>,
+    /// Time to retain inactive external worker transcripts in memory. Default: 900.
+    pub terminal_session_retention_seconds: Option<u64>,
 }
 
 impl AgentSettingsContent {

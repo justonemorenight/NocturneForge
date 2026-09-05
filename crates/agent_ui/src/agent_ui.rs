@@ -1025,6 +1025,8 @@ mod tests {
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
             terminal_output_limit: agent_settings::DEFAULT_TERMINAL_OUTPUT_LIMIT,
+            enable_acp_delegation: false,
+            orchestration: Default::default(),
         };
 
         cx.update(|cx| {

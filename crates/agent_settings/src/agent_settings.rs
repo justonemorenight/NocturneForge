@@ -315,6 +315,8 @@ pub struct AgentSettings {
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
     pub terminal_output_limit: u64,
+    pub enable_acp_delegation: bool,
+    pub orchestration: settings::OrchestrationSettingsContent,
 }
 
 impl AgentSettings {
@@ -892,6 +894,8 @@ impl Settings for AgentSettings {
             terminal_output_limit: agent
                 .terminal_output_limit
                 .unwrap_or(DEFAULT_TERMINAL_OUTPUT_LIMIT),
+            enable_acp_delegation: agent.enable_acp_delegation.unwrap_or(false),
+            orchestration: agent.orchestration.unwrap_or_default(),
         }
     }
 }

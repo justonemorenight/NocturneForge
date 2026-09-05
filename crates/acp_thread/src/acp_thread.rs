@@ -2908,6 +2908,10 @@ impl AcpThread {
         }
     }
 
+    pub fn flush_pending_output(&mut self, cx: &mut Context<Self>) {
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+    }
+
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
         self.prompt_capabilities.clone()
     }

@@ -2,6 +2,7 @@ use crate::budget::{BudgetExceeded, BudgetUsage};
 use crate::ids::TaskId;
 use crate::state::{TaskAttempt, TaskState, TaskStatus};
 use crate::verification::VerificationResult;
+use crate::worker::{StructuredWaitReason, WorkerMetadata, WorkerTarget};
 use agent_client_protocol::schema::v1 as acp;
 use chrono::Utc;
 use collections::{HashMap, HashSet};
@@ -16,6 +17,29 @@ pub struct TaskRegistry {
     tasks_by_session: Arc<RwLock<HashMap<acp::SessionId, TaskId>>>,
 }
 
+fn can_retry_apply(status: &TaskStatus) -> bool {
+    status.state == TaskState::Parked
+        && matches!(
+            &status.wait_reason,
+            Some(StructuredWaitReason::ApplyConflict { .. })
+                | Some(StructuredWaitReason::WorktreeVerificationFailed { .. })
+                | Some(StructuredWaitReason::PostApplyVerificationFailed {
+                    rollback_error: None,
+                    ..
+                })
+        )
+}
+
+fn can_reject_apply(status: &TaskStatus) -> bool {
+    status.state == TaskState::Parked
+        && matches!(
+            &status.wait_reason,
+            Some(StructuredWaitReason::ApplyConflict { .. })
+                | Some(StructuredWaitReason::WorktreeVerificationFailed { .. })
+                | Some(StructuredWaitReason::PostApplyVerificationFailed { .. })
+        )
+}
+
 impl TaskRegistry {
     fn update_lifecycle(status: &mut TaskStatus, state: TaskState) {
         status.state = state;
@@ -24,6 +48,7 @@ impl TaskRegistry {
             TaskState::Verifying => Some("verifying".to_string()),
             TaskState::Repairing => Some("repairing".to_string()),
             TaskState::Retrying => Some("retrying".to_string()),
+            TaskState::AwaitingApply => Some("awaiting_apply".to_string()),
             _ => None,
         };
         if state != TaskState::Running {
@@ -79,6 +104,15 @@ impl TaskRegistry {
         if let Some(status) = statuses.get_mut(task_id) {
             Self::update_lifecycle(status, state);
             status.updated_at = Utc::now();
+            if state == TaskState::Cancelled {
+                if let Some(attempt) = self.attempts.write().get_mut(task_id).and_then(|attempts| {
+                    attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.attempt_index == status.current_attempt)
+                }) {
+                    attempt.finished_at.get_or_insert(status.updated_at);
+                }
+            }
         }
     }
 
@@ -98,6 +132,7 @@ impl TaskRegistry {
             Self::update_lifecycle(status, TaskState::Running);
             status.current_attempt = attempt_index;
             status.total_attempts = attempt_index;
+            status.wait_reason = None;
             self.replace_active_session(status, session_id);
             status.updated_at = Utc::now();
         }
@@ -123,6 +158,26 @@ impl TaskRegistry {
         status.updated_at = Utc::now();
     }
 
+    pub fn restart_parked_task(&self, task_id: &TaskId) -> bool {
+        let mut statuses = self.statuses.write();
+        let Some(status) = statuses.get_mut(task_id) else {
+            return false;
+        };
+        if status.state != TaskState::Parked
+            || !matches!(
+                status.wait_reason,
+                Some(StructuredWaitReason::AwaitingUserInput { .. })
+            )
+        {
+            return false;
+        }
+        self.replace_active_session(status, None);
+        Self::update_lifecycle(status, TaskState::Pending);
+        status.wait_reason = None;
+        status.updated_at = Utc::now();
+        true
+    }
+
     fn replace_active_session(&self, status: &mut TaskStatus, session_id: Option<acp::SessionId>) {
         let mut tasks_by_session = self.tasks_by_session.write();
         if let Some(previous_session_id) = status.active_session_id.take() {
@@ -143,8 +198,36 @@ impl TaskRegistry {
         tokens_used: Option<u64>,
         verification: Option<VerificationResult>,
     ) {
+        self.complete_attempt_with_awaiting_apply(
+            task_id,
+            attempt,
+            output,
+            tokens_used,
+            verification,
+            false,
+        );
+    }
+
+    /// Completes an execution attempt, transitioning to `AwaitingApply` if verification passed
+    /// and `awaiting_apply` is true.
+    pub fn complete_attempt_with_awaiting_apply(
+        &self,
+        task_id: &TaskId,
+        attempt: u32,
+        output: Option<String>,
+        tokens_used: Option<u64>,
+        verification: Option<VerificationResult>,
+        awaiting_apply: bool,
+    ) {
         let mut statuses = self.statuses.write();
         let mut attempts = self.attempts.write();
+
+        if statuses.get(task_id).is_none_or(|status| {
+            attempt != status.current_attempt
+                || matches!(status.state, TaskState::Cancelled | TaskState::Completed)
+        }) {
+            return;
+        }
 
         if let Some(list) = attempts.get_mut(task_id) {
             if let Some(record) = list.iter_mut().find(|a| a.attempt_index == attempt) {
@@ -165,7 +248,11 @@ impl TaskRegistry {
 
             let state = if let Some(ver) = verification {
                 if ver.passed {
-                    TaskState::Completed
+                    if awaiting_apply {
+                        TaskState::AwaitingApply
+                    } else {
+                        TaskState::Completed
+                    }
                 } else if ver.repairable {
                     TaskState::Repairing
                 } else if ver.retryable {
@@ -173,10 +260,23 @@ impl TaskRegistry {
                 } else {
                     TaskState::Failed
                 }
+            } else if awaiting_apply {
+                TaskState::AwaitingApply
             } else {
                 TaskState::Completed
             };
             Self::update_lifecycle(status, state);
+            if state == TaskState::AwaitingApply && status.wait_reason.is_none() {
+                status.wait_reason = Some(StructuredWaitReason::AwaitingApply {
+                    patch_id: None,
+                    worktree_path: status
+                        .worker_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.worktree_path.clone()),
+                });
+            } else if state == TaskState::Completed {
+                status.wait_reason = None;
+            }
         }
     }
 
@@ -204,6 +304,13 @@ impl TaskRegistry {
     ) {
         let mut statuses = self.statuses.write();
         let mut attempts = self.attempts.write();
+
+        if statuses.get(task_id).is_none_or(|status| {
+            attempt != status.current_attempt
+                || matches!(status.state, TaskState::Cancelled | TaskState::Completed)
+        }) {
+            return;
+        }
 
         if let Some(list) = attempts.get_mut(task_id) {
             if let Some(record) = list.iter_mut().find(|a| a.attempt_index == attempt) {
@@ -344,7 +451,152 @@ impl TaskRegistry {
         attempts.get(task_id).cloned().unwrap_or_default()
     }
 
-    /// Set of completed task IDs.
+    /// Sets the target worker executing this task.
+    pub fn set_target(&self, task_id: &TaskId, target: WorkerTarget) {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            status.target = target;
+            status.updated_at = Utc::now();
+        }
+    }
+
+    /// Sets or updates the worker metadata for this task.
+    pub fn set_worker_metadata(&self, task_id: &TaskId, metadata: WorkerMetadata) {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            status.target = metadata.target.clone();
+            status.worker_metadata = Some(metadata);
+            status.updated_at = Utc::now();
+        }
+    }
+
+    /// Sets or clears the structured wait reason for this task.
+    pub fn set_wait_reason(&self, task_id: &TaskId, reason: Option<StructuredWaitReason>) {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            status.wait_reason = reason;
+            status.updated_at = Utc::now();
+        }
+    }
+
+    /// Transitions a task from `AwaitingApply` to `Completed` after successful apply.
+    pub fn mark_applied(&self, task_id: &TaskId) -> bool {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            if status.state == TaskState::AwaitingApply || can_retry_apply(status) {
+                Self::update_lifecycle(status, TaskState::Completed);
+                status.wait_reason = None;
+                status.updated_at = Utc::now();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Transitions a task from `AwaitingApply` to `Cancelled` or `Failed` on rejection.
+    pub fn mark_rejected(&self, task_id: &TaskId, reason: Option<String>) -> bool {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            if status.state == TaskState::AwaitingApply || can_reject_apply(status) {
+                Self::update_lifecycle(status, TaskState::Cancelled);
+                status.latest_error = reason;
+                status.wait_reason = None;
+                status.updated_at = Utc::now();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set of tasks currently awaiting apply.
+    pub fn awaiting_apply_tasks(&self) -> HashSet<TaskId> {
+        let statuses = self.statuses.read();
+        statuses
+            .iter()
+            .filter(|(_, s)| s.state == TaskState::AwaitingApply)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    pub fn park_apply_conflict(
+        &self,
+        task_id: &TaskId,
+        error: String,
+        worktree_path: String,
+    ) -> bool {
+        let mut statuses = self.statuses.write();
+        let Some(status) = statuses.get_mut(task_id) else {
+            return false;
+        };
+        if status.state != TaskState::AwaitingApply && status.state != TaskState::Parked {
+            return false;
+        }
+        Self::update_lifecycle(status, TaskState::Parked);
+        status.latest_error = Some(error.clone());
+        status.wait_reason = Some(StructuredWaitReason::ApplyConflict {
+            error,
+            worktree_path,
+        });
+        status.updated_at = Utc::now();
+        true
+    }
+
+    pub fn park_verification_failed(
+        &self,
+        task_id: &TaskId,
+        error: String,
+        worktree_path: String,
+        rollback_error: Option<String>,
+    ) -> bool {
+        let mut statuses = self.statuses.write();
+        let Some(status) = statuses.get_mut(task_id) else {
+            return false;
+        };
+        if status.state != TaskState::AwaitingApply && status.state != TaskState::Parked {
+            return false;
+        }
+        Self::update_lifecycle(status, TaskState::Parked);
+        status.latest_error = Some(error.clone());
+        status.wait_reason = Some(StructuredWaitReason::PostApplyVerificationFailed {
+            error,
+            worktree_path,
+            rollback_error,
+        });
+        status.updated_at = Utc::now();
+        true
+    }
+
+    pub fn park_worktree_verification_failed(
+        &self,
+        task_id: &TaskId,
+        error: String,
+        worktree_path: String,
+    ) -> bool {
+        let mut statuses = self.statuses.write();
+        let Some(status) = statuses.get_mut(task_id) else {
+            return false;
+        };
+        if status.state != TaskState::AwaitingApply && status.state != TaskState::Parked {
+            return false;
+        }
+        Self::update_lifecycle(status, TaskState::Parked);
+        status.latest_error = Some(error.clone());
+        status.wait_reason = Some(StructuredWaitReason::WorktreeVerificationFailed {
+            error,
+            worktree_path,
+        });
+        status.updated_at = Utc::now();
+        true
+    }
+
+    pub fn parked_tasks(&self) -> HashSet<TaskId> {
+        let statuses = self.statuses.read();
+        statuses
+            .iter()
+            .filter(|(_, status)| status.state == TaskState::Parked)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
     pub fn completed_tasks(&self) -> HashSet<TaskId> {
         let statuses = self.statuses.read();
         statuses

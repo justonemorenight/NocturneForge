@@ -54,6 +54,11 @@ impl From<AcpTaskBridge> for OrchestrationTask {
             tool_call_budget: None,
             objective: None,
             scope: None,
+            native_role: None,
+            target: crate::worker::WorkerTarget::Native,
+            mode: None,
+            workspace_policy: crate::worker::WorkspacePolicy::default(),
+            verification_command: None,
         }
     }
 }

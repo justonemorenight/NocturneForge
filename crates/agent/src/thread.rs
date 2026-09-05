@@ -106,6 +106,14 @@ pub(crate) fn resolve_subagent_role_policy(
 }
 
 impl SubagentRole {
+    pub(crate) fn identifier(self) -> &'static str {
+        match self {
+            Self::Explorer => "explorer",
+            Self::FlowReader => "flow-reader",
+            Self::CodingWorker => "coding-worker",
+        }
+    }
+
     fn model_selection(self, roles: &ChatGptSubagentRolesSettings) -> LanguageModelSelection {
         let configured = match self {
             Self::Explorer => &roles.explorer,
@@ -1022,6 +1030,18 @@ pub trait ThreadEnvironment {
         Err(anyhow::anyhow!(
             "Listing available agents is not supported in this environment"
         ))
+    }
+
+    fn create_orchestration_worker_host(
+        &self,
+        _agent_id: String,
+        _task: agent_orchestration::OrchestrationTask,
+        _context: agent_orchestration::TaskExecutionContext,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<Rc<dyn agent_orchestration::WorkerHost>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "External orchestration workers are not supported in this environment"
+        )))
     }
 }
 

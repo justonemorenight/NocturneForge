@@ -1,4 +1,5 @@
 use crate::ids::{PlanId, TaskId};
+use crate::worker::{WorkerTarget, WorkspacePolicy};
 use collections::{HashMap, HashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,24 @@ pub struct OrchestrationTask {
     /// Bounded write scope / affected file patterns for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Native subagent role. External workers do not interpret this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_role: Option<String>,
+    /// Worker execution target: Native or ACP agent.
+    #[serde(default)]
+    pub target: WorkerTarget,
+    /// Mode to request from the worker (e.g. session mode or profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Workspace isolation policy for this task.
+    #[serde(default)]
+    pub workspace_policy: WorkspacePolicy,
+    /// Optional, trusted verification command to run in the worktree and on the
+    /// parent checkout after apply. Model-generated task input does not expose
+    /// this field; runtime validation rejects shell syntax and non-allowlisted
+    /// executables before spawning it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_command: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -90,6 +109,11 @@ impl OrchestrationTask {
             tool_call_budget: None,
             objective: None,
             scope: None,
+            native_role: None,
+            target: WorkerTarget::Native,
+            mode: None,
+            workspace_policy: WorkspacePolicy::default(),
+            verification_command: None,
         }
     }
 

@@ -68,9 +68,16 @@ enum AgentActivityStatus {
     Waiting,
     Blocked,
     Stopped,
+    AwaitingApply,
     Completed,
     Failed,
     Canceled,
+}
+
+struct PendingWorkerPermission {
+    session_id: acp::SessionId,
+    label: SharedString,
+    entry_ix: Option<usize>,
 }
 
 impl AgentActivityStatus {
@@ -119,7 +126,8 @@ impl AgentActivityStatus {
             agent_orchestration::TaskState::Pending
             | agent_orchestration::TaskState::WaitingDependency => Self::Pending,
             agent_orchestration::TaskState::Blocked => Self::Blocked,
-            agent_orchestration::TaskState::Parked => Self::Stopped,
+            agent_orchestration::TaskState::Parked => Self::Blocked,
+            agent_orchestration::TaskState::AwaitingApply => Self::AwaitingApply,
             agent_orchestration::TaskState::Running
             | agent_orchestration::TaskState::Verifying
             | agent_orchestration::TaskState::Repairing
@@ -132,7 +140,7 @@ impl AgentActivityStatus {
     }
 
     fn is_active(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::Waiting)
+        matches!(self, Self::Running | Self::Waiting)
     }
 
     fn label(self) -> &'static str {
@@ -142,6 +150,7 @@ impl AgentActivityStatus {
             Self::Waiting => "Needs input",
             Self::Blocked => "Blocked",
             Self::Stopped => "Stopped",
+            Self::AwaitingApply => "Awaiting apply",
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Canceled => "Canceled",
@@ -151,6 +160,7 @@ impl AgentActivityStatus {
 
 #[derive(Clone)]
 struct AgentActivityItem {
+    runtime_task_id: Option<agent_orchestration::TaskId>,
     entry_ix: usize,
     session_id: Option<acp::SessionId>,
     name: SharedString,
@@ -166,6 +176,25 @@ struct AgentActivityItem {
     tokens: Option<u64>,
     token_budget: Option<u64>,
     tool_call_budget: Option<u64>,
+    worker: Option<SharedString>,
+    mode: Option<SharedString>,
+    scope: Option<SharedString>,
+    objective: Option<SharedString>,
+    worktree_path: Option<SharedString>,
+    patch_status: Option<SharedString>,
+    last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Clone, Copy)]
+enum WorkerPatchAction {
+    Output,
+    Cancel,
+    OpenWorktree,
+    Restart,
+    Cleanup,
+    Review,
+    Apply,
+    Reject,
 }
 
 fn delegated_task_status_is_complete(status: &str) -> bool {
@@ -3613,12 +3642,13 @@ impl ThreadView {
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: None,
+                        runtime_task_id: None,
                         name: name.into(),
                         harness: "ACP",
                         status,
                         model: model.map(Into::into),
-                        role: (!agent.is_empty()).then(|| agent.into()),
-                        task: (!task.is_empty()).then(|| task.into()),
+                        role: (!agent.is_empty()).then(|| SharedString::from(agent.clone())),
+                        task: (!task.is_empty()).then(|| SharedString::from(task.clone())),
                         current_tool: result.and_then(|result| result.current_tool.clone()),
                         last_intent: result
                             .and_then(|result| result.last_intent.clone())
@@ -3628,6 +3658,13 @@ impl ThreadView {
                         tokens: result.and_then(|result| result.tokens),
                         token_budget: None,
                         tool_call_budget: None,
+                        worker: (!agent.is_empty()).then(|| SharedString::from(agent)),
+                        mode: None,
+                        scope: None,
+                        objective: (!task.is_empty()).then(|| SharedString::from(task)),
+                        worktree_path: None,
+                        patch_status: None,
+                        last_activity_at: None,
                     });
                 }
                 continue;
@@ -3738,6 +3775,12 @@ impl ThreadView {
                     let (status, task_status, orchestration_task) = orchestration_status
                         .map(|(status, task_status, task)| (Some(status), Some(task_status), task))
                         .unwrap_or((None, None, None));
+                    let mut mode = None;
+                    let mut scope = None;
+                    let mut objective = None;
+                    let mut worktree_path = None;
+                    let mut patch_status = None;
+                    let mut worker_target = None;
                     if let Some(task) = orchestration_task {
                         model = task
                             .model_override
@@ -3746,6 +3789,10 @@ impl ThreadView {
                             .or(model);
                         token_budget = task.token_budget;
                         tool_call_budget = task.tool_call_budget;
+                        mode = task.mode.clone().map(SharedString::from);
+                        scope = task.scope.clone().map(SharedString::from);
+                        objective = task.objective.clone().map(SharedString::from);
+                        worker_target = Some(SharedString::from(task.target.to_string()));
                     }
                     if let Some(task_status) = task_status {
                         current_tool = task_status
@@ -3755,6 +3802,12 @@ impl ThreadView {
                                 arguments: None,
                             })
                             .or(current_tool);
+                        if let Some(meta) = &task_status.worker_metadata {
+                            worktree_path = meta.worktree_path.clone().map(SharedString::from);
+                        }
+                        if task_status.state == agent_orchestration::TaskState::AwaitingApply {
+                            patch_status = Some(SharedString::from("Awaiting apply"));
+                        }
                     }
                     let status = status.unwrap_or_else(|| {
                         let mut status =
@@ -3782,6 +3835,7 @@ impl ThreadView {
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: Some(session_id),
+                        runtime_task_id: None,
                         name,
                         harness: "Native",
                         status,
@@ -3795,6 +3849,13 @@ impl ThreadView {
                         tokens,
                         token_budget,
                         tool_call_budget,
+                        worker: worker_target,
+                        mode,
+                        scope,
+                        objective,
+                        worktree_path,
+                        patch_status,
+                        last_activity_at: None,
                     });
                 }
                 continue;
@@ -3841,6 +3902,7 @@ impl ThreadView {
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: Some(session_id.into()),
+                        runtime_task_id: None,
                         name: name.into(),
                         harness: "Native",
                         status,
@@ -3854,6 +3916,13 @@ impl ThreadView {
                         tokens: None,
                         token_budget: None,
                         tool_call_budget: None,
+                        worker: None,
+                        mode: None,
+                        scope: None,
+                        objective: None,
+                        worktree_path: None,
+                        patch_status: None,
+                        last_activity_at: None,
                     });
                 }
                 continue;
@@ -4002,6 +4071,7 @@ impl ThreadView {
             let item = AgentActivityItem {
                 entry_ix,
                 session_id: Some(session_id.clone()),
+                runtime_task_id: None,
                 name,
                 harness: if native_thread.is_some() {
                     "Native"
@@ -4019,6 +4089,13 @@ impl ThreadView {
                 tokens,
                 token_budget,
                 tool_call_budget: None,
+                worker: None,
+                mode: None,
+                scope: None,
+                objective: None,
+                worktree_path: None,
+                patch_status: None,
+                last_activity_at: None,
             };
 
             if let Some(position) = session_positions.get(&session_id).copied() {
@@ -4026,6 +4103,160 @@ impl ThreadView {
             } else {
                 session_positions.insert(session_id, items.len());
                 items.push(item);
+            }
+        }
+
+        let orchestration_snapshot = self.as_native_thread(cx).and_then(|thread| {
+            let thread = thread.read(cx);
+            thread
+                .orchestration_run()
+                .map(|run| (run.task_statuses(), run.plan().tasks.clone()))
+                .or_else(|| {
+                    thread
+                        .persisted_orchestration_run()
+                        .map(|run| (run.task_statuses.clone(), run.plan.tasks.clone()))
+                })
+        });
+        if let Some((statuses, tasks)) = orchestration_snapshot {
+            let fallback_entry_ix = entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(entry_ix, entry)| {
+                    let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                        return None;
+                    };
+                    (tool_call.tool_name.as_deref() == Some("spawn_agent")).then_some(entry_ix)
+                })
+                .unwrap_or_default();
+
+            for status in statuses {
+                let Some(task) = tasks.iter().find(|task| task.id == status.task_id) else {
+                    continue;
+                };
+                let activity_status = AgentActivityStatus::from_orchestration_state(status.state);
+                let metadata = status.worker_metadata.as_ref();
+                let model = metadata
+                    .and_then(|metadata| metadata.model.clone())
+                    .or_else(|| task.model_override.clone())
+                    .map(SharedString::from);
+                let mode = metadata
+                    .and_then(|metadata| metadata.mode.clone())
+                    .or_else(|| task.mode.clone())
+                    .map(SharedString::from);
+                let worktree_path = metadata
+                    .and_then(|metadata| metadata.worktree_path.clone())
+                    .map(SharedString::from);
+                let worker = Some(SharedString::from(
+                    match metadata.and_then(|metadata| metadata.nested_agent_count) {
+                        Some(count) => format!("{} · {count} nested", task.target),
+                        None => task.target.to_string(),
+                    },
+                ));
+                let current_tool =
+                    status
+                        .current_tool
+                        .clone()
+                        .map(|name| DelegatedTaskToolActivity {
+                            name,
+                            arguments: None,
+                        });
+                let wait_reason = status
+                    .wait_reason
+                    .as_ref()
+                    .map(|reason| SharedString::from(reason.description()));
+                let patch_status = if status.state == agent_orchestration::TaskState::AwaitingApply
+                {
+                    Some(SharedString::from("Awaiting apply"))
+                } else if matches!(
+                    &status.wait_reason,
+                    Some(agent_orchestration::StructuredWaitReason::ApplyConflict { .. })
+                ) {
+                    Some(SharedString::from("Apply conflict"))
+                } else if matches!(
+                    &status.wait_reason,
+                    Some(
+                        agent_orchestration::StructuredWaitReason::WorktreeVerificationFailed { .. }
+                    )
+                ) {
+                    Some(SharedString::from("Worktree verification failed"))
+                } else if matches!(
+                    &status.wait_reason,
+                    Some(
+                        agent_orchestration::StructuredWaitReason::PostApplyVerificationFailed { .. }
+                    )
+                ) {
+                    Some(SharedString::from("Verification failed"))
+                } else {
+                    None
+                };
+                let session_position = status.active_session_id.as_ref().and_then(|session_id| {
+                    items
+                        .iter()
+                        .position(|item| item.session_id.as_ref() == Some(session_id))
+                });
+
+                if let Some(position) = session_position {
+                    let item = &mut items[position];
+                    item.runtime_task_id = Some(task.id.clone());
+                    item.harness = if task.target.is_native() {
+                        "Native"
+                    } else {
+                        "ACP"
+                    };
+                    item.status = activity_status;
+                    item.worker = worker;
+                    item.model = model.or_else(|| item.model.clone());
+                    item.mode = mode;
+                    item.role = task
+                        .native_role
+                        .clone()
+                        .map(SharedString::from)
+                        .or_else(|| item.role.clone());
+                    item.scope = task.scope.clone().map(SharedString::from);
+                    item.objective = task.objective.clone().map(SharedString::from);
+                    item.current_tool = current_tool;
+                    item.last_intent = wait_reason.or_else(|| item.last_intent.clone());
+                    item.tokens = Some(status.tokens_used)
+                        .filter(|tokens| *tokens > 0)
+                        .or(item.tokens);
+                    item.token_budget = task.token_budget;
+                    item.tool_call_budget = task.tool_call_budget;
+                    item.worktree_path = worktree_path;
+                    item.patch_status = patch_status;
+                    item.last_activity_at = metadata.and_then(|metadata| metadata.last_activity_at);
+                    continue;
+                }
+
+                items.push(AgentActivityItem {
+                    entry_ix: fallback_entry_ix,
+                    runtime_task_id: Some(task.id.clone()),
+                    session_id: status.active_session_id.clone(),
+                    name: task.label.clone().into(),
+                    harness: if task.target.is_native() {
+                        "Native"
+                    } else {
+                        "ACP"
+                    },
+                    status: activity_status,
+                    model,
+                    role: task.native_role.clone().map(SharedString::from),
+                    task: Some(task.description.clone().into()),
+                    current_tool,
+                    last_intent: wait_reason,
+                    tool_count: None,
+                    requests: None,
+                    tokens: Some(status.tokens_used).filter(|tokens| *tokens > 0),
+                    token_budget: task.token_budget,
+                    tool_call_budget: task.tool_call_budget,
+                    worker,
+                    mode,
+                    scope: task.scope.clone().map(SharedString::from),
+                    objective: task.objective.clone().map(SharedString::from),
+                    worktree_path,
+                    patch_status,
+                    last_activity_at: metadata.and_then(|metadata| metadata.last_activity_at),
+                });
             }
         }
 
@@ -4045,6 +4276,7 @@ impl ThreadView {
                 AgentActivityStatus::Waiting => (IconName::Circle, Color::Warning),
                 AgentActivityStatus::Blocked => (IconName::Stop, Color::Warning),
                 AgentActivityStatus::Stopped => (IconName::Stop, Color::Muted),
+                AgentActivityStatus::AwaitingApply => (IconName::FileCode, Color::Accent),
                 AgentActivityStatus::Completed => (IconName::Check, Color::Success),
                 AgentActivityStatus::Failed => (IconName::Close, Color::Error),
                 AgentActivityStatus::Canceled => (IconName::Circle, Color::Muted),
@@ -4059,6 +4291,153 @@ impl ThreadView {
         }
     }
 
+    fn worker_patch_action(
+        &mut self,
+        task_id: agent_orchestration::TaskId,
+        action: WorkerPatchAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(run) = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+        else {
+            return;
+        };
+        let confirmation = match action {
+            WorkerPatchAction::Review
+            | WorkerPatchAction::Output
+            | WorkerPatchAction::OpenWorktree
+            | WorkerPatchAction::Restart
+            | WorkerPatchAction::Cleanup => None,
+            WorkerPatchAction::Cancel => Some(window.prompt(
+                gpui::PromptLevel::Warning,
+                "Cancel this worker?",
+                Some("The worker will stop without cancelling sibling workers."),
+                &["Cancel Worker", "Keep Running"],
+                cx,
+            )),
+            WorkerPatchAction::Apply => Some(window.prompt(
+                gpui::PromptLevel::Warning,
+                "Apply this worker patch to the parent checkout?",
+                Some("Review the diff first. Conflicting changes will not be overwritten."),
+                &["Apply", "Cancel"],
+                cx,
+            )),
+            WorkerPatchAction::Reject => Some(window.prompt(
+                gpui::PromptLevel::Warning,
+                "Reject this worker patch?",
+                Some("The managed worktree will be removed. The parent checkout is not changed."),
+                &["Reject Patch", "Cancel"],
+                cx,
+            )),
+        };
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                if let Some(confirmation) = confirmation {
+                    if confirmation.await? != 0 {
+                        return Ok(());
+                    }
+                }
+                match action {
+                    WorkerPatchAction::Cancel => {
+                        run.cancel_task(
+                            &task_id,
+                            agent_orchestration::CancellationReason::UserRequested,
+                        );
+                    }
+                    WorkerPatchAction::OpenWorktree => {
+                        let path = run
+                            .task_status(&task_id)
+                            .and_then(|status| status.worker_metadata)
+                            .and_then(|metadata| metadata.worktree_path)
+                            .ok_or_else(|| anyhow!("Worker has no managed worktree"))?;
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            workspace
+                                .open_abs_path(
+                                    path.into(),
+                                    OpenOptions {
+                                        focus: Some(true),
+                                        ..Default::default()
+                                    },
+                                    window,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                        })?;
+                    }
+                    WorkerPatchAction::Restart => {
+                        anyhow::ensure!(
+                            run.restart_task(&task_id)?,
+                            "Worker is no longer awaiting restart"
+                        );
+                    }
+                    WorkerPatchAction::Cleanup => run.retry_cleanup(&task_id).await?,
+                    WorkerPatchAction::Review | WorkerPatchAction::Output => {
+                        let diff = if matches!(action, WorkerPatchAction::Output) {
+                            run.task_status(&task_id)
+                                .and_then(|status| status.latest_output)
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "Worker transcript expired and no final output is available"
+                                    )
+                                })?
+                        } else {
+                            run.review_diff(&task_id)
+                                .await?
+                                .ok_or_else(|| anyhow!("Worker has no patch to review"))?
+                        };
+                        let title = if matches!(action, WorkerPatchAction::Output) {
+                            format!("Worker output · {task_id}")
+                        } else {
+                            format!("Worker patch · {task_id}")
+                        };
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            let buffer = cx.new(|cx| Buffer::local(diff, cx));
+                            let buffer =
+                                cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title));
+                            let editor = cx.new(|cx| {
+                                let mut editor = Editor::for_multibuffer(buffer, None, window, cx);
+                                editor.set_read_only(true);
+                                editor
+                            });
+                            workspace.add_item_to_active_pane(
+                                Box::new(editor),
+                                None,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })?;
+                    }
+                    WorkerPatchAction::Apply => {
+                        anyhow::ensure!(
+                            run.apply_task(&task_id).await?,
+                            "Worker patch is no longer awaiting apply"
+                        );
+                    }
+                    WorkerPatchAction::Reject => {
+                        anyhow::ensure!(
+                            run.reject_task(&task_id, Some("Rejected by user".to_string()))
+                                .await?,
+                            "Worker patch is no longer awaiting review"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                workspace
+                    .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                    .log_err();
+            }
+            this.update(cx, |_, cx| cx.notify()).log_err();
+        })
+        .detach();
+    }
+
     fn render_agent_activity(
         &self,
         items: &[AgentActivityItem],
@@ -4069,10 +4448,22 @@ impl ThreadView {
             .iter()
             .filter(|item| item.status == AgentActivityStatus::Waiting)
             .count();
+        let pending_count = items
+            .iter()
+            .filter(|item| item.status == AgentActivityStatus::Pending)
+            .count();
+        let awaiting_apply_count = items
+            .iter()
+            .filter(|item| item.status == AgentActivityStatus::AwaitingApply)
+            .count();
         let summary = if waiting_count > 0 {
             format!("{active_count} active · {waiting_count} need input")
         } else if active_count > 0 {
             format!("{active_count} active")
+        } else if awaiting_apply_count > 0 {
+            format!("{awaiting_apply_count} awaiting review")
+        } else if pending_count > 0 {
+            format!("{pending_count} queued")
         } else {
             format!("{} finished", items.len())
         };
@@ -4132,15 +4523,46 @@ impl ThreadView {
                         .children(items.iter().cloned().enumerate().map(|(index, item)| {
                             let is_last = index + 1 == items.len();
                             let target_session_id = item.session_id.clone();
+                            let target_task_id = item.runtime_task_id.clone();
                             let entry_ix = item.entry_ix;
                             let status = item.status;
+                            let patch_reviewable = item.patch_status.is_some();
+                            let can_restart = item.runtime_task_id.as_ref().is_some_and(|task_id| {
+                                self.as_native_thread(cx)
+                                    .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+                                    .is_some_and(|run| !run.state().is_terminal() && run.task_status(task_id).is_some_and(|task| {
+                                        task.state == agent_orchestration::TaskState::Parked
+                                            && matches!(&task.wait_reason, Some(agent_orchestration::StructuredWaitReason::AwaitingUserInput { .. }))
+                                    }))
+                            });
+                            let can_cancel = item.runtime_task_id.as_ref().is_some_and(|task_id| {
+                                self.as_native_thread(cx)
+                                    .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+                                    .is_some_and(|run| {
+                                        !run.state().is_terminal()
+                                            && run.task_status(task_id).is_some_and(|task| {
+                                                matches!(
+                                                    task.state,
+                                                    agent_orchestration::TaskState::Pending
+                                                        | agent_orchestration::TaskState::WaitingDependency
+                                                        | agent_orchestration::TaskState::Running
+                                                        | agent_orchestration::TaskState::Verifying
+                                                        | agent_orchestration::TaskState::Repairing
+                                                        | agent_orchestration::TaskState::Retrying
+                                                )
+                                            })
+                                    })
+                            });
                             let status_label = status.label();
                             let name = item.name.clone();
-                            let task_tooltip = item.task.clone();
                             let metadata = [
                                 Some(item.harness.to_owned()),
+                                item.worker.as_ref().map(|w| format!("worker: {w}")),
                                 item.role.as_ref().map(ToString::to_string),
                                 item.model.as_ref().map(ToString::to_string),
+                                item.mode.as_ref().map(|m| format!("mode: {m}")),
+                                item.scope.as_ref().map(|s| format!("scope: {s}")),
+                                item.patch_status.as_ref().map(ToString::to_string),
                                 item.tool_count.map(|count| format!("{count} tools")),
                                 item.requests.map(|count| format!("{count} requests")),
                                 item.tokens.map(|tokens| {
@@ -4160,9 +4582,21 @@ impl ThreadView {
                             let current_activity = item.current_tool.as_ref().map(|activity| {
                                 format!("Current: {}", delegated_task_activity_label(activity))
                             });
+                            let last_activity = item.last_activity_at.map(|timestamp| {
+                                format!("Last activity: {}", timestamp.format("%H:%M:%S UTC"))
+                            });
                             let detail = current_activity
+                                .or(last_activity)
                                 .or_else(|| item.last_intent.as_ref().map(ToString::to_string))
+                                .or_else(|| item.objective.as_ref().map(ToString::to_string))
                                 .or_else(|| item.task.as_ref().map(ToString::to_string));
+                            let task_tooltip = item.task.clone().map(|task| {
+                                if let Some(wt) = &item.worktree_path {
+                                    format!("{task}\nWorktree: {wt}")
+                                } else {
+                                    task.to_string()
+                                }
+                            });
 
                             v_flex()
                                 .id(("agent-activity-item", index))
@@ -4210,6 +4644,53 @@ impl ThreadView {
                                             .truncate(),
                                     )
                                 })
+                                .when_some(item.runtime_task_id.clone().filter(|_| can_restart), |element, task_id| {
+                                    element.child(Button::new(SharedString::from(format!("restart-{task_id}")), "Restart Attempt")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Restart, window, cx);
+                                        })))
+                                })
+                                .when_some(item.runtime_task_id.clone().filter(|_| can_cancel), |element, task_id| {
+                                    element.child(Button::new(SharedString::from(format!("cancel-{task_id}")), "Cancel Worker")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Cancel, window, cx);
+                                        })))
+                                })
+                                .when_some(item.runtime_task_id.clone().filter(|_| item.worktree_path.is_some()), |element, task_id| {
+                                    element.child(Button::new(SharedString::from(format!("open-worktree-{task_id}")), "Open Worktree")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::OpenWorktree, window, cx);
+                                        })))
+                                })
+                                .when_some(item.runtime_task_id.clone().filter(|_| item.worktree_path.is_some() && matches!(status, AgentActivityStatus::Completed | AgentActivityStatus::Failed | AgentActivityStatus::Canceled)), |element, task_id| {
+                                    element.child(Button::new(SharedString::from(format!("cleanup-{task_id}")), "Retry Cleanup")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Cleanup, window, cx);
+                                        })))
+                                })
+                                .when_some(item.runtime_task_id.filter(|_| patch_reviewable), |element, task_id| {
+                                    let apply_label = if status == AgentActivityStatus::Blocked {
+                                        "Retry Apply"
+                                    } else {
+                                        "Apply"
+                                    };
+                                    element.child(h_flex().gap_1().children([
+                                        ("Review Diff", WorkerPatchAction::Review),
+                                        (apply_label, WorkerPatchAction::Apply),
+                                        ("Reject", WorkerPatchAction::Reject),
+                                    ].into_iter().map(|(label, action)| {
+                                        let task_id = task_id.clone();
+                                        Button::new(SharedString::from(format!("worker-{task_id}-{label}")), label)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.worker_patch_action(task_id.clone(), action, window, cx);
+                                            }))
+                                    })))
+                                })
                                 .when(status == AgentActivityStatus::Stopped && task_tooltip.is_none(), |this| {
                                     this.tooltip(Tooltip::text("Agent stopped/idle without verified completion contract"))
                                 })
@@ -4217,6 +4698,14 @@ impl ThreadView {
                                     this.tooltip(Tooltip::text(task))
                                 })
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(task_id) = target_task_id.clone()
+                                        && target_session_id.as_ref().is_none_or(|session_id| {
+                                            this.server_view.read_with(cx, |view, _| view.thread_view(session_id).is_none()).unwrap_or(true)
+                                        })
+                                    {
+                                        this.worker_patch_action(task_id, WorkerPatchAction::Output, window, cx);
+                                        return;
+                                    }
                                     if let Some(session_id) = target_session_id.clone() {
                                         let server_view = this.server_view.clone();
                                         window.defer(cx, move |window, cx| {
@@ -4944,7 +5433,7 @@ impl ThreadView {
         entries: &[AgentThreadEntry],
         awaiting_session_ids: &[acp::SessionId],
         cx: &App,
-    ) -> Vec<(SharedString, usize)> {
+    ) -> Vec<PendingWorkerPermission> {
         let tool_calls_by_session: HashMap<_, _> = entries
             .iter()
             .enumerate()
@@ -4965,7 +5454,14 @@ impl ThreadView {
 
         awaiting_session_ids
             .iter()
-            .filter_map(|session_id| tool_calls_by_session.get(session_id).cloned())
+            .filter_map(|session_id| {
+                let (label, entry_ix) = tool_calls_by_session.get(session_id)?.clone();
+                Some(PendingWorkerPermission {
+                    session_id: session_id.clone(),
+                    label,
+                    entry_ix: Some(entry_ix),
+                })
+            })
             .collect()
     }
 
@@ -4983,8 +5479,24 @@ impl ThreadView {
 
         let thread = self.thread.read(cx);
         let entries = thread.entries();
-        let subagent_items =
+        let mut subagent_items =
             Self::collect_subagent_items_for_sessions(entries, &awaiting_session_ids, cx);
+        let conversation = self.conversation.read(cx);
+        for session_id in awaiting_session_ids {
+            if subagent_items
+                .iter()
+                .any(|item| item.session_id == session_id)
+            {
+                continue;
+            }
+            if let Some(label) = conversation.orchestration_worker_label(&session_id, cx) {
+                subagent_items.push(PendingWorkerPermission {
+                    session_id,
+                    label,
+                    entry_ix: None,
+                });
+            }
+        }
 
         if subagent_items.is_empty() {
             return None;
@@ -5010,58 +5522,71 @@ impl ThreadView {
                         .child(Label::new(item_count.to_string()).size(LabelSize::Small)),
                 )
                 .child(
-                    v_flex().children(subagent_items.into_iter().enumerate().map(
-                        |(ix, (label, entry_ix))| {
-                            let is_last = ix == item_count - 1;
-                            let group = format!("group-{}", entry_ix);
+                    v_flex().children(subagent_items.into_iter().enumerate().map(|(ix, item)| {
+                        let is_last = ix == item_count - 1;
+                        let group = format!("group-worker-permission-{ix}");
+                        let entry_ix = item.entry_ix;
+                        let session_id = item.session_id;
+                        let server_view = self.server_view.clone();
 
-                            h_flex()
-                                .cursor_pointer()
-                                .id(format!("subagent-permission-{}", entry_ix))
-                                .group(&group)
-                                .p_1()
-                                .pl_2()
-                                .min_w_0()
-                                .w_full()
-                                .gap_1()
-                                .justify_between()
-                                .bg(cx.theme().colors().editor_background)
-                                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                .when(!is_last, |this| {
-                                    this.border_b_1().border_color(cx.theme().colors().border)
-                                })
-                                .child(
-                                    h_flex()
-                                        .gap_1p5()
-                                        .child(
-                                            Icon::new(IconName::Circle)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Warning),
-                                        )
-                                        .child(
-                                            Label::new(label)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted)
-                                                .truncate(),
-                                        ),
-                                )
-                                .child(
-                                    div().visible_on_hover(&group).child(
-                                        Label::new("Scroll to Subagent")
+                        h_flex()
+                            .cursor_pointer()
+                            .id(format!("subagent-permission-{ix}"))
+                            .group(&group)
+                            .p_1()
+                            .pl_2()
+                            .min_w_0()
+                            .w_full()
+                            .gap_1()
+                            .justify_between()
+                            .bg(cx.theme().colors().editor_background)
+                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                            .when(!is_last, |this| {
+                                this.border_b_1().border_color(cx.theme().colors().border)
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::Circle)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                    .child(
+                                        Label::new(item.label)
                                             .size(LabelSize::Small)
                                             .color(Color::Muted)
                                             .truncate(),
                                     ),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            )
+                            .child(
+                                div().visible_on_hover(&group).child(
+                                    Label::new(if entry_ix.is_some() {
+                                        "Scroll to Subagent"
+                                    } else {
+                                        "Open Worker"
+                                    })
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                                ),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(entry_ix) = entry_ix {
                                     this.list_state.scroll_to(ListOffset {
                                         item_ix: entry_ix,
                                         offset_in_item: px(0.0),
                                     });
                                     cx.notify();
-                                }))
-                        },
-                    )),
+                                } else {
+                                    server_view
+                                        .update(cx, |view, cx| {
+                                            view.navigate_to_thread(session_id.clone(), window, cx)
+                                        })
+                                        .log_err();
+                                }
+                            }))
+                    })),
                 )
                 .into_any(),
         )
@@ -15508,7 +16033,8 @@ mod tests {
             );
             assert!(!AgentActivityStatus::from_external_status(status).is_active());
         }
-        for status in ["pending", "running", "in_progress", "active"] {
+        assert!(!AgentActivityStatus::from_external_status("pending").is_active());
+        for status in ["running", "in_progress", "active"] {
             assert!(AgentActivityStatus::from_external_status(status).is_active());
         }
         for status in ["idle", "parked", "settled", "disposed", "stopped"] {
@@ -15635,6 +16161,7 @@ mod tests {
         task.objective = Some("Refactor the module".to_owned());
 
         let item = AgentActivityItem {
+            runtime_task_id: None,
             entry_ix: 0,
             session_id: None,
             name: "Subagent 1".into(),
@@ -15653,6 +16180,13 @@ mod tests {
             tokens: Some(1_000),
             token_budget: task.token_budget,
             tool_call_budget: task.tool_call_budget,
+            worker: None,
+            mode: None,
+            scope: None,
+            objective: None,
+            worktree_path: None,
+            patch_status: None,
+            last_activity_at: None,
         };
 
         assert_eq!(item.token_budget, Some(50_000));

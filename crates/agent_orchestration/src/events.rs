@@ -3,6 +3,7 @@ use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
 use crate::state::RunState;
 use crate::verification::VerificationResult;
+use crate::worker::{StructuredWaitReason, WorkerMetadata};
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentExecutionPolicy;
 use chrono::{DateTime, Utc};
@@ -135,6 +136,25 @@ pub enum RuntimeEvent {
         task_id: TaskId,
         reason: String,
     },
+    TaskAwaitingApply {
+        run_id: RunId,
+        task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        patch_id: Option<String>,
+    },
+    TaskWaitReasonChanged {
+        run_id: RunId,
+        task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_reason: Option<StructuredWaitReason>,
+    },
+    WorkerMetadataUpdated {
+        run_id: RunId,
+        task_id: TaskId,
+        metadata: WorkerMetadata,
+    },
     ArtifactRecorded {
         run_id: RunId,
         task_id: TaskId,
@@ -185,6 +205,9 @@ impl RuntimeEvent {
             | Self::TaskCompleted { run_id, .. }
             | Self::TaskFailed { run_id, .. }
             | Self::TaskCancelled { run_id, .. }
+            | Self::TaskAwaitingApply { run_id, .. }
+            | Self::TaskWaitReasonChanged { run_id, .. }
+            | Self::WorkerMetadataUpdated { run_id, .. }
             | Self::ArtifactRecorded { run_id, .. }
             | Self::RunCompleted { run_id, .. }
             | Self::RunFailed { run_id, .. }

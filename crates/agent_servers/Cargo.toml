@@ -49,6 +49,7 @@ project.workspace = true
 release_channel.workspace = true
 remote.workspace = true
 reqwest_client = { workspace = true, optional = true }
+sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true

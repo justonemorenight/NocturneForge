@@ -13,13 +13,13 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
-use agent_servers::AgentServer;
+use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{UserAgentsMd, UserAgentsTemplate, UserAgentsTemplateCustomization};
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
 use project::agent_server_store::AllAgentServersSettings;
-use project::{AgentId, ProjectItem};
+use project::{AgentId, LocalProjectFlags, ProjectItem};
 use serde::{Deserialize, Serialize};
 
 use zed_actions::{
@@ -5049,6 +5049,221 @@ impl AgentPanelSiblingHost {
     }
 }
 
+struct PreparedOrchestrationWorkspace {
+    project: Entity<Project>,
+    worktree: Option<agent_orchestration::IsolatedWorktree>,
+    process_sandbox_policy: sandbox::SandboxPolicy,
+    terminal_sandbox_wrap: acp_thread::SandboxWrap,
+    read_only: bool,
+}
+
+async fn prepare_orchestration_workspace(
+    parent_project: Entity<Project>,
+    task: &agent_orchestration::OrchestrationTask,
+    context: &agent_orchestration::TaskExecutionContext,
+    cx: &mut gpui::AsyncApp,
+) -> Result<PreparedOrchestrationWorkspace> {
+    let read_only = task.workspace_policy.read_only;
+    anyhow::ensure!(
+        (read_only
+            && task.workspace_policy.isolation
+                == agent_orchestration::WorkspaceIsolation::SharedParent)
+            || (!read_only
+                && task.workspace_policy.isolation
+                    == agent_orchestration::WorkspaceIsolation::DedicatedWorktree),
+        "ACP workers require shared read-only access or a dedicated managed worktree"
+    );
+
+    let (parent_repo, client, node, user_store, languages, fs, environment) = parent_project
+        .read_with(cx, |project, cx| -> Result<_> {
+            anyhow::ensure!(
+                project.is_local(),
+                "ACP managed worktrees are only supported for local projects"
+            );
+            let roots = project
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>();
+            let [parent_repo] = roots.as_slice() else {
+                anyhow::bail!(
+                    "ACP managed worktrees require exactly one visible project root; found {}",
+                    roots.len()
+                );
+            };
+            Ok((
+                parent_repo.clone(),
+                project.client(),
+                project
+                    .node_runtime()
+                    .cloned()
+                    .context("local project has no Node runtime")?,
+                project.user_store(),
+                project.languages().clone(),
+                project.fs().clone(),
+                project.cli_environment(cx),
+            ))
+        })?;
+
+    let worktree = if read_only {
+        None
+    } else {
+        let worktrees_root = paths::data_dir().join("orchestration-worktrees");
+        let manager = agent_orchestration::WorktreeManager::new(&parent_repo, worktrees_root);
+        let previous_path = context
+            .previous_worker_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.worktree_path.as_ref())
+            .map(PathBuf::from);
+        Some(
+            if let Some(previous_path) = previous_path.filter(|path| path.exists()) {
+                let marker =
+                    agent_orchestration::WorktreeOwnershipMarker::read_from(&previous_path)?;
+                anyhow::ensure!(
+                    marker.attempt == context.attempt
+                        || marker.attempt.checked_add(1) == Some(context.attempt),
+                    "managed workspace belongs to a different execution attempt"
+                );
+                let worktree = agent_orchestration::IsolatedWorktree::reopen_managed(
+                    previous_path,
+                    &context.run_id,
+                    &task.id,
+                    marker.attempt,
+                )
+                .await?;
+                if marker.attempt == context.attempt {
+                    worktree
+                } else {
+                    worktree.advance_attempt(context.attempt).await?
+                }
+            } else {
+                manager
+                    .create_isolated_worktree_with_scope(
+                        &context.run_id,
+                        &task.id,
+                        context.attempt,
+                        task.workspace_policy.allowed_subpaths.as_deref(),
+                    )
+                    .await?
+            },
+        )
+    };
+
+    let mut worker_metadata = agent_orchestration::WorkerMetadata::new(task.target.clone());
+    worker_metadata.model = task.model_override.clone();
+    worker_metadata.mode = task.mode.clone();
+    worker_metadata.workspace_policy = task.workspace_policy.clone();
+    worker_metadata.worktree_path = worktree
+        .as_ref()
+        .map(|worktree| worktree.worktree_path.display().to_string());
+    worker_metadata.baseline_commit = worktree
+        .as_ref()
+        .map(|worktree| worktree.baseline_commit.clone());
+    worker_metadata.capabilities.can_cancel = true;
+    worker_metadata.capabilities.can_enforce_read_only = read_only;
+    worker_metadata.capabilities.can_select_model = true;
+    worker_metadata.capabilities.can_select_mode = true;
+    worker_metadata.capabilities.supports_worktree_isolation = true;
+    context
+        .reporter
+        .report_worker_started(None, worker_metadata);
+
+    let worker_project = if let Some(worktree) = &worktree {
+        let worker_project = cx.update(|cx| {
+            Project::local(
+                client,
+                node,
+                user_store,
+                languages,
+                fs,
+                environment,
+                LocalProjectFlags {
+                    init_worktree_trust: false,
+                    watch_global_configs: false,
+                },
+                cx,
+            )
+        });
+        let (worker_tree, _) = worker_project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(&worktree.worktree_path, true, cx)
+            })
+            .await?;
+        worker_tree
+            .read_with(cx, |worktree, _| {
+                worktree
+                    .as_local()
+                    .context("managed worktree was not opened as a local worktree")
+                    .map(|worktree| worktree.scan_complete())
+            })?
+            .await;
+        worker_project
+    } else {
+        parent_project
+    };
+
+    let writable_paths = worktree
+        .as_ref()
+        .map(|worktree| {
+            sandbox::HostFilesystemLocation::new(&worktree.worktree_path)
+                .context("failed to capture managed worktree for ACP sandbox")
+        })
+        .transpose()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let protected_parent = sandbox::HostFilesystemLocation::new(&parent_repo)
+        .context("failed to capture parent checkout for ACP sandbox")?;
+    let mut protected_paths = vec![protected_parent];
+    if let Some(worktree) = &worktree {
+        protected_paths.push(
+            sandbox::HostFilesystemLocation::new(worktree.worktree_path.join(".git"))
+                .context("failed to protect managed worktree Git metadata")?,
+        );
+        protected_paths.push(
+            sandbox::HostFilesystemLocation::new(
+                worktree
+                    .worktree_path
+                    .join(agent_orchestration::WorktreeOwnershipMarker::FILENAME),
+            )
+            .context("failed to protect managed worktree ownership marker")?,
+        );
+    }
+    let process_sandbox_policy = sandbox::SandboxPolicy {
+        fs: sandbox::SandboxFsPolicy::Restricted {
+            writable_paths,
+            protected_paths,
+        },
+        network: sandbox::SandboxNetPolicy::Unrestricted,
+    };
+    let terminal_sandbox_wrap = acp_thread::SandboxWrap {
+        writable_paths: worktree
+            .as_ref()
+            .map(|worktree| worktree.worktree_path.clone())
+            .into_iter()
+            .collect(),
+        protected_paths: std::iter::once(parent_repo.clone())
+            .chain(worktree.as_ref().into_iter().flat_map(|worktree| {
+                [
+                    worktree.worktree_path.join(".git"),
+                    worktree
+                        .worktree_path
+                        .join(agent_orchestration::WorktreeOwnershipMarker::FILENAME),
+                ]
+            }))
+            .collect(),
+        network: acp_thread::SandboxNetworkAccess::All,
+        is_local: true,
+        ..Default::default()
+    };
+
+    Ok(PreparedOrchestrationWorkspace {
+        project: worker_project,
+        worktree,
+        process_sandbox_policy,
+        terminal_sandbox_wrap,
+        read_only,
+    })
+}
+
 impl agent::SiblingThreadHost for AgentPanelSiblingHost {
     fn create_sibling_thread(
         &self,
@@ -5260,6 +5475,104 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
         }
 
         Ok(agent::AvailableAgents { agents })
+    }
+
+    fn create_orchestration_worker_host(
+        &self,
+        agent_query: String,
+        task: agent_orchestration::OrchestrationTask,
+        context: agent_orchestration::TaskExecutionContext,
+        cx: &mut gpui::AsyncApp,
+    ) -> Task<Result<Rc<dyn agent_orchestration::WorkerHost>>> {
+        let panel = self.panel.clone();
+        let window = self.window;
+        cx.spawn(async move |cx| {
+            let (server, agent_server_store, parent_project, conversation_view) =
+                panel.update(cx, |panel, cx| {
+                    let parent_project = panel.project.clone();
+                    let agent_server_store = parent_project.read(cx).agent_server_store().clone();
+                    let available = {
+                        let store = agent_server_store.read(cx);
+                        store
+                            .external_agents()
+                            .map(|agent_id| {
+                                (
+                                    agent_id.clone(),
+                                    store
+                                        .agent_display_name(agent_id)
+                                        .map(|name| name.to_string()),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let agent_id = agent::resolve_configured_agent(&available, &agent_query)?;
+                    let agent = Agent::Custom { id: agent_id };
+                    let server = agent.server(panel.fs.clone(), panel.thread_store.clone());
+                    let conversation_view = panel
+                        .conversation_views()
+                        .into_iter()
+                        .find(|view| {
+                            view.read(cx).as_native_thread(cx).is_some_and(|thread| {
+                                thread
+                                    .read(cx)
+                                    .orchestration_run()
+                                    .is_some_and(|run| run.run_id() == &context.run_id)
+                            })
+                        })
+                        .map(|view| view.downgrade());
+                    anyhow::Ok((
+                        server,
+                        agent_server_store,
+                        parent_project,
+                        conversation_view,
+                    ))
+                })??;
+            let workspace =
+                prepare_orchestration_workspace(parent_project, &task, &context, cx).await?;
+            let connection_task = cx.update(|cx| {
+                let delegate = AgentServerDelegate::new(agent_server_store, None, None)
+                    .with_process_sandbox_policy(workspace.process_sandbox_policy.clone())
+                    .with_worker_policy(
+                        workspace.read_only,
+                        workspace.terminal_sandbox_wrap.clone(),
+                    );
+                server.connect(delegate, workspace.project.clone(), cx)
+            });
+            let connection = connection_task
+                .await
+                .map_err(|error| anyhow!("failed to connect ACP worker: {error}"))?;
+            let worker_host = cx.update(|cx| {
+                let host = agent::AcpWorkerHost::new(connection, workspace.project, cx)
+                    .with_process_ownership()
+                    .with_read_only_enforcement(workspace.read_only);
+                let host = if let Some(worktree) = workspace.worktree {
+                    host.with_isolated_worktree(worktree)
+                } else {
+                    host
+                };
+                let host = if let Some(conversation_view) = conversation_view {
+                    host.with_thread_observer(Rc::new(move |thread, cx| {
+                        window
+                            .update(cx, |_root, window, cx| {
+                                conversation_view.update(cx, |view, cx| {
+                                    view.register_orchestration_worker_thread(
+                                        thread,
+                                        context.reporter.clone(),
+                                        context.worker_config.terminal_session_retention,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            })
+                            .log_err();
+                    }))
+                } else {
+                    host
+                };
+                Rc::new(host) as Rc<dyn agent_orchestration::WorkerHost>
+            });
+            Ok(worker_host)
+        })
     }
 }
 

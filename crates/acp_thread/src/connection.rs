@@ -91,6 +91,12 @@ pub fn build_terminal_auth_task(
 pub trait AgentConnection {
     fn agent_id(&self) -> AgentId;
 
+    /// Stops a process owned exclusively by an orchestration worker. Shared
+    /// conversation connections must reject this operation.
+    fn stop_worker_process(&self) -> Result<()> {
+        anyhow::bail!("this connection does not own a dedicated worker process")
+    }
+
     fn telemetry_id(&self) -> SharedString;
 
     fn agent_version(&self) -> Option<SharedString> {
