@@ -9,6 +9,7 @@ use crate::executor::TaskExecutor;
 use crate::ids::{RunId, TaskId};
 use crate::persistence::PersistedRun;
 use crate::plan_graph::{OrchestrationPlan, PlanGraph};
+use crate::residency::{AgentResidencyConfig, AgentResidencyManager, AgentResidencyRecord};
 use crate::scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 use crate::state::{RunState, TaskState, TaskStatus};
 use crate::task_registry::TaskRegistry;
@@ -58,6 +59,8 @@ pub struct RuntimeConfig {
     pub control_plane: AgentControlPlaneConfig,
     /// Bounded typed context retained across task turns and process restarts.
     pub context_checkpoints: ContextCheckpointConfig,
+    /// Idle worker eviction and process-local reload policy.
+    pub residency: AgentResidencyConfig,
     /// Optional GPUI foreground executor.
     pub foreground_executor: Option<gpui::ForegroundExecutor>,
     /// Optional GPUI background executor.
@@ -73,6 +76,7 @@ impl Default for RuntimeConfig {
             scheduler: SchedulerConfig::default(),
             control_plane: AgentControlPlaneConfig::default(),
             context_checkpoints: ContextCheckpointConfig::default(),
+            residency: AgentResidencyConfig::default(),
             foreground_executor: None,
             background_executor: None,
             enable_acp_delegation: false,
@@ -99,6 +103,7 @@ pub struct RunHandle {
     task_registry: TaskRegistry,
     agent_control_plane: AgentControlPlane,
     context_checkpoints: ContextCheckpointStore,
+    residency: AgentResidencyManager,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     event_stream: RuntimeEventStream,
@@ -156,6 +161,17 @@ impl RunHandle {
                 checkpoint: checkpoint.clone(),
             });
         Ok(checkpoint)
+    }
+
+    pub fn agent_residency(
+        &self,
+        agent_path: &crate::control_plane::AgentPath,
+    ) -> Option<AgentResidencyRecord> {
+        self.residency.get(agent_path)
+    }
+
+    pub fn evict_idle_agents(&self, now: chrono::DateTime<Utc>) -> Vec<AgentResidencyRecord> {
+        self.residency.evict_idle(now)
     }
 
     pub fn task_status(&self, task_id: &TaskId) -> Option<TaskStatus> {
@@ -674,6 +690,7 @@ impl RunHandle {
         )
         .with_agent_control_plane(self.agent_control_plane.snapshot())
         .with_context_checkpoints(self.context_checkpoints.snapshot())
+        .with_agent_residency(self.residency.snapshot())
     }
 
     /// Returns the sequence number of the last event emitted, used as the
@@ -729,6 +746,8 @@ impl OrchestrationRuntime {
         let agent_control_plane =
             AgentControlPlane::from_plan(&plan, config.control_plane.clone())?;
         let context_checkpoints = ContextCheckpointStore::new(config.context_checkpoints.clone())?;
+        let residency = AgentResidencyManager::new(config.residency.clone())?
+            .with_runtime_events(run_id.clone(), event_stream.clone());
         let initial_state = match disposition {
             RuntimeLaunchDisposition::Approved => RunState::Approved,
             RuntimeLaunchDisposition::AwaitApproval => RunState::Proposed,
@@ -781,6 +800,7 @@ impl OrchestrationRuntime {
             cancellation_tree.clone(),
             agent_control_plane.clone(),
             context_checkpoints.clone(),
+            residency.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -793,6 +813,7 @@ impl OrchestrationRuntime {
             task_registry,
             agent_control_plane,
             context_checkpoints,
+            residency,
             artifact_store,
             cancellation_tree,
             event_stream,
@@ -862,6 +883,11 @@ impl OrchestrationRuntime {
             }
             None => ContextCheckpointStore::new(config.context_checkpoints.clone())?,
         };
+        let residency = match persisted.agent_residency.clone() {
+            Some(snapshot) => AgentResidencyManager::restore(snapshot, config.residency.clone())?,
+            None => AgentResidencyManager::new(config.residency.clone())?,
+        }
+        .with_runtime_events(run_id.clone(), event_stream.clone());
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
@@ -894,6 +920,7 @@ impl OrchestrationRuntime {
             cancellation_tree.clone(),
             agent_control_plane.clone(),
             context_checkpoints.clone(),
+            residency.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -906,6 +933,7 @@ impl OrchestrationRuntime {
             task_registry,
             agent_control_plane,
             context_checkpoints,
+            residency,
             artifact_store,
             cancellation_tree,
             event_stream,

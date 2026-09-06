@@ -10,12 +10,14 @@ use crate::events::{RuntimeEvent, RuntimeEventStream};
 use crate::executor::{DependencyInput, TaskExecutionContext, TaskExecutor};
 use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::PlanGraph;
+use crate::residency::AgentResidencyManager;
 use crate::state::{RunState, TaskState};
 use crate::task_registry::TaskRegistry;
 use crate::verification::{
     VerificationPolicy, VerificationResult, output_without_verification_claim,
 };
 use anyhow::Result;
+use chrono::Utc;
 use collections::HashSet;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use parking_lot::RwLock;
@@ -123,6 +125,7 @@ pub struct Scheduler {
     cancellation_tree: Arc<CancellationTree>,
     agent_control_plane: AgentControlPlane,
     context_checkpoints: ContextCheckpointStore,
+    residency: AgentResidencyManager,
     event_stream: RuntimeEventStream,
     executor: Rc<dyn TaskExecutor>,
     config: SchedulerConfig,
@@ -138,6 +141,7 @@ impl Scheduler {
         cancellation_tree: Arc<CancellationTree>,
         agent_control_plane: AgentControlPlane,
         context_checkpoints: ContextCheckpointStore,
+        residency: AgentResidencyManager,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -150,6 +154,7 @@ impl Scheduler {
             cancellation_tree,
             agent_control_plane,
             context_checkpoints,
+            residency,
             event_stream,
             executor,
             config,
@@ -165,6 +170,7 @@ impl Scheduler {
         cancellation_tree: Arc<CancellationTree>,
         agent_control_plane: AgentControlPlane,
         context_checkpoints: ContextCheckpointStore,
+        residency: AgentResidencyManager,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -183,6 +189,7 @@ impl Scheduler {
             cancellation_tree,
             agent_control_plane,
             context_checkpoints,
+            residency,
             event_stream,
             executor,
             config,
@@ -476,6 +483,37 @@ impl Scheduler {
             .and_then(|status| status.active_session_id);
 
         loop {
+            let context_checkpoint = self.context_checkpoints.latest(&agent_identity.path);
+            if let Err(error) = self.residency.prepare_execution(
+                agent_identity.path.clone(),
+                session_id.clone(),
+                context_checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.revision),
+                Utc::now(),
+            ) {
+                self.task_registry.set_state(&task_id, TaskState::Failed);
+                self.event_stream.emit(RuntimeEvent::TaskFailed {
+                    run_id: self.run_id.clone(),
+                    task_id: task_id.clone(),
+                    error: error.to_string(),
+                    retryable: false,
+                });
+                return;
+            }
+            let _residency_lease = match self.residency.lease(&agent_identity.path) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.task_registry.set_state(&task_id, TaskState::Failed);
+                    self.event_stream.emit(RuntimeEvent::TaskFailed {
+                        run_id: self.run_id.clone(),
+                        task_id: task_id.clone(),
+                        error: error.to_string(),
+                        retryable: false,
+                    });
+                    return;
+                }
+            };
             let _execution_permit = match self
                 .agent_control_plane
                 .execution_limiter()
@@ -568,7 +606,7 @@ impl Scheduler {
                 task: task.clone(),
                 agent_identity: agent_identity.clone(),
                 agent_control_plane: self.agent_control_plane.clone(),
-                context_checkpoint: self.context_checkpoints.latest(&agent_identity.path),
+                context_checkpoint,
                 attempt,
                 cancellation_token: task_token.clone(),
                 correlation_id,
@@ -642,7 +680,14 @@ impl Scheduler {
                     session_id = output.session_id.clone();
                     if let Some(session_id) = session_id.clone() {
                         self.task_registry
-                            .set_active_session_id(&task_id, session_id);
+                            .set_active_session_id(&task_id, session_id.clone());
+                        if let Err(error) = self.residency.mark_loaded(
+                            &agent_identity.path,
+                            Some(session_id),
+                            Utc::now(),
+                        ) {
+                            log::error!("failed to update agent residency session: {error}");
+                        }
                     }
 
                     if task.workspace_policy.isolation
@@ -869,8 +914,19 @@ impl Scheduler {
                                         repaired_output.session_id.clone()
                                     {
                                         session_id = Some(repaired_session_id.clone());
-                                        self.task_registry
-                                            .set_active_session_id(&task_id, repaired_session_id);
+                                        self.task_registry.set_active_session_id(
+                                            &task_id,
+                                            repaired_session_id.clone(),
+                                        );
+                                        if let Err(error) = self.residency.mark_loaded(
+                                            &agent_identity.path,
+                                            Some(repaired_session_id),
+                                            Utc::now(),
+                                        ) {
+                                            log::error!(
+                                                "failed to update repaired agent residency session: {error}"
+                                            );
+                                        }
                                     }
                                     for artifact in &repaired_output.artifacts {
                                         let artifact = self.artifact_store.record(artifact.clone());

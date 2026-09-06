@@ -12,6 +12,7 @@ pub mod ids;
 pub mod persistence;
 pub mod plan_graph;
 pub mod planner;
+pub mod residency;
 pub mod runtime;
 pub mod scheduler;
 pub mod state;
@@ -52,6 +53,10 @@ pub use ids::{CorrelationId, PlanId, RunId, TaskId};
 pub use persistence::{PERSISTENCE_SCHEMA_VERSION, PersistedRun};
 pub use plan_graph::{GraphValidationError, OrchestrationPlan, OrchestrationTask, PlanGraph};
 pub use planner::{OrchestrationPlanner, PlanProposal};
+pub use residency::{
+    AgentResidencyConfig, AgentResidencyLease, AgentResidencyManager, AgentResidencyRecord,
+    AgentResidencySnapshot, AgentResidencyState,
+};
 pub use runtime::{OrchestrationRuntime, RunHandle, RuntimeConfig, RuntimeLaunchDisposition};
 pub use scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 pub use state::{RunState, TaskAttempt, TaskState, TaskStatus};
@@ -904,6 +909,7 @@ mod tests {
             agent_control_plane,
             ContextCheckpointStore::new(ContextCheckpointConfig::default())
                 .expect("context checkpoints"),
+            AgentResidencyManager::new(AgentResidencyConfig::default()).expect("residency"),
             RuntimeEventStream::new(),
             executor,
             scheduler_config,
