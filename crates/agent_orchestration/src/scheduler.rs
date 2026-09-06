@@ -4,6 +4,7 @@ use crate::artifacts::{
 };
 use crate::budget::{BudgetExceeded, ExecutionBudget, TaskExecutionReporter};
 use crate::cancellation::CancellationTree;
+use crate::control_plane::AgentControlPlane;
 use crate::events::{RuntimeEvent, RuntimeEventStream};
 use crate::executor::{DependencyInput, TaskExecutionContext, TaskExecutor};
 use crate::ids::{CorrelationId, RunId, TaskId};
@@ -119,6 +120,7 @@ pub struct Scheduler {
     task_registry: TaskRegistry,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
+    agent_control_plane: AgentControlPlane,
     event_stream: RuntimeEventStream,
     executor: Rc<dyn TaskExecutor>,
     config: SchedulerConfig,
@@ -132,6 +134,7 @@ impl Scheduler {
         task_registry: TaskRegistry,
         artifact_store: ArtifactStore,
         cancellation_tree: Arc<CancellationTree>,
+        agent_control_plane: AgentControlPlane,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -142,6 +145,7 @@ impl Scheduler {
             task_registry,
             artifact_store,
             cancellation_tree,
+            agent_control_plane,
             event_stream,
             executor,
             config,
@@ -155,6 +159,7 @@ impl Scheduler {
         task_registry: TaskRegistry,
         artifact_store: ArtifactStore,
         cancellation_tree: Arc<CancellationTree>,
+        agent_control_plane: AgentControlPlane,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -171,6 +176,7 @@ impl Scheduler {
             task_registry,
             artifact_store,
             cancellation_tree,
+            agent_control_plane,
             event_stream,
             executor,
             config,
@@ -443,6 +449,17 @@ impl Scheduler {
         let Some(task) = self.plan_graph.task(&task_id).cloned() else {
             return;
         };
+        let Some(agent_identity) = self.agent_control_plane.identity_for_task(&task_id) else {
+            let error = format!("task '{task_id}' has no registered agent identity");
+            self.task_registry.set_state(&task_id, TaskState::Failed);
+            self.event_stream.emit(RuntimeEvent::TaskFailed {
+                run_id: self.run_id.clone(),
+                task_id,
+                error,
+                retryable: false,
+            });
+            return;
+        };
 
         let task_token = self.cancellation_tree.task_token(&task_id);
         let mut attempt =
@@ -453,6 +470,37 @@ impl Scheduler {
             .and_then(|status| status.active_session_id);
 
         loop {
+            let _execution_permit = match self
+                .agent_control_plane
+                .execution_limiter()
+                .acquire(&agent_identity.path, &task_token)
+                .await
+            {
+                Ok(permit) => permit,
+                Err(error) if task_token.is_cancelled() => {
+                    let reason = task_token
+                        .reason()
+                        .map(|reason| reason.description().to_string())
+                        .unwrap_or_else(|| error.to_string());
+                    self.task_registry.set_state(&task_id, TaskState::Cancelled);
+                    self.event_stream.emit(RuntimeEvent::TaskCancelled {
+                        run_id: self.run_id.clone(),
+                        task_id: task_id.clone(),
+                        reason,
+                    });
+                    return;
+                }
+                Err(error) => {
+                    self.task_registry.set_state(&task_id, TaskState::Failed);
+                    self.event_stream.emit(RuntimeEvent::TaskFailed {
+                        run_id: self.run_id.clone(),
+                        task_id: task_id.clone(),
+                        error: error.to_string(),
+                        retryable: false,
+                    });
+                    return;
+                }
+            };
             attempt = attempt.saturating_add(1);
             let now = || {
                 self.config
@@ -512,6 +560,8 @@ impl Scheduler {
 
             let context = TaskExecutionContext {
                 task: task.clone(),
+                agent_identity: agent_identity.clone(),
+                agent_control_plane: self.agent_control_plane.clone(),
                 attempt,
                 cancellation_token: task_token.clone(),
                 correlation_id,
