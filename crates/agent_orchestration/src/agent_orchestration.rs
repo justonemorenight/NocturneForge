@@ -3,6 +3,7 @@ pub mod artifacts;
 pub mod auto_policy;
 pub mod budget;
 pub mod cancellation;
+pub mod context_checkpoint;
 pub mod control_plane;
 pub mod events;
 pub mod execution_limiter;
@@ -32,6 +33,10 @@ pub use budget::{
     BudgetExceeded, BudgetUsage, ExecutionBudget, TaskBudgetState, TaskExecutionReporter,
 };
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};
+pub use context_checkpoint::{
+    ContextCheckpoint, ContextCheckpointConfig, ContextCheckpointKind, ContextCheckpointStore,
+    ContextCheckpointStoreSnapshot, ContextDelta, ContextDiagnostic, ContextState,
+};
 pub use control_plane::{
     AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentIdentity,
     AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
@@ -897,6 +902,8 @@ mod tests {
             ArtifactStore::new(),
             Arc::new(CancellationTree::new()),
             agent_control_plane,
+            ContextCheckpointStore::new(ContextCheckpointConfig::default())
+                .expect("context checkpoints"),
             RuntimeEventStream::new(),
             executor,
             scheduler_config,

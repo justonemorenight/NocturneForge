@@ -1,4 +1,5 @@
 use crate::artifacts::Artifact;
+use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentIdentity, AgentMessage, AgentPath};
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
@@ -58,6 +59,10 @@ pub enum RuntimeEvent {
     AgentUnregistered {
         run_id: RunId,
         path: AgentPath,
+    },
+    ContextCheckpointRecorded {
+        run_id: RunId,
+        checkpoint: ContextCheckpoint,
     },
     TaskScheduled {
         run_id: RunId,
@@ -211,6 +216,7 @@ impl RuntimeEvent {
             | Self::AgentMessageQueued { run_id, .. }
             | Self::AgentMailboxDrained { run_id, .. }
             | Self::AgentUnregistered { run_id, .. }
+            | Self::ContextCheckpointRecorded { run_id, .. }
             | Self::TaskScheduled { run_id, .. }
             | Self::TaskDispatched { run_id, .. }
             | Self::TaskPhaseChanged { run_id, .. }

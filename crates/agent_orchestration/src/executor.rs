@@ -1,6 +1,7 @@
 use crate::artifacts::Artifact;
 use crate::budget::{ExecutionBudget, TaskExecutionReporter};
 use crate::cancellation::CancellationToken;
+use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentControlPlane, AgentIdentity};
 use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::OrchestrationTask;
@@ -20,6 +21,8 @@ pub struct TaskExecutionContext {
     pub agent_identity: AgentIdentity,
     /// Run-scoped registry and mailbox service shared by native and ACP workers.
     pub agent_control_plane: AgentControlPlane,
+    /// Latest materialized editor/runtime context for this agent.
+    pub context_checkpoint: Option<ContextCheckpoint>,
     pub attempt: u32,
     pub cancellation_token: CancellationToken,
     pub correlation_id: CorrelationId,

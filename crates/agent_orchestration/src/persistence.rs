@@ -1,4 +1,5 @@
 use crate::artifacts::Artifact;
+use crate::context_checkpoint::ContextCheckpointStoreSnapshot;
 use crate::control_plane::AgentControlPlaneSnapshot;
 use crate::events::SequencedRuntimeEvent;
 use crate::ids::{PlanId, RunId, TaskId};
@@ -9,7 +10,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PERSISTENCE_SCHEMA_VERSION: u32 = 4;
+pub const PERSISTENCE_SCHEMA_VERSION: u32 = 5;
 
 /// A completely serializable, database-safe snapshot of an orchestration run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -28,6 +29,8 @@ pub struct PersistedRun {
     pub event_log: Vec<SequencedRuntimeEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_control_plane: Option<AgentControlPlaneSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_checkpoints: Option<ContextCheckpointStoreSnapshot>,
     /// Sequence number of the last event persisted. Subscribers replay events
     /// with `seq > last_event_seq` on resume to bridge the persistence gap.
     #[serde(default)]
@@ -64,6 +67,7 @@ impl PersistedRun {
             artifacts,
             event_log,
             agent_control_plane: None,
+            context_checkpoints: None,
             last_event_seq,
             created_at: now,
             updated_at: now,
@@ -72,6 +76,11 @@ impl PersistedRun {
 
     pub fn with_agent_control_plane(mut self, snapshot: AgentControlPlaneSnapshot) -> Self {
         self.agent_control_plane = Some(snapshot);
+        self
+    }
+
+    pub fn with_context_checkpoints(mut self, snapshot: ContextCheckpointStoreSnapshot) -> Self {
+        self.context_checkpoints = Some(snapshot);
         self
     }
 
