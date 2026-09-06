@@ -3658,6 +3658,15 @@ impl SubagentHandle for NativeSubagentHandle {
             result
         })
     }
+
+    fn cancel(&self, cx: &AsyncApp) -> Task<()> {
+        let acp_thread = self.acp_thread.clone();
+        cx.spawn(async move |cx| {
+            let cancel =
+                cx.update(|cx| acp_thread.update(cx, |acp_thread, cx| acp_thread.cancel(cx)));
+            cancel.await;
+        })
+    }
 }
 
 pub struct AcpTerminalHandle {

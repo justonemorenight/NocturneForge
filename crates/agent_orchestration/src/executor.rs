@@ -98,6 +98,16 @@ pub trait TaskExecutor: 'static {
         context: TaskExecutionContext,
     ) -> LocalBoxFuture<'static, Result<TaskExecutionOutput>>;
 
+    /// Requests cancellation of the active worker turn and resolves once the
+    /// worker has acknowledged the request or no live session is available.
+    fn cancel(
+        &self,
+        _task: &OrchestrationTask,
+        _session_id: Option<acp::SessionId>,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Verifies task output against its acceptance criteria.
     fn verify(
         &self,

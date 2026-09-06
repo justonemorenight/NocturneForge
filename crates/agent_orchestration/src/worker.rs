@@ -857,6 +857,19 @@ impl TaskExecutor for WorkerBroker {
         }
     }
 
+    fn cancel(
+        &self,
+        task: &OrchestrationTask,
+        session_id: Option<acp::SessionId>,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        if task.target.is_native()
+            && let Some(executor) = self.native_executor.clone()
+        {
+            return executor.cancel(task, session_id);
+        }
+        Box::pin(async { Ok(()) })
+    }
+
     fn verify(
         &self,
         task: &OrchestrationTask,

@@ -975,6 +975,9 @@ pub trait SubagentHandle {
     fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage>;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+    /// Cancels the active subagent turn and resolves after the underlying
+    /// provider request has settled.
+    fn cancel(&self, cx: &AsyncApp) -> Task<()>;
 }
 
 pub trait ThreadEnvironment {
