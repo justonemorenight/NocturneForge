@@ -13,6 +13,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "control_plane_snapshot.rs"]
+mod snapshot;
+pub use snapshot::{AgentControlPlaneSnapshot, AgentMailboxSnapshot};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentControlPlaneConfig {
     pub max_registered_agents: usize,

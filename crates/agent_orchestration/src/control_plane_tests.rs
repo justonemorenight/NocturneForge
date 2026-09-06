@@ -250,3 +250,70 @@ fn control_plane_lifecycle_is_recorded_in_the_runtime_event_log() {
             .any(|entry| matches!(entry.event, RuntimeEvent::AgentUnregistered { .. }))
     );
 }
+
+#[test]
+fn snapshot_restores_dynamic_agents_and_unread_mailbox_messages() {
+    let control_plane = AgentControlPlane::new(AgentControlPlaneConfig::default()).unwrap();
+    let root = AgentPath::root();
+    let parent = control_plane
+        .register_child(
+            &root,
+            TaskId::new("parent"),
+            "parent",
+            Some("worker".to_string()),
+            WorkerTarget::Native,
+        )
+        .unwrap();
+    let child = control_plane
+        .register_child(
+            &parent,
+            TaskId::new("dynamic-child"),
+            "scout",
+            Some("scout".to_string()),
+            WorkerTarget::Native,
+        )
+        .unwrap();
+    let original_message = control_plane
+        .send(
+            &parent,
+            &child,
+            AgentMessageKind::FollowUp,
+            "inspect parser",
+        )
+        .unwrap();
+
+    let restored =
+        AgentControlPlane::restore(control_plane.snapshot(), AgentControlPlaneConfig::default())
+            .unwrap();
+    assert_eq!(
+        restored
+            .identity_for_task(&TaskId::new("dynamic-child"))
+            .map(|identity| identity.path),
+        Some(child.clone())
+    );
+    assert_eq!(restored.drain(&child).unwrap(), vec![original_message]);
+}
+
+#[test]
+fn snapshot_rejects_cross_mailbox_message_injection() {
+    let control_plane = AgentControlPlane::from_plan(
+        &OrchestrationPlan::new("test", vec![task("first"), task("second")]),
+        AgentControlPlaneConfig::default(),
+    )
+    .unwrap();
+    let root = AgentPath::root();
+    let first = control_plane.resolve(&root, "first").unwrap();
+    let second = control_plane.resolve(&root, "second").unwrap();
+    control_plane
+        .send(&root, &first, AgentMessageKind::Message, "hello")
+        .unwrap();
+    let mut snapshot = control_plane.snapshot();
+    let mailbox = snapshot
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.recipient == first)
+        .unwrap();
+    mailbox.messages[0].recipient = second;
+
+    assert!(AgentControlPlane::restore(snapshot, AgentControlPlaneConfig::default()).is_err());
+}
