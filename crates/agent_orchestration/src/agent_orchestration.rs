@@ -8,6 +8,7 @@ pub mod control_plane;
 pub mod events;
 pub mod execution_limiter;
 pub mod executor;
+pub mod goal_controller;
 pub mod ids;
 pub mod persistence;
 pub mod plan_graph;
@@ -48,6 +49,9 @@ pub use execution_limiter::{
 };
 pub use executor::{
     DependencyInput, MockTaskExecutor, TaskExecutionContext, TaskExecutionOutput, TaskExecutor,
+};
+pub use goal_controller::{
+    GoalBlocker, GoalController, GoalControllerConfig, GoalSnapshot, GoalStatus,
 };
 pub use ids::{CorrelationId, PlanId, RunId, TaskId};
 pub use persistence::{PERSISTENCE_SCHEMA_VERSION, PersistedRun};

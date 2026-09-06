@@ -2,6 +2,7 @@ use crate::artifacts::Artifact;
 use crate::context_checkpoint::ContextCheckpointStoreSnapshot;
 use crate::control_plane::AgentControlPlaneSnapshot;
 use crate::events::SequencedRuntimeEvent;
+use crate::goal_controller::GoalSnapshot;
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::{OrchestrationPlan, OrchestrationTask};
 use crate::residency::AgentResidencySnapshot;
@@ -11,7 +12,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PERSISTENCE_SCHEMA_VERSION: u32 = 6;
+pub const PERSISTENCE_SCHEMA_VERSION: u32 = 7;
 
 /// A completely serializable, database-safe snapshot of an orchestration run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,6 +35,8 @@ pub struct PersistedRun {
     pub context_checkpoints: Option<ContextCheckpointStoreSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_residency: Option<AgentResidencySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalSnapshot>,
     /// Sequence number of the last event persisted. Subscribers replay events
     /// with `seq > last_event_seq` on resume to bridge the persistence gap.
     #[serde(default)]
@@ -72,6 +75,7 @@ impl PersistedRun {
             agent_control_plane: None,
             context_checkpoints: None,
             agent_residency: None,
+            goal: None,
             last_event_seq,
             created_at: now,
             updated_at: now,
@@ -90,6 +94,11 @@ impl PersistedRun {
 
     pub fn with_agent_residency(mut self, snapshot: AgentResidencySnapshot) -> Self {
         self.agent_residency = Some(snapshot);
+        self
+    }
+
+    pub fn with_goal(mut self, snapshot: GoalSnapshot) -> Self {
+        self.goal = Some(snapshot);
         self
     }
 
