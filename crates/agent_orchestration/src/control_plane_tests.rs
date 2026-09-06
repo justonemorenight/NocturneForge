@@ -95,6 +95,56 @@ fn mailbox_coalesces_wakes_and_preserves_order() {
 }
 
 #[test]
+fn acknowledging_delivery_removes_only_the_delivered_message() {
+    let control_plane = AgentControlPlane::from_plan(
+        &OrchestrationPlan::new("test", vec![task("worker")]),
+        AgentControlPlaneConfig::default(),
+    )
+    .unwrap();
+    let root = AgentPath::root();
+    let worker = control_plane.resolve(&root, "worker").unwrap();
+    let first = control_plane
+        .send(&root, &worker, AgentMessageKind::FollowUp, "first")
+        .unwrap();
+    let second = control_plane
+        .send(&root, &worker, AgentMessageKind::Message, "second")
+        .unwrap();
+
+    assert_eq!(
+        control_plane
+            .acknowledge_delivery(&worker, first.sequence)
+            .unwrap(),
+        first
+    );
+    assert_eq!(control_plane.drain(&worker).unwrap(), vec![second]);
+}
+
+#[test]
+fn rejected_delivery_is_removed_without_draining_other_messages() {
+    let control_plane = AgentControlPlane::from_plan(
+        &OrchestrationPlan::new("test", vec![task("worker")]),
+        AgentControlPlaneConfig::default(),
+    )
+    .unwrap();
+    let root = AgentPath::root();
+    let worker = control_plane.resolve(&root, "worker").unwrap();
+    let rejected = control_plane
+        .send(&root, &worker, AgentMessageKind::FollowUp, "interrupt")
+        .unwrap();
+    let retained = control_plane
+        .send(&root, &worker, AgentMessageKind::Message, "later")
+        .unwrap();
+
+    assert_eq!(
+        control_plane
+            .reject_delivery(&worker, rejected.sequence, "worker finished")
+            .unwrap(),
+        rejected
+    );
+    assert_eq!(control_plane.drain(&worker).unwrap(), vec![retained]);
+}
+
+#[test]
 fn relative_resolution_is_scoped_and_ambiguous_leaf_names_are_rejected() {
     let control_plane = AgentControlPlane::new(AgentControlPlaneConfig::default()).unwrap();
     let root = AgentPath::root();

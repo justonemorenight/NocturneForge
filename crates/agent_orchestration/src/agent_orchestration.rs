@@ -127,6 +127,84 @@ mod tests {
         dependent_started: async_channel::Sender<()>,
     }
 
+    struct SteerablePendingExecutor {
+        delivered: async_channel::Sender<(String, bool)>,
+    }
+
+    struct RejectingSteerExecutor;
+
+    impl TaskExecutor for RejectingSteerExecutor {
+        fn execute(
+            &self,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            context.reporter.report_worker_started(
+                Some(acp::SessionId::new("rejecting-session")),
+                WorkerMetadata::new(WorkerTarget::Native),
+            );
+            Box::pin(futures::future::pending())
+        }
+
+        fn deliver_message(
+            &self,
+            _task: &OrchestrationTask,
+            _session_id: acp::SessionId,
+            _message: String,
+            _interrupt: bool,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+            Box::pin(async { anyhow::bail!("worker already settled") })
+        }
+    }
+
+    struct DescriptionCapturingExecutor {
+        descriptions: async_channel::Sender<String>,
+    }
+
+    impl TaskExecutor for DescriptionCapturingExecutor {
+        fn execute(
+            &self,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            let descriptions = self.descriptions.clone();
+            Box::pin(async move {
+                descriptions
+                    .send(context.task.description)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok(TaskExecutionOutput::new("done"))
+            })
+        }
+    }
+
+    impl TaskExecutor for SteerablePendingExecutor {
+        fn execute(
+            &self,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            context.reporter.report_worker_started(
+                Some(acp::SessionId::new("steerable-session")),
+                WorkerMetadata::new(WorkerTarget::Native),
+            );
+            Box::pin(futures::future::pending())
+        }
+
+        fn deliver_message(
+            &self,
+            _task: &OrchestrationTask,
+            _session_id: acp::SessionId,
+            message: String,
+            interrupt: bool,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+            let delivered = self.delivered.clone();
+            Box::pin(async move {
+                delivered
+                    .send((message, interrupt))
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))
+            })
+        }
+    }
+
     impl TaskExecutor for DependencyProgressExecutor {
         fn execute(
             &self,
@@ -679,6 +757,191 @@ mod tests {
         assert_eq!(
             completion.await.expect("receive").expect("complete"),
             RunState::Cancelled
+        );
+    }
+
+    #[gpui::test]
+    async fn active_messages_preserve_delivery_semantics(cx: &mut gpui::TestAppContext) {
+        let (delivered_sender, delivered_receiver) = async_channel::bounded(2);
+        let plan = OrchestrationPlan::new(
+            "Steering",
+            vec![OrchestrationTask::new("task-1", "Task", "desc")],
+        );
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) = OrchestrationRuntime::start(
+            plan,
+            policy,
+            Rc::new(SteerablePendingExecutor {
+                delivered: delivered_sender,
+            }),
+            config,
+        )
+        .expect("start run");
+        cx.run_until_parked();
+
+        let recipient = handle
+            .agent_control_plane()
+            .resolve(&AgentPath::root(), "task-1")
+            .expect("resolve task agent");
+        handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::FollowUp,
+                "focus on the parser".to_string(),
+            )
+            .await
+            .expect("deliver follow-up");
+        assert_eq!(
+            delivered_receiver.recv().await.expect("steered message"),
+            ("focus on the parser".to_string(), true)
+        );
+        handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::Message,
+                "also inspect parser tests".to_string(),
+            )
+            .await
+            .expect("deliver deferred message");
+        assert_eq!(
+            delivered_receiver.recv().await.expect("deferred message"),
+            ("also inspect parser tests".to_string(), false)
+        );
+        assert!(
+            handle
+                .agent_control_plane()
+                .drain(&recipient)
+                .expect("drain mailbox")
+                .is_empty()
+        );
+
+        handle.cancel(CancellationReason::UserRequested);
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Cancelled
+        );
+    }
+
+    #[gpui::test]
+    async fn failed_active_delivery_does_not_leave_a_phantom_mailbox_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let plan = OrchestrationPlan::new(
+            "Steering",
+            vec![OrchestrationTask::new("task-1", "Task", "desc")],
+        );
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, Rc::new(RejectingSteerExecutor), config)
+                .expect("start run");
+        cx.run_until_parked();
+
+        let recipient = handle
+            .agent_control_plane()
+            .resolve(&AgentPath::root(), "task-1")
+            .expect("resolve task agent");
+        let error = handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::FollowUp,
+                "late follow-up".to_string(),
+            )
+            .await
+            .expect_err("steer should fail");
+        assert!(error.to_string().contains("already settled"));
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox depth"),
+            0
+        );
+
+        handle.cancel(CancellationReason::UserRequested);
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Cancelled
+        );
+    }
+
+    #[gpui::test]
+    async fn queued_message_is_delivered_when_an_approved_task_starts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (description_sender, description_receiver) = async_channel::bounded(1);
+        let plan = OrchestrationPlan::new(
+            "Mailbox",
+            vec![OrchestrationTask::new("task-1", "Task", "original context")],
+        );
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Manual,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) = OrchestrationRuntime::start(
+            plan,
+            policy,
+            Rc::new(DescriptionCapturingExecutor {
+                descriptions: description_sender,
+            }),
+            config,
+        )
+        .expect("start run");
+        let recipient = handle
+            .agent_control_plane()
+            .resolve(&AgentPath::root(), "task-1")
+            .expect("resolve task agent");
+        handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::Message,
+                "prioritize cancellation safety".to_string(),
+            )
+            .await
+            .expect("queue context");
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox depth"),
+            1
+        );
+
+        handle.approve().expect("approve run");
+        let description = description_receiver
+            .recv()
+            .await
+            .expect("captured description");
+        assert!(description.contains("original context"));
+        assert!(description.contains("prioritize cancellation safety"));
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox depth"),
+            0
         );
     }
 

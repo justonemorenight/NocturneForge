@@ -2,10 +2,11 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
-    UpdatePlanTool, WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
+    ListOrchestrationAgentsTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
+    SandboxedTerminalTool, SendMessageToAgentTool, SpawnAgentTool, SystemPromptTemplate, Template,
+    Templates, TerminalTool, ToolPermissionDecision, UpdateOrchestrationGoalTool, UpdatePlanTool,
+    WaitForAgentsTool, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2503,6 +2504,12 @@ impl Thread {
 
         self.add_tool(AskUserTool);
         self.add_tool(UpdatePlanTool::new(cx.weak_entity()));
+        if self.depth() == 0 {
+            self.add_tool(ListOrchestrationAgentsTool::new(cx.weak_entity()));
+            self.add_tool(SendMessageToAgentTool::new(cx.weak_entity()));
+            self.add_tool(UpdateOrchestrationGoalTool::new(cx.weak_entity()));
+            self.add_tool(WaitForAgentsTool::new(cx.weak_entity()));
+        }
 
         self.add_tool(DiagnosticsTool::new(
             self.project.clone(),
@@ -2642,6 +2649,14 @@ impl Thread {
         run: agent_orchestration::RunHandle,
         cx: &mut Context<Self>,
     ) {
+        if let Some(previous) = &self.orchestration_run
+            && previous.run_id() != run.run_id()
+            && !previous.state().is_terminal()
+        {
+            previous.cancel(agent_orchestration::CancellationReason::Custom(
+                "superseded by another orchestration run".to_string(),
+            ));
+        }
         self.orchestration_run = Some(run);
         self.updated_at = Utc::now();
         cx.notify();
@@ -6621,6 +6636,16 @@ pub async fn stream_thread_title(
         title.push_str(&text);
     }
     Ok(title)
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if let Some(run) = &self.orchestration_run
+            && !run.state().is_terminal()
+        {
+            run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
+        }
+    }
 }
 
 pub struct TokenUsageUpdated(pub Option<acp_thread::TokenUsage>);
