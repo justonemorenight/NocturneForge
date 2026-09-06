@@ -4,6 +4,7 @@ use crate::artifacts::{
 };
 use crate::budget::{BudgetExceeded, ExecutionBudget, TaskExecutionReporter};
 use crate::cancellation::CancellationTree;
+use crate::context_checkpoint::ContextCheckpointStore;
 use crate::control_plane::AgentControlPlane;
 use crate::events::{RuntimeEvent, RuntimeEventStream};
 use crate::executor::{DependencyInput, TaskExecutionContext, TaskExecutor};
@@ -121,6 +122,7 @@ pub struct Scheduler {
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     agent_control_plane: AgentControlPlane,
+    context_checkpoints: ContextCheckpointStore,
     event_stream: RuntimeEventStream,
     executor: Rc<dyn TaskExecutor>,
     config: SchedulerConfig,
@@ -135,6 +137,7 @@ impl Scheduler {
         artifact_store: ArtifactStore,
         cancellation_tree: Arc<CancellationTree>,
         agent_control_plane: AgentControlPlane,
+        context_checkpoints: ContextCheckpointStore,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -146,6 +149,7 @@ impl Scheduler {
             artifact_store,
             cancellation_tree,
             agent_control_plane,
+            context_checkpoints,
             event_stream,
             executor,
             config,
@@ -160,6 +164,7 @@ impl Scheduler {
         artifact_store: ArtifactStore,
         cancellation_tree: Arc<CancellationTree>,
         agent_control_plane: AgentControlPlane,
+        context_checkpoints: ContextCheckpointStore,
         event_stream: RuntimeEventStream,
         executor: Rc<dyn TaskExecutor>,
         config: SchedulerConfig,
@@ -177,6 +182,7 @@ impl Scheduler {
             artifact_store,
             cancellation_tree,
             agent_control_plane,
+            context_checkpoints,
             event_stream,
             executor,
             config,
@@ -562,6 +568,7 @@ impl Scheduler {
                 task: task.clone(),
                 agent_identity: agent_identity.clone(),
                 agent_control_plane: self.agent_control_plane.clone(),
+                context_checkpoint: self.context_checkpoints.latest(&agent_identity.path),
                 attempt,
                 cancellation_token: task_token.clone(),
                 correlation_id,

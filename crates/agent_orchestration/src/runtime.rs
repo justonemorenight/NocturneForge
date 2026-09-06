@@ -1,5 +1,8 @@
 use crate::artifacts::ArtifactStore;
 use crate::cancellation::{CancellationReason, CancellationTree};
+use crate::context_checkpoint::{
+    ContextCheckpoint, ContextCheckpointConfig, ContextCheckpointStore, ContextDelta, ContextState,
+};
 use crate::control_plane::{AgentControlPlane, AgentControlPlaneConfig};
 use crate::events::{EventSubscription, RuntimeEvent, RuntimeEventStream};
 use crate::executor::TaskExecutor;
@@ -53,6 +56,8 @@ pub struct RuntimeConfig {
     pub scheduler: SchedulerConfig,
     /// Agent identity, relationship, and mailbox limits for this run.
     pub control_plane: AgentControlPlaneConfig,
+    /// Bounded typed context retained across task turns and process restarts.
+    pub context_checkpoints: ContextCheckpointConfig,
     /// Optional GPUI foreground executor.
     pub foreground_executor: Option<gpui::ForegroundExecutor>,
     /// Optional GPUI background executor.
@@ -67,6 +72,7 @@ impl Default for RuntimeConfig {
             enabled: true,
             scheduler: SchedulerConfig::default(),
             control_plane: AgentControlPlaneConfig::default(),
+            context_checkpoints: ContextCheckpointConfig::default(),
             foreground_executor: None,
             background_executor: None,
             enable_acp_delegation: false,
@@ -92,6 +98,7 @@ pub struct RunHandle {
     plan_graph: PlanGraph,
     task_registry: TaskRegistry,
     agent_control_plane: AgentControlPlane,
+    context_checkpoints: ContextCheckpointStore,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     event_stream: RuntimeEventStream,
@@ -123,6 +130,32 @@ impl RunHandle {
 
     pub fn agent_control_plane(&self) -> &AgentControlPlane {
         &self.agent_control_plane
+    }
+
+    pub fn latest_context_checkpoint(
+        &self,
+        agent_path: &crate::control_plane::AgentPath,
+    ) -> Option<ContextCheckpoint> {
+        self.context_checkpoints.latest(agent_path)
+    }
+
+    pub fn update_context(
+        &self,
+        agent_path: crate::control_plane::AgentPath,
+        delta: ContextDelta,
+    ) -> Result<ContextCheckpoint> {
+        if self.agent_control_plane.identity(&agent_path).is_none() {
+            anyhow::bail!("agent '{agent_path}' is not registered in this run");
+        }
+        let checkpoint = self
+            .context_checkpoints
+            .record_incremental(agent_path, delta)?;
+        self.event_stream
+            .emit(RuntimeEvent::ContextCheckpointRecorded {
+                run_id: self.run_id.clone(),
+                checkpoint: checkpoint.clone(),
+            });
+        Ok(checkpoint)
     }
 
     pub fn task_status(&self, task_id: &TaskId) -> Option<TaskStatus> {
@@ -640,6 +673,7 @@ impl RunHandle {
             self.event_stream.history(),
         )
         .with_agent_control_plane(self.agent_control_plane.snapshot())
+        .with_context_checkpoints(self.context_checkpoints.snapshot())
     }
 
     /// Returns the sequence number of the last event emitted, used as the
@@ -694,6 +728,7 @@ impl OrchestrationRuntime {
         let event_stream = RuntimeEventStream::new();
         let agent_control_plane =
             AgentControlPlane::from_plan(&plan, config.control_plane.clone())?;
+        let context_checkpoints = ContextCheckpointStore::new(config.context_checkpoints.clone())?;
         let initial_state = match disposition {
             RuntimeLaunchDisposition::Approved => RunState::Approved,
             RuntimeLaunchDisposition::AwaitApproval => RunState::Proposed,
@@ -715,6 +750,28 @@ impl OrchestrationRuntime {
         }
         let agent_control_plane =
             agent_control_plane.with_runtime_events(run_id.clone(), event_stream.clone());
+        for task in &plan_graph.plan().tasks {
+            let identity = agent_control_plane
+                .identity_for_task(&task.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("task '{}' has no registered agent identity", task.id)
+                })?;
+            let checkpoint = context_checkpoints.record_full(
+                identity.path,
+                ContextState {
+                    objective: task
+                        .objective
+                        .clone()
+                        .or_else(|| Some(task.description.clone())),
+                    paths: task.context_paths.clone(),
+                    ..Default::default()
+                },
+            )?;
+            event_stream.emit(RuntimeEvent::ContextCheckpointRecorded {
+                run_id: run_id.clone(),
+                checkpoint,
+            });
+        }
 
         let scheduler = Scheduler::new_with_control(
             run_id.clone(),
@@ -723,6 +780,7 @@ impl OrchestrationRuntime {
             artifact_store.clone(),
             cancellation_tree.clone(),
             agent_control_plane.clone(),
+            context_checkpoints.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -734,6 +792,7 @@ impl OrchestrationRuntime {
             plan_graph,
             task_registry,
             agent_control_plane,
+            context_checkpoints,
             artifact_store,
             cancellation_tree,
             event_stream,
@@ -797,6 +856,12 @@ impl OrchestrationRuntime {
             None => AgentControlPlane::from_plan(&persisted.plan, config.control_plane.clone())?,
         }
         .with_runtime_events(run_id.clone(), event_stream.clone());
+        let context_checkpoints = match persisted.context_checkpoints.clone() {
+            Some(snapshot) => {
+                ContextCheckpointStore::restore(snapshot, config.context_checkpoints.clone())?
+            }
+            None => ContextCheckpointStore::new(config.context_checkpoints.clone())?,
+        };
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
@@ -828,6 +893,7 @@ impl OrchestrationRuntime {
             artifact_store.clone(),
             cancellation_tree.clone(),
             agent_control_plane.clone(),
+            context_checkpoints.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -839,6 +905,7 @@ impl OrchestrationRuntime {
             plan_graph,
             task_registry,
             agent_control_plane,
+            context_checkpoints,
             artifact_store,
             cancellation_tree,
             event_stream,
