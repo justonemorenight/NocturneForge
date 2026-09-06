@@ -3,7 +3,9 @@ pub mod artifacts;
 pub mod auto_policy;
 pub mod budget;
 pub mod cancellation;
+pub mod control_plane;
 pub mod events;
+pub mod execution_limiter;
 pub mod executor;
 pub mod ids;
 pub mod persistence;
@@ -30,7 +32,14 @@ pub use budget::{
     BudgetExceeded, BudgetUsage, ExecutionBudget, TaskBudgetState, TaskExecutionReporter,
 };
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};
+pub use control_plane::{
+    AgentControlPlane, AgentControlPlaneConfig, AgentIdentity, AgentMessage, AgentMessageKind,
+    AgentPath,
+};
 pub use events::{RuntimeEvent, RuntimeEventStream};
+pub use execution_limiter::{
+    AgentExecutionLimiter, AgentExecutionLimiterConfig, AgentExecutionPermit,
+};
 pub use executor::{
     DependencyInput, MockTaskExecutor, TaskExecutionContext, TaskExecutionOutput, TaskExecutor,
 };
@@ -875,6 +884,9 @@ mod tests {
             vec![OrchestrationTask::new("task-1", "Task", "desc")],
         );
         let plan_graph = PlanGraph::new(plan).expect("valid plan");
+        let agent_control_plane =
+            AgentControlPlane::from_plan(plan_graph.plan(), AgentControlPlaneConfig::default())
+                .expect("control plane");
         let control = RuntimeControl::new(RunState::Paused);
         let mut scheduler_config = SchedulerConfig::default();
         scheduler_config.background_executor = Some(cx.background_executor.clone());
@@ -884,6 +896,7 @@ mod tests {
             TaskRegistry::new(),
             ArtifactStore::new(),
             Arc::new(CancellationTree::new()),
+            agent_control_plane,
             RuntimeEventStream::new(),
             executor,
             scheduler_config,

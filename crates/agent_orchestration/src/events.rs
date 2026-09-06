@@ -1,4 +1,5 @@
 use crate::artifacts::Artifact;
+use crate::control_plane::{AgentIdentity, AgentMessage, AgentPath};
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
 use crate::state::RunState;
@@ -39,6 +40,24 @@ pub enum RuntimeEvent {
     },
     RunResumed {
         run_id: RunId,
+    },
+    AgentRegistered {
+        run_id: RunId,
+        identity: AgentIdentity,
+    },
+    AgentMessageQueued {
+        run_id: RunId,
+        message: AgentMessage,
+    },
+    AgentMailboxDrained {
+        run_id: RunId,
+        recipient: AgentPath,
+        through_sequence: u64,
+        count: usize,
+    },
+    AgentUnregistered {
+        run_id: RunId,
+        path: AgentPath,
     },
     TaskScheduled {
         run_id: RunId,
@@ -188,6 +207,10 @@ impl RuntimeEvent {
             | Self::RunStarted { run_id, .. }
             | Self::RunPaused { run_id, .. }
             | Self::RunResumed { run_id, .. }
+            | Self::AgentRegistered { run_id, .. }
+            | Self::AgentMessageQueued { run_id, .. }
+            | Self::AgentMailboxDrained { run_id, .. }
+            | Self::AgentUnregistered { run_id, .. }
             | Self::TaskScheduled { run_id, .. }
             | Self::TaskDispatched { run_id, .. }
             | Self::TaskPhaseChanged { run_id, .. }

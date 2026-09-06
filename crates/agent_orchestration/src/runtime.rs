@@ -1,5 +1,6 @@
 use crate::artifacts::ArtifactStore;
 use crate::cancellation::{CancellationReason, CancellationTree};
+use crate::control_plane::{AgentControlPlane, AgentControlPlaneConfig};
 use crate::events::{EventSubscription, RuntimeEvent, RuntimeEventStream};
 use crate::executor::TaskExecutor;
 use crate::ids::{RunId, TaskId};
@@ -50,6 +51,8 @@ pub struct RuntimeConfig {
     pub enabled: bool,
     /// Concurrency and scheduler settings.
     pub scheduler: SchedulerConfig,
+    /// Agent identity, relationship, and mailbox limits for this run.
+    pub control_plane: AgentControlPlaneConfig,
     /// Optional GPUI foreground executor.
     pub foreground_executor: Option<gpui::ForegroundExecutor>,
     /// Optional GPUI background executor.
@@ -63,6 +66,7 @@ impl Default for RuntimeConfig {
         Self {
             enabled: true,
             scheduler: SchedulerConfig::default(),
+            control_plane: AgentControlPlaneConfig::default(),
             foreground_executor: None,
             background_executor: None,
             enable_acp_delegation: false,
@@ -87,6 +91,7 @@ pub struct RunHandle {
     run_id: RunId,
     plan_graph: PlanGraph,
     task_registry: TaskRegistry,
+    agent_control_plane: AgentControlPlane,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     event_stream: RuntimeEventStream,
@@ -114,6 +119,10 @@ impl RunHandle {
 
     pub fn task_statuses(&self) -> Vec<TaskStatus> {
         self.task_registry.all_statuses()
+    }
+
+    pub fn agent_control_plane(&self) -> &AgentControlPlane {
+        &self.agent_control_plane
     }
 
     pub fn task_status(&self, task_id: &TaskId) -> Option<TaskStatus> {
@@ -682,6 +691,7 @@ impl OrchestrationRuntime {
         let artifact_store = ArtifactStore::new();
         let cancellation_tree = Arc::new(CancellationTree::new());
         let event_stream = RuntimeEventStream::new();
+        let agent_control_plane = AgentControlPlane::from_plan(&plan, config.control_plane.clone())?;
         let initial_state = match disposition {
             RuntimeLaunchDisposition::Approved => RunState::Approved,
             RuntimeLaunchDisposition::AwaitApproval => RunState::Proposed,
@@ -701,6 +711,8 @@ impl OrchestrationRuntime {
                 plan,
             });
         }
+        let agent_control_plane =
+            agent_control_plane.with_runtime_events(run_id.clone(), event_stream.clone());
 
         let scheduler = Scheduler::new_with_control(
             run_id.clone(),
@@ -708,6 +720,7 @@ impl OrchestrationRuntime {
             task_registry.clone(),
             artifact_store.clone(),
             cancellation_tree.clone(),
+            agent_control_plane.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -718,6 +731,7 @@ impl OrchestrationRuntime {
             run_id,
             plan_graph,
             task_registry,
+            agent_control_plane,
             artifact_store,
             cancellation_tree,
             event_stream,
@@ -776,6 +790,9 @@ impl OrchestrationRuntime {
         let cancellation_tree = Arc::new(CancellationTree::new());
         let persisted_policy = persisted.policy;
         let event_stream = RuntimeEventStream::from_history(persisted.event_log.clone());
+        let agent_control_plane =
+            AgentControlPlane::from_plan(&persisted.plan, config.control_plane.clone())?
+                .with_runtime_events(run_id.clone(), event_stream.clone());
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
@@ -806,6 +823,7 @@ impl OrchestrationRuntime {
             task_registry.clone(),
             artifact_store.clone(),
             cancellation_tree.clone(),
+            agent_control_plane.clone(),
             event_stream.clone(),
             executor,
             config.scheduler,
@@ -816,6 +834,7 @@ impl OrchestrationRuntime {
             run_id,
             plan_graph,
             task_registry,
+            agent_control_plane,
             artifact_store,
             cancellation_tree,
             event_stream,
