@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::{AgentTool, SubagentRole, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput};
 use agent_orchestration::{
-    MAX_DEPENDENCY_CONTEXT_BYTES, VERIFICATION_END, VERIFICATION_START, truncate_text,
+    MAX_DEPENDENCY_CONTEXT_BYTES, VERIFICATION_END, VERIFICATION_START,
+    output_without_verification_claim, truncate_text,
 };
 use settings::Settings;
 
@@ -190,6 +191,23 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                 artifacts: vec![artifact],
                 worker_metadata: None,
             })
+        })
+    }
+
+    fn cancel(
+        &self,
+        _task: &agent_orchestration::OrchestrationTask,
+        session_id: Option<agent_client_protocol::schema::v1::SessionId>,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        let environment = self.environment.clone();
+        let app = self.app.clone();
+        Box::pin(async move {
+            let Some(session_id) = session_id else {
+                return Ok(());
+            };
+            let subagent = app.update(move |cx| environment.resume_subagent(session_id, cx))?;
+            subagent.cancel(&app).await;
+            Ok(())
         })
     }
 
@@ -454,7 +472,8 @@ pub struct SpawnAgentTask {
     /// Stated high-level objective for this task.
     #[serde(default)]
     pub objective: Option<String>,
-    /// Bounded write scope / affected file patterns.
+    /// Comma-separated repository-relative paths or glob patterns that define
+    /// the primary evidence and affected-file scope. Do not use prose.
     #[serde(default)]
     pub scope: Option<String>,
     /// Target worker agent: "native", "omp", "opencode", or a configured agent name.
@@ -1137,7 +1156,12 @@ async fn run_batch_tasks(
                     task_id,
                     session_id,
                     label: task.label,
-                    output: status.latest_output.unwrap_or_default(),
+                    output: status
+                        .latest_output
+                        .as_deref()
+                        .map(output_without_verification_claim)
+                        .unwrap_or_default()
+                        .to_string(),
                 });
             }
         } else if status.state == agent_orchestration::TaskState::Failed {

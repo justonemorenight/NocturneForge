@@ -1,5 +1,5 @@
 use crate::artifacts::{
-    ArtifactStore, MAX_DEPENDENCY_ARTIFACTS, MAX_DEPENDENCY_CONTEXT_BYTES,
+    ArtifactKind, ArtifactStore, MAX_DEPENDENCY_ARTIFACTS, MAX_DEPENDENCY_CONTEXT_BYTES,
     MAX_DEPENDENCY_OUTPUT_BYTES, MAX_INLINE_OUTPUT_BYTES, truncate_text,
 };
 use crate::budget::{BudgetExceeded, ExecutionBudget, TaskExecutionReporter};
@@ -10,7 +10,9 @@ use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::PlanGraph;
 use crate::state::{RunState, TaskState};
 use crate::task_registry::TaskRegistry;
-use crate::verification::{VerificationPolicy, VerificationResult};
+use crate::verification::{
+    VerificationPolicy, VerificationResult, output_without_verification_claim,
+};
 use anyhow::Result;
 use collections::HashSet;
 use futures::stream::{FuturesUnordered, StreamExt as _};
@@ -354,6 +356,7 @@ impl Scheduler {
                 .status(dependency_id)
                 .and_then(|status| status.latest_output)
                 .map(|output| {
+                    let output = output_without_verification_claim(&output).to_string();
                     let output =
                         truncate_text(output, MAX_DEPENDENCY_OUTPUT_BYTES.min(remaining_bytes));
                     remaining_bytes = remaining_bytes.saturating_sub(output.len());
@@ -369,6 +372,9 @@ impl Scheduler {
             {
                 if remaining_bytes == 0 {
                     break;
+                }
+                if artifact.kind == ArtifactKind::Text {
+                    artifact.data = output_without_verification_claim(&artifact.data).to_string();
                 }
                 artifact.data = truncate_text(artifact.data, remaining_bytes);
                 remaining_bytes = remaining_bytes.saturating_sub(artifact.data.len());
@@ -528,6 +534,7 @@ impl Scheduler {
                 .await;
 
             if task_token.is_cancelled() {
+                self.cancel_active_worker(&task, &task_id).await;
                 if matches!(
                     task_token.reason(),
                     Some(crate::cancellation::CancellationReason::Timeout)
@@ -880,6 +887,7 @@ impl Scheduler {
                         }
 
                         if task_token.is_cancelled() {
+                            self.cancel_active_worker(&task, &task_id).await;
                             if matches!(
                                 task_token.reason(),
                                 Some(crate::cancellation::CancellationReason::Timeout)
@@ -1236,6 +1244,35 @@ impl Scheduler {
             timeout_secs.map(std::time::Duration::from_secs),
         )
         .await
+    }
+
+    async fn cancel_active_worker(
+        &self,
+        task: &crate::plan_graph::OrchestrationTask,
+        task_id: &TaskId,
+    ) {
+        let session_id = self
+            .task_registry
+            .status(task_id)
+            .and_then(|status| status.active_session_id);
+        let cancellation = self.executor.cancel(task, session_id);
+        let Some(background_executor) = self.config.background_executor.as_ref() else {
+            if let Err(error) = cancellation.await {
+                log::warn!("failed to cancel worker for task '{task_id}': {error}");
+            }
+            return;
+        };
+        let grace_period = background_executor.timer(self.config.acp_workers.cancel_grace_period);
+        futures::pin_mut!(cancellation, grace_period);
+        match futures::future::select(cancellation, grace_period).await {
+            futures::future::Either::Left((Err(error), _)) => {
+                log::warn!("failed to cancel worker for task '{task_id}': {error}");
+            }
+            futures::future::Either::Right(_) => {
+                log::warn!("worker cancellation timed out for task '{task_id}'");
+            }
+            _ => {}
+        }
     }
 
     async fn run_controlled<T>(

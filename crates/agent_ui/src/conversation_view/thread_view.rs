@@ -182,7 +182,77 @@ struct AgentActivityItem {
     objective: Option<SharedString>,
     worktree_path: Option<SharedString>,
     patch_status: Option<SharedString>,
+    verification: Option<agent_orchestration::VerificationResult>,
     last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn verification_summary(result: &agent_orchestration::VerificationResult) -> String {
+    let passed = result
+        .criteria_verdicts
+        .iter()
+        .filter(|(_, passed)| *passed)
+        .count();
+    let total = result.criteria_verdicts.len();
+    if total == 0 {
+        if result.passed {
+            "Verified".to_string()
+        } else {
+            "Verification failed".to_string()
+        }
+    } else if result.passed {
+        format!("Verified {passed}/{total}")
+    } else {
+        format!("Verification failed {passed}/{total}")
+    }
+}
+
+fn verification_has_details(result: &agent_orchestration::VerificationResult) -> bool {
+    !result.criterion_results.is_empty()
+        || !result.criteria_verdicts.is_empty()
+        || !result.citations.is_empty()
+        || result.expected_output_satisfied.is_some()
+        || result.feedback.is_some()
+}
+
+fn verification_visual(passed: bool) -> (IconName, Color) {
+    if passed {
+        (IconName::Check, Color::Success)
+    } else {
+        (IconName::Close, Color::Error)
+    }
+}
+
+fn verification_citation_link(citation: &str) -> Option<SharedString> {
+    if !agent_orchestration::is_file_line_citation(citation) {
+        return None;
+    }
+    let (path, location) = citation.rsplit_once(':')?;
+    Some(format!("{path}#L{location}").into())
+}
+
+fn effective_verification_criteria(
+    verification: &agent_orchestration::VerificationResult,
+) -> Vec<agent_orchestration::CriterionClaim> {
+    if verification.criteria_verdicts.is_empty() {
+        return verification.criterion_results.clone();
+    }
+    verification
+        .criteria_verdicts
+        .iter()
+        .map(|(criterion, passed)| {
+            let evidence = verification
+                .criterion_results
+                .iter()
+                .find(|result| result.criterion == *criterion)
+                .map(|result| result.evidence.clone())
+                .unwrap_or_default();
+            agent_orchestration::CriterionClaim {
+                criterion: criterion.clone(),
+                passed: *passed,
+                evidence,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -968,6 +1038,7 @@ pub struct ThreadView {
     large_diff_review_prompt: bool,
     full_diff_review_opted_in: bool,
     agent_activity_expanded: bool,
+    expanded_agent_verification: Option<agent_orchestration::TaskId>,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
@@ -1475,6 +1546,7 @@ impl ThreadView {
             large_diff_review_prompt: false,
             full_diff_review_opted_in: false,
             agent_activity_expanded: false,
+            expanded_agent_verification: None,
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
@@ -3664,6 +3736,7 @@ impl ThreadView {
                         objective: (!task.is_empty()).then(|| SharedString::from(task)),
                         worktree_path: None,
                         patch_status: None,
+                        verification: None,
                         last_activity_at: None,
                     });
                 }
@@ -3780,6 +3853,7 @@ impl ThreadView {
                     let mut objective = None;
                     let mut worktree_path = None;
                     let mut patch_status = None;
+                    let mut verification = None;
                     let mut worker_target = None;
                     if let Some(task) = orchestration_task {
                         model = task
@@ -3795,6 +3869,7 @@ impl ThreadView {
                         worker_target = Some(SharedString::from(task.target.to_string()));
                     }
                     if let Some(task_status) = task_status {
+                        verification = task_status.latest_verification.clone();
                         current_tool = task_status
                             .current_tool
                             .map(|tool| DelegatedTaskToolActivity {
@@ -3855,6 +3930,7 @@ impl ThreadView {
                         objective,
                         worktree_path,
                         patch_status,
+                        verification,
                         last_activity_at: None,
                     });
                 }
@@ -3922,6 +3998,7 @@ impl ThreadView {
                         objective: None,
                         worktree_path: None,
                         patch_status: None,
+                        verification: None,
                         last_activity_at: None,
                     });
                 }
@@ -4095,6 +4172,7 @@ impl ThreadView {
                 objective: None,
                 worktree_path: None,
                 patch_status: None,
+                verification: None,
                 last_activity_at: None,
             };
 
@@ -4224,6 +4302,7 @@ impl ThreadView {
                     item.tool_call_budget = task.tool_call_budget;
                     item.worktree_path = worktree_path;
                     item.patch_status = patch_status;
+                    item.verification = status.latest_verification.clone();
                     item.last_activity_at = metadata.and_then(|metadata| metadata.last_activity_at);
                     continue;
                 }
@@ -4255,6 +4334,7 @@ impl ThreadView {
                     objective: task.objective.clone().map(SharedString::from),
                     worktree_path,
                     patch_status,
+                    verification: status.latest_verification.clone(),
                     last_activity_at: metadata.and_then(|metadata| metadata.last_activity_at),
                 });
             }
@@ -4289,6 +4369,193 @@ impl ThreadView {
                 .color(color)
                 .into_any_element()
         }
+    }
+
+    fn render_agent_verification_criterion(
+        criterion: agent_orchestration::CriterionClaim,
+    ) -> AnyElement {
+        let (icon, color) = verification_visual(criterion.passed);
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .child(
+                        Label::new(criterion.criterion)
+                            .size(LabelSize::XSmall)
+                            .truncate(),
+                    ),
+            )
+            .when(!criterion.evidence.trim().is_empty(), |this| {
+                this.child(
+                    Label::new(criterion.evidence)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .line_clamp(2),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_agent_verification_citations(
+        &self,
+        citations: &[String],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let workspace = self.workspace.clone();
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .children(citations.iter().enumerate().map(move |(index, citation)| {
+                let citation = citation.clone();
+                let link = verification_citation_link(&citation);
+                let workspace = workspace.clone();
+                h_flex()
+                    .id(("agent-verification-citation", index))
+                    .min_w_0()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .when(link.is_some(), |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    })
+                    .child(
+                        Label::new(citation)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent)
+                            .truncate(),
+                    )
+                    .when_some(link, |this, link| {
+                        this.on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            open_link(link.clone(), &workspace, window, cx);
+                        })
+                    })
+            }))
+            .into_any_element()
+    }
+
+    fn render_agent_verification_details(
+        &self,
+        verification: &agent_orchestration::VerificationResult,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .w_full()
+            .px_1p5()
+            .pb_1p5()
+            .gap_1()
+            .children(
+                effective_verification_criteria(verification)
+                    .into_iter()
+                    .map(Self::render_agent_verification_criterion),
+            )
+            .when_some(verification.expected_output_satisfied, |this, passed| {
+                let (icon, color) = verification_visual(passed);
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        .child(
+                            Label::new("Expected output")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(!verification.citations.is_empty(), |this| {
+                this.child(self.render_agent_verification_citations(&verification.citations, cx))
+            })
+            .when_some(verification.feedback.clone(), |this, feedback| {
+                this.child(
+                    Label::new(feedback)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error)
+                        .line_clamp(2),
+                )
+            })
+            .child(
+                Label::new(format!(
+                    "Attempt verified at {}",
+                    verification.verified_at.format("%H:%M:%S UTC")
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent_verification(
+        &self,
+        task_id: agent_orchestration::TaskId,
+        verification: agent_orchestration::VerificationResult,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let expanded = self.expanded_agent_verification.as_ref() == Some(&task_id);
+        let summary = verification_summary(&verification);
+        let (verdict_icon, verdict_color) = verification_visual(verification.passed);
+        let disclosure_icon = if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let has_details = verification_has_details(&verification);
+        let header_task_id = task_id.clone();
+
+        v_flex()
+            .w_full()
+            .mt_0p5()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_sm()
+            .child(
+                h_flex()
+                    .id(format!("agent-verification-summary-{task_id}"))
+                    .w_full()
+                    .min_w_0()
+                    .px_1p5()
+                    .py_1()
+                    .gap_1()
+                    .when(has_details, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    })
+                    .child(
+                        Icon::new(verdict_icon)
+                            .size(IconSize::XSmall)
+                            .color(verdict_color),
+                    )
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::XSmall)
+                            .color(verdict_color),
+                    )
+                    .child(div().flex_1())
+                    .when(has_details, |this| {
+                        this.child(
+                            Icon::new(disclosure_icon)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.expanded_agent_verification =
+                                (this.expanded_agent_verification.as_ref()
+                                    != Some(&header_task_id))
+                                .then(|| header_task_id.clone());
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .when(expanded && has_details, |this| {
+                this.child(self.render_agent_verification_details(&verification, cx))
+            })
+            .into_any_element()
     }
 
     fn worker_patch_action(
@@ -4378,6 +4645,10 @@ impl ThreadView {
                         let diff = if matches!(action, WorkerPatchAction::Output) {
                             run.task_status(&task_id)
                                 .and_then(|status| status.latest_output)
+                                .map(|output| {
+                                    agent_orchestration::output_without_verification_claim(&output)
+                                        .to_string()
+                                })
                                 .ok_or_else(|| {
                                     anyhow!(
                                         "Worker transcript expired and no final output is available"
@@ -4644,6 +4915,18 @@ impl ThreadView {
                                             .truncate(),
                                     )
                                 })
+                                .when_some(
+                                    item.runtime_task_id
+                                        .clone()
+                                        .zip(item.verification.clone()),
+                                    |this, (task_id, verification)| {
+                                        this.child(self.render_agent_verification(
+                                            task_id,
+                                            verification,
+                                            cx,
+                                        ))
+                                    },
+                                )
                                 .when_some(item.runtime_task_id.clone().filter(|_| can_restart), |element, task_id| {
                                     element.child(Button::new(SharedString::from(format!("restart-{task_id}")), "Restart Attempt")
                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -16150,6 +16433,36 @@ mod tests {
     }
 
     #[test]
+    fn summarizes_structured_verification_for_activity_center() {
+        let mut verification = agent_orchestration::VerificationResult::pass();
+        verification.criteria_verdicts = vec![
+            ("tests pass".to_string(), true),
+            ("diff reviewed".to_string(), false),
+        ];
+        verification.passed = false;
+
+        assert_eq!(
+            verification_summary(&verification),
+            "Verification failed 1/2"
+        );
+        verification.passed = true;
+        verification.criteria_verdicts = vec![
+            ("tests pass".to_string(), true),
+            ("diff reviewed".to_string(), true),
+        ];
+        assert_eq!(verification_summary(&verification), "Verified 2/2");
+    }
+
+    #[test]
+    fn converts_verification_citations_to_openable_links() {
+        assert_eq!(
+            verification_citation_link("src/main.rs:12-24").as_deref(),
+            Some("src/main.rs#L12-24")
+        );
+        assert_eq!(verification_citation_link("src/main.rs"), None);
+    }
+
+    #[test]
     fn orchestration_plan_budgets_surface_in_activity_item() {
         let mut task = agent_orchestration::OrchestrationTask::new(
             agent_orchestration::TaskId::new("task-1"),
@@ -16186,6 +16499,7 @@ mod tests {
             objective: None,
             worktree_path: None,
             patch_status: None,
+            verification: None,
             last_activity_at: None,
         };
 

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::plan_graph::OrchestrationTask;
+use crate::truncate_text;
 
 /// Classification of errors encountered during task execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -89,6 +90,12 @@ pub struct VerificationResult {
     pub verdict: VerificationVerdict,
     #[serde(default)]
     pub criteria_verdicts: Vec<(String, bool)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criterion_results: Vec<CriterionClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output_satisfied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub citations_valid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,6 +113,9 @@ impl VerificationResult {
             passed: true,
             verdict: VerificationVerdict::Verified,
             criteria_verdicts: Vec::new(),
+            criterion_results: Vec::new(),
+            expected_output_satisfied: None,
+            citations: Vec::new(),
             citations_valid: None,
             feedback: None,
             error_class: None,
@@ -122,6 +132,9 @@ impl VerificationResult {
             passed: false,
             verdict: VerificationVerdict::FailedVerification,
             criteria_verdicts: Vec::new(),
+            criterion_results: Vec::new(),
+            expected_output_satisfied: None,
+            citations: Vec::new(),
             citations_valid: None,
             feedback: Some(feedback.into()),
             error_class: Some(error_class),
@@ -253,9 +266,12 @@ impl VerificationPolicy {
 pub const VERIFICATION_START: &str = "<zed_orchestration_verification>";
 /// Closing marker for a structured verification claim.
 pub const VERIFICATION_END: &str = "</zed_orchestration_verification>";
+const MAX_PERSISTED_VERIFICATION_CITATIONS: usize = 64;
+const MAX_PERSISTED_VERIFICATION_EVIDENCE_BYTES: usize = 4 * 1024;
+const MAX_PERSISTED_VERIFICATION_CITATION_BYTES: usize = 1024;
 
 /// A claim from a task's output describing how each acceptance criterion was met.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationClaim {
     #[serde(default)]
     pub criteria: Vec<CriterionClaim>,
@@ -265,7 +281,7 @@ pub struct VerificationClaim {
 }
 
 /// A single acceptance criterion claim with supporting evidence.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CriterionClaim {
     pub criterion: String,
     pub passed: bool,
@@ -286,14 +302,42 @@ pub fn parse_verification_claim(output: &str) -> anyhow::Result<VerificationClai
         .map_err(|error| anyhow::anyhow!("invalid structured verification claim: {error}"))
 }
 
-/// Returns true when a citation looks like `path/to/file.rs:123`.
+/// Removes a valid trailing structured verification envelope from output shown
+/// to the parent model or user. The unmodified output remains in runtime state
+/// and artifacts for auditing and replay.
+pub fn output_without_verification_claim(output: &str) -> &str {
+    let Some(start) = output.rfind(VERIFICATION_START) else {
+        return output;
+    };
+    let claim = &output[start..];
+    let Some(end) = claim.find(VERIFICATION_END) else {
+        return output;
+    };
+    let trailing = &claim[end + VERIFICATION_END.len()..];
+    if !trailing.trim().is_empty() || parse_verification_claim(output).is_err() {
+        return output;
+    }
+    output[..start].trim_end()
+}
+
+/// Returns true when a citation looks like `path/to/file.rs:123` or
+/// `path/to/file.rs:123-140`.
 pub fn is_file_line_citation(citation: &str) -> bool {
-    let Some((path, line)) = citation.rsplit_once(':') else {
+    let Some((path, location)) = citation.rsplit_once(':') else {
         return false;
     };
-    !path.trim().is_empty()
-        && path.rsplit_once('.').is_some()
-        && line.trim().parse::<u64>().is_ok_and(|line| line > 0)
+    if path.trim().is_empty() || path.rsplit_once('.').is_none() {
+        return false;
+    }
+
+    let parse_line = |line: &str| line.trim().parse::<u64>().ok().filter(|line| *line > 0);
+    match location.split_once('-') {
+        Some((start, end)) => match (parse_line(start), parse_line(end)) {
+            (Some(start), Some(end)) => start <= end,
+            _ => false,
+        },
+        None => parse_line(location).is_some(),
+    }
 }
 
 /// Runs native verification checks against a task's output.
@@ -332,6 +376,36 @@ impl VerificationRunner {
                 (criterion.clone(), passed)
             })
             .collect::<Vec<_>>();
+        let criterion_results = task
+            .acceptance_criteria
+            .iter()
+            .map(|criterion| {
+                let claim = claim
+                    .criteria
+                    .iter()
+                    .find(|result| result.criterion == *criterion);
+                CriterionClaim {
+                    criterion: criterion.clone(),
+                    passed: claim
+                        .is_some_and(|result| result.passed && !result.evidence.trim().is_empty()),
+                    evidence: claim
+                        .map(|result| {
+                            truncate_text(
+                                result.evidence.clone(),
+                                MAX_PERSISTED_VERIFICATION_EVIDENCE_BYTES,
+                            )
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let persisted_citations = claim
+            .citations
+            .iter()
+            .take(MAX_PERSISTED_VERIFICATION_CITATIONS)
+            .cloned()
+            .map(|citation| truncate_text(citation, MAX_PERSISTED_VERIFICATION_CITATION_BYTES))
+            .collect::<Vec<_>>();
         let criteria_valid = criteria_verdicts.iter().all(|(_, passed)| *passed);
         let expected_output_valid =
             task.expected_output.is_none() || claim.expected_output_satisfied == Some(true);
@@ -362,6 +436,9 @@ impl VerificationRunner {
                 passed: false,
                 verdict: VerificationVerdict::FailedVerification,
                 criteria_verdicts,
+                criterion_results,
+                expected_output_satisfied: claim.expected_output_satisfied,
+                citations: persisted_citations,
                 citations_valid,
                 feedback: Some(feedback.into()),
                 error_class: Some(ErrorClass::VerificationAssertionFailure),
@@ -375,6 +452,9 @@ impl VerificationRunner {
             passed: true,
             verdict: VerificationVerdict::Claimed,
             criteria_verdicts,
+            criterion_results,
+            expected_output_satisfied: claim.expected_output_satisfied,
+            citations: persisted_citations,
             citations_valid,
             feedback: None,
             error_class: None,
@@ -384,11 +464,11 @@ impl VerificationRunner {
         }
     }
 
-    /// Checks that every citation falls within the task's declared scope.
+    /// Checks that the task has primary evidence within its declared scope.
     ///
-    /// When the task declares a scope, each citation path (the part before the
-    /// `:line` suffix) must match at least one scope glob pattern. A task with no
-    /// scope, or a task whose output carries no citations, is not scope-checked.
+    /// Directory scopes include their descendants. At least one citation must
+    /// fall within the primary scope; additional citations may support the
+    /// result from adjacent documentation or dependency metadata.
     fn scope_citations_valid(&self, task: &OrchestrationTask, claim: &VerificationClaim) -> bool {
         let Some(scope) = task.scope.as_deref() else {
             return true;
@@ -397,13 +477,44 @@ impl VerificationRunner {
             return true;
         }
         let mut builder = GlobSetBuilder::new();
-        for pattern in scope.split_whitespace().flat_map(|part| part.split(',')) {
-            if !pattern.is_empty() {
-                let Ok(glob) = globset::Glob::new(pattern) else {
+        let mut pattern_count = 0;
+        for pattern in scope
+            .split([',', '\n'])
+            .flat_map(|entry| {
+                let entry = entry.trim();
+                if entry.split_whitespace().count() > 1 {
+                    entry
+                        .split_whitespace()
+                        .filter(|part| part.contains('/') || part.contains(['*', '?']))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![entry]
+                }
+            })
+            .map(|pattern| {
+                pattern.trim_matches(|character: char| {
+                    character.is_ascii_punctuation()
+                        && !matches!(character, '/' | '*' | '?' | '[' | ']' | '.' | '-' | '_')
+                })
+            })
+            .filter(|pattern| !pattern.is_empty())
+        {
+            let patterns = if pattern.contains(['*', '?', '[', ']']) {
+                vec![pattern.to_string()]
+            } else {
+                let normalized = pattern.trim_end_matches('/');
+                vec![normalized.to_string(), format!("{normalized}/**")]
+            };
+            for pattern in patterns {
+                let Ok(glob) = globset::Glob::new(&pattern) else {
                     continue;
                 };
                 builder.add(glob);
+                pattern_count += 1;
             }
+        }
+        if pattern_count == 0 {
+            return false;
         }
         let Ok(glob_set) = builder.build() else {
             return false;
@@ -411,7 +522,7 @@ impl VerificationRunner {
         claim
             .citations
             .iter()
-            .all(|citation| citation_path(citation).is_some_and(|path| glob_set.is_match(path)))
+            .any(|citation| citation_path(citation).is_some_and(|path| glob_set.is_match(path)))
     }
 }
 
@@ -482,6 +593,16 @@ mod tests {
         assert!(result.passed);
         assert_eq!(result.verdict, VerificationVerdict::Claimed);
         assert!(result.criteria_verdicts.iter().all(|(_, passed)| *passed));
+        assert_eq!(result.criterion_results.len(), 2);
+        assert_eq!(
+            result
+                .criterion_results
+                .first()
+                .map(|criterion| criterion.evidence.as_str()),
+            Some("cargo test passed")
+        );
+        assert_eq!(result.expected_output_satisfied, Some(true));
+        assert_eq!(result.citations, ["src/main.rs:12"]);
     }
 
     #[test]
@@ -493,6 +614,79 @@ mod tests {
         let result = runner.verify(&task, &output);
         assert!(!result.passed);
         assert_eq!(result.citations_valid, Some(false));
+    }
+
+    #[test]
+    fn file_line_ranges_are_valid_citations() {
+        assert!(is_file_line_citation("src/main.rs:12-24"));
+        assert!(is_file_line_citation("src/main.rs:12"));
+        assert!(!is_file_line_citation("src/main.rs:24-12"));
+        assert!(!is_file_line_citation("src/main.rs:12-"));
+    }
+
+    #[test]
+    fn strips_only_valid_trailing_verification_claims() {
+        let output = format!(
+            "Useful result\n\n{VERIFICATION_START}\n{}\n{VERIFICATION_END}\n",
+            r#"{"criteria":[],"expected_output_satisfied":true,"citations":[]}"#
+        );
+        assert_eq!(output_without_verification_claim(&output), "Useful result");
+
+        let malformed = format!("Useful result\n{VERIFICATION_START}not json{VERIFICATION_END}");
+        assert_eq!(output_without_verification_claim(&malformed), malformed);
+        let followed_by_text = format!(
+            "Useful result\n{VERIFICATION_START}{{\"criteria\":[]}}{VERIFICATION_END}\nkeep me"
+        );
+        assert_eq!(
+            output_without_verification_claim(&followed_by_text),
+            followed_by_text
+        );
+    }
+
+    #[test]
+    fn legacy_verification_result_deserializes_with_empty_details() {
+        let legacy = serde_json::json!({
+            "passed": true,
+            "verdict": "claimed",
+            "criteria_verdicts": [["criterion", true]],
+            "verified_at": "2026-09-05T00:00:00Z",
+            "retryable": false,
+            "repairable": false
+        });
+        let result: VerificationResult = serde_json::from_value(legacy).unwrap();
+
+        assert!(result.criterion_results.is_empty());
+        assert!(result.citations.is_empty());
+        assert_eq!(result.expected_output_satisfied, None);
+    }
+
+    #[test]
+    fn persisted_verification_details_are_bounded() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&["bounded evidence"]);
+        task.evidence_required = true;
+        let claim = VerificationClaim {
+            criteria: vec![CriterionClaim {
+                criterion: "bounded evidence".to_string(),
+                passed: true,
+                evidence: "e".repeat(MAX_PERSISTED_VERIFICATION_EVIDENCE_BYTES * 2),
+            }],
+            expected_output_satisfied: Some(true),
+            citations: (1..=MAX_PERSISTED_VERIFICATION_CITATIONS + 10)
+                .map(|line| format!("src/main.rs:{line}"))
+                .collect(),
+        };
+        let output = format!(
+            "Done\n{VERIFICATION_START}{}{VERIFICATION_END}",
+            serde_json::to_string(&claim).expect("serialize verification claim")
+        );
+        let result = runner.verify(&task, &output);
+
+        assert!(result.passed);
+        assert_eq!(result.citations.len(), MAX_PERSISTED_VERIFICATION_CITATIONS);
+        assert!(result.criterion_results.first().is_some_and(
+            |criterion| criterion.evidence.len() <= MAX_PERSISTED_VERIFICATION_EVIDENCE_BYTES
+        ));
     }
 
     #[test]
@@ -523,5 +717,39 @@ mod tests {
         task.scope = Some("src/**/*.rs".to_string());
         let output = claim_json("", "");
         assert!(runner.verify(&task, &output).passed);
+    }
+
+    #[test]
+    fn directory_scope_accepts_descendants_and_supporting_citations() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope = Some(
+            "vhmap-portal-web/src/modules/app-runtime and related dependency metadata".to_string(),
+        );
+        let output = claim_json(
+            "",
+            r#""vhmap-portal-web/src/modules/app-runtime/components/AppLoader.tsx:119-128","vhmap-portal-web/docs/architecture.md:220-249""#,
+        );
+
+        assert!(runner.verify(&task, &output).passed);
+    }
+
+    #[test]
+    fn directory_scope_still_requires_primary_scope_evidence() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope = Some("vhmap-portal-web/src/modules/app-runtime".to_string());
+        let output = claim_json("", r#""vhmap-portal-web/docs/architecture.md:220-249""#);
+
+        let result = runner.verify(&task, &output);
+        assert!(!result.passed);
+        assert!(
+            result
+                .feedback
+                .as_deref()
+                .is_some_and(|feedback| feedback.contains("scope"))
+        );
     }
 }

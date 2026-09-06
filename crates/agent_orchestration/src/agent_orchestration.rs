@@ -43,8 +43,9 @@ pub use scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 pub use state::{RunState, TaskAttempt, TaskState, TaskStatus};
 pub use task_registry::TaskRegistry;
 pub use verification::{
-    ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START, VerificationPolicy,
-    VerificationResult, VerificationRunner, VerificationVerdict,
+    CriterionClaim, ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START,
+    VerificationPolicy, VerificationResult, VerificationRunner, VerificationVerdict,
+    is_file_line_citation, output_without_verification_claim,
 };
 pub use worker::{
     AcpWorkerRuntimeConfig, CapabilitySnapshot, StructuredWaitReason, WorkerBroker, WorkerHandle,
@@ -59,7 +60,7 @@ mod tests {
     use agent_settings::{AgentAutonomy, AgentExecutionPolicy, AgentExecutionStrategy};
     use std::rc::Rc;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct PendingExecutor;
@@ -70,6 +71,31 @@ mod tests {
             _context: TaskExecutionContext,
         ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
             Box::pin(futures::future::pending())
+        }
+    }
+
+    struct PendingExecutorWithCancellation {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl TaskExecutor for PendingExecutorWithCancellation {
+        fn execute(
+            &self,
+            _context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            Box::pin(futures::future::pending())
+        }
+
+        fn cancel(
+            &self,
+            _task: &OrchestrationTask,
+            _session_id: Option<acp::SessionId>,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+            let cancelled = self.cancelled.clone();
+            Box::pin(async move {
+                cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            })
         }
     }
 
@@ -663,6 +689,38 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_task_timeout_cancels_active_worker(cx: &mut gpui::TestAppContext) {
+        let plan = OrchestrationPlan::new(
+            "Timeout cancellation",
+            vec![OrchestrationTask::new("task-1", "Task", "desc")],
+        );
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.task_timeout_secs = Some(0);
+        let (_, completion) = OrchestrationRuntime::start(
+            plan,
+            policy,
+            Rc::new(PendingExecutorWithCancellation {
+                cancelled: cancelled.clone(),
+            }),
+            config,
+        )
+        .expect("start run");
+
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Failed
+        );
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
     async fn test_timeout_and_cancel_interrupt_verification_and_repair(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -855,20 +913,25 @@ mod tests {
             let captured = captured.clone();
             move |context| {
                 if context.task.id.as_str() == "upstream" {
-                    return Ok(
-                        TaskExecutionOutput::new("o".repeat(64 * 1024)).with_artifacts(
-                            (0..20)
-                                .map(|index| {
-                                    Artifact::new(
-                                        context.task.id.clone(),
-                                        format!("artifact-{index}"),
-                                        ArtifactKind::Text,
-                                        "a".repeat(32 * 1024),
-                                    )
-                                })
-                                .collect(),
-                        ),
+                    let verification = format!(
+                        "\n{VERIFICATION_START}{{\"criteria\":[],\"expected_output_satisfied\":true,\"citations\":[]}}{VERIFICATION_END}"
                     );
+                    return Ok(TaskExecutionOutput::new(format!(
+                        "{}{verification}",
+                        "o".repeat(64 * 1024)
+                    ))
+                    .with_artifacts(
+                        (0..20)
+                            .map(|index| {
+                                Artifact::new(
+                                    context.task.id.clone(),
+                                    format!("artifact-{index}"),
+                                    ArtifactKind::Text,
+                                    format!("{}{verification}", "a".repeat(32 * 1024)),
+                                )
+                            })
+                            .collect(),
+                    ));
                 }
                 captured.lock().replace(context.dependency_inputs);
                 Ok(TaskExecutionOutput::new("done"))
@@ -901,7 +964,19 @@ mod tests {
                 .as_ref()
                 .is_some_and(|output| output.len() <= artifacts::MAX_DEPENDENCY_OUTPUT_BYTES)
         );
+        assert!(
+            inputs[0]
+                .output
+                .as_ref()
+                .is_some_and(|output| !output.contains(VERIFICATION_START))
+        );
         assert!(inputs[0].artifacts.len() <= artifacts::MAX_DEPENDENCY_ARTIFACTS);
+        assert!(
+            inputs[0]
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.data.contains(VERIFICATION_START))
+        );
         let total_bytes = inputs
             .iter()
             .map(|input| {

@@ -183,6 +183,10 @@ impl SubagentHandle for FakeSubagentHandle {
         let task = self.send_task.clone();
         cx.background_spawn(async move { Ok(task.await) })
     }
+
+    fn cancel(&self, _cx: &AsyncApp) -> Task<()> {
+        Task::ready(())
+    }
 }
 
 #[derive(Default)]

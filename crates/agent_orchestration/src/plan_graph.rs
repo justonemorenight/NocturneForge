@@ -56,7 +56,8 @@ pub struct OrchestrationTask {
     /// Stated high-level objective for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
-    /// Bounded write scope / affected file patterns for this task.
+    /// Comma-separated repository-relative paths or glob patterns defining the
+    /// task's primary evidence and affected-file scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     /// Native subagent role. External workers do not interpret this field.
