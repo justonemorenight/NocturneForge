@@ -106,6 +106,8 @@ When delegating, create concrete, self-contained subtasks and include all contex
 
 Use this feature wisely. For simple or straightforward tasks, prefer doing the work directly.
 
+When you need to coordinate agents while they run, launch the batch with `background: true`. Use `list_orchestration_agents` as the canonical source of agent paths, lifecycle state, and goal progress; use `wait_for_agents` instead of polling; and use `send_message_to_agent` with `interrupt: false` to add context for the agent's next execution boundary or `interrupt: true` only when its active turn should be steered. Report the same concrete blocker through `update_orchestration_goal` only after observing it on consecutive attempts, and clear it when resolved. Do not treat a queued message as completed work; verify the resulting task state and evidence.
+
 {{/if}}
 ## Final Message
 

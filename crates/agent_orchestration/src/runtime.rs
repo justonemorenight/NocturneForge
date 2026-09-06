@@ -3,18 +3,22 @@ use crate::cancellation::{CancellationReason, CancellationTree};
 use crate::context_checkpoint::{
     ContextCheckpoint, ContextCheckpointConfig, ContextCheckpointStore, ContextDelta, ContextState,
 };
-use crate::control_plane::{AgentControlPlane, AgentControlPlaneConfig};
+use crate::control_plane::{
+    AgentControlPlane, AgentControlPlaneConfig, AgentMessage, AgentMessageKind, AgentPath,
+};
 use crate::events::{EventSubscription, RuntimeEvent, RuntimeEventStream};
 use crate::executor::TaskExecutor;
 use crate::goal_controller::{GoalController, GoalControllerConfig, GoalSnapshot};
 use crate::ids::{RunId, TaskId};
 use crate::persistence::PersistedRun;
-use crate::plan_graph::{OrchestrationPlan, PlanGraph};
+use crate::plan_graph::{OrchestrationPlan, OrchestrationTask, PlanGraph};
 use crate::residency::{AgentResidencyConfig, AgentResidencyManager, AgentResidencyRecord};
 use crate::scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 use crate::state::{RunState, TaskState, TaskStatus};
 use crate::task_registry::TaskRegistry;
+use crate::worker::StructuredWaitReason;
 use crate::worktree_isolation::IsolatedWorktree;
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::Utc;
@@ -109,12 +113,25 @@ pub struct RunHandle {
     context_checkpoints: ContextCheckpointStore,
     residency: AgentResidencyManager,
     goal: GoalController,
+    executor: Rc<dyn TaskExecutor>,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     event_stream: RuntimeEventStream,
     control: RuntimeControl,
     policy: AgentExecutionPolicy,
     patch_operations: Arc<Mutex<HashSet<TaskId>>>,
+}
+
+enum AgentMessageDelivery {
+    Queued,
+    Wake {
+        task_id: TaskId,
+    },
+    Active {
+        task: OrchestrationTask,
+        session_id: acp::SessionId,
+        interrupt: bool,
+    },
 }
 
 impl RunHandle {
@@ -188,11 +205,142 @@ impl RunHandle {
         code: impl Into<String>,
         detail: impl Into<String>,
     ) -> Result<GoalSnapshot> {
-        self.goal.record_blocker(code, detail)
+        let goal = self.goal.record_blocker(code, detail)?;
+        self.event_stream.emit(RuntimeEvent::GoalUpdated {
+            run_id: self.run_id.clone(),
+            goal: goal.clone(),
+        });
+        Ok(goal)
     }
 
     pub fn clear_goal_blocker(&self) -> GoalSnapshot {
-        self.goal.clear_blocker()
+        let goal = self.goal.clear_blocker();
+        self.event_stream.emit(RuntimeEvent::GoalUpdated {
+            run_id: self.run_id.clone(),
+            goal: goal.clone(),
+        });
+        goal
+    }
+
+    pub async fn send_agent_message(
+        &self,
+        author: AgentPath,
+        recipient: AgentPath,
+        kind: AgentMessageKind,
+        body: String,
+    ) -> Result<AgentMessage> {
+        let delivery = self.agent_message_delivery(&recipient, kind)?;
+        let message = self
+            .agent_control_plane
+            .send(&author, &recipient, kind, body)?;
+        match delivery {
+            AgentMessageDelivery::Queued => Ok(message),
+            AgentMessageDelivery::Wake { task_id } => {
+                let result = self.restart_task(&task_id).and_then(|restarted| {
+                    anyhow::ensure!(
+                        restarted,
+                        "agent '{recipient}' changed state before it could be woken"
+                    );
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => Ok(message),
+                    Err(error) => Err(self.reject_agent_message(&recipient, &message, error)),
+                }
+            }
+            AgentMessageDelivery::Active {
+                task,
+                session_id,
+                interrupt,
+            } => {
+                if let Err(error) = self
+                    .executor
+                    .deliver_message(&task, session_id, message.body.clone(), interrupt)
+                    .await
+                {
+                    return Err(self.reject_agent_message(&recipient, &message, error));
+                }
+                self.agent_control_plane
+                    .acknowledge_delivery(&recipient, message.sequence)?;
+                Ok(message)
+            }
+        }
+    }
+
+    fn agent_message_delivery(
+        &self,
+        recipient: &AgentPath,
+        kind: AgentMessageKind,
+    ) -> Result<AgentMessageDelivery> {
+        let identity = self
+            .agent_control_plane
+            .identity(recipient)
+            .with_context(|| {
+                format!("recipient agent '{recipient}' is not registered in this run")
+            })?;
+        let Some(task_id) = identity.task_id else {
+            return Ok(AgentMessageDelivery::Queued);
+        };
+        anyhow::ensure!(
+            kind != AgentMessageKind::Completion,
+            "completion messages must target the orchestration root"
+        );
+        let status = self
+            .task_registry
+            .status(&task_id)
+            .with_context(|| format!("recipient agent '{recipient}' has no registered task"))?;
+        if status.state.is_terminal() {
+            anyhow::bail!("cannot message terminal agent '{recipient}'; start a new task instead");
+        }
+        if matches!(status.state, TaskState::Verifying | TaskState::Repairing) {
+            anyhow::bail!(
+                "cannot message agent '{recipient}' while its output is being verified or repaired"
+            );
+        }
+        if status.state == TaskState::Running {
+            let session_id = status.active_session_id.with_context(|| {
+                format!(
+                    "agent '{recipient}' is running but has not published an addressable session yet"
+                )
+            })?;
+            let task = self.plan_graph.task(&task_id).cloned().with_context(|| {
+                format!("recipient agent '{recipient}' references an unknown task")
+            })?;
+            return Ok(AgentMessageDelivery::Active {
+                task,
+                session_id,
+                interrupt: kind.triggers_turn(),
+            });
+        }
+        if kind.triggers_turn()
+            && status.state == TaskState::Parked
+            && matches!(
+                status.wait_reason,
+                Some(StructuredWaitReason::AwaitingUserInput { .. })
+            )
+        {
+            return Ok(AgentMessageDelivery::Wake { task_id });
+        }
+        Ok(AgentMessageDelivery::Queued)
+    }
+
+    fn reject_agent_message(
+        &self,
+        recipient: &AgentPath,
+        message: &AgentMessage,
+        delivery_error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.agent_control_plane.reject_delivery(
+            recipient,
+            message.sequence,
+            delivery_error.to_string(),
+        ) {
+            Ok(_) => delivery_error,
+            Err(rollback_error) => delivery_error.context(format!(
+                "failed to remove rejected message {} from '{recipient}': {rollback_error}",
+                message.sequence
+            )),
+        }
     }
 
     pub fn task_status(&self, task_id: &TaskId) -> Option<TaskStatus> {
@@ -830,7 +978,7 @@ impl OrchestrationRuntime {
             context_checkpoints.clone(),
             residency.clone(),
             event_stream.clone(),
-            executor,
+            executor.clone(),
             config.scheduler,
             control.clone(),
         );
@@ -843,6 +991,7 @@ impl OrchestrationRuntime {
             context_checkpoints,
             residency,
             goal,
+            executor,
             artifact_store,
             cancellation_tree,
             event_stream,
@@ -965,7 +1114,7 @@ impl OrchestrationRuntime {
             context_checkpoints.clone(),
             residency.clone(),
             event_stream.clone(),
-            executor,
+            executor.clone(),
             config.scheduler,
             control.clone(),
         );
@@ -978,6 +1127,7 @@ impl OrchestrationRuntime {
             context_checkpoints,
             residency,
             goal,
+            executor,
             artifact_store,
             cancellation_tree,
             event_stream,

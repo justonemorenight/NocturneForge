@@ -1,6 +1,7 @@
 use crate::artifacts::Artifact;
 use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentIdentity, AgentMessage, AgentPath};
+use crate::goal_controller::GoalSnapshot;
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
 use crate::residency::AgentResidencyRecord;
@@ -51,6 +52,15 @@ pub enum RuntimeEvent {
         run_id: RunId,
         message: AgentMessage,
     },
+    AgentMessageDelivered {
+        run_id: RunId,
+        message: AgentMessage,
+    },
+    AgentMessageDeliveryFailed {
+        run_id: RunId,
+        message: AgentMessage,
+        error: String,
+    },
     AgentMailboxDrained {
         run_id: RunId,
         recipient: AgentPath,
@@ -68,6 +78,10 @@ pub enum RuntimeEvent {
     AgentResidencyChanged {
         run_id: RunId,
         record: AgentResidencyRecord,
+    },
+    GoalUpdated {
+        run_id: RunId,
+        goal: GoalSnapshot,
     },
     TaskScheduled {
         run_id: RunId,
@@ -219,10 +233,13 @@ impl RuntimeEvent {
             | Self::RunResumed { run_id, .. }
             | Self::AgentRegistered { run_id, .. }
             | Self::AgentMessageQueued { run_id, .. }
+            | Self::AgentMessageDelivered { run_id, .. }
+            | Self::AgentMessageDeliveryFailed { run_id, .. }
             | Self::AgentMailboxDrained { run_id, .. }
             | Self::AgentUnregistered { run_id, .. }
             | Self::ContextCheckpointRecorded { run_id, .. }
             | Self::AgentResidencyChanged { run_id, .. }
+            | Self::GoalUpdated { run_id, .. }
             | Self::TaskScheduled { run_id, .. }
             | Self::TaskDispatched { run_id, .. }
             | Self::TaskPhaseChanged { run_id, .. }

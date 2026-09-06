@@ -6,11 +6,14 @@ use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::{AgentTool, SubagentRole, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use crate::{
+    AgentTool, SubagentHandle, SubagentRole, Thread, ThreadEnvironment, ToolCallEventStream,
+    ToolInput,
+};
 use agent_orchestration::{
     MAX_DEPENDENCY_CONTEXT_BYTES, VERIFICATION_END, VERIFICATION_START,
     output_without_verification_claim, truncate_text,
@@ -98,6 +101,121 @@ struct SubagentRuntimeExecutor {
             collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
         >,
     >,
+    active_deliveries: ActiveDeliveries,
+    maximum_pending_deliveries: usize,
+}
+
+#[derive(Debug)]
+struct AgentDelivery {
+    message: String,
+    interrupt: bool,
+}
+
+type ActiveDeliveries =
+    Arc<parking_lot::RwLock<HashMap<acp::SessionId, async_channel::Sender<AgentDelivery>>>>;
+
+struct SteeringSession {
+    session_id: acp::SessionId,
+    receiver: async_channel::Receiver<AgentDelivery>,
+    active_deliveries: ActiveDeliveries,
+}
+
+enum AgentTurnBoundary {
+    Complete(Result<String>),
+    Continue(String),
+}
+
+impl SteeringSession {
+    fn register(
+        session_id: acp::SessionId,
+        active_deliveries: ActiveDeliveries,
+        maximum_pending_deliveries: usize,
+    ) -> Result<Self> {
+        let (sender, receiver) = async_channel::bounded(maximum_pending_deliveries);
+        {
+            let mut deliveries = active_deliveries.write();
+            match deliveries.entry(session_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(sender);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    anyhow::bail!("subagent session '{session_id}' already has an active owner");
+                }
+            }
+        }
+        Ok(Self {
+            session_id,
+            receiver,
+            active_deliveries,
+        })
+    }
+
+    async fn send(
+        &self,
+        subagent: Rc<dyn SubagentHandle>,
+        initial_prompt: String,
+        app: gpui::AsyncApp,
+    ) -> Result<String> {
+        let mut next_prompt = initial_prompt;
+        loop {
+            match self
+                .run_turn(subagent.clone(), next_prompt, app.clone())
+                .await?
+            {
+                AgentTurnBoundary::Complete(result) => return result,
+                AgentTurnBoundary::Continue(prompt) => next_prompt = prompt,
+            }
+        }
+    }
+
+    async fn run_turn(
+        &self,
+        subagent: Rc<dyn SubagentHandle>,
+        prompt: String,
+        app: gpui::AsyncApp,
+    ) -> Result<AgentTurnBoundary> {
+        let mut send_task = Box::pin(subagent.send(prompt, &app));
+        let mut deferred_messages = Vec::new();
+        loop {
+            let delivery = self.receiver.recv();
+            futures::pin_mut!(delivery);
+            match futures::future::select(send_task.as_mut(), delivery).await {
+                futures::future::Either::Left((result, _)) => {
+                    self.drain_messages(&mut deferred_messages);
+                    if deferred_messages.is_empty() {
+                        self.active_deliveries.write().remove(&self.session_id);
+                        return Ok(AgentTurnBoundary::Complete(result));
+                    }
+                    return Ok(AgentTurnBoundary::Continue(deferred_messages.join("\n\n")));
+                }
+                futures::future::Either::Right((delivery, _)) => {
+                    let delivery = delivery
+                        .map_err(|error| anyhow::anyhow!("steering channel closed: {error}"))?;
+                    deferred_messages.push(delivery.message);
+                    if delivery.interrupt {
+                        subagent.cancel(&app).await;
+                        if let Err(error) = send_task.await {
+                            log::debug!("steered subagent turn settled with error: {error}");
+                        }
+                        self.drain_messages(&mut deferred_messages);
+                        return Ok(AgentTurnBoundary::Continue(deferred_messages.join("\n\n")));
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_messages(&self, messages: &mut Vec<String>) {
+        while let Ok(delivery) = self.receiver.try_recv() {
+            messages.push(delivery.message);
+        }
+    }
+}
+
+impl Drop for SteeringSession {
+    fn drop(&mut self) {
+        self.active_deliveries.write().remove(&self.session_id);
+    }
 }
 
 impl SubagentRuntimeExecutor {
@@ -110,12 +228,15 @@ impl SubagentRuntimeExecutor {
                 collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
             >,
         >,
+        maximum_pending_deliveries: usize,
     ) -> Self {
         Self {
             environment,
             app,
             event_stream,
             roles_map,
+            active_deliveries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            maximum_pending_deliveries,
         }
     }
 }
@@ -134,6 +255,8 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
         let task = context.task;
         let role = self.roles_map.read().get(&task.id).cloned().flatten();
         let existing_session = context.existing_session_id;
+        let active_deliveries = self.active_deliveries.clone();
+        let maximum_pending_deliveries = self.maximum_pending_deliveries;
 
         Box::pin(async move {
             if context.cancellation_token.is_cancelled() || event_stream.was_cancelled_by_user() {
@@ -155,6 +278,11 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             })?;
 
             let session_id = subagent.id();
+            let steering_session = SteeringSession::register(
+                session_id.clone(),
+                active_deliveries,
+                maximum_pending_deliveries,
+            )?;
             let mut worker_metadata = agent_orchestration::WorkerMetadata::new(task.target.clone());
             worker_metadata.model = task.model_override.clone();
             worker_metadata.mode = task.mode.clone();
@@ -164,7 +292,9 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                 anyhow::bail!("{exceeded}");
             }
             let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
-            let send_result = subagent.send(execution_prompt, &app).await;
+            let send_result = steering_session
+                .send(subagent.clone(), execution_prompt, app.clone())
+                .await;
             reporter.report_tool_call_finished();
 
             let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
@@ -208,6 +338,26 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             let subagent = app.update(move |cx| environment.resume_subagent(session_id, cx))?;
             subagent.cancel(&app).await;
             Ok(())
+        })
+    }
+
+    fn deliver_message(
+        &self,
+        _task: &agent_orchestration::OrchestrationTask,
+        session_id: agent_client_protocol::schema::v1::SessionId,
+        message: String,
+        interrupt: bool,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        let active_deliveries = self.active_deliveries.clone();
+        Box::pin(async move {
+            active_deliveries
+                .read()
+                .get(&session_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("subagent session '{session_id}' has no active turn owner")
+                })?
+                .try_send(AgentDelivery { message, interrupt })
+                .map_err(|error| anyhow::anyhow!("failed to message subagent: {error}"))
         })
     }
 
@@ -384,6 +534,7 @@ impl Default for SpawnAgentToolInput {
             session_id: None,
             tools: None,
             tasks: None,
+            background: false,
             agent: None,
             model: None,
             mode: None,
@@ -416,6 +567,11 @@ pub struct SpawnAgentToolInput {
     /// single-task fields above are ignored.
     #[serde(default)]
     pub tasks: Option<Vec<SpawnAgentTask>>,
+    /// For batch tasks, return after the orchestration run starts so it can be
+    /// coordinated with list_orchestration_agents, send_message_to_agent, and
+    /// wait_for_agents. Invalid without tasks.
+    #[serde(default)]
+    pub background: bool,
     /// Target worker agent: "native", "omp", "opencode", or a configured agent name.
     /// Defaults to "native".
     #[serde(default)]
@@ -644,6 +800,17 @@ fn validate_task_worker_fields(task: &SpawnAgentTask) -> Result<()> {
     Ok(())
 }
 
+fn validate_background_mode(input: &SpawnAgentToolInput) -> Result<(), SpawnAgentToolOutput> {
+    if input.background && input.tasks.is_none() {
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: "background execution requires the orchestration tasks array".to_string(),
+            session_info: None,
+        });
+    }
+    Ok(())
+}
+
 fn parse_persisted_native_role(role: &str) -> Result<Option<SubagentRole>> {
     match role {
         "explorer" => Ok(Some(SubagentRole::Explorer)),
@@ -671,6 +838,10 @@ pub enum SpawnAgentToolOutput {
     },
     BatchSuccess {
         results: Vec<SpawnAgentBatchResult>,
+    },
+    BatchStarted {
+        run_id: String,
+        agents: Vec<String>,
     },
     PlanProposed {
         run_id: String,
@@ -712,6 +883,16 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
             SpawnAgentToolOutput::BatchSuccess { results } => serde_json::to_string(&results)
                 .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
                 .into(),
+            SpawnAgentToolOutput::BatchStarted { run_id, agents } => {
+                serde_json::to_string(&serde_json::json!({
+                    "run_id": run_id,
+                    "status": "running",
+                    "agents": agents,
+                    "next": "Use wait_for_agents, list_orchestration_agents, or send_message_to_agent",
+                }))
+                .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
+                .into()
+            }
             SpawnAgentToolOutput::PlanProposed {
                 run_id,
                 plan,
@@ -782,6 +963,7 @@ impl SpawnAgentTool {
             cx.clone(),
             event_stream,
             Arc::new(parking_lot::RwLock::new(roles_map)),
+            runtime_config.control_plane.max_messages_per_agent,
         ));
         let mut broker = agent_orchestration::WorkerBroker::new(enable_acp_delegation)
             .with_acp_runtime_config(runtime_config.scheduler.acp_workers.clone())
@@ -851,11 +1033,7 @@ impl SpawnAgentTool {
                     }
                     let snapshot = completion_handle.snapshot();
                     app.update(|cx| {
-                        if let Some(parent) = thread.upgrade() {
-                            parent.update(cx, |parent, cx| {
-                                parent.set_persisted_orchestration_run(Some(snapshot), cx);
-                            });
-                        }
+                        persist_snapshot_if_current(&thread, snapshot, cx);
                     });
                 }
             })
@@ -865,283 +1043,157 @@ impl SpawnAgentTool {
     }
 }
 
-async fn run_batch_tasks(
-    environment: Rc<dyn ThreadEnvironment>,
-    thread: gpui::WeakEntity<Thread>,
-    tasks: Vec<SpawnAgentTask>,
-    event_stream: ToolCallEventStream,
-    cx: &mut gpui::AsyncApp,
-) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
-    if tasks.is_empty() {
-        return Err(SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: "tasks must contain at least one subagent task".to_string(),
-            session_info: None,
-        });
-    }
-    let pending = tasks
-        .into_iter()
-        .enumerate()
-        .map(|(index, task)| {
-            let task_id = task
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("task-{}", index + 1));
-            (task_id, task)
-        })
-        .collect::<Vec<_>>();
-    validate_task_graph(&pending).map_err(|error| SpawnAgentToolOutput::Error {
-        session_id: None,
-        error: error.to_string(),
-        session_info: None,
-    })?;
-    for (_, task) in &pending {
-        validate_task_worker_fields(task).map_err(|error| SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: error.to_string(),
-            session_info: None,
-        })?;
-    }
-
-    let (configured_strategy, resolved_turn_policy, autonomy) = cx
-        .update(|cx| {
-            thread.upgrade().map(|t| {
-                let t = t.read(cx);
-                (
-                    t.execution_strategy(),
-                    t.resolved_turn_policy().cloned(),
-                    t.autonomy(),
-                )
-            })
-        })
-        .unwrap_or((
-            agent_settings::AgentExecutionStrategy::Direct,
-            None,
-            agent_settings::AgentAutonomy::default(),
-        ));
-
-    let prompt = pending
-        .iter()
-        .map(|(task_id, task)| {
-            let mut message = task.message.clone();
-            if !task.depends_on.is_empty() {
-                message.push_str(&format!("\n[depends on: {}]", task.depends_on.join(", ")));
-            }
-            format!("[{task_id}] {message}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let (policy, disposition) = batch_launch_policy(
-        configured_strategy,
-        resolved_turn_policy.as_ref(),
-        &prompt,
-        pending.len(),
-        autonomy,
-    );
-
-    let mut roles_map = collections::HashMap::default();
-    let orchestration_tasks = pending
-        .iter()
-        .map(|(task_id, task)| {
-            let id = agent_orchestration::TaskId::new(task_id);
-            roles_map.insert(id.clone(), task.agent_type);
-            let mut orchestration_task = agent_orchestration::OrchestrationTask::new(
-                id,
-                task.label.clone(),
-                task.message.clone(),
-            );
-            orchestration_task.tools = task.tools.clone();
-            orchestration_task.depends_on = task
-                .depends_on
-                .iter()
-                .map(agent_orchestration::TaskId::new)
-                .collect();
-            orchestration_task.max_retries = Some(task.max_retries);
-            orchestration_task.token_budget = task.token_budget;
-            if let Some(criteria) = &task.acceptance_criteria {
-                orchestration_task.acceptance_criteria = criteria.clone();
-            }
-            orchestration_task.expected_output = task.expected_output.clone();
-            orchestration_task.evidence_required = task.evidence_required.unwrap_or(false);
-            orchestration_task.time_budget_secs = task.time_budget_secs;
-            orchestration_task.tool_call_budget = task.tool_call_budget;
-            orchestration_task.objective = task.objective.clone();
-            orchestration_task.scope = task.scope.clone();
-            orchestration_task.native_role =
-                task.agent_type.map(|role| role.identifier().to_string());
-            orchestration_task.target = agent_orchestration::WorkerTarget::from_identifier(
-                task.agent.as_deref().unwrap_or("native"),
-            );
-            orchestration_task.model_override = task.model.clone();
-            orchestration_task.mode = task.mode.clone();
-            orchestration_task.workspace_policy = match &task.workspace {
-                Some(workspace) => workspace.to_policy()?,
-                None if orchestration_task.target.is_acp() => {
-                    agent_orchestration::WorkspacePolicy::isolated_worktree()
-                }
-                None => agent_orchestration::WorkspacePolicy::shared_parent(),
-            };
-            if orchestration_task.workspace_policy.isolation
-                == agent_orchestration::WorkspaceIsolation::DedicatedWorktree
-            {
-                // Keep the default product path on a bounded, non-shell verifier. Custom
-                // verification remains available to trusted programmatic plan builders.
-                orchestration_task.verification_command = Some("git diff --check".to_string());
-            }
-            Ok(orchestration_task)
-        })
-        .collect::<Result<Vec<_>>>()
-        .map_err(|error| SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: error.to_string(),
-            session_info: None,
-        })?;
-
-    let plan =
-        agent_orchestration::OrchestrationPlan::new("Parallel delegation", orchestration_tasks);
-
-    let mut runtime_config = agent_orchestration::RuntimeConfig::default();
-    runtime_config.scheduler.max_parallel_tasks = MAX_PARALLEL_SUBAGENTS;
-    runtime_config.foreground_executor = Some(cx.foreground_executor().clone());
-    runtime_config.scheduler.background_executor = Some(cx.background_executor().clone());
-
-    let enable_acp_delegation =
-        cx.update(|cx| agent_settings::AgentSettings::get_global(cx).enable_acp_delegation);
-    runtime_config.enable_acp_delegation = enable_acp_delegation;
-    runtime_config.scheduler.acp_workers = cx.update(|cx| {
-        agent_orchestration::AcpWorkerRuntimeConfig::from_settings(
-            agent_settings::AgentSettings::get_global(cx),
-        )
-    });
-
-    let native_executor = Rc::new(SubagentRuntimeExecutor::new(
-        environment.clone(),
-        cx.clone(),
-        event_stream.clone(),
-        Arc::new(parking_lot::RwLock::new(roles_map)),
-    ));
-
-    let mut broker = agent_orchestration::WorkerBroker::new(enable_acp_delegation)
-        .with_acp_runtime_config(runtime_config.scheduler.acp_workers.clone())
-        .with_native_executor(native_executor);
-    for target in plan
-        .tasks
-        .iter()
-        .map(|task| task.target.clone())
-        .filter(agent_orchestration::WorkerTarget::is_acp)
-        .collect::<HashSet<_>>()
-    {
-        broker.register_host(
-            target.clone(),
-            Rc::new(LazyExternalWorkerHost {
-                target,
-                environment: environment.clone(),
-                app: cx.clone(),
-            }),
-        );
-    }
-
-    let executor = Rc::new(broker);
-
-    let (run_handle, completion_rx) =
-        agent_orchestration::OrchestrationRuntime::start_with_disposition(
-            plan,
-            policy,
-            disposition,
-            executor,
-            runtime_config,
-        )
-        .map_err(|error| SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: error.to_string(),
-            session_info: None,
-        })?;
-
-    cx.update(|cx| {
-        if let Some(parent) = thread.upgrade() {
-            parent.update(cx, |parent, cx| {
-                parent.set_orchestration_run(run_handle.clone(), cx);
-            });
+fn persist_snapshot_if_current(
+    thread: &gpui::WeakEntity<Thread>,
+    snapshot: agent_orchestration::PersistedRun,
+    cx: &mut App,
+) {
+    let Some(parent) = thread.upgrade() else {
+        return;
+    };
+    let run_id = snapshot.run_id.clone();
+    parent.update(cx, |parent, cx| {
+        if parent
+            .orchestration_run()
+            .is_some_and(|run| run.run_id() == &run_id)
+        {
+            parent.set_persisted_orchestration_run(Some(snapshot), cx);
         }
     });
+}
 
-    let runtime_events = run_handle.subscribe_live();
+fn persist_background_completion(
+    run_handle: agent_orchestration::RunHandle,
+    completion: futures::channel::oneshot::Receiver<Result<agent_orchestration::RunState>>,
+    thread: gpui::WeakEntity<Thread>,
+    cx: &mut gpui::AsyncApp,
+) {
     cx.foreground_executor()
         .spawn({
             let app = cx.clone();
-            let thread = thread.clone();
             async move {
-                while let Ok(event) = runtime_events.receiver.recv().await {
-                    app.update(|cx| {
-                        if let Some(parent) = thread.upgrade() {
-                            parent.update(cx, |_, cx| cx.notify());
-                        }
-                    });
-                    if matches!(
-                        event.event,
-                        agent_orchestration::RuntimeEvent::RunStateChanged { state, .. }
-                            if state.is_terminal()
-                    ) {
-                        break;
+                match completion.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        log::error!("background orchestration run failed: {error}")
+                    }
+                    Err(_) => {
+                        log::warn!("background orchestration completion sender dropped")
                     }
                 }
+                let snapshot = run_handle.snapshot();
+                app.update(|cx| {
+                    persist_snapshot_if_current(&thread, snapshot, cx);
+                });
             }
         })
         .detach();
+}
 
+fn background_run_output(
+    run_handle: &agent_orchestration::RunHandle,
+    disposition: agent_orchestration::RuntimeLaunchDisposition,
+    strategy: agent_settings::AgentExecutionStrategy,
+) -> SpawnAgentToolOutput {
     if disposition == agent_orchestration::RuntimeLaunchDisposition::AwaitApproval {
-        // Keep the tool future alive while the detached runtime waits for the
-        // approval action so the parent turn receives the real batch result.
-        let proposal = run_handle.snapshot();
-        cx.update(|cx| {
-            if let Some(parent) = thread.upgrade() {
-                parent.update(cx, |parent, cx| {
-                    parent.set_persisted_orchestration_run(Some(proposal), cx);
-                });
-            }
-        });
+        return SpawnAgentToolOutput::PlanProposed {
+            run_id: run_handle.run_id().to_string(),
+            plan: Box::new(run_handle.plan().clone()),
+            strategy,
+            reason: "The orchestration run requires user approval before dispatch".to_string(),
+        };
     }
+    let agents = run_handle
+        .agent_control_plane()
+        .list(None)
+        .into_iter()
+        .filter_map(|identity| identity.task_id.map(|_| identity.path.to_string()))
+        .collect();
+    SpawnAgentToolOutput::BatchStarted {
+        run_id: run_handle.run_id().to_string(),
+        agents,
+    }
+}
 
-    let completion_result = completion_rx.await;
+struct BatchRunCompletion {
+    run_handle: agent_orchestration::RunHandle,
+    completion: futures::channel::oneshot::Receiver<Result<agent_orchestration::RunState>>,
+    pending: Vec<(String, SpawnAgentTask)>,
+    background: bool,
+    disposition: agent_orchestration::RuntimeLaunchDisposition,
+    strategy: agent_settings::AgentExecutionStrategy,
+    thread: gpui::WeakEntity<Thread>,
+    event_stream: ToolCallEventStream,
+}
 
-    let snapshot = run_handle.snapshot();
-    cx.update(|cx| {
-        if let Some(parent) = thread.upgrade() {
-            parent.update(cx, |parent, cx| {
-                parent.set_persisted_orchestration_run(Some(snapshot), cx);
+impl BatchRunCompletion {
+    async fn finish(
+        self,
+        cx: &mut gpui::AsyncApp,
+    ) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
+        if self.background {
+            let output = background_run_output(&self.run_handle, self.disposition, self.strategy);
+            persist_background_completion(self.run_handle, self.completion, self.thread, cx);
+            return Ok(output);
+        }
+
+        let completion = self.completion.await;
+        let snapshot = self.run_handle.snapshot();
+        cx.update(|cx| {
+            persist_snapshot_if_current(&self.thread, snapshot, cx);
+        });
+        if self.event_stream.was_cancelled_by_user()
+            || matches!(
+                &completion,
+                Ok(Ok(agent_orchestration::RunState::Cancelled))
+            )
+        {
+            self.run_handle
+                .cancel(agent_orchestration::CancellationReason::UserRequested);
+            return Err(SpawnAgentToolOutput::Error {
+                session_id: None,
+                error: "parallel orchestration cancelled".to_string(),
+                session_info: None,
             });
         }
-    });
+        match completion {
+            Err(error) => {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: None,
+                    error: error.to_string(),
+                    session_info: None,
+                });
+            }
+            Ok(Err(error)) => {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: None,
+                    error: error.to_string(),
+                    session_info: None,
+                });
+            }
+            Ok(Ok(_)) => {}
+        }
 
-    if event_stream.was_cancelled_by_user()
-        || matches!(
-            completion_result,
-            Ok(Ok(agent_orchestration::RunState::Cancelled))
-        )
-    {
-        run_handle.cancel(agent_orchestration::CancellationReason::UserRequested);
-        return Err(SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: "parallel orchestration cancelled".to_string(),
-            session_info: None,
-        });
+        let batch = collect_batch_results(&self.run_handle, self.pending)?;
+        let raw_output =
+            serde_json::to_value(&batch).map_err(|error| SpawnAgentToolOutput::Error {
+                session_id: None,
+                error: format!("Failed to serialize batch output: {error}"),
+                session_info: None,
+            })?;
+        self.event_stream.update_fields(
+            acp::ToolCallUpdateFields::new()
+                .title("Parallel agents completed")
+                .raw_output(raw_output),
+        );
+        Ok(SpawnAgentToolOutput::BatchSuccess { results: batch })
     }
-    if let Err(error) = completion_result {
-        return Err(SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: error.to_string(),
-            session_info: None,
-        });
-    }
-    if let Ok(Err(error)) = completion_result {
-        return Err(SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: error.to_string(),
-            session_info: None,
-        });
-    }
+}
 
+fn collect_batch_results(
+    run_handle: &agent_orchestration::RunHandle,
+    pending: Vec<(String, SpawnAgentTask)>,
+) -> Result<Vec<SpawnAgentBatchResult>, SpawnAgentToolOutput> {
     let mut batch = Vec::new();
     let mut last_error = None;
     let mut last_session_id = None;
@@ -1183,17 +1235,331 @@ async fn run_batch_tasks(
             session_info: None,
         });
     }
-    let raw_output = serde_json::to_value(&batch).map_err(|error| SpawnAgentToolOutput::Error {
+    Ok(batch)
+}
+
+struct PreparedBatch {
+    pending: Vec<(String, SpawnAgentTask)>,
+    prompt: String,
+    roles: collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
+    plan: agent_orchestration::OrchestrationPlan,
+}
+
+fn batch_error(error: impl ToString) -> SpawnAgentToolOutput {
+    SpawnAgentToolOutput::Error {
         session_id: None,
-        error: format!("Failed to serialize batch output: {error}"),
+        error: error.to_string(),
         session_info: None,
-    })?;
-    event_stream.update_fields(
-        acp::ToolCallUpdateFields::new()
-            .title("Parallel agents completed")
-            .raw_output(raw_output),
+    }
+}
+
+fn prepare_orchestration_task(
+    task_id: &str,
+    task: &SpawnAgentTask,
+) -> Result<agent_orchestration::OrchestrationTask> {
+    let mut orchestration_task = agent_orchestration::OrchestrationTask::new(
+        agent_orchestration::TaskId::new(task_id),
+        task.label.clone(),
+        task.message.clone(),
     );
-    Ok(SpawnAgentToolOutput::BatchSuccess { results: batch })
+    orchestration_task.tools = task.tools.clone();
+    orchestration_task.depends_on = task
+        .depends_on
+        .iter()
+        .map(agent_orchestration::TaskId::new)
+        .collect();
+    orchestration_task.max_retries = Some(task.max_retries);
+    orchestration_task.token_budget = task.token_budget;
+    if let Some(criteria) = &task.acceptance_criteria {
+        orchestration_task.acceptance_criteria = criteria.clone();
+    }
+    orchestration_task.expected_output = task.expected_output.clone();
+    orchestration_task.evidence_required = task.evidence_required.unwrap_or(false);
+    orchestration_task.time_budget_secs = task.time_budget_secs;
+    orchestration_task.tool_call_budget = task.tool_call_budget;
+    orchestration_task.objective = task.objective.clone();
+    orchestration_task.scope = task.scope.clone();
+    orchestration_task.native_role = task.agent_type.map(|role| role.identifier().to_string());
+    orchestration_task.target = agent_orchestration::WorkerTarget::from_identifier(
+        task.agent.as_deref().unwrap_or("native"),
+    );
+    orchestration_task.model_override = task.model.clone();
+    orchestration_task.mode = task.mode.clone();
+    orchestration_task.workspace_policy = match &task.workspace {
+        Some(workspace) => workspace.to_policy()?,
+        None if orchestration_task.target.is_acp() => {
+            agent_orchestration::WorkspacePolicy::isolated_worktree()
+        }
+        None => agent_orchestration::WorkspacePolicy::shared_parent(),
+    };
+    if orchestration_task.workspace_policy.isolation
+        == agent_orchestration::WorkspaceIsolation::DedicatedWorktree
+    {
+        // Keep the default product path on a bounded, non-shell verifier. Custom
+        // verification remains available to trusted programmatic plan builders.
+        orchestration_task.verification_command = Some("git diff --check".to_string());
+    }
+    Ok(orchestration_task)
+}
+
+fn prepare_batch(tasks: Vec<SpawnAgentTask>) -> Result<PreparedBatch, SpawnAgentToolOutput> {
+    if tasks.is_empty() {
+        return Err(batch_error("tasks must contain at least one subagent task"));
+    }
+    let pending = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let task_id = task
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("task-{}", index + 1));
+            (task_id, task)
+        })
+        .collect::<Vec<_>>();
+    validate_task_graph(&pending).map_err(batch_error)?;
+    for (_, task) in &pending {
+        validate_task_worker_fields(task).map_err(batch_error)?;
+    }
+
+    let prompt = pending
+        .iter()
+        .map(|(task_id, task)| {
+            let mut message = task.message.clone();
+            if !task.depends_on.is_empty() {
+                message.push_str(&format!("\n[depends on: {}]", task.depends_on.join(", ")));
+            }
+            format!("[{task_id}] {message}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut roles = collections::HashMap::default();
+    let tasks = pending
+        .iter()
+        .map(|(task_id, task)| {
+            let id = agent_orchestration::TaskId::new(task_id);
+            roles.insert(id, task.agent_type);
+            prepare_orchestration_task(task_id, task)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(batch_error)?;
+
+    Ok(PreparedBatch {
+        pending,
+        prompt,
+        roles,
+        plan: agent_orchestration::OrchestrationPlan::new("Parallel delegation", tasks),
+    })
+}
+
+fn orchestration_runtime_config(
+    cx: &mut gpui::AsyncApp,
+) -> (agent_orchestration::RuntimeConfig, bool) {
+    let mut config = agent_orchestration::RuntimeConfig::default();
+    config.scheduler.max_parallel_tasks = MAX_PARALLEL_SUBAGENTS;
+    config.foreground_executor = Some(cx.foreground_executor().clone());
+    config.scheduler.background_executor = Some(cx.background_executor().clone());
+    let enable_acp_delegation =
+        cx.update(|cx| agent_settings::AgentSettings::get_global(cx).enable_acp_delegation);
+    config.enable_acp_delegation = enable_acp_delegation;
+    config.scheduler.acp_workers = cx.update(|cx| {
+        agent_orchestration::AcpWorkerRuntimeConfig::from_settings(
+            agent_settings::AgentSettings::get_global(cx),
+        )
+    });
+    (config, enable_acp_delegation)
+}
+
+struct OrchestrationExecutorInputs {
+    environment: Rc<dyn ThreadEnvironment>,
+    event_stream: ToolCallEventStream,
+    roles: collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
+    enable_acp_delegation: bool,
+}
+
+fn orchestration_executor(
+    inputs: OrchestrationExecutorInputs,
+    plan: &agent_orchestration::OrchestrationPlan,
+    config: &agent_orchestration::RuntimeConfig,
+    cx: &mut gpui::AsyncApp,
+) -> Rc<dyn agent_orchestration::TaskExecutor> {
+    let OrchestrationExecutorInputs {
+        environment,
+        event_stream,
+        roles,
+        enable_acp_delegation,
+    } = inputs;
+    let native_executor = Rc::new(SubagentRuntimeExecutor::new(
+        environment.clone(),
+        cx.clone(),
+        event_stream,
+        Arc::new(parking_lot::RwLock::new(roles)),
+        config.control_plane.max_messages_per_agent,
+    ));
+    let mut broker = agent_orchestration::WorkerBroker::new(enable_acp_delegation)
+        .with_acp_runtime_config(config.scheduler.acp_workers.clone())
+        .with_native_executor(native_executor);
+    for target in plan
+        .tasks
+        .iter()
+        .map(|task| task.target.clone())
+        .filter(agent_orchestration::WorkerTarget::is_acp)
+        .collect::<HashSet<_>>()
+    {
+        broker.register_host(
+            target.clone(),
+            Rc::new(LazyExternalWorkerHost {
+                target,
+                environment: environment.clone(),
+                app: cx.clone(),
+            }),
+        );
+    }
+    Rc::new(broker)
+}
+
+fn observe_orchestration_run(
+    run_handle: &agent_orchestration::RunHandle,
+    thread: gpui::WeakEntity<Thread>,
+    cx: &mut gpui::AsyncApp,
+) {
+    let runtime_events = run_handle.subscribe_live();
+    cx.foreground_executor()
+        .spawn({
+            let app = cx.clone();
+            async move {
+                while let Ok(event) = runtime_events.receiver.recv().await {
+                    app.update(|cx| {
+                        if let Some(parent) = thread.upgrade() {
+                            parent.update(cx, |_, cx| cx.notify());
+                        }
+                    });
+                    if matches!(
+                        event.event,
+                        agent_orchestration::RuntimeEvent::RunStateChanged { state, .. }
+                            if state.is_terminal()
+                    ) {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+}
+
+async fn run_batch_tasks(
+    environment: Rc<dyn ThreadEnvironment>,
+    thread: gpui::WeakEntity<Thread>,
+    tasks: Vec<SpawnAgentTask>,
+    background: bool,
+    event_stream: ToolCallEventStream,
+    cx: &mut gpui::AsyncApp,
+) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
+    let active_run_id = cx.update(|cx| {
+        thread.upgrade().and_then(|thread| {
+            thread
+                .read(cx)
+                .orchestration_run()
+                .filter(|run| !run.state().is_terminal())
+                .map(|run| run.run_id().to_string())
+        })
+    });
+    if let Some(run_id) = active_run_id {
+        return Err(SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: format!(
+                "orchestration run '{run_id}' is still active; wait for it or cancel it before starting another batch"
+            ),
+            session_info: None,
+        });
+    }
+    let PreparedBatch {
+        pending,
+        prompt,
+        roles,
+        plan,
+    } = prepare_batch(tasks)?;
+
+    let (configured_strategy, resolved_turn_policy, autonomy) = cx
+        .update(|cx| {
+            thread.upgrade().map(|t| {
+                let t = t.read(cx);
+                (
+                    t.execution_strategy(),
+                    t.resolved_turn_policy().cloned(),
+                    t.autonomy(),
+                )
+            })
+        })
+        .unwrap_or((
+            agent_settings::AgentExecutionStrategy::Direct,
+            None,
+            agent_settings::AgentAutonomy::default(),
+        ));
+
+    let (policy, disposition) = batch_launch_policy(
+        configured_strategy,
+        resolved_turn_policy.as_ref(),
+        &prompt,
+        pending.len(),
+        autonomy,
+    );
+
+    let (runtime_config, enable_acp_delegation) = orchestration_runtime_config(cx);
+    let executor = orchestration_executor(
+        OrchestrationExecutorInputs {
+            environment,
+            event_stream: event_stream.clone(),
+            roles,
+            enable_acp_delegation,
+        },
+        &plan,
+        &runtime_config,
+        cx,
+    );
+
+    let (run_handle, completion_rx) =
+        agent_orchestration::OrchestrationRuntime::start_with_disposition(
+            plan,
+            policy,
+            disposition,
+            executor,
+            runtime_config,
+        )
+        .map_err(batch_error)?;
+
+    cx.update(|cx| {
+        if let Some(parent) = thread.upgrade() {
+            parent.update(cx, |parent, cx| {
+                parent.set_orchestration_run(run_handle.clone(), cx);
+            });
+        }
+    });
+
+    observe_orchestration_run(&run_handle, thread.clone(), cx);
+
+    if disposition == agent_orchestration::RuntimeLaunchDisposition::AwaitApproval {
+        // Persist the proposal before either returning it to a background
+        // caller or waiting for approval in the foreground tool call.
+        let proposal = run_handle.snapshot();
+        cx.update(|cx| {
+            persist_snapshot_if_current(&thread, proposal, cx);
+        });
+    }
+
+    BatchRunCompletion {
+        run_handle,
+        completion: completion_rx,
+        pending,
+        background,
+        disposition,
+        strategy: policy.strategy,
+        thread,
+        event_stream,
+    }
+    .finish(cx)
+    .await
 }
 
 struct LazyExternalWorkerHost {
@@ -1305,11 +1671,13 @@ impl AgentTool for SpawnAgentTool {
                     session_info: None,
                 })?;
 
+            validate_background_mode(&input)?;
             if let Some(tasks) = input.tasks {
                 return run_batch_tasks(
                     self.environment.clone(),
                     self.thread.clone(),
                     tasks,
+                    input.background,
                     event_stream,
                     cx,
                 )
@@ -1468,6 +1836,16 @@ impl AgentTool for SpawnAgentTool {
                     .into(),
                 None,
             ),
+            SpawnAgentToolOutput::BatchStarted { run_id, agents } => (
+                serde_json::to_string(&serde_json::json!({
+                    "run_id": run_id,
+                    "status": "running",
+                    "agents": agents,
+                }))
+                .unwrap_or_else(|error| format!("Failed to serialize batch start: {error}"))
+                .into(),
+                None,
+            ),
             SpawnAgentToolOutput::PlanProposed {
                 run_id,
                 plan,
@@ -1611,6 +1989,85 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].label, "one");
         assert_eq!(tasks[1].tools, Some(vec!["read_file".to_string()]));
+    }
+
+    #[test]
+    fn background_batch_execution_is_explicit_and_defaults_off() {
+        let blocking: SpawnAgentToolInput = serde_json::from_value(json!({
+            "label": "ignored",
+            "message": "ignored",
+            "tasks": [{"label": "one", "message": "first"}]
+        }))
+        .expect("deserialize blocking batch");
+        assert!(!blocking.background);
+
+        let background: SpawnAgentToolInput = serde_json::from_value(json!({
+            "label": "ignored",
+            "message": "ignored",
+            "background": true,
+            "tasks": [{"label": "one", "message": "first"}]
+        }))
+        .expect("deserialize background batch");
+        assert!(background.background);
+        assert!(validate_background_mode(&background).is_ok());
+
+        let invalid = SpawnAgentToolInput {
+            background: true,
+            ..SpawnAgentToolInput::default()
+        };
+        assert!(validate_background_mode(&invalid).is_err());
+    }
+
+    #[test]
+    fn prepared_batch_preserves_dependencies_and_worker_policy() {
+        let input: SpawnAgentToolInput = serde_json::from_value(json!({
+            "label": "ignored",
+            "message": "ignored",
+            "tasks": [
+                {
+                    "id": "scan",
+                    "label": "Scan",
+                    "message": "inspect the parser",
+                    "agent_type": "explorer"
+                },
+                {
+                    "id": "fix",
+                    "label": "Fix",
+                    "message": "apply the patch",
+                    "agent": "omp",
+                    "depends_on": ["scan"]
+                }
+            ]
+        }))
+        .expect("deserialize batch");
+        let prepared = prepare_batch(input.tasks.expect("batch tasks")).expect("prepare batch");
+
+        assert!(
+            prepared
+                .prompt
+                .contains("[fix] apply the patch\n[depends on: scan]")
+        );
+        assert_eq!(
+            prepared
+                .roles
+                .get(&agent_orchestration::TaskId::new("scan")),
+            Some(&Some(SubagentRole::Explorer))
+        );
+        let fix = prepared
+            .plan
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == "fix")
+            .expect("fix task");
+        assert!(fix.target.is_acp());
+        assert_eq!(
+            fix.workspace_policy.isolation,
+            agent_orchestration::WorkspaceIsolation::DedicatedWorktree
+        );
+        assert_eq!(
+            fix.verification_command.as_deref(),
+            Some("git diff --check")
+        );
     }
 
     #[test]

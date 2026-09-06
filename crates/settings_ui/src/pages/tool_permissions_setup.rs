@@ -1414,6 +1414,7 @@ mod tests {
             "go_to_definition",
             "grep",
             "list_agents_and_models",
+            "list_orchestration_agents",
             "list_directory",
             "open",
             "read_file",
@@ -1426,6 +1427,9 @@ mod tests {
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
             "spawn_agent",
+            "send_message_to_agent",
+            "update_orchestration_goal",
+            "wait_for_agents",
             // Progress-only state update with no external side effects.
             "update_plan",
         ];

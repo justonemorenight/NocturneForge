@@ -116,6 +116,20 @@ pub trait TaskExecutor: 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Delivers a message to a worker turn that is already running. When
+    /// `interrupt` is false, the worker should finish its current turn before
+    /// starting the message. Executors must fail explicitly when their
+    /// transport cannot deliver to an active turn.
+    fn deliver_message(
+        &self,
+        _task: &OrchestrationTask,
+        _session_id: acp::SessionId,
+        _message: String,
+        _interrupt: bool,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        Box::pin(async { anyhow::bail!("active worker messaging is not supported") })
+    }
+
     /// Verifies task output against its acceptance criteria.
     fn verify(
         &self,

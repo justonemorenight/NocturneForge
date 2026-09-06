@@ -870,6 +870,24 @@ impl TaskExecutor for WorkerBroker {
         Box::pin(async { Ok(()) })
     }
 
+    fn deliver_message(
+        &self,
+        task: &OrchestrationTask,
+        session_id: acp::SessionId,
+        message: String,
+        interrupt: bool,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        if task.target.is_native()
+            && let Some(executor) = self.native_executor.clone()
+        {
+            return executor.deliver_message(task, session_id, message, interrupt);
+        }
+        let target = task.target.clone();
+        Box::pin(
+            async move { bail!("active messaging is not supported for worker target '{target}'") },
+        )
+    }
+
     fn verify(
         &self,
         task: &OrchestrationTask,

@@ -161,6 +161,8 @@ impl AgentActivityStatus {
 #[derive(Clone)]
 struct AgentActivityItem {
     runtime_task_id: Option<agent_orchestration::TaskId>,
+    canonical_path: Option<SharedString>,
+    queued_messages: usize,
     entry_ix: usize,
     session_id: Option<acp::SessionId>,
     name: SharedString,
@@ -3715,6 +3717,8 @@ impl ThreadView {
                         entry_ix,
                         session_id: None,
                         runtime_task_id: None,
+                        canonical_path: None,
+                        queued_messages: 0,
                         name: name.into(),
                         harness: "ACP",
                         status,
@@ -3911,6 +3915,8 @@ impl ThreadView {
                         entry_ix,
                         session_id: Some(session_id),
                         runtime_task_id: None,
+                        canonical_path: None,
+                        queued_messages: 0,
                         name,
                         harness: "Native",
                         status,
@@ -3979,6 +3985,8 @@ impl ThreadView {
                         entry_ix,
                         session_id: Some(session_id.into()),
                         runtime_task_id: None,
+                        canonical_path: None,
+                        queued_messages: 0,
                         name: name.into(),
                         harness: "Native",
                         status,
@@ -4149,6 +4157,8 @@ impl ThreadView {
                 entry_ix,
                 session_id: Some(session_id.clone()),
                 runtime_task_id: None,
+                canonical_path: None,
+                queued_messages: 0,
                 name,
                 harness: if native_thread.is_some() {
                     "Native"
@@ -4186,16 +4196,61 @@ impl ThreadView {
 
         let orchestration_snapshot = self.as_native_thread(cx).and_then(|thread| {
             let thread = thread.read(cx);
-            thread
-                .orchestration_run()
-                .map(|run| (run.task_statuses(), run.plan().tasks.clone()))
-                .or_else(|| {
-                    thread
-                        .persisted_orchestration_run()
-                        .map(|run| (run.task_statuses.clone(), run.plan.tasks.clone()))
+            if let Some(run) = thread.orchestration_run() {
+                let agents = run
+                    .agent_control_plane()
+                    .list(None)
+                    .into_iter()
+                    .filter_map(|identity| {
+                        let task_id = identity.task_id?;
+                        let queued_messages = run
+                            .agent_control_plane()
+                            .mailbox_depth(&identity.path)
+                            .unwrap_or_else(|error| {
+                                log::warn!(
+                                    "failed to read mailbox depth for '{}': {error}",
+                                    identity.path
+                                );
+                                0
+                            });
+                        Some((
+                            task_id,
+                            (
+                                SharedString::from(identity.path.to_string()),
+                                queued_messages,
+                            ),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
+                Some((run.task_statuses(), run.plan().tasks.clone(), agents))
+            } else {
+                thread.persisted_orchestration_run().map(|run| {
+                    let mut agents = HashMap::default();
+                    if let Some(control_plane) = &run.agent_control_plane {
+                        for identity in &control_plane.identities {
+                            let Some(task_id) = identity.task_id.clone() else {
+                                continue;
+                            };
+                            let queued_messages = control_plane
+                                .mailboxes
+                                .iter()
+                                .find(|mailbox| mailbox.recipient == identity.path)
+                                .map(|mailbox| mailbox.messages.len())
+                                .unwrap_or_default();
+                            agents.insert(
+                                task_id,
+                                (
+                                    SharedString::from(identity.path.to_string()),
+                                    queued_messages,
+                                ),
+                            );
+                        }
+                    }
+                    (run.task_statuses.clone(), run.plan.tasks.clone(), agents)
                 })
+            }
         });
-        if let Some((statuses, tasks)) = orchestration_snapshot {
+        if let Some((statuses, tasks, agents)) = orchestration_snapshot {
             let fallback_entry_ix = entries
                 .iter()
                 .enumerate()
@@ -4273,10 +4328,17 @@ impl ThreadView {
                         .iter()
                         .position(|item| item.session_id.as_ref() == Some(session_id))
                 });
+                let (canonical_path, queued_messages) = agents
+                    .get(&task.id)
+                    .cloned()
+                    .map(|(path, count)| (Some(path), count))
+                    .unwrap_or_default();
 
                 if let Some(position) = session_position {
                     let item = &mut items[position];
                     item.runtime_task_id = Some(task.id.clone());
+                    item.canonical_path = canonical_path;
+                    item.queued_messages = queued_messages;
                     item.harness = if task.target.is_native() {
                         "Native"
                     } else {
@@ -4310,6 +4372,8 @@ impl ThreadView {
                 items.push(AgentActivityItem {
                     entry_ix: fallback_entry_ix,
                     runtime_task_id: Some(task.id.clone()),
+                    canonical_path,
+                    queued_messages,
                     session_id: status.active_session_id.clone(),
                     name: task.label.clone().into(),
                     harness: if task.target.is_native() {
@@ -4714,6 +4778,17 @@ impl ThreadView {
         items: &[AgentActivityItem],
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let goal = self.as_native_thread(cx).and_then(|thread| {
+            let thread = thread.read(cx);
+            thread
+                .orchestration_run()
+                .map(|run| run.goal_snapshot())
+                .or_else(|| {
+                    thread
+                        .persisted_orchestration_run()
+                        .and_then(|run| run.goal.clone())
+                })
+        });
         let active_count = items.iter().filter(|item| item.status.is_active()).count();
         let waiting_count = items
             .iter()
@@ -4727,7 +4802,7 @@ impl ThreadView {
             .iter()
             .filter(|item| item.status == AgentActivityStatus::AwaitingApply)
             .count();
-        let summary = if waiting_count > 0 {
+        let mut summary = if waiting_count > 0 {
             format!("{active_count} active · {waiting_count} need input")
         } else if active_count > 0 {
             format!("{active_count} active")
@@ -4738,6 +4813,26 @@ impl ThreadView {
         } else {
             format!("{} finished", items.len())
         };
+        if let Some(goal) = &goal {
+            if goal.status == agent_orchestration::GoalStatus::Blocked {
+                summary.push_str(" · goal blocked");
+            } else if goal.total_tasks > 0 {
+                summary.push_str(&format!(
+                    " · {}/{} verified",
+                    goal.verified_tasks, goal.total_tasks
+                ));
+            }
+        }
+        let goal_tooltip = goal.map(|goal| {
+            if let Some(blocker) = goal.blocker {
+                format!(
+                    "Goal: {}\nBlocker: {} ({})",
+                    goal.objective, blocker.detail, blocker.consecutive_observations
+                )
+            } else {
+                format!("Goal: {}", goal.objective)
+            }
+        });
         let expanded = self.agent_activity_expanded;
 
         v_flex()
@@ -4783,7 +4878,10 @@ impl ThreadView {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.agent_activity_expanded = !this.agent_activity_expanded;
                         cx.notify();
-                    })),
+                    }))
+                    .when_some(goal_tooltip, |header, tooltip| {
+                        header.tooltip(Tooltip::text(tooltip))
+                    }),
             )
             .when(expanded, |this| {
                 this.child(
@@ -4828,6 +4926,7 @@ impl ThreadView {
                             let name = item.name.clone();
                             let metadata = [
                                 Some(item.harness.to_owned()),
+                                item.canonical_path.as_ref().map(ToString::to_string),
                                 item.worker.as_ref().map(|w| format!("worker: {w}")),
                                 item.role.as_ref().map(ToString::to_string),
                                 item.model.as_ref().map(ToString::to_string),
@@ -4845,6 +4944,8 @@ impl ThreadView {
                                 item.tool_call_budget.map(|budget| {
                                     format!("budget {budget} tool calls")
                                 }),
+                                (item.queued_messages > 0)
+                                    .then(|| format!("{} queued messages", item.queued_messages)),
                             ]
                             .into_iter()
                             .flatten()
@@ -16475,6 +16576,8 @@ mod tests {
 
         let item = AgentActivityItem {
             runtime_task_id: None,
+            canonical_path: None,
+            queued_messages: 0,
             entry_ix: 0,
             session_id: None,
             name: "Subagent 1".into(),

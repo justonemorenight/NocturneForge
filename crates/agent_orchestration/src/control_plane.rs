@@ -466,6 +466,62 @@ impl AgentControlPlane {
         Ok(messages)
     }
 
+    pub fn mailbox_depth(&self, recipient: &AgentPath) -> Result<usize> {
+        Ok(self.mailbox(recipient)?.queue.lock().messages.len())
+    }
+
+    pub fn acknowledge_delivery(
+        &self,
+        recipient: &AgentPath,
+        sequence: u64,
+    ) -> Result<AgentMessage> {
+        let message = self.remove_queued_message(recipient, sequence)?;
+        self.emit(|run_id| RuntimeEvent::AgentMessageDelivered {
+            run_id,
+            message: message.clone(),
+        });
+        Ok(message)
+    }
+
+    pub fn reject_delivery(
+        &self,
+        recipient: &AgentPath,
+        sequence: u64,
+        error: impl Into<String>,
+    ) -> Result<AgentMessage> {
+        let message = self.remove_queued_message(recipient, sequence)?;
+        let error = error.into();
+        self.emit(|run_id| RuntimeEvent::AgentMessageDeliveryFailed {
+            run_id,
+            message: message.clone(),
+            error,
+        });
+        Ok(message)
+    }
+
+    fn remove_queued_message(&self, recipient: &AgentPath, sequence: u64) -> Result<AgentMessage> {
+        let mailbox = self.mailbox(recipient)?;
+        let mut queue = mailbox.queue.lock();
+        let position = queue
+            .messages
+            .iter()
+            .position(|message| message.sequence == sequence)
+            .ok_or_else(|| {
+                anyhow::anyhow!("message {sequence} is not queued for recipient '{recipient}'")
+            })?;
+        let message = queue
+            .messages
+            .remove(position)
+            .ok_or_else(|| anyhow::anyhow!("mailbox changed while acknowledging delivery"))?;
+        queue.bytes = queue.bytes.saturating_sub(message.body.len());
+        let is_empty = queue.messages.is_empty();
+        drop(queue);
+        if is_empty {
+            while mailbox.activity_receiver.try_recv().is_ok() {}
+        }
+        Ok(message)
+    }
+
     pub async fn wait_for_messages(&self, recipient: &AgentPath) -> Result<Vec<AgentMessage>> {
         let mailbox = self.mailbox(recipient)?;
         let queued = mailbox.drain();
