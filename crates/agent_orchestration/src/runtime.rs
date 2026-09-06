@@ -639,6 +639,7 @@ impl RunHandle {
             self.artifact_store.all(),
             self.event_stream.history(),
         )
+        .with_agent_control_plane(self.agent_control_plane.snapshot())
     }
 
     /// Returns the sequence number of the last event emitted, used as the
@@ -691,7 +692,8 @@ impl OrchestrationRuntime {
         let artifact_store = ArtifactStore::new();
         let cancellation_tree = Arc::new(CancellationTree::new());
         let event_stream = RuntimeEventStream::new();
-        let agent_control_plane = AgentControlPlane::from_plan(&plan, config.control_plane.clone())?;
+        let agent_control_plane =
+            AgentControlPlane::from_plan(&plan, config.control_plane.clone())?;
         let initial_state = match disposition {
             RuntimeLaunchDisposition::Approved => RunState::Approved,
             RuntimeLaunchDisposition::AwaitApproval => RunState::Proposed,
@@ -790,9 +792,11 @@ impl OrchestrationRuntime {
         let cancellation_tree = Arc::new(CancellationTree::new());
         let persisted_policy = persisted.policy;
         let event_stream = RuntimeEventStream::from_history(persisted.event_log.clone());
-        let agent_control_plane =
-            AgentControlPlane::from_plan(&persisted.plan, config.control_plane.clone())?
-                .with_runtime_events(run_id.clone(), event_stream.clone());
+        let agent_control_plane = match persisted.agent_control_plane.clone() {
+            Some(snapshot) => AgentControlPlane::restore(snapshot, config.control_plane.clone())?,
+            None => AgentControlPlane::from_plan(&persisted.plan, config.control_plane.clone())?,
+        }
+        .with_runtime_events(run_id.clone(), event_stream.clone());
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts

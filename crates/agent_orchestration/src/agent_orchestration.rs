@@ -33,8 +33,8 @@ pub use budget::{
 };
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};
 pub use control_plane::{
-    AgentControlPlane, AgentControlPlaneConfig, AgentIdentity, AgentMessage, AgentMessageKind,
-    AgentPath,
+    AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentIdentity,
+    AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
 };
 pub use events::{RuntimeEvent, RuntimeEventStream};
 pub use execution_limiter::{
