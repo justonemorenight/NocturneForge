@@ -3,6 +3,7 @@ use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentIdentity, AgentMessage, AgentPath};
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
+use crate::residency::AgentResidencyRecord;
 use crate::state::RunState;
 use crate::verification::VerificationResult;
 use crate::worker::{StructuredWaitReason, WorkerMetadata};
@@ -63,6 +64,10 @@ pub enum RuntimeEvent {
     ContextCheckpointRecorded {
         run_id: RunId,
         checkpoint: ContextCheckpoint,
+    },
+    AgentResidencyChanged {
+        run_id: RunId,
+        record: AgentResidencyRecord,
     },
     TaskScheduled {
         run_id: RunId,
@@ -217,6 +222,7 @@ impl RuntimeEvent {
             | Self::AgentMailboxDrained { run_id, .. }
             | Self::AgentUnregistered { run_id, .. }
             | Self::ContextCheckpointRecorded { run_id, .. }
+            | Self::AgentResidencyChanged { run_id, .. }
             | Self::TaskScheduled { run_id, .. }
             | Self::TaskDispatched { run_id, .. }
             | Self::TaskPhaseChanged { run_id, .. }
