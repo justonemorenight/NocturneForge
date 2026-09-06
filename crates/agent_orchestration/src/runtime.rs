@@ -6,6 +6,7 @@ use crate::context_checkpoint::{
 use crate::control_plane::{AgentControlPlane, AgentControlPlaneConfig};
 use crate::events::{EventSubscription, RuntimeEvent, RuntimeEventStream};
 use crate::executor::TaskExecutor;
+use crate::goal_controller::{GoalController, GoalControllerConfig, GoalSnapshot};
 use crate::ids::{RunId, TaskId};
 use crate::persistence::PersistedRun;
 use crate::plan_graph::{OrchestrationPlan, PlanGraph};
@@ -61,6 +62,8 @@ pub struct RuntimeConfig {
     pub context_checkpoints: ContextCheckpointConfig,
     /// Idle worker eviction and process-local reload policy.
     pub residency: AgentResidencyConfig,
+    /// Convergence and repeated-blocker policy for the run objective.
+    pub goal: GoalControllerConfig,
     /// Optional GPUI foreground executor.
     pub foreground_executor: Option<gpui::ForegroundExecutor>,
     /// Optional GPUI background executor.
@@ -77,6 +80,7 @@ impl Default for RuntimeConfig {
             control_plane: AgentControlPlaneConfig::default(),
             context_checkpoints: ContextCheckpointConfig::default(),
             residency: AgentResidencyConfig::default(),
+            goal: GoalControllerConfig::default(),
             foreground_executor: None,
             background_executor: None,
             enable_acp_delegation: false,
@@ -104,6 +108,7 @@ pub struct RunHandle {
     agent_control_plane: AgentControlPlane,
     context_checkpoints: ContextCheckpointStore,
     residency: AgentResidencyManager,
+    goal: GoalController,
     artifact_store: ArtifactStore,
     cancellation_tree: Arc<CancellationTree>,
     event_stream: RuntimeEventStream,
@@ -172,6 +177,22 @@ impl RunHandle {
 
     pub fn evict_idle_agents(&self, now: chrono::DateTime<Utc>) -> Vec<AgentResidencyRecord> {
         self.residency.evict_idle(now)
+    }
+
+    pub fn goal_snapshot(&self) -> GoalSnapshot {
+        self.goal.observe(self.state(), &self.task_statuses())
+    }
+
+    pub fn record_goal_blocker(
+        &self,
+        code: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Result<GoalSnapshot> {
+        self.goal.record_blocker(code, detail)
+    }
+
+    pub fn clear_goal_blocker(&self) -> GoalSnapshot {
+        self.goal.clear_blocker()
     }
 
     pub fn task_status(&self, task_id: &TaskId) -> Option<TaskStatus> {
@@ -691,6 +712,7 @@ impl RunHandle {
         .with_agent_control_plane(self.agent_control_plane.snapshot())
         .with_context_checkpoints(self.context_checkpoints.snapshot())
         .with_agent_residency(self.residency.snapshot())
+        .with_goal(self.goal_snapshot())
     }
 
     /// Returns the sequence number of the last event emitted, used as the
@@ -748,6 +770,12 @@ impl OrchestrationRuntime {
         let context_checkpoints = ContextCheckpointStore::new(config.context_checkpoints.clone())?;
         let residency = AgentResidencyManager::new(config.residency.clone())?
             .with_runtime_events(run_id.clone(), event_stream.clone());
+        let goal = GoalController::new(
+            run_id.clone(),
+            plan.title.clone(),
+            plan.tasks.iter().map(|task| task.id.clone()).collect(),
+            config.goal.clone(),
+        )?;
         let initial_state = match disposition {
             RuntimeLaunchDisposition::Approved => RunState::Approved,
             RuntimeLaunchDisposition::AwaitApproval => RunState::Proposed,
@@ -814,6 +842,7 @@ impl OrchestrationRuntime {
             agent_control_plane,
             context_checkpoints,
             residency,
+            goal,
             artifact_store,
             cancellation_tree,
             event_stream,
@@ -888,6 +917,20 @@ impl OrchestrationRuntime {
             None => AgentResidencyManager::new(config.residency.clone())?,
         }
         .with_runtime_events(run_id.clone(), event_stream.clone());
+        let goal = match persisted.goal.clone() {
+            Some(snapshot) => GoalController::restore(snapshot, config.goal.clone())?,
+            None => GoalController::new(
+                run_id.clone(),
+                persisted.plan.title.clone(),
+                persisted
+                    .plan
+                    .tasks
+                    .iter()
+                    .map(|task| task.id.clone())
+                    .collect(),
+                config.goal.clone(),
+            )?,
+        };
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
@@ -934,6 +977,7 @@ impl OrchestrationRuntime {
             agent_control_plane,
             context_checkpoints,
             residency,
+            goal,
             artifact_store,
             cancellation_tree,
             event_stream,
