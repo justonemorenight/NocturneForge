@@ -141,7 +141,7 @@ impl HeadlessExtensionStore {
             let config = fs
                 .load(&language_path.join(LanguageConfig::FILE_NAME))
                 .await?;
-            let mut config = ::toml::from_str::<LanguageConfig>(&config)?;
+            let mut config = LanguageConfig::from_toml(&config)?;
 
             this.update(cx, |this, _cx| {
                 this.loaded_languages
