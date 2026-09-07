@@ -14432,6 +14432,6 @@ mod tests {
             .load(path!("/project/partially_staged.rs").as_ref())
             .await
             .expect("checked out file should be readable");
-        assert_eq!(content.as_ref(), "staged content\n");
+        assert_eq!(content.as_str(), "staged content\n");
     }
 }
