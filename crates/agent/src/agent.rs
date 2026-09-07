@@ -6960,10 +6960,10 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("first".to_string(), None, None, cx))
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), cx))
+            .update(|cx| environment.create_subagent_thread("second".to_string(), None, None, cx))
             .unwrap();
         cx.run_until_parked();
 
