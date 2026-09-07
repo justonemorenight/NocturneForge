@@ -24,7 +24,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use std::mem::MaybeUninit;
@@ -32,6 +32,7 @@ use std::mem::MaybeUninit;
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
 use git::repository::{GitRepository, RealGitRepository};
+#[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
@@ -1109,7 +1110,12 @@ impl Fs for RealFs {
         #[cfg(unix)]
         let is_fifo = metadata.file_type().is_fifo();
 
+        #[cfg(unix)]
+        let is_executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+
+        #[cfg(windows)]
         let path_buf = path.to_path_buf();
+        #[cfg(windows)]
         let is_executable = self
             .executor
             .spawn(async move { path_buf.is_executable() })
