@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 gpui.workspace = true
+gpui_util.workspace = true
 util.workspace = true
 log.workspace = true
 

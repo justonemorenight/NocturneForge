@@ -964,7 +964,7 @@ pub async fn stream_response_with_body(
                             if line == "[DONE]" || line.is_empty() {
                                 None
                             } else {
-                                match serde_json::from_str::<StreamEvent>(line) {
+                                match decode_stream_event(line) {
                                     Ok(event) => Some(Ok(event)),
                                     Err(error) => {
                                         log::error!(
@@ -1116,6 +1116,11 @@ pub async fn stream_response_with_body(
             headers: Box::new(response.headers().clone()),
         })
     }
+}
+
+#[inline(never)]
+fn decode_stream_event(line: &str) -> serde_json::Result<StreamEvent> {
+    serde_json::from_str(line)
 }
 
 #[cfg(test)]
