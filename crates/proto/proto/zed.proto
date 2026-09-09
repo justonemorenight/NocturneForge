@@ -501,7 +501,10 @@ message Envelope {
     GitAddPathToGitignore git_add_path_to_gitignore = 470;
     GitAddPathToGitInfoExclude git_add_path_to_git_info_exclude = 471;
     BlameBufferAtRevision blame_buffer_at_revision = 478;
-    BlameBufferAtRevisionResponse blame_buffer_at_revision_response = 479; // current max
+    BlameBufferAtRevisionResponse blame_buffer_at_revision_response = 479;
+    LanguageServerShowDocumentRequest language_server_show_document_request = 490;
+    ExecuteLspCommand execute_lsp_command = 491;
+    ExecuteLspCommandResponse execute_lsp_command_response = 492; // current max
   }
 
   reserved 87 to 88;
