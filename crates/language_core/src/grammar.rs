@@ -103,7 +103,7 @@ pub struct Grammar {
 pub struct HighlightsConfig {
     pub query: Query,
     pub identifier_capture_indices: Vec<u32>,
-    pub text_captures_cache: TextHighlightCache,
+    pub text_highlight_cache: TextHighlightCache,
 }
 
 pub struct IndentConfig {
@@ -367,6 +367,10 @@ impl Grammar {
         self.highlight_map.lock().clone()
     }
 
+    pub fn highlight_map_matches(&self, highlight_map: &HighlightMap) -> bool {
+        self.highlight_map.lock().same(highlight_map)
+    }
+
     pub fn highlight_id_for_name(&self, name: &str) -> Option<HighlightId> {
         self.highlights_config
             .as_ref()?
@@ -469,7 +473,7 @@ impl Grammar {
         self.highlights_config = Some(HighlightsConfig {
             query,
             identifier_capture_indices,
-            text_captures_cache: TextHighlightCache::default(),
+            text_highlight_cache: TextHighlightCache::default(),
         });
 
         Ok(self)

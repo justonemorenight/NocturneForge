@@ -1,25 +1,28 @@
-use crate::highlight_map::CapturedRange;
+use crate::grammar::Grammar;
+use crate::highlight_map::{HighlightId, HighlightMap};
 use collections::FxHasher;
 use lru::LruCache;
 use parking_lot::Mutex;
-use smallvec::{Array, SmallVec};
+use smallvec::SmallVec;
 use std::{
+    fmt,
     hash::{Hash, Hasher as _},
+    ops::Range,
     sync::Arc,
 };
 
-pub const MAX_TEXT_CAPTURES_ENTRY_BYTES: usize = MAX_TEXT_CAPTURES_CACHE_BYTES / 8;
+pub const MAX_TEXT_HIGHLIGHT_ENTRY_BYTES: usize = MAX_TEXT_HIGHLIGHT_CACHE_BYTES / 8;
 
-const MAX_TEXT_CAPTURES_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TEXT_HIGHLIGHT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const APPROXIMATE_LRU_NODE_BYTES: usize = 4 * size_of::<usize>();
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TextCapturesKey {
+pub struct TextHighlightKey {
     text_hash: u64,
     text_len: usize,
 }
 
-impl TextCapturesKey {
+impl TextHighlightKey {
     pub fn new<'a>(text_chunks: impl Iterator<Item = &'a str>, text_len: usize) -> Self {
         let mut hasher = FxHasher::default();
         for chunk in text_chunks {
@@ -32,13 +35,40 @@ impl TextCapturesKey {
     }
 }
 
-pub struct TextHighlightCache(Mutex<CostBudgetedLru<TextCapturesKey, TextCapturesEntry>>);
+#[derive(Clone, Default)]
+pub struct ResolvedHighlights {
+    pub sources: SmallVec<[(Arc<Grammar>, HighlightMap); 2]>,
+    pub runs: Arc<[(Range<usize>, HighlightId)]>,
+}
+
+impl ResolvedHighlights {
+    pub fn is_current(&self) -> bool {
+        self.sources
+            .iter()
+            .all(|(grammar, highlight_map)| grammar.highlight_map_matches(highlight_map))
+    }
+
+    pub fn cost_bytes(&self) -> usize {
+        self.sources.len() * size_of::<(Arc<Grammar>, HighlightMap)>()
+            + self.runs.len() * size_of::<(Range<usize>, HighlightId)>()
+    }
+}
+
+impl fmt::Debug for ResolvedHighlights {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedHighlights")
+            .field("runs", &self.runs)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct TextHighlightCache(Mutex<CostBudgetedLru<TextHighlightKey, TextHighlightEntry>>);
 
 impl Default for TextHighlightCache {
     fn default() -> Self {
         Self(Mutex::new(CostBudgetedLru::new(
-            MAX_TEXT_CAPTURES_CACHE_BYTES,
-            MAX_TEXT_CAPTURES_ENTRY_BYTES,
+            MAX_TEXT_HIGHLIGHT_CACHE_BYTES,
+            MAX_TEXT_HIGHLIGHT_ENTRY_BYTES,
         )))
     }
 }
@@ -46,39 +76,36 @@ impl Default for TextHighlightCache {
 impl TextHighlightCache {
     pub fn get<'a>(
         &self,
-        key: &TextCapturesKey,
+        key: &TextHighlightKey,
         text_chunks: impl Iterator<Item = &'a str>,
-    ) -> Option<Arc<[CapturedRange]>> {
+    ) -> Option<ResolvedHighlights> {
         let mut cache = self.0.lock();
         let entry = cache.get(key)?;
+        if !entry.highlights.is_current() {
+            return None;
+        }
         if !chunks_match_text(&entry.text, text_chunks) {
             return None;
         }
-        Some(entry.captures.clone())
+        Some(entry.highlights.clone())
     }
 
     pub fn insert(
         &self,
-        key: TextCapturesKey,
+        key: TextHighlightKey,
         text: Arc<str>,
-        captures: Arc<[CapturedRange]>,
-    ) -> Arc<[CapturedRange]> {
-        let captures_cost = captures
-            .iter()
-            .map(|captured| {
-                size_of::<CapturedRange>() + small_vec_heap_bytes(&captured.capture_ids)
-            })
-            .sum::<usize>();
-        let cost = text.len() + captures_cost;
+        highlights: ResolvedHighlights,
+    ) -> ResolvedHighlights {
+        let cost = text.len() + highlights.cost_bytes();
         self.0.lock().insert(
             key,
-            TextCapturesEntry {
+            TextHighlightEntry {
                 text,
-                captures: Arc::clone(&captures),
+                highlights: highlights.clone(),
             },
             cost,
         );
-        captures
+        highlights
     }
 }
 
@@ -124,17 +151,9 @@ impl<K: Hash + Eq, V> CostBudgetedLru<K, V> {
     }
 }
 
-struct TextCapturesEntry {
+struct TextHighlightEntry {
     text: Arc<str>,
-    captures: Arc<[CapturedRange]>,
-}
-
-fn small_vec_heap_bytes<A: Array>(vec: &SmallVec<A>) -> usize {
-    if vec.spilled() {
-        vec.capacity() * size_of::<A::Item>()
-    } else {
-        0
-    }
+    highlights: ResolvedHighlights,
 }
 
 fn chunks_match_text<'a>(text: &str, text_chunks: impl Iterator<Item = &'a str>) -> bool {
@@ -151,8 +170,6 @@ fn chunks_match_text<'a>(text: &str, text_chunks: impl Iterator<Item = &'a str>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::highlight_map::CaptureId;
-    use std::ops::Range;
 
     #[test]
     fn test_budget_evicts_least_recently_used() {
@@ -212,55 +229,56 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_captures_are_returned_but_not_cached() {
+    fn test_oversized_highlights_are_returned_but_not_cached() {
         let text = Arc::<str>::from("fn main() {}");
-        let max_entry_cost = text.len() + 2 * size_of::<CapturedRange>();
+        let run_bytes = size_of::<(Range<usize>, HighlightId)>();
+        let max_entry_cost = text.len() + 2 * run_bytes;
         let cache = TextHighlightCache(Mutex::new(CostBudgetedLru::new(
             max_entry_cost * 10,
             max_entry_cost,
         )));
-        let captured_range = |range: Range<usize>| CapturedRange {
-            range,
-            capture_ids: [CaptureId(0)].into_iter().collect(),
+        let resolved = |ranges: &[Range<usize>]| ResolvedHighlights {
+            sources: SmallVec::new(),
+            runs: ranges
+                .iter()
+                .map(|range| (range.clone(), HighlightId::new(0)))
+                .collect(),
         };
 
         let small_text = Arc::<str>::from("fn f() {}");
-        let small_key = TextCapturesKey::new([small_text.as_ref()].into_iter(), small_text.len());
-        let small_captures = cache.insert(
+        let small_key = TextHighlightKey::new([small_text.as_ref()].into_iter(), small_text.len());
+        let small_range = 0..2;
+        let small_highlights = cache.insert(
             small_key.clone(),
             Arc::clone(&small_text),
-            [captured_range(0..2)].into_iter().collect(),
+            resolved(std::slice::from_ref(&small_range)),
         );
-        assert_eq!(small_captures.as_ref(), &[captured_range(0..2)]);
+        assert_eq!(
+            small_highlights.runs.as_ref(),
+            resolved(std::slice::from_ref(&small_range)).runs.as_ref()
+        );
         assert_eq!(
             cache
                 .get(&small_key, [small_text.as_ref()].into_iter())
-                .as_deref(),
-            Some(small_captures.as_ref()),
-            "captures within the entry budget must be cached as-is"
+                .map(|highlights| highlights.runs),
+            Some(small_highlights.runs.clone()),
+            "highlights within the entry budget must be cached as-is"
         );
 
-        let big_key = TextCapturesKey::new([text.as_ref()].into_iter(), text.len());
-        let big_captures_source = [
-            captured_range(0..2),
-            captured_range(3..7),
-            captured_range(8..9),
-        ]
-        .into_iter()
-        .collect::<Arc<[_]>>();
-        let big_captures = cache.insert(
+        let big_key = TextHighlightKey::new([text.as_ref()].into_iter(), text.len());
+        let big_highlights_source = resolved(&[0..2, 3..7, 8..9]);
+        let big_highlights = cache.insert(
             big_key.clone(),
             Arc::clone(&text),
-            Arc::clone(&big_captures_source),
+            big_highlights_source.clone(),
         );
         assert!(
-            Arc::ptr_eq(&big_captures, &big_captures_source),
-            "captures over the entry budget must be returned unchanged"
+            Arc::ptr_eq(&big_highlights.runs, &big_highlights_source.runs),
+            "highlights over the entry budget must be returned unchanged"
         );
-        assert_eq!(
-            cache.get(&big_key, [text.as_ref()].into_iter()),
-            None,
-            "captures over the entry budget must not be cached"
+        assert!(
+            cache.get(&big_key, [text.as_ref()].into_iter()).is_none(),
+            "highlights over the entry budget must not be cached"
         );
     }
 }

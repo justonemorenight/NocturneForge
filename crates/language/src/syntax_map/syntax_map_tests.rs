@@ -1158,8 +1158,8 @@ fn test_random_syntax_map_edits_with_heex(rng: StdRng, cx: &mut App) {
 
 #[test]
 fn test_flatten_capture_regions_with_nested_captures() {
-    let outer = CaptureId(1);
-    let inner = CaptureId(2);
+    let outer = capture_ref(1);
+    let inner = capture_ref(2);
     assert_eq!(
         flattened(0..12, &[(0..10, outer), (2..5, inner)]),
         vec![
@@ -1172,8 +1172,8 @@ fn test_flatten_capture_regions_with_nested_captures() {
 
 #[test]
 fn test_flatten_capture_regions_with_overlapping_captures() {
-    let first = CaptureId(1);
-    let second = CaptureId(2);
+    let first = capture_ref(1);
+    let second = capture_ref(2);
     assert_eq!(
         flattened(0..25, &[(0..10, first), (2..20, second)]),
         vec![
@@ -1187,7 +1187,7 @@ fn test_flatten_capture_regions_with_overlapping_captures() {
 
 #[test]
 fn test_flatten_capture_regions_clips_to_the_requested_range() {
-    let capture = CaptureId(1);
+    let capture = capture_ref(1);
     assert_eq!(
         flattened(5..8, &[(0..10, capture)]),
         vec![(5..8, vec![capture])],
@@ -1601,13 +1601,20 @@ fn comment_lang() -> Language {
     )
 }
 
+fn capture_ref(capture_id: u32) -> HighlightCaptureRef {
+    HighlightCaptureRef {
+        grammar_index: 0,
+        capture_id: CaptureId(capture_id),
+    }
+}
+
 fn flattened(
     range: Range<usize>,
-    captures: &[(Range<usize>, CaptureId)],
-) -> Vec<(Range<usize>, Vec<CaptureId>)> {
+    captures: &[(Range<usize>, HighlightCaptureRef)],
+) -> Vec<(Range<usize>, Vec<HighlightCaptureRef>)> {
     flatten_capture_regions(range, captures.iter().cloned())
         .into_iter()
-        .map(|region| (region.range, region.capture_ids.to_vec()))
+        .map(|region| (region.range, region.stack.to_vec()))
         .collect()
 }
 
