@@ -41,10 +41,10 @@ pub use visual_test_context::*;
 use crate::InspectorElementRegistry;
 use crate::asset_cache::CachedLoad;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
+    Action, ActionBuildError, ActionRegistry, ActivityGuard, Any, AnyView, AnyWindowHandle,
+    AppContext, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem,
+    CursorStyle, DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor,
+    Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
     PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
     PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
@@ -1308,6 +1308,11 @@ impl App {
     /// Returns the current thermal state of the system.
     pub fn thermal_state(&self) -> ThermalState {
         self.platform.thermal_state()
+    }
+
+    /// Prevents idle sleep while the returned guard is held.
+    pub fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        self.platform.prevent_idle_sleep(reason)
     }
 
     /// Invokes a handler when the thermal state changes

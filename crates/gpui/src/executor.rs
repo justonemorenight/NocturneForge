@@ -1,4 +1,4 @@
-use crate::{App, PlatformDispatcher, PlatformScheduler};
+use crate::{ActivityGuard, App, PlatformDispatcher, PlatformScheduler};
 use futures::channel::mpsc;
 use futures::prelude::*;
 use gpui_util::{TryFutureExt, TryFutureExtBacktrace};
@@ -84,6 +84,13 @@ impl BackgroundExecutor {
     /// This is used by Ex to pass the executor to thread/worktree code.
     pub fn scheduler_executor(&self) -> scheduler::BackgroundExecutor {
         self.inner.clone()
+    }
+
+    /// Prevents App Nap-style throttling while the returned guard is held.
+    ///
+    /// This does not prevent the system from entering idle sleep.
+    pub fn prevent_app_nap(&self, reason: &str) -> ActivityGuard {
+        self.dispatcher.prevent_app_nap(reason)
     }
 
     /// Enqueues the given future to be run to completion on a background thread.

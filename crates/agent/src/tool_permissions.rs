@@ -596,6 +596,7 @@ mod tests {
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             terminal_notification_style: settings::AgentNotificationStyle::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::default(),
+            prevent_idle_sleep: true,
             single_file_review: false,
             review_control_location: Default::default(),
             experimental_lsp_leases: false,
