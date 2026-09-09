@@ -1,5 +1,5 @@
 use crate::artifacts::Artifact;
-use crate::budget::{ExecutionBudget, TaskExecutionReporter};
+use crate::budget::TaskExecutionReporter;
 use crate::cancellation::CancellationToken;
 use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentControlPlane, AgentIdentity};
@@ -37,8 +37,6 @@ pub struct TaskExecutionContext {
     pub background_executor: Option<gpui::BackgroundExecutor>,
     /// Run-level identifier for correlation and telemetry.
     pub run_id: RunId,
-    /// Budget limits copied from the task definition.
-    pub budget: ExecutionBudget,
     /// Telemetry reporter for tool calls, tokens, phases, and progress.
     pub reporter: TaskExecutionReporter,
 }

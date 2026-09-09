@@ -17,6 +17,16 @@ pub struct OrchestrationTask {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Optional fallback model as `provider/model-id`. The scheduler may use it
+    /// once for model/infrastructure failures, never for verification failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_thinking_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_fallback_from_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_effort: Option<String>,
     /// Optional tool allowlist for this task.
@@ -31,13 +41,6 @@ pub struct OrchestrationTask {
     /// Override for maximum retries on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u8>,
-    /// Cumulative provider-reported token ceiling across all attempts, including
-    /// input, output, and cache tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<u64>,
-    /// Execution timeout in seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub time_budget_secs: Option<u64>,
     /// Whether to attempt repair on verification failure.
     #[serde(default = "default_true")]
     pub repair_on_failure: bool,
@@ -50,9 +53,6 @@ pub struct OrchestrationTask {
     /// Whether task output must include valid file citations (evidence).
     #[serde(default)]
     pub evidence_required: bool,
-    /// Hard budget on tool calls reported by the task executor.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_budget: Option<u64>,
     /// Stated high-level objective for this task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
@@ -96,18 +96,19 @@ impl OrchestrationTask {
             description: description.into(),
             role: None,
             model_override: None,
+            fallback_model_override: None,
+            fallback_thinking_effort: None,
+            active_fallback_from_model: None,
+            active_fallback_reason: None,
             thinking_effort: None,
             tools: None,
             depends_on: Vec::new(),
             acceptance_criteria: Vec::new(),
             max_retries: None,
-            token_budget: None,
-            time_budget_secs: None,
             repair_on_failure: true,
             context_paths: Vec::new(),
             expected_output: None,
             evidence_required: false,
-            tool_call_budget: None,
             objective: None,
             scope: None,
             native_role: None,
@@ -130,11 +131,6 @@ impl OrchestrationTask {
 
     pub fn with_acceptance_criteria(mut self, criteria: Vec<String>) -> Self {
         self.acceptance_criteria = criteria;
-        self
-    }
-
-    pub fn with_token_budget(mut self, budget: u64) -> Self {
-        self.token_budget = Some(budget);
         self
     }
 }
@@ -172,7 +168,6 @@ pub enum GraphValidationError {
     DuplicateTaskId(TaskId),
     MissingDependency { task_id: TaskId, dependency: TaskId },
     CyclicDependency(Vec<TaskId>),
-    InvalidBudget { task_id: TaskId, reason: String },
     MaxRetriesExceeded { task_id: TaskId, max: u8 },
 }
 
@@ -198,9 +193,6 @@ impl fmt::Display for GraphValidationError {
                     .collect::<Vec<_>>()
                     .join(" -> ");
                 write!(f, "dependency graph contains a cycle: {}", formatted)
-            }
-            Self::InvalidBudget { task_id, reason } => {
-                write!(f, "invalid budget for task `{}`: {}", task_id, reason)
             }
             Self::MaxRetriesExceeded { task_id, max } => {
                 write!(f, "task `{}` max_retries cannot exceed {}", task_id, max)
@@ -236,14 +228,6 @@ impl PlanGraph {
                     return Err(GraphValidationError::MaxRetriesExceeded {
                         task_id: task.id.clone(),
                         max: MAX_TASK_RETRIES,
-                    });
-                }
-            }
-            if let Some(budget) = task.token_budget {
-                if budget == 0 {
-                    return Err(GraphValidationError::InvalidBudget {
-                        task_id: task.id.clone(),
-                        reason: "token budget must be greater than zero".into(),
                     });
                 }
             }

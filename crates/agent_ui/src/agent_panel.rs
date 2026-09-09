@@ -12035,6 +12035,7 @@ mod tests {
             sandbox_grants: Default::default(),
             tool_filter: None,
             orchestration_run: None,
+            orchestration_goal: None,
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));

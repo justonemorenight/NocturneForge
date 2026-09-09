@@ -124,19 +124,23 @@ impl AgentTool for ListOrchestrationAgentsTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let result = self
-            .thread
-            .read_with(cx, |thread, _cx| thread.orchestration_run().cloned())
-            .map_err(|error| error.to_string())
-            .and_then(|run| run.ok_or_else(|| "no orchestration run is active".to_string()))
-            .and_then(|run| {
-                summaries(&run)
-                    .map(|agents| (run, agents))
-                    .map_err(|error| error.to_string())
-            });
-        Task::ready(match result {
-            Ok((run, agents)) => Ok(success_output(&run, agents)),
-            Err(error) => Err(OrchestrationControlOutput::Error { error }),
+        // Tool dispatch holds the parent Thread's update lease until run returns.
+        // Defer reading it to the foreground executor, as the other control tools do.
+        cx.spawn(async move |cx| {
+            let result = self
+                .thread
+                .read_with(cx, |thread, _cx| thread.orchestration_run().cloned())
+                .map_err(|error| error.to_string())
+                .and_then(|run| run.ok_or_else(|| "no orchestration run is active".to_string()))
+                .and_then(|run| {
+                    summaries(&run)
+                        .map(|agents| (run, agents))
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok((run, agents)) => Ok(success_output(&run, agents)),
+                Err(error) => Err(OrchestrationControlOutput::Error { error }),
+            }
         })
     }
 }
@@ -247,7 +251,7 @@ impl AgentTool for SendMessageToAgentTool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-/// Record a repeated blocker observation or clear a resolved blocker for the active goal.
+/// Update the parent orchestration goal by observing a blocker, clearing it, or completing the goal.
 pub struct UpdateOrchestrationGoalInput {
     pub action: UpdateOrchestrationGoalAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +265,7 @@ pub struct UpdateOrchestrationGoalInput {
 pub enum UpdateOrchestrationGoalAction {
     ObserveBlocker,
     ClearBlocker,
+    Complete,
 }
 
 pub struct UpdateOrchestrationGoalTool {
@@ -297,6 +302,10 @@ impl AgentTool for UpdateOrchestrationGoalTool {
                 action: UpdateOrchestrationGoalAction::ClearBlocker,
                 ..
             }) => "Clear orchestration blocker".into(),
+            Ok(UpdateOrchestrationGoalInput {
+                action: UpdateOrchestrationGoalAction::Complete,
+                ..
+            }) => "Complete orchestration goal".into(),
             Err(_) => "Update orchestration goal".into(),
         }
     }
@@ -315,13 +324,15 @@ impl AgentTool for UpdateOrchestrationGoalTool {
                 .map_err(|error| OrchestrationControlOutput::Error {
                     error: error.to_string(),
                 })?;
-            let run = thread
-                .read_with(cx, |thread, _cx| thread.orchestration_run().cloned())
+            let (run, parent_goal) = thread
+                .read_with(cx, |thread, _cx| {
+                    (
+                        thread.orchestration_run().cloned(),
+                        thread.parent_orchestration_goal(),
+                    )
+                })
                 .map_err(|error| OrchestrationControlOutput::Error {
                     error: error.to_string(),
-                })?
-                .ok_or_else(|| OrchestrationControlOutput::Error {
-                    error: "no orchestration run is active".to_string(),
                 })?;
             let goal = match input.action {
                 UpdateOrchestrationGoalAction::ObserveBlocker => {
@@ -335,13 +346,43 @@ impl AgentTool for UpdateOrchestrationGoalTool {
                         .ok_or_else(|| OrchestrationControlOutput::Error {
                             error: "detail is required when observing a blocker".to_string(),
                         })?;
-                    run.record_goal_blocker(code, detail).map_err(|error| {
-                        OrchestrationControlOutput::Error {
-                            error: error.to_string(),
-                        }
+                    if let Some(run) = run {
+                        run.record_goal_blocker(code, detail)
+                    } else if let Some(goal) = parent_goal {
+                        goal.record_blocker(code, detail)
+                    } else {
+                        Err(anyhow::anyhow!("no orchestration goal is active"))
+                    }
+                    .map_err(|error| OrchestrationControlOutput::Error {
+                        error: error.to_string(),
                     })?
                 }
-                UpdateOrchestrationGoalAction::ClearBlocker => run.clear_goal_blocker(),
+                UpdateOrchestrationGoalAction::ClearBlocker => {
+                    if let Some(run) = run {
+                        run.clear_goal_blocker()
+                    } else if let Some(goal) = parent_goal {
+                        goal.clear_blocker()
+                    } else {
+                        return Err(OrchestrationControlOutput::Error {
+                            error: "no orchestration goal is active".to_string(),
+                        });
+                    }
+                }
+                UpdateOrchestrationGoalAction::Complete => {
+                    if run.as_ref().is_some_and(|run| !run.state().is_terminal()) {
+                        return Err(OrchestrationControlOutput::Error {
+                            error: "the active orchestration run must reach a terminal state before the parent goal can be completed".to_string(),
+                        });
+                    }
+                    parent_goal
+                        .ok_or_else(|| OrchestrationControlOutput::Error {
+                            error: "no parent orchestration goal is active".to_string(),
+                        })?
+                        .mark_achieved()
+                        .map_err(|error| OrchestrationControlOutput::Error {
+                            error: error.to_string(),
+                        })?
+                }
             };
             Ok(OrchestrationControlOutput::GoalUpdated { goal })
         })

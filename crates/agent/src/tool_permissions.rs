@@ -570,6 +570,8 @@ mod tests {
         AgentSettings {
             enabled: true,
             enable_checkpoints: true,
+            cache_keepalive: false,
+            cache_keepalive_config: Default::default(),
             button: true,
             dock: DockPosition::Right,
             flexible: true,
@@ -578,7 +580,7 @@ mod tests {
             max_content_width: Some(px(850.)),
             default_model: None,
             subagent_model: None,
-            chatgpt_subagent_roles: Default::default(),
+            native_subagent_roles: Default::default(),
             compaction_model: None,
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,

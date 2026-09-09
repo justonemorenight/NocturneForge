@@ -1,5 +1,5 @@
 use agent_settings::AgentExecutionStrategy;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,9 @@ pub struct AutoPolicyContext {
     pub work_item_count: usize,
     pub available_tool_count: Option<usize>,
     pub can_orchestrate: bool,
+    pub previous_strategy: Option<AgentExecutionStrategy>,
+    pub has_incomplete_plan: bool,
+    pub has_active_orchestration: bool,
 }
 
 /// Tunable routing weights and thresholds owned by the orchestration crate.
@@ -106,6 +109,7 @@ pub struct AutoPolicyConfig {
     pub multi_work_item_bonus: f32,
     pub large_work_item_bonus: f32,
     pub structured_list_bonus: f32,
+    pub broad_scope_bonus: f32,
     pub explicit_plan_score: f32,
     pub orchestration_route_threshold: f32,
     pub planning_route_threshold: f32,
@@ -115,11 +119,15 @@ pub struct AutoPolicyConfig {
     pub explicit_confidence: f32,
     pub capability_fallback_confidence: f32,
     pub requested_plan_confidence: f32,
+    pub continuation_confidence: f32,
     pub multi_work_item_threshold: usize,
     pub large_work_item_threshold: usize,
     pub structured_list_item_threshold: usize,
     pub short_prompt_character_limit: usize,
     pub short_prompt_line_limit: usize,
+    pub terse_follow_up_character_limit: usize,
+    pub terse_follow_up_word_limit: usize,
+    pub scope_reference_threshold: usize,
     pub tool_count_normalization_cap: usize,
 }
 
@@ -134,6 +142,7 @@ impl Default for AutoPolicyConfig {
             multi_work_item_bonus: 0.35,
             large_work_item_bonus: 0.65,
             structured_list_bonus: 0.55,
+            broad_scope_bonus: 0.6,
             explicit_plan_score: 0.85,
             orchestration_route_threshold: 0.55,
             planning_route_threshold: 0.55,
@@ -143,11 +152,15 @@ impl Default for AutoPolicyConfig {
             explicit_confidence: 0.98,
             capability_fallback_confidence: 0.9,
             requested_plan_confidence: 0.9,
+            continuation_confidence: 0.9,
             multi_work_item_threshold: 2,
             large_work_item_threshold: 4,
             structured_list_item_threshold: 3,
             short_prompt_character_limit: 100,
             short_prompt_line_limit: 3,
+            terse_follow_up_character_limit: 80,
+            terse_follow_up_word_limit: 8,
+            scope_reference_threshold: 2,
             tool_count_normalization_cap: 20,
         }
     }
@@ -160,6 +173,7 @@ struct PromptSignals {
     orchestrate: bool,
     requests_plan: bool,
     executes_after_plan: bool,
+    broad_scope: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -185,20 +199,46 @@ impl AutoPolicyEngine {
     ) -> AutoPolicyDecision {
         let prompt_lower = prompt.to_lowercase();
         let signals = PromptSignals::detect(&prompt_lower);
+        let context = AutoPolicyContext {
+            work_item_count: context
+                .work_item_count
+                .max(infer_work_item_count(prompt, config)),
+            ..context
+        };
+        let terse_follow_up = is_terse_follow_up(prompt, context, config);
         let scores = PolicyScores::calculate(prompt, &prompt_lower, signals, context, config);
-        let heuristics = scores.heuristics(context, config);
-        select_decision(signals, scores, context, config, heuristics)
+        let mut heuristics = scores.heuristics(context, config);
+        heuristics.insert(
+            "terse_follow_up".into(),
+            if terse_follow_up { 1.0 } else { 0.0 },
+        );
+        select_decision(
+            signals,
+            scores,
+            context,
+            config,
+            terse_follow_up,
+            heuristics,
+        )
     }
 }
 
 impl PromptSignals {
     fn detect(prompt: &str) -> Self {
+        let requests_plan =
+            contains_any(prompt, PLAN_REQUEST_PHRASES) || contains_keyword(prompt, "plan");
+        let maintains_plan = contains_any(prompt, PLAN_MAINTENANCE_PHRASES);
+        let executes_after_plan = contains_any(prompt, PLAN_THEN_EXECUTE_PHRASES)
+            || (requests_plan
+                && contains_any_keyword(prompt, EXECUTION_KEYWORDS)
+                && !maintains_plan);
         Self {
             plan_only: contains_any(prompt, PLAN_ONLY_PHRASES),
             direct: contains_any(prompt, DIRECT_OVERRIDE_PHRASES),
             orchestrate: contains_any(prompt, ORCHESTRATION_OVERRIDE_PHRASES),
-            requests_plan: contains_any(prompt, PLAN_REQUEST_PHRASES),
-            executes_after_plan: contains_any(prompt, PLAN_THEN_EXECUTE_PHRASES),
+            requests_plan,
+            executes_after_plan,
+            broad_scope: contains_any_keyword(prompt, BROAD_SCOPE_KEYWORDS),
         }
     }
 }
@@ -229,14 +269,20 @@ impl PolicyScores {
         if signals.orchestrate {
             orchestration = 1.0;
         } else {
-            orchestration += work_item_bonus(context.work_item_count, config);
-            if original_prompt
+            let structured_list_bonus = if original_prompt
                 .lines()
                 .filter(|line| is_list_item(line))
                 .count()
                 >= config.structured_list_item_threshold
             {
-                orchestration += config.structured_list_bonus;
+                config.structured_list_bonus
+            } else {
+                0.0
+            };
+            orchestration +=
+                work_item_bonus(context.work_item_count, config).max(structured_list_bonus);
+            if signals.broad_scope {
+                orchestration += config.broad_scope_bonus;
             }
         }
 
@@ -273,6 +319,23 @@ impl PolicyScores {
             "orchestration_capability".into(),
             if context.can_orchestrate { 1.0 } else { 0.0 },
         );
+        heuristics.insert("work_item_count".into(), context.work_item_count as f32);
+        heuristics.insert(
+            "incomplete_plan".into(),
+            if context.has_incomplete_plan {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        heuristics.insert(
+            "active_orchestration".into(),
+            if context.has_active_orchestration {
+                1.0
+            } else {
+                0.0
+            },
+        );
         let normalization_cap = config.tool_count_normalization_cap.max(1);
         if let Some(available_tool_count) = context.available_tool_count {
             heuristics.insert(
@@ -299,6 +362,7 @@ fn select_decision(
     scores: PolicyScores,
     context: AutoPolicyContext,
     config: &AutoPolicyConfig,
+    terse_follow_up: bool,
     heuristics: HashMap<String, f32>,
 ) -> AutoPolicyDecision {
     if signals.plan_only {
@@ -328,7 +392,13 @@ fn select_decision(
             heuristics,
         );
     }
-    if context.can_orchestrate && scores.orchestration >= config.orchestration_route_threshold {
+    if let Some(reason) = continuation_reason(context, terse_follow_up) {
+        return continuation_decision(context, config, reason, heuristics);
+    }
+    if context.can_orchestrate
+        && scores.orchestration >= config.orchestration_route_threshold
+        && scores.orchestration > scores.direct
+    {
         return decision(
             AgentExecutionStrategy::Orchestrate,
             scores.orchestration.max(config.inferred_confidence_floor),
@@ -353,6 +423,41 @@ fn select_decision(
         "The request is best handled as one direct agent turn",
         heuristics,
     )
+}
+
+fn continuation_reason(context: AutoPolicyContext, terse_follow_up: bool) -> Option<&'static str> {
+    if !terse_follow_up {
+        None
+    } else if context.has_active_orchestration {
+        Some("The request continues an active orchestration run")
+    } else if context.has_incomplete_plan {
+        Some("The request continues execution of an incomplete plan")
+    } else {
+        None
+    }
+}
+
+fn continuation_decision(
+    context: AutoPolicyContext,
+    config: &AutoPolicyConfig,
+    reason: &str,
+    heuristics: HashMap<String, f32>,
+) -> AutoPolicyDecision {
+    if context.can_orchestrate {
+        decision(
+            AgentExecutionStrategy::Orchestrate,
+            config.continuation_confidence,
+            reason,
+            heuristics,
+        )
+    } else {
+        decision(
+            AgentExecutionStrategy::Direct,
+            config.capability_fallback_confidence,
+            "The request continues structured work, but the complete orchestration tool surface is unavailable",
+            heuristics,
+        )
+    }
 }
 
 fn explicit_orchestration_decision(
@@ -428,6 +533,12 @@ const PLAN_THEN_EXECUTE_PHRASES: &[&str] = &[
     "then execute",
     "and execute",
 ];
+const PLAN_MAINTENANCE_PHRASES: &[&str] = &[
+    "update the plan",
+    "revise the plan",
+    "refine the plan",
+    "review the plan",
+];
 const PLANNING_KEYWORDS: &[&str] = &[
     "plan",
     "architecture",
@@ -453,6 +564,17 @@ const ORCHESTRATION_KEYWORDS: &[&str] = &[
     "test suite",
     "end to end",
 ];
+const BROAD_SCOPE_KEYWORDS: &[&str] = &[
+    "codebase",
+    "repository-wide",
+    "repo-wide",
+    "project-wide",
+    "workspace-wide",
+    "entire repository",
+    "whole repository",
+    "entire project",
+    "whole project",
+];
 const EXECUTION_KEYWORDS: &[&str] = &[
     "implement",
     "fix",
@@ -476,6 +598,12 @@ const DIRECT_KEYWORDS: &[&str] = &[
 
 fn contains_any(prompt: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|phrase| prompt.contains(phrase))
+}
+
+fn contains_any_keyword(prompt: &str, keywords: &[&str]) -> bool {
+    keywords
+        .iter()
+        .any(|keyword| contains_keyword(prompt, keyword))
 }
 
 fn keyword_score(prompt: &str, keywords: &[&str], weight: f32) -> f32 {
@@ -519,6 +647,63 @@ fn is_list_item(line: &str) -> bool {
             .is_some_and(|(prefix, _)| {
                 !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
             })
+}
+
+fn infer_work_item_count(prompt: &str, config: &AutoPolicyConfig) -> usize {
+    let list_items = prompt.lines().filter(|line| is_list_item(line)).count();
+    let headings = prompt
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .count();
+    let scope_references = prompt
+        .split_whitespace()
+        .filter_map(normalize_scope_reference)
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut work_item_count = list_items;
+    if headings >= config.multi_work_item_threshold {
+        work_item_count = work_item_count.max(headings);
+    }
+    if scope_references >= config.scope_reference_threshold {
+        work_item_count = work_item_count.max(scope_references);
+    }
+    work_item_count
+}
+
+fn normalize_scope_reference(token: &str) -> Option<&str> {
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ':' | ';'
+        )
+    });
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return None;
+    }
+    let looks_like_path = token.contains('/')
+        || token.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 8
+                && extension
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphabetic())
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        });
+    looks_like_path.then_some(token)
+}
+
+fn is_terse_follow_up(prompt: &str, context: AutoPolicyContext, config: &AutoPolicyConfig) -> bool {
+    (context.previous_strategy.is_some()
+        || context.has_incomplete_plan
+        || context.has_active_orchestration)
+        && prompt.chars().count() <= config.terse_follow_up_character_limit
+        && prompt.split_whitespace().count() <= config.terse_follow_up_word_limit
+        && !prompt.lines().any(is_list_item)
 }
 
 fn decision(
@@ -634,6 +819,101 @@ mod tests {
             capable_context(),
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+    }
+
+    #[test]
+    fn broad_codebase_request_routes_without_localized_keywords() {
+        let decision =
+            AutoPolicyEngine::evaluate("Phân tích tối ưu codebase cực đoan", capable_context());
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+        assert_eq!(decision.heuristics["work_item_count"], 0.0);
+    }
+
+    #[test]
+    fn direct_codebase_question_is_not_overrouted() {
+        let decision = AutoPolicyEngine::evaluate("What does this codebase do?", capable_context());
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
+    }
+
+    #[test]
+    fn a_plan_token_routes_a_mixed_language_request_to_plan() {
+        let decision =
+            AutoPolicyEngine::evaluate("Oke thực hiện xem, lên plan đã", capable_context());
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Plan);
+    }
+
+    #[test]
+    fn executing_an_existing_plan_is_not_routed_back_to_plan() {
+        let decision = AutoPolicyEngine::evaluate("Implement the plan", capable_context());
+        assert_ne!(decision.strategy, AgentExecutionStrategy::Plan);
+    }
+
+    #[test]
+    fn terse_follow_up_continues_active_orchestration() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Continue",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Orchestrate),
+                has_active_orchestration: true,
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+        assert_eq!(decision.heuristics["terse_follow_up"], 1.0);
+    }
+
+    #[test]
+    fn terse_follow_up_continues_restored_orchestration_without_transient_policy() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Continue",
+            AutoPolicyContext {
+                has_active_orchestration: true,
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+    }
+
+    #[test]
+    fn terse_follow_up_executes_an_incomplete_plan_with_orchestration() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Proceed",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Plan),
+                has_incomplete_plan: true,
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+    }
+
+    #[test]
+    fn completed_work_does_not_make_unrelated_short_prompts_sticky() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Thanks",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Orchestrate),
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
+    }
+
+    #[test]
+    fn scope_references_are_inferred_as_work_items() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Review crates/agent/src/thread.rs crates/agent/src/db.rs crates/agent/src/agent.rs crates/agent/src/tests/mod.rs",
+            capable_context(),
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+        assert_eq!(decision.heuristics["work_item_count"], 4.0);
+    }
+
+    #[test]
+    fn version_numbers_are_not_inferred_as_file_references() {
+        let decision = AutoPolicyEngine::evaluate("Compare v1.2 v2.3 v3.4 v4.5", capable_context());
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
+        assert_eq!(decision.heuristics["work_item_count"], 0.0);
     }
 
     #[test]

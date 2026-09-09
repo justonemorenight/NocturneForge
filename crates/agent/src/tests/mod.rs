@@ -69,6 +69,11 @@ pub(crate) fn release_dropped_entities(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+fn delegated_task_prompt(label: &str, message: &str) -> String {
+    let task = agent_orchestration::OrchestrationTask::new("test", label, message);
+    task_execution_prompt(&task)
+}
+
 pub(crate) struct FakeTerminalHandle {
     killed: Arc<AtomicBool>,
     stopped_by_user: Arc<AtomicBool>,
@@ -244,6 +249,8 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         &self,
         _label: String,
         _role: Option<crate::SubagentRole>,
+        _model_override: Option<String>,
+        _thinking_effort: Option<String>,
         _tool_filter: Option<Vec<SharedString>>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
@@ -291,6 +298,8 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         &self,
         _label: String,
         _role: Option<crate::SubagentRole>,
+        _model_override: Option<String>,
+        _thinking_effort: Option<String>,
         _tool_filter: Option<Vec<SharedString>>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
@@ -5502,20 +5511,13 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
 
     cx.run_until_parked();
 
+    let delegated_prompt = delegated_task_prompt("label", "subagent task prompt");
     assert_eq!(
         subagent_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
-        indoc! {"
-            ## User
-
-            subagent task prompt
-
-            ## Assistant
-
-            subagent task response
-
-        "}
+        format!("## User\n\n{delegated_prompt}\n\n## Assistant\n\nsubagent task response\n\n")
     );
 
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
 
@@ -5557,6 +5559,14 @@ fn pending_completion_tool_names(model: &FakeLanguageModel) -> Vec<String> {
         .collect::<Vec<_>>();
     tool_names.sort();
     tool_names
+}
+
+fn complete_parent_orchestration_goal(thread: &Entity<Thread>, cx: &mut TestAppContext) {
+    thread.update(cx, |thread, _cx| {
+        thread
+            .complete_parent_orchestration_goal_for_test()
+            .expect("parent orchestration goal should be active");
+    });
 }
 
 #[gpui::test]
@@ -5656,6 +5666,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     model.send_last_completion_stream_text_chunk("search results");
     model.end_last_completion_stream();
     cx.run_until_parked();
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
     send.await.unwrap();
@@ -5696,6 +5707,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     model.send_last_completion_stream_text_chunk("follow-up results");
     model.end_last_completion_stream();
     cx.run_until_parked();
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Second response");
     model.end_last_completion_stream();
     send2.await.unwrap();
@@ -5792,6 +5804,7 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
     model.send_last_completion_stream_text_chunk("analysis");
     model.end_last_completion_stream();
     cx.run_until_parked();
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
     send.await.unwrap();
@@ -5909,6 +5922,7 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
         "parent model should receive the `tools` validation error as the tool result"
     );
 
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
     send.await.unwrap();
@@ -6018,26 +6032,15 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
 
     cx.run_until_parked();
 
+    let delegated_prompt = delegated_task_prompt("label", "subagent task prompt");
     assert_eq!(
         subagent_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
-        indoc! {"
-            ## User
-
-            subagent task prompt
-
-            ## Assistant
-
-            subagent task response 1
-
-            <thinking>
-            thinking more about the subagent task
-            </thinking>
-
-            subagent task response 2
-
-        "}
+        format!(
+            "## User\n\n{delegated_prompt}\n\n## Assistant\n\nsubagent task response 1\n\n<thinking>\nthinking more about the subagent task\n</thinking>\n\nsubagent task response 2\n\n"
+        )
     );
 
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
 
@@ -6194,14 +6197,10 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     });
     subagent_acp_thread.read_with(cx, |thread, cx| {
         assert_eq!(thread.status(), ThreadStatus::Idle);
+        let delegated_prompt = delegated_task_prompt("label", "subagent task prompt");
         assert_eq!(
             thread.to_markdown(cx),
-            indoc! {"
-                ## User
-
-                subagent task prompt
-
-            "}
+            format!("## User\n\n{delegated_prompt}\n\n")
         );
     });
 }
@@ -6307,6 +6306,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Parent model responds to complete first turn
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("First response");
     model.end_last_completion_stream();
 
@@ -6359,6 +6359,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Parent model responds to complete second turn
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Second response");
     model.end_last_completion_stream();
 
@@ -6373,26 +6374,12 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     });
 
     // Verify the subagent's acp thread has both conversation turns
+    let delegated_prompt = delegated_task_prompt("initial task", "do the first task");
     assert_eq!(
         subagent_acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
-        indoc! {"
-            ## User
-
-            do the first task
-
-            ## Assistant
-
-            first task response
-
-            ## User
-
-            do the follow-up task
-
-            ## Assistant
-
-            follow-up task response
-
-        "}
+        format!(
+            "## User\n\n{delegated_prompt}\n\n## Assistant\n\nfirst task response\n\n## User\n\ndo the follow-up task\n\n## Assistant\n\nfollow-up task response\n\n"
+        )
     );
 }
 
@@ -6989,6 +6976,7 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
     cx.run_until_parked();
 
     // The parent model receives the successful subagent result and completes its turn.
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response after subagent completion");
     model.end_last_completion_stream();
 
@@ -7117,6 +7105,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     });
 
     // The parent model should get a new completion request to respond to the tool error
+    complete_parent_orchestration_goal(&thread, cx);
     model.send_last_completion_stream_text_chunk("Response after error");
     model.end_last_completion_stream();
 
@@ -8569,6 +8558,142 @@ async fn test_queued_message_does_not_end_turn_without_boundary_flag(cx: &mut Te
         stop_reasons,
         vec![acp::StopReason::EndTurn],
         "Turn should end only after the agent finishes, not at the tool boundary"
+    );
+}
+
+#[gpui::test]
+async fn test_orchestrate_continues_until_parent_goal_is_complete(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let goal = agent_orchestration::GoalController::new(
+        agent_orchestration::RunId::new(),
+        "Finish and verify the requested work",
+        Vec::new(),
+        agent_orchestration::GoalControllerConfig::default(),
+    )
+    .unwrap();
+    thread.update(cx, |thread, cx| {
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Do the work"], cx)
+        })
+        .unwrap();
+    thread.update(cx, |thread, _cx| {
+        thread.set_parent_orchestration_goal_for_test(goal.clone());
+    });
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk(
+        "I saw call:default_api:grep in the logs and inspected the first file.",
+    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completions = fake_model.pending_completions();
+    assert_eq!(completions.len(), 1);
+    let continuation = completions.last().unwrap();
+    let MessageContent::Text(resume_prompt) = continuation
+        .messages
+        .last()
+        .expect("continuation should contain an internal user message")
+        .content
+        .last()
+        .expect("continuation message should contain text")
+    else {
+        panic!("expected orchestration resume text");
+    };
+    assert!(resume_prompt.contains("goal is still active"));
+
+    goal.mark_achieved().unwrap();
+    fake_model.send_last_completion_stream_text_chunk("Finished and verified.");
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
+    fake_model.end_last_completion_stream();
+
+    assert_eq!(
+        stop_events(collect_events_until_stop(&mut events, cx).await),
+        vec![acp::StopReason::EndTurn]
+    );
+}
+
+#[gpui::test]
+async fn test_orchestrate_repairs_plaintext_tool_call(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let goal = agent_orchestration::GoalController::new(
+        agent_orchestration::RunId::new(),
+        "Finish and verify the requested work",
+        Vec::new(),
+        agent_orchestration::GoalControllerConfig::default(),
+    )
+    .unwrap();
+    thread.update(cx, |thread, cx| {
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Manual,
+            cx,
+        );
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Do the work"], cx)
+        })
+        .unwrap();
+    thread.update(cx, |thread, _cx| {
+        thread.set_parent_orchestration_goal_for_test(goal.clone());
+    });
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk(
+        r#"call:default_api:grep{\"regex\":\"file-saver\"}"#,
+    );
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completions = fake_model.pending_completions();
+    assert_eq!(completions.len(), 1);
+    let continuation = completions.last().unwrap();
+    let MessageContent::Text(resume_prompt) = continuation
+        .messages
+        .last()
+        .expect("continuation should contain an internal user message")
+        .content
+        .last()
+        .expect("continuation message should contain text")
+    else {
+        panic!("expected orchestration repair text");
+    };
+    assert!(
+        resume_prompt.contains("encoded as plain text")
+            && resume_prompt.contains("structured tool interface"),
+        "unexpected orchestration repair prompt: {resume_prompt}"
+    );
+
+    goal.mark_achieved().unwrap();
+    fake_model.send_last_completion_stream_text_chunk("Finished and verified.");
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::EndTurn));
+    fake_model.end_last_completion_stream();
+
+    assert_eq!(
+        stop_events(collect_events_until_stop(&mut events, cx).await),
+        vec![acp::StopReason::EndTurn]
     );
 }
 

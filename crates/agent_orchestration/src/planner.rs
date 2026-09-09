@@ -140,6 +140,7 @@ mod tests {
                 work_item_count: 1,
                 available_tool_count: Some(5),
                 can_orchestrate: true,
+                ..Default::default()
             },
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
@@ -154,6 +155,7 @@ mod tests {
                 work_item_count: 5,
                 available_tool_count: Some(10),
                 can_orchestrate: true,
+                ..Default::default()
             },
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);

@@ -344,32 +344,6 @@ impl TaskRegistry {
         }
     }
 
-    /// Records a tool call on a task, enforcing the tool-call budget if set.
-    pub fn add_tool_call(
-        &self,
-        task_id: &TaskId,
-        budget: Option<u64>,
-    ) -> Result<(), BudgetExceeded> {
-        let mut statuses = self.statuses.write();
-        let Some(status) = statuses.get_mut(task_id) else {
-            return Ok(());
-        };
-        status.budget_state.tool_calls_used = status.budget_state.tool_calls_used.saturating_add(1);
-        if let Some(budget) = budget
-            && status.budget_state.tool_calls_used > budget
-        {
-            let exceeded = BudgetExceeded::ToolCallBudgetExceeded {
-                budget,
-                used: status.budget_state.tool_calls_used,
-            };
-            status.budget_state.stopped_reason = Some(exceeded.clone());
-            status.updated_at = Utc::now();
-            return Err(exceeded);
-        }
-        status.updated_at = Utc::now();
-        Ok(())
-    }
-
     /// Merges budget usage reported by the executor into the task status.
     pub fn update_budget_usage(&self, task_id: &TaskId, tokens_used: u64, tool_calls: u64) {
         let mut statuses = self.statuses.write();
@@ -384,16 +358,6 @@ impl TaskRegistry {
         }
     }
 
-    /// Records a budget stop reason on a task (never completes the task).
-    pub fn stop_for_budget(&self, task_id: &TaskId, reason: BudgetExceeded) {
-        let mut statuses = self.statuses.write();
-        if let Some(status) = statuses.get_mut(task_id) {
-            status.budget_state.stopped_reason = Some(reason);
-            Self::update_lifecycle(status, TaskState::Failed);
-            status.updated_at = Utc::now();
-        }
-    }
-
     /// Sets the model assigned to a task, preserving an earlier assignment.
     pub fn set_model(&self, task_id: &TaskId, model: impl Into<String>) {
         let mut statuses = self.statuses.write();
@@ -402,6 +366,15 @@ impl TaskRegistry {
                 status.model = Some(model.into());
                 status.updated_at = Utc::now();
             }
+        }
+    }
+
+    /// Replaces the active model after an explicit runtime model transition.
+    pub fn replace_model(&self, task_id: &TaskId, model: impl Into<String>) {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            status.model = Some(model.into());
+            status.updated_at = Utc::now();
         }
     }
 

@@ -5821,6 +5821,43 @@ impl AcpThread {
         }
     }
 
+    pub fn strip_last_assistant_message_suffix(
+        &mut self,
+        suffix: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if suffix.is_empty() {
+            return false;
+        }
+        let Some((entry_index, markdown, visible)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(entry_index, entry)| {
+                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                    return None;
+                };
+                message.chunks.iter().rev().find_map(|chunk| {
+                    let AssistantMessageChunk::Message { block, .. } = chunk else {
+                        return None;
+                    };
+                    let markdown = block.markdown()?.clone();
+                    let visible =
+                        source_without_trimmed_suffix(markdown.read(cx).source(), suffix)?;
+                    Some((entry_index, markdown, visible))
+                })
+            })
+        else {
+            return false;
+        };
+
+        markdown.update(cx, |markdown, cx| markdown.replace(visible, cx));
+        cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+        cx.notify();
+        true
+    }
+
     pub fn on_terminal_provider_event(
         &mut self,
         event: TerminalProviderEvent,
@@ -5921,6 +5958,13 @@ impl AcpThread {
     }
 }
 
+fn source_without_trimmed_suffix(source: &str, suffix: &str) -> Option<String> {
+    source
+        .trim_end()
+        .strip_suffix(suffix)
+        .map(|visible| visible.trim_end().to_string())
+}
+
 fn markdown_for_raw_output(
     raw_output: &serde_json::Value,
     language_registry: &Arc<LanguageRegistry>,
@@ -5988,6 +6032,16 @@ mod tests {
         time::Duration,
     };
     use util::{path, path_list::PathList};
+
+    #[test]
+    fn strips_a_trimmed_utf8_suffix_without_byte_indexing() {
+        let suffix = "<verification>✓</verification>";
+        assert_eq!(
+            source_without_trimmed_suffix(&format!("Kết quả 🌙\n\n{suffix}\n"), suffix),
+            Some("Kết quả 🌙".to_string())
+        );
+        assert_eq!(source_without_trimmed_suffix("Kết quả 🌙", suffix), None);
+    }
 
     #[test]
     fn command_category_meta_round_trips() {

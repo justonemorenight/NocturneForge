@@ -227,6 +227,22 @@ impl GoalController {
         snapshot.updated_at = Utc::now();
         snapshot.clone()
     }
+
+    pub fn mark_achieved(&self) -> Result<GoalSnapshot> {
+        let mut snapshot = self.snapshot.write();
+        match snapshot.status {
+            GoalStatus::Active | GoalStatus::Blocked => {
+                snapshot.status = GoalStatus::Achieved;
+                snapshot.blocker = None;
+                snapshot.updated_at = Utc::now();
+                Ok(snapshot.clone())
+            }
+            GoalStatus::Achieved => Ok(snapshot.clone()),
+            GoalStatus::Failed | GoalStatus::Cancelled => {
+                bail!("cannot complete a terminal orchestration goal")
+            }
+        }
+    }
 }
 
 fn task_ids_in_state(

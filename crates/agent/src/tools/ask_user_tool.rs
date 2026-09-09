@@ -26,6 +26,13 @@ const OTHER_FIELD: &str = "other";
 /// You must provide either at least two `options`, or set `allow_free_text` to
 /// `true` (or both). If both are supplied, the user may pick an option or type
 /// their own answer, and a typed answer takes precedence.
+///
+/// Do not use this tool to ask whether you may spawn subagents, start an
+/// orchestration run, or execute a proposed orchestration plan. Call
+/// `spawn_agent` directly; when approval is required, the runtime presents its
+/// own native approval card. Asking here would make the user approve the same
+/// action twice. Use this tool only when a missing user choice or piece of
+/// information materially changes the work itself.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AskUserToolInput {
     /// The question to ask the user. Keep it short and specific.

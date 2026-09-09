@@ -9,7 +9,7 @@ Agent Settings live in the **AI** section of the Settings Editor, which configur
 Open it with {#action agent::OpenSettings} (also available from the top-right menu in the [Agent Panel](./agent-panel.md)), which takes you straight to the AI page.
 You can also reach the same page with {#action zed::OpenSettings} and selecting **AI** in the sidebar.
 
-Within the AI page, LLM Providers, External Agents, and MCP Servers each open as their own sub-page under the **General** section.
+Within the AI page, LLM Providers, External Agents, MCP Servers, and Task Models each open as their own sub-page.
 
 | Surface         | Opens with                      | Use it for                                                                  |
 | --------------- | ------------------------------- | --------------------------------------------------------------------------- |
@@ -40,24 +40,46 @@ Some Zed AI features have their own model or prompt settings in `settings.json`,
 - `agent.thread_summary_model`
 - `agent.compaction_model`
 - `agent.subagent_model`
-- `agent.chatgpt_subagent_roles`
+- `agent.native_subagent_roles`
 - `agent.review_control_location`
 - `agent.commit_message_instructions`
 - `agent.commit_message_skill`
 - `agent.inline_alternatives`
 
-`agent.chatgpt_subagent_roles` controls native role routing only for the
-ChatGPT Subscription provider. Disable it to restore the standard
-`agent.subagent_model` or parent-model inheritance flow:
+`agent.native_subagent_roles` controls role routing for Native Agent workers.
+The parent conversation and each child role may use different configured
+providers. Disable it to restore the standard `agent.subagent_model` or
+parent-model inheritance flow. The legacy key `chatgpt_subagent_roles` remains
+accepted for existing settings:
 
 ```json [settings]
 {
   "agent": {
-    "chatgpt_subagent_roles": {
+    "native_subagent_roles": {
       "enabled": true,
-      "explorer": { "model": "gpt-5.6-luna", "effort": "low" },
-      "flow_reader": { "model": "gpt-5.6-luna", "effort": "medium" },
-      "coding_worker": { "model": "gpt-5.6-luna", "effort": "xhigh" }
+      "explorer": {
+        "provider": "openai-subscribed",
+        "model": "gpt-5.6-luna",
+        "effort": "low",
+        "fallback": "none"
+      },
+      "flow_reader": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "effort": "medium",
+        "fallback": "inherit_from_parent"
+      },
+      "coding_worker": {
+        "provider": "openai-subscribed",
+        "model": "gpt-5.6-luna",
+        "effort": "xhigh",
+        "fallback": {
+          "provider": "openai-subscribed",
+          "model": "gpt-5.6-sol",
+          "enable_thinking": true,
+          "effort": "high"
+        }
+      }
     }
   }
 }
@@ -65,7 +87,17 @@ ChatGPT Subscription provider. Disable it to restore the standard
 
 While role routing is enabled, `explorer` and `flow-reader` remain read-only,
 while `coding-worker` uses the workspace's normal write profile and sandbox.
-These permission boundaries are not configurable through this setting.
+These permission boundaries are not configurable through this setting. Native
+subagents without an explicit role keep the standard subagent-model or parent
+inheritance behavior.
+
+The **Task Models** page exposes the same role settings and only lists enabled,
+tool-capable models from authenticated Native providers. `fallback` defaults to
+`none`; it can also inherit the parent thread's model or select an explicit model
+from any authenticated provider. A fallback starts one fresh attempt only for provider unavailability,
+rate limits, transient network failures, or context overflow. Tool failures,
+permission denials, failed verification, and user cancellation never trigger a
+model switch. External ACP agents select models through their own capabilities.
 
 ### Review Controls {#review-controls}
 

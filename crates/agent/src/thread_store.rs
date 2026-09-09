@@ -18,6 +18,7 @@ impl ThreadStore {
     pub fn init_global(cx: &mut App) {
         let thread_store = cx.new(|cx| Self::new(cx));
         cx.set_global(GlobalThreadStore(thread_store));
+        crate::cache_keepalive::init(cx);
     }
 
     pub fn global(cx: &App) -> Entity<Self> {
@@ -174,6 +175,7 @@ mod tests {
             sandbox_grants: Default::default(),
             tool_filter: None,
             orchestration_run: None,
+            orchestration_goal: None,
         }
     }
 

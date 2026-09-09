@@ -103,6 +103,8 @@ pub struct DbThread {
     pub tool_filter: Option<Vec<SharedString>>,
     #[serde(default)]
     pub orchestration_run: Option<agent_orchestration::PersistedRun>,
+    #[serde(default)]
+    pub orchestration_goal: Option<agent_orchestration::GoalSnapshot>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -188,6 +190,7 @@ impl SharedThread {
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
             orchestration_run: None,
+            orchestration_goal: None,
         }
     }
 
@@ -232,7 +235,9 @@ impl DbThread {
                         }
                     }
                 }
-                crate::Message::Resume | crate::Message::Compaction(_) => {}
+                crate::Message::Resume
+                | crate::Message::OrchestrationResume(_)
+                | crate::Message::Compaction(_) => {}
             }
         }
         transcript
@@ -406,6 +411,7 @@ impl DbThread {
             thinking_enabled: false,
             thinking_effort: None,
             orchestration_run: None,
+            orchestration_goal: None,
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
@@ -888,6 +894,7 @@ mod tests {
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
             orchestration_run: None,
+            orchestration_goal: None,
         }
     }
 
@@ -1307,6 +1314,42 @@ mod tests {
         assert_eq!(loaded_run.state, agent_orchestration::RunState::Completed);
         assert_eq!(loaded_run.plan.title, "Orch Plan");
         assert_eq!(loaded_run.task_statuses.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_orchestration_goal_roundtrips_through_save_load(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let thread_id = session_id("orchestration-goal-thread");
+        let mut thread = make_thread(
+            "Orchestration Goal Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        let goal = agent_orchestration::GoalController::new(
+            agent_orchestration::RunId::new(),
+            "Complete the requested change",
+            Vec::new(),
+            agent_orchestration::GoalControllerConfig::default(),
+        )
+        .unwrap()
+        .snapshot();
+        thread.orchestration_goal = Some(goal.clone());
+
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded = database
+            .load_thread(thread_id)
+            .await
+            .unwrap()
+            .expect("thread should exist");
+        let loaded_goal = loaded
+            .orchestration_goal
+            .expect("orchestration goal should be restored");
+        assert_eq!(loaded_goal.run_id, goal.run_id);
+        assert_eq!(loaded_goal.objective, goal.objective);
+        assert_eq!(loaded_goal.status, agent_orchestration::GoalStatus::Active);
     }
 
     #[gpui::test]

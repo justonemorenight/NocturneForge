@@ -68,7 +68,12 @@ impl AgentExecutionStrategy {
                     acceptance criteria, repair failures, and continue through dependent phases\n\
                     until closure. Report actionable progress and evidence, not just intent. Do not\n\
                     yield at an intermediate phase, and stop only when complete or when a concrete\n\
-                    blocker requires the user's input. Respect an explicit request to work directly\n\
+                    blocker requires the user's input. When `spawn_agent` returns an orchestration\n\
+                    proposal awaiting approval, the native approval card is the only approval\n\
+                    control: do not call `ask_user`, ask for confirmation in prose, or tell the user to reply;\n\
+                    give at most a brief non-interrogative summary and wait. Before presenting the final response, call\n\
+                    `update_orchestration_goal` with action `complete`; do this only after the goal\n\
+                    is actually satisfied and verification is complete. Respect an explicit request to work directly\n\
                     or not to delegate.",
             ),
         }
@@ -115,7 +120,11 @@ mod tests {
         assert!(
             AgentExecutionStrategy::Orchestrate
                 .system_prompt()
-                .is_some_and(|prompt| prompt.contains("subagent tasks"))
+                .is_some_and(|prompt| {
+                    prompt.contains("subagent tasks")
+                        && prompt.contains("native approval card")
+                        && prompt.contains("only approval")
+                })
         );
     }
 }

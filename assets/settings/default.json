@@ -1089,6 +1089,20 @@
     "enabled": true,
     // Whether to create and update git checkpoints around Agent turns.
     "enable_checkpoints": true,
+    "cache_keepalive": false,
+    "cache_keepalive_config": {
+      "estimated_ttl_seconds": 1800,
+      "lead_seconds": 120,
+      "idle_window_seconds": 5400,
+      "max_pings": 2,
+      "max_requests_per_hour": 4,
+      "max_input_tokens_per_hour": 1000000,
+      "timeout_seconds": 30,
+      "max_output_bytes": 1024,
+      "max_capture_bytes": 1048576,
+      "max_captures": 8,
+      "min_cache_hit_percent": 90
+    },
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
@@ -1119,22 +1133,28 @@
       // Whether thinking is enabled.
       "enable_thinking": false,
     },
-    // Native role routing for subagents created by ChatGPT Subscription.
+    // Native role routing for subagents, independent of the parent provider.
     // Set enabled to false to restore Zed's standard subagent_model/parent
     // inheritance behavior. While enabled, tool permissions remain fixed by role.
-    "chatgpt_subagent_roles": {
+    "native_subagent_roles": {
       "enabled": true,
       "explorer": {
+        "provider": "openai-subscribed",
         "model": "gpt-5.6-luna",
         "effort": "low",
+        "fallback": "inherit_from_parent",
       },
       "flow_reader": {
+        "provider": "openai-subscribed",
         "model": "gpt-5.6-luna",
         "effort": "medium",
+        "fallback": "inherit_from_parent",
       },
       "coding_worker": {
+        "provider": "openai-subscribed",
         "model": "gpt-5.6-luna",
         "effort": "xhigh",
+        "fallback": "inherit_from_parent",
       },
     },
     // Additional parameters for language model requests. When making a request to a model, parameters will be taken

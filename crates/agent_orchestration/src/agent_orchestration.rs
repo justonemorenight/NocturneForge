@@ -31,9 +31,7 @@ pub use auto_policy::{
     AgentToolProfile, AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,
     ResolvedTurnPolicy, TurnPolicySource,
 };
-pub use budget::{
-    BudgetExceeded, BudgetUsage, ExecutionBudget, TaskBudgetState, TaskExecutionReporter,
-};
+pub use budget::{BudgetExceeded, BudgetUsage, TaskBudgetState, TaskExecutionReporter};
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};
 pub use context_checkpoint::{
     ContextCheckpoint, ContextCheckpointConfig, ContextCheckpointKind, ContextCheckpointStore,
@@ -68,11 +66,13 @@ pub use task_registry::TaskRegistry;
 pub use verification::{
     CriterionClaim, ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START,
     VerificationPolicy, VerificationResult, VerificationRunner, VerificationVerdict,
-    is_file_line_citation, output_without_verification_claim,
+    is_file_line_citation, output_without_verification_claim, verification_claim_envelope,
+    web_citation_url,
 };
 pub use worker::{
     AcpWorkerRuntimeConfig, CapabilitySnapshot, StructuredWaitReason, WorkerBroker, WorkerHandle,
-    WorkerHost, WorkerMetadata, WorkerTarget, WorkspaceIsolation, WorkspacePolicy,
+    WorkerHost, WorkerHostRegistry, WorkerMetadata, WorkerTarget, WorkspaceIsolation,
+    WorkspacePolicy,
 };
 pub use worktree_isolation::{IsolatedWorktree, WorktreeManager, WorktreeOwnershipMarker};
 
@@ -310,9 +310,9 @@ mod tests {
         assert!(policy.should_retry(2, &class, Some(2)));
         assert!(!policy.should_retry(3, &class, Some(2)));
 
-        let budget_err = "token budget of 1000 was exceeded";
+        let budget_err = "tool call budget of 10 was exceeded";
         let class = VerificationPolicy::classify_error(budget_err);
-        assert_eq!(class, ErrorClass::TokenBudgetExceeded);
+        assert_eq!(class, ErrorClass::ToolCallBudgetExceeded);
         assert!(!policy.should_retry(0, &class, Some(2)));
     }
 
@@ -581,6 +581,7 @@ mod tests {
             work_item_count: 1,
             available_tool_count: Some(5),
             can_orchestrate: true,
+            ..Default::default()
         };
         let decision_direct = AutoPolicyEngine::evaluate("fix typo in readme", context);
         assert_eq!(decision_direct.strategy, AgentExecutionStrategy::Direct);
@@ -597,6 +598,7 @@ mod tests {
                 work_item_count: 5,
                 available_tool_count: Some(10),
                 can_orchestrate: true,
+                ..Default::default()
             },
         );
         assert_eq!(decision_orch.strategy, AgentExecutionStrategy::Orchestrate);
@@ -639,6 +641,67 @@ mod tests {
         let statuses = handle.task_statuses();
         assert_eq!(statuses.len(), 2);
         assert!(statuses.iter().all(|s| s.state == TaskState::Completed));
+    }
+
+    #[gpui::test]
+    async fn test_native_model_fallback_starts_one_fresh_attempt(cx: &mut gpui::TestAppContext) {
+        let observed_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let observed_models = observed_models.clone();
+            let attempt_count = attempt_count.clone();
+            move |context| {
+                observed_models
+                    .lock()
+                    .expect("model observations lock")
+                    .push(context.task.model_override);
+                if attempt_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("429 rate limit exceeded");
+                }
+                Ok(TaskExecutionOutput::new("completed with fallback"))
+            }
+        }));
+
+        let mut task = OrchestrationTask::new("task-1", "Task 1", "desc");
+        task.model_override = Some("provider/primary".to_string());
+        task.fallback_model_override = Some("provider/fallback".to_string());
+        task.max_retries = Some(0);
+        let plan = OrchestrationPlan::new("Fallback", vec![task]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(
+            observed_models
+                .lock()
+                .expect("model observations lock")
+                .as_slice(),
+            [
+                Some("provider/primary".to_string()),
+                Some("provider/fallback".to_string())
+            ]
+        );
+
+        let status = handle.task_status(&TaskId::new("task-1")).expect("status");
+        assert_eq!(status.total_attempts, 2);
+        assert_eq!(status.model.as_deref(), Some("provider/fallback"));
+        assert_eq!(
+            status
+                .worker_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.fallback_from_model.as_deref()),
+            Some("provider/primary")
+        );
     }
 
     #[gpui::test]
@@ -1344,6 +1407,7 @@ mod tests {
                 work_item_count: 1,
                 available_tool_count: Some(5),
                 can_orchestrate: true,
+                ..Default::default()
             },
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
@@ -1422,62 +1486,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_token_budget_exceeded_fails_task_without_retry(cx: &mut gpui::TestAppContext) {
+    async fn test_reported_tokens_are_telemetry_only(cx: &mut gpui::TestAppContext) {
         let mut task = OrchestrationTask::new("task-token", "Token Task", "desc");
         task.max_retries = Some(3);
-        task.token_budget = Some(100);
-        let plan = OrchestrationPlan::new("Token Budget", vec![task]);
-        let policy = AgentExecutionPolicy {
-            strategy: AgentExecutionStrategy::Orchestrate,
-            autonomy: AgentAutonomy::Autonomous,
-        };
-        let mut config = RuntimeConfig::default();
-        config.foreground_executor = Some(cx.foreground_executor().clone());
-        config.scheduler.background_executor = Some(cx.background_executor.clone());
-
-        let executor = Rc::new(MockTaskExecutor::new(|_| {
-            Ok(TaskExecutionOutput::new("done").with_tokens_used(200))
-        }));
-        let (handle, completion) =
-            OrchestrationRuntime::start(plan, policy, executor, config).expect("start run");
-        assert_eq!(
-            completion.await.expect("receive").expect("complete"),
-            RunState::Failed
-        );
-        let status = handle
-            .task_status_by_session_id(&acp::SessionId::new("done"))
-            .or_else(|| {
-                handle
-                    .task_status(&TaskId::new("task-token"))
-                    .or_else(|| handle.task_statuses().into_iter().next())
-            });
-        let status = status.expect("task status present");
-        assert_eq!(status.state, TaskState::Failed);
-        assert_eq!(status.tokens_used, 200);
-        assert_eq!(status.budget_state.tokens_used, 200);
-        assert_eq!(status.phase, None);
-        assert_eq!(status.current_tool, None);
-        assert_eq!(
-            status.budget_state.stopped_reason,
-            Some(BudgetExceeded::TokenBudgetExceeded {
-                budget: 100,
-                used: 200,
-            })
-        );
-        let snapshot = handle.snapshot();
-        assert_eq!(snapshot.task_attempts[0].1[0].tokens_used, Some(200));
-        assert_eq!(
-            snapshot.task_attempts[0].1[0].output.as_deref(),
-            Some("done")
-        );
-    }
-
-    #[gpui::test]
-    async fn test_midflight_token_budget_failure_persists_usage(cx: &mut gpui::TestAppContext) {
-        let mut task = OrchestrationTask::new("task-token", "Token Task", "desc");
-        task.max_retries = Some(3);
-        task.token_budget = Some(100);
-        let plan = OrchestrationPlan::new("Token Budget", vec![task]);
+        let plan = OrchestrationPlan::new("Token Telemetry", vec![task]);
         let policy = AgentExecutionPolicy {
             strategy: AgentExecutionStrategy::Orchestrate,
             autonomy: AgentAutonomy::Autonomous,
@@ -1494,8 +1506,8 @@ mod tests {
             ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>>
             {
                 Box::pin(async move {
-                    context.reporter.report_tokens(200)?;
-                    Ok(TaskExecutionOutput::new("unreachable"))
+                    context.reporter.report_tokens(200);
+                    Ok(TaskExecutionOutput::new("done"))
                 })
             }
         }
@@ -1505,33 +1517,47 @@ mod tests {
                 .expect("start run");
         assert_eq!(
             completion.await.expect("receive").expect("complete"),
-            RunState::Failed
+            RunState::Completed
         );
         let status = handle
             .task_status(&TaskId::new("task-token"))
             .expect("task status present");
-        assert_eq!(status.state, TaskState::Failed);
+        assert_eq!(status.state, TaskState::Completed);
         assert_eq!(status.tokens_used, 200);
         assert_eq!(status.budget_state.tokens_used, 200);
         assert_eq!(status.phase, None);
-        assert_eq!(
-            status.budget_state.stopped_reason,
-            Some(BudgetExceeded::TokenBudgetExceeded {
-                budget: 100,
-                used: 200,
-            })
-        );
+        assert!(status.budget_state.stopped_reason.is_none());
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.task_attempts[0].1[0].tokens_used, Some(200));
-        assert!(snapshot.task_attempts[0].1[0].output.is_none());
+        assert_eq!(
+            snapshot.task_attempts[0].1[0].output.as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn legacy_task_hard_budgets_are_ignored() {
+        let task: OrchestrationTask = serde_json::from_value(serde_json::json!({
+            "id": "legacy-task",
+            "label": "Legacy task",
+            "description": "Previously persisted task",
+            "token_budget": 100,
+            "tool_call_budget": 10,
+            "time_budget_secs": 60
+        }))
+        .expect("legacy task remains readable");
+
+        let serialized = serde_json::to_value(task).expect("serialize task");
+        assert!(serialized.get("token_budget").is_none());
+        assert!(serialized.get("tool_call_budget").is_none());
+        assert!(serialized.get("time_budget_secs").is_none());
     }
 
     #[gpui::test]
-    async fn test_tool_call_budget_exceeded_fails_task(cx: &mut gpui::TestAppContext) {
+    async fn test_reported_tool_calls_are_telemetry_only(cx: &mut gpui::TestAppContext) {
         let mut task = OrchestrationTask::new("task-tool", "Tool Task", "desc");
         task.max_retries = Some(3);
-        task.tool_call_budget = Some(2);
-        let plan = OrchestrationPlan::new("Tool Call Budget", vec![task]);
+        let plan = OrchestrationPlan::new("Tool Call Telemetry", vec![task]);
         let policy = AgentExecutionPolicy {
             strategy: AgentExecutionStrategy::Orchestrate,
             autonomy: AgentAutonomy::Autonomous,
@@ -1549,12 +1575,11 @@ mod tests {
             {
                 let reporter = context.reporter;
                 Box::pin(async move {
-                    // Two tool calls exceed the budget of 2.
-                    reporter.report_tool_call_started("read_file")?;
+                    reporter.report_tool_call_started("read_file");
                     reporter.report_tool_call_finished();
-                    reporter.report_tool_call_started("read_file")?;
+                    reporter.report_tool_call_started("read_file");
                     reporter.report_tool_call_finished();
-                    reporter.report_tool_call_started("bash")?;
+                    reporter.report_tool_call_started("bash");
                     reporter.report_tool_call_finished();
                     Ok(TaskExecutionOutput::new("done"))
                 })
@@ -1565,50 +1590,16 @@ mod tests {
                 .expect("start run");
         assert_eq!(
             completion.await.expect("receive").expect("complete"),
-            RunState::Failed
+            RunState::Completed
         );
         let status = handle
             .task_status(&TaskId::new("task-tool"))
             .or_else(|| handle.task_statuses().into_iter().next());
         let status = status.expect("task status present");
-        assert_eq!(status.state, TaskState::Failed);
+        assert_eq!(status.state, TaskState::Completed);
         assert_eq!(status.budget_state.tool_calls_used, 3);
         assert_eq!(status.phase, None);
         assert_eq!(status.current_tool, None);
-        assert_eq!(
-            status.budget_state.stopped_reason,
-            Some(BudgetExceeded::ToolCallBudgetExceeded { budget: 2, used: 3 })
-        );
-    }
-
-    #[gpui::test]
-    async fn test_within_budget_completes_task(cx: &mut gpui::TestAppContext) {
-        let mut task = OrchestrationTask::new("task-ok", "Ok Task", "desc");
-        task.token_budget = Some(1_000);
-        task.tool_call_budget = Some(5);
-        let plan = OrchestrationPlan::new("Within Budget", vec![task]);
-        let policy = AgentExecutionPolicy {
-            strategy: AgentExecutionStrategy::Orchestrate,
-            autonomy: AgentAutonomy::Autonomous,
-        };
-        let mut config = RuntimeConfig::default();
-        config.foreground_executor = Some(cx.foreground_executor().clone());
-        config.scheduler.background_executor = Some(cx.background_executor.clone());
-
-        let executor = Rc::new(MockTaskExecutor::new(|_| {
-            Ok(TaskExecutionOutput::new("done").with_tokens_used(50))
-        }));
-        let (handle, completion) =
-            OrchestrationRuntime::start(plan, policy, executor, config).expect("start run");
-        assert_eq!(
-            completion.await.expect("receive").expect("complete"),
-            RunState::Completed
-        );
-        let status = handle
-            .task_status(&TaskId::new("task-ok"))
-            .or_else(|| handle.task_statuses().into_iter().next());
-        let status = status.expect("task status present");
-        assert_eq!(status.state, TaskState::Completed);
         assert!(status.budget_state.stopped_reason.is_none());
     }
 
@@ -1616,7 +1607,6 @@ mod tests {
     async fn test_repair_usage_is_included_in_attempt_total(cx: &mut gpui::TestAppContext) {
         let mut task = OrchestrationTask::new("task-repair", "Repair Task", "desc");
         task.acceptance_criteria = vec!["result is valid".to_string()];
-        task.token_budget = Some(1_000);
         let plan = OrchestrationPlan::new("Repair Budget", vec![task]);
         let policy = AgentExecutionPolicy {
             strategy: AgentExecutionStrategy::Orchestrate,
@@ -1895,6 +1885,55 @@ mod tests {
         );
         native_task.mode = None;
         native_task.model_override = Some("requested-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_err()
+        );
+        native_task.model_override = Some("provider/primary-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_ok()
+        );
+        native_task.fallback_model_override = Some("fallback-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_err()
+        );
+        native_task.fallback_model_override = Some("provider/primary-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_ok()
+        );
+        native_task.fallback_model_override = Some("provider/fallback-model".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_ok()
+        );
+
+        native_task.workspace_policy = WorkspacePolicy::read_only();
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_err()
+        );
+        native_task.native_role = Some("explorer".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_ok()
+        );
+        native_task.native_role = Some("flow-reader".to_string());
+        assert!(
+            broker_enabled
+                .validate_task_parameters(&native_task)
+                .is_ok()
+        );
+        native_task.native_role = Some("coding-worker".to_string());
         assert!(
             broker_enabled
                 .validate_task_parameters(&native_task)
