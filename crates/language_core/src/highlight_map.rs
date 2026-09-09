@@ -1,5 +1,4 @@
-use smallvec::SmallVec;
-use std::{num::NonZeroU32, ops::Range, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub struct HighlightMap(Arc<[Option<HighlightId>]>);
@@ -7,10 +6,10 @@ pub struct HighlightMap(Arc<[Option<HighlightId>]>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CaptureId(pub u32);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapturedRange {
-    pub range: Range<usize>,
-    pub capture_ids: SmallVec<[CaptureId; 4]>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HighlightCaptureRef {
+    pub grammar_index: usize,
+    pub capture_id: CaptureId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,11 +41,9 @@ impl HighlightMap {
         self.0.get(capture_id.0 as usize).copied().flatten()
     }
 
-    pub fn get_innermost(&self, capture_ids: &[CaptureId]) -> Option<HighlightId> {
-        capture_ids
-            .iter()
-            .rev()
-            .find_map(|&capture_id| self.get(capture_id))
+    #[inline]
+    pub fn same(&self, other: &HighlightMap) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 

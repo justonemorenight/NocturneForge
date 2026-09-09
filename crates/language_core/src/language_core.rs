@@ -12,7 +12,7 @@ pub use grammar::{
     NEXT_GRAMMAR_ID, OutlineConfig, OverrideConfig, OverrideEntry, ParseableLanguage,
     RedactionConfig, RunnableCapture, RunnableConfig, TextObject, TextObjectConfig,
 };
-pub use highlight_map::{CaptureId, CapturedRange, HighlightId, HighlightMap};
+pub use highlight_map::{CaptureId, HighlightId, HighlightMap};
 pub use language_config::{
     BlockCommentConfig, BracketPair, BracketPairConfig, BracketPairContent, DecreaseIndentConfig,
     JsxTagAutoCloseConfig, LanguageConfig, LanguageConfigOverride, LanguageMatcher,
