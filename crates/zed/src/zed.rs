@@ -5569,6 +5569,7 @@ mod tests {
                 "language_selector",
                 "welcome",
                 "line_ending_selector",
+                "lsp_command_selector",
                 "lsp_tool",
                 "markdown",
                 "menu",

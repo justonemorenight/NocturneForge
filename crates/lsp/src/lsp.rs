@@ -1056,7 +1056,7 @@ impl LanguageServer {
                             additional_properties_support: Some(true),
                         }),
                     }),
-                    ..WindowClientCapabilities::default()
+                    show_document: Some(ShowDocumentClientCapabilities { support: true }),
                 }),
             },
             trace: None,
