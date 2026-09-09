@@ -20,11 +20,12 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    AgentNotificationStyle, ChatGptSubagentRoleContent, ChatGptSubagentRolesContent, DockPosition,
-    DockSide, LanguageModelParameters, LanguageModelSelection, NotifyWhenAgentWaiting,
-    PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation, Settings, SettingsContent,
-    SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    AgentNotificationStyle, DockPosition, DockSide, LanguageModelParameters,
+    LanguageModelSelection, NativeSubagentRoleContent, NativeSubagentRolesContent,
+    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation,
+    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
+    SubagentFallbackModelContent, SubagentFallbackStrategy, ThinkingBlockDisplay,
+    ToolPermissionMode, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -49,33 +50,66 @@ pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
 
 #[derive(Clone, Debug)]
-pub struct ChatGptSubagentRoleSettings {
+pub struct NativeSubagentRoleSettings {
+    pub provider: settings::LanguageModelProviderSetting,
     pub model: String,
     pub effort: String,
+    pub fallback: SubagentFallbackModelSettings,
 }
 
-impl From<ChatGptSubagentRoleContent> for ChatGptSubagentRoleSettings {
-    fn from(content: ChatGptSubagentRoleContent) -> Self {
-        Self {
-            model: content.model.unwrap(),
-            effort: content.effort.unwrap(),
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SubagentFallbackModelSettings {
+    #[default]
+    None,
+    InheritFromParent,
+    Model(LanguageModelSelection),
+}
+
+impl From<SubagentFallbackModelContent> for SubagentFallbackModelSettings {
+    fn from(content: SubagentFallbackModelContent) -> Self {
+        match content {
+            SubagentFallbackModelContent::Strategy(SubagentFallbackStrategy::None) => Self::None,
+            SubagentFallbackModelContent::Strategy(SubagentFallbackStrategy::InheritFromParent) => {
+                Self::InheritFromParent
+            }
+            SubagentFallbackModelContent::Model(model) => Self::Model(model),
         }
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ChatGptSubagentRolesSettings {
-    pub enabled: bool,
-    pub explorer: ChatGptSubagentRoleSettings,
-    pub flow_reader: ChatGptSubagentRoleSettings,
-    pub coding_worker: ChatGptSubagentRoleSettings,
+impl NativeSubagentRoleSettings {
+    fn merge_content(mut self, content: NativeSubagentRoleContent) -> Self {
+        if let Some(provider) = content.provider {
+            self.provider = provider;
+        }
+        if let Some(model) = content.model {
+            self.model = model;
+        }
+        if let Some(effort) = content.effort {
+            self.effort = effort;
+        }
+        if let Some(fallback) = content.fallback {
+            self.fallback = fallback.into();
+        }
+        self
+    }
 }
 
-impl Default for ChatGptSubagentRolesSettings {
+#[derive(Clone, Debug)]
+pub struct NativeSubagentRolesSettings {
+    pub enabled: bool,
+    pub explorer: NativeSubagentRoleSettings,
+    pub flow_reader: NativeSubagentRoleSettings,
+    pub coding_worker: NativeSubagentRoleSettings,
+}
+
+impl Default for NativeSubagentRolesSettings {
     fn default() -> Self {
-        let role = |effort: &str| ChatGptSubagentRoleSettings {
+        let role = |effort: &str| NativeSubagentRoleSettings {
+            provider: settings::LanguageModelProviderSetting("openai-subscribed".to_string()),
             model: "gpt-5.6-luna".to_string(),
             effort: effort.to_string(),
+            fallback: SubagentFallbackModelSettings::InheritFromParent,
         };
         Self {
             enabled: true,
@@ -86,14 +120,22 @@ impl Default for ChatGptSubagentRolesSettings {
     }
 }
 
-impl From<ChatGptSubagentRolesContent> for ChatGptSubagentRolesSettings {
-    fn from(content: ChatGptSubagentRolesContent) -> Self {
-        Self {
-            enabled: content.enabled.unwrap(),
-            explorer: content.explorer.unwrap().into(),
-            flow_reader: content.flow_reader.unwrap().into(),
-            coding_worker: content.coding_worker.unwrap().into(),
+impl From<NativeSubagentRolesContent> for NativeSubagentRolesSettings {
+    fn from(content: NativeSubagentRolesContent) -> Self {
+        let mut settings = Self::default();
+        if let Some(enabled) = content.enabled {
+            settings.enabled = enabled;
         }
+        if let Some(explorer) = content.explorer {
+            settings.explorer = settings.explorer.merge_content(explorer);
+        }
+        if let Some(flow_reader) = content.flow_reader {
+            settings.flow_reader = settings.flow_reader.merge_content(flow_reader);
+        }
+        if let Some(coding_worker) = content.coding_worker {
+            settings.coding_worker = settings.coding_worker.merge_content(coding_worker);
+        }
+        settings
     }
 }
 
@@ -271,6 +313,8 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 pub struct AgentSettings {
     pub enabled: bool,
     pub enable_checkpoints: bool,
+    pub cache_keepalive: bool,
+    pub cache_keepalive_config: settings::CacheKeepaliveSettings,
     pub button: bool,
     pub dock: DockPosition,
     pub flexible: bool,
@@ -280,7 +324,7 @@ pub struct AgentSettings {
     pub max_content_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
-    pub chatgpt_subagent_roles: ChatGptSubagentRolesSettings,
+    pub native_subagent_roles: NativeSubagentRolesSettings,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -824,6 +868,8 @@ impl Settings for AgentSettings {
         Self {
             enabled: agent.enabled.unwrap(),
             enable_checkpoints: agent.enable_checkpoints.unwrap(),
+            cache_keepalive: agent.cache_keepalive.unwrap_or(false),
+            cache_keepalive_config: agent.cache_keepalive_config.clone().unwrap_or_default(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
             sidebar_side: agent.sidebar_side.unwrap(),
@@ -837,7 +883,7 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
-            chatgpt_subagent_roles: agent.chatgpt_subagent_roles.unwrap().into(),
+            native_subagent_roles: agent.native_subagent_roles.unwrap().into(),
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
@@ -1060,6 +1106,33 @@ mod tests {
     use settings::ToolPermissionMode;
     use settings::ToolPermissionsContent;
 
+    #[test]
+    fn native_subagent_roles_default_to_parent_fallback() {
+        let roles = NativeSubagentRolesSettings::default();
+        for role in [&roles.explorer, &roles.flow_reader, &roles.coding_worker] {
+            assert_eq!(
+                role.fallback,
+                SubagentFallbackModelSettings::InheritFromParent
+            );
+        }
+    }
+
+    #[test]
+    fn native_subagent_roles_accept_partial_content_without_panicking() {
+        let roles = NativeSubagentRolesSettings::from(NativeSubagentRolesContent {
+            explorer: Some(NativeSubagentRoleContent {
+                model: Some("custom-model".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(roles.explorer.model, "custom-model");
+        assert_eq!(roles.explorer.provider.0, "openai-subscribed");
+        assert_eq!(roles.flow_reader.effort, "medium");
+        assert_eq!(roles.coding_worker.effort, "xhigh");
+    }
+
     #[gpui::test]
     fn test_terminal_output_limit_defaults(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1205,7 +1278,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_chatgpt_subagent_roles_settings_merge_with_defaults(cx: &mut gpui::App) {
+    fn test_native_subagent_roles_settings_merge_with_legacy_alias(cx: &mut gpui::App) {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         project::DisableAiSettings::register(cx);
@@ -1220,7 +1293,20 @@ mod tests {
                                 "enabled": false,
                                 "explorer": {
                                     "model": "custom-luna",
-                                    "effort": "high"
+                                    "effort": "high",
+                                    "fallback": "inherit_from_parent"
+                                },
+                                "flow_reader": {
+                                    "provider": "anthropic",
+                                    "model": "claude-sonnet-4-5"
+                                },
+                                "coding_worker": {
+                                    "fallback": {
+                                        "provider": "openai-subscribed",
+                                        "model": "fallback-model",
+                                        "enable_thinking": true,
+                                        "effort": "medium"
+                                    }
                                 }
                             }
                         }
@@ -1230,13 +1316,25 @@ mod tests {
                 .unwrap();
         });
 
-        let roles = &AgentSettings::get_global(cx).chatgpt_subagent_roles;
+        let roles = &AgentSettings::get_global(cx).native_subagent_roles;
         assert!(!roles.enabled);
+        assert_eq!(roles.explorer.provider.0, "openai-subscribed");
         assert_eq!(roles.explorer.model, "custom-luna");
         assert_eq!(roles.explorer.effort, "high");
-        assert_eq!(roles.flow_reader.model, "gpt-5.6-luna");
+        assert_eq!(
+            roles.explorer.fallback,
+            SubagentFallbackModelSettings::InheritFromParent
+        );
+        assert_eq!(roles.flow_reader.provider.0, "anthropic");
+        assert_eq!(roles.flow_reader.model, "claude-sonnet-4-5");
         assert_eq!(roles.flow_reader.effort, "medium");
         assert_eq!(roles.coding_worker.effort, "xhigh");
+        let SubagentFallbackModelSettings::Model(fallback) = &roles.coding_worker.fallback else {
+            panic!("expected an explicit fallback model");
+        };
+        assert_eq!(fallback.provider.0, "openai-subscribed");
+        assert_eq!(fallback.model, "fallback-model");
+        assert_eq!(fallback.effort.as_deref(), Some("medium"));
     }
 
     #[test]

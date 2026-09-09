@@ -424,6 +424,18 @@ pub struct WorkerMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -464,6 +476,12 @@ impl WorkerMetadata {
             display_name: Some(target.display_name().to_string()),
             target,
             model: None,
+            model_display_name: None,
+            model_provider: None,
+            model_provider_display_name: None,
+            thinking_effort: None,
+            fallback_from_model: None,
+            fallback_reason: None,
             mode: None,
             version: None,
             workspace_policy: WorkspacePolicy::default(),
@@ -635,12 +653,78 @@ pub trait WorkerHost: 'static {
     ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>>;
 }
 
-/// Worker broker routing tasks to Native or ACP worker hosts based on target and capabilities.
-pub struct WorkerBroker {
+#[derive(Clone, Default)]
+pub struct WorkerHostRegistry {
     hosts: HashMap<WorkerTarget, Rc<dyn WorkerHost>>,
-    feature_flag_acp_delegation: bool,
+}
+
+impl WorkerHostRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_host(mut self, target: WorkerTarget, host: Rc<dyn WorkerHost>) -> Self {
+        self.register(target, host);
+        self
+    }
+
+    pub fn register(&mut self, target: WorkerTarget, host: Rc<dyn WorkerHost>) {
+        self.hosts.insert(target, host);
+    }
+
+    pub fn get(&self, target: &WorkerTarget) -> Option<Rc<dyn WorkerHost>> {
+        self.hosts.get(target).cloned()
+    }
+}
+
+struct WorkerTaskValidator<'a> {
+    host_registry: &'a WorkerHostRegistry,
+    acp_delegation_enabled: bool,
+}
+
+impl<'a> WorkerTaskValidator<'a> {
+    fn new(host_registry: &'a WorkerHostRegistry, acp_delegation_enabled: bool) -> Self {
+        Self {
+            host_registry,
+            acp_delegation_enabled,
+        }
+    }
+
+    fn validate(&self, task: &OrchestrationTask) -> Result<()> {
+        match &task.target {
+            WorkerTarget::Native => validate_native_task_parameters(task),
+            WorkerTarget::Acp { agent_id } => self.validate_acp(task, agent_id),
+        }
+    }
+
+    fn validate_acp(&self, task: &OrchestrationTask, agent_id: &str) -> Result<()> {
+        if !self.acp_delegation_enabled {
+            bail!(
+                "ACP delegation is currently disabled (feature flag is off); cannot delegate to agent '{}'",
+                agent_id
+            );
+        }
+
+        let host = self.host_registry.get(&task.target).ok_or_else(|| {
+            anyhow::anyhow!("worker agent '{}' is not configured or available", agent_id)
+        })?;
+        let capabilities = host.capabilities();
+        validate_acp_model(task.model_override.as_deref(), agent_id, &capabilities)?;
+        validate_acp_mode(task.mode.as_deref(), agent_id, &capabilities)?;
+        validate_acp_workspace(task, agent_id, &capabilities)
+    }
+}
+
+/// Worker broker routing tasks to Native or ACP worker hosts based on target and capabilities.
+struct WorkerBrokerConfiguration {
+    acp_delegation_enabled: bool,
+    acp_runtime: AcpWorkerRuntimeConfig,
+}
+
+pub struct WorkerBroker {
+    host_registry: WorkerHostRegistry,
+    configuration: WorkerBrokerConfiguration,
     native_executor: Option<Rc<dyn TaskExecutor>>,
-    acp_runtime_config: AcpWorkerRuntimeConfig,
     acp_concurrency_limiter: AcpConcurrencyLimiter,
 }
 
@@ -648,26 +732,28 @@ impl WorkerBroker {
     pub fn new(feature_flag_acp_delegation: bool) -> Self {
         let acp_runtime_config = AcpWorkerRuntimeConfig::default();
         Self {
-            hosts: HashMap::default(),
-            feature_flag_acp_delegation,
+            host_registry: WorkerHostRegistry::new(),
+            configuration: WorkerBrokerConfiguration {
+                acp_delegation_enabled: feature_flag_acp_delegation,
+                acp_runtime: acp_runtime_config.clone(),
+            },
             native_executor: None,
             acp_concurrency_limiter: AcpConcurrencyLimiter::new(acp_runtime_config.max_concurrency),
-            acp_runtime_config,
         }
     }
 
     pub fn with_acp_runtime_config(mut self, config: AcpWorkerRuntimeConfig) -> Self {
         self.acp_concurrency_limiter = AcpConcurrencyLimiter::new(config.max_concurrency);
-        self.acp_runtime_config = config;
+        self.configuration.acp_runtime = config;
         self
     }
 
     pub fn acp_runtime_config(&self) -> &AcpWorkerRuntimeConfig {
-        &self.acp_runtime_config
+        &self.configuration.acp_runtime
     }
 
-    pub fn with_host(mut self, target: WorkerTarget, host: Rc<dyn WorkerHost>) -> Self {
-        self.hosts.insert(target, host);
+    pub fn with_host_registry(mut self, host_registry: WorkerHostRegistry) -> Self {
+        self.host_registry = host_registry;
         self
     }
 
@@ -676,116 +762,129 @@ impl WorkerBroker {
         self
     }
 
-    pub fn register_host(&mut self, target: WorkerTarget, host: Rc<dyn WorkerHost>) {
-        self.hosts.insert(target, host);
-    }
-
-    pub fn get_host(&self, target: &WorkerTarget) -> Option<Rc<dyn WorkerHost>> {
-        self.hosts.get(target).cloned()
-    }
-
     pub fn set_feature_flag_acp_delegation(&mut self, enabled: bool) {
-        self.feature_flag_acp_delegation = enabled;
+        self.configuration.acp_delegation_enabled = enabled;
     }
 
     pub fn validate_task_parameters(&self, task: &OrchestrationTask) -> Result<()> {
-        match &task.target {
-            WorkerTarget::Native => {
-                if task.workspace_policy.isolation == WorkspaceIsolation::DedicatedWorktree {
-                    bail!("Native worker is not connected to a managed isolated worktree");
-                }
-                if task.workspace_policy.read_only {
-                    bail!("Native worker read-only enforcement is not implemented by this broker");
-                }
-                if task.model_override.is_some() || task.mode.is_some() {
-                    bail!(
-                        "model/mode override is not supported for native agent; use native_role for a Native role"
-                    );
-                }
-            }
-            WorkerTarget::Acp { agent_id } => {
-                if !self.feature_flag_acp_delegation {
-                    bail!(
-                        "ACP delegation is currently disabled (feature flag is off); cannot delegate to agent '{}'",
-                        agent_id
-                    );
-                }
-
-                let host = self.hosts.get(&task.target).ok_or_else(|| {
-                    anyhow::anyhow!("worker agent '{}' is not configured or available", agent_id)
-                })?;
-
-                let caps = host.capabilities();
-
-                if let Some(model) = &task.model_override {
-                    if !caps.can_select_model {
-                        bail!("worker '{}' does not support selecting a model", agent_id);
-                    }
-                    if !caps.supported_models.is_empty()
-                        && !caps.supported_models.iter().any(|m| m == model)
-                    {
-                        bail!(
-                            "model '{}' is not supported by worker '{}'; supported models: {:?}",
-                            model,
-                            agent_id,
-                            caps.supported_models
-                        );
-                    }
-                }
-
-                if let Some(mode) = &task.mode {
-                    if !caps.can_select_mode {
-                        bail!(
-                            "worker '{}' does not support selecting a session mode",
-                            agent_id
-                        );
-                    }
-                    if !caps.supported_modes.is_empty()
-                        && !caps.supported_modes.iter().any(|m| m == mode)
-                    {
-                        bail!(
-                            "mode '{}' is not supported by worker '{}'; supported modes: {:?}",
-                            mode,
-                            agent_id,
-                            caps.supported_modes
-                        );
-                    }
-                }
-
-                if task.workspace_policy.read_only && !caps.can_enforce_read_only {
-                    bail!(
-                        "worker '{}' cannot enforce read-only execution; read-only tasks cannot run without proper enforcement",
-                        agent_id
-                    );
-                }
-                if task.workspace_policy.read_only
-                    && task.workspace_policy.isolation != WorkspaceIsolation::SharedParent
-                {
-                    bail!(
-                        "worker '{}' read-only tasks must use the shared parent workspace",
-                        agent_id
-                    );
-                }
-                if !task.workspace_policy.read_only
-                    && task.workspace_policy.isolation != WorkspaceIsolation::DedicatedWorktree
-                {
-                    bail!(
-                        "worker '{}' write tasks require a dedicated managed worktree",
-                        agent_id
-                    );
-                }
-                if task.workspace_policy.isolation == WorkspaceIsolation::DedicatedWorktree
-                    && !caps.supports_worktree_isolation
-                {
-                    bail!(
-                        "worker '{}' is not connected to a managed isolated worktree",
-                        agent_id
-                    );
-                }
-            }
-        }
-        Ok(())
+        WorkerTaskValidator::new(
+            &self.host_registry,
+            self.configuration.acp_delegation_enabled,
+        )
+        .validate(task)
     }
+}
+
+fn validate_native_task_parameters(task: &OrchestrationTask) -> Result<()> {
+    if task.workspace_policy.isolation == WorkspaceIsolation::DedicatedWorktree {
+        bail!("Native worker is not connected to a managed isolated worktree");
+    }
+    if task.workspace_policy.read_only
+        && !matches!(
+            task.native_role.as_deref(),
+            Some("explorer" | "flow-reader")
+        )
+    {
+        bail!("Native read-only workspace requires native_role `explorer` or `flow-reader`");
+    }
+    if task.mode.is_some() {
+        bail!("mode override is not supported for native agent; use native_role for a Native role");
+    }
+    validate_native_model(task.model_override.as_deref(), "model")?;
+    validate_native_model(task.fallback_model_override.as_deref(), "fallback model")
+}
+
+fn validate_native_model(model: Option<&str>, field_name: &str) -> Result<()> {
+    if let Some(model) = model
+        && !is_valid_native_model_identifier(model)
+    {
+        bail!("invalid native {field_name} identifier '{model}'; expected provider/model");
+    }
+    Ok(())
+}
+
+fn validate_acp_model(
+    model: Option<&str>,
+    agent_id: &str,
+    capabilities: &CapabilitySnapshot,
+) -> Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+    if !capabilities.can_select_model {
+        bail!("worker '{agent_id}' does not support selecting a model");
+    }
+    if !capabilities.supported_models.is_empty()
+        && !capabilities
+            .supported_models
+            .iter()
+            .any(|supported| supported == model)
+    {
+        bail!(
+            "model '{model}' is not supported by worker '{agent_id}'; supported models: {:?}",
+            capabilities.supported_models
+        );
+    }
+    Ok(())
+}
+
+fn validate_acp_mode(
+    mode: Option<&str>,
+    agent_id: &str,
+    capabilities: &CapabilitySnapshot,
+) -> Result<()> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    if !capabilities.can_select_mode {
+        bail!("worker '{agent_id}' does not support selecting a session mode");
+    }
+    if !capabilities.supported_modes.is_empty()
+        && !capabilities
+            .supported_modes
+            .iter()
+            .any(|supported| supported == mode)
+    {
+        bail!(
+            "mode '{mode}' is not supported by worker '{agent_id}'; supported modes: {:?}",
+            capabilities.supported_modes
+        );
+    }
+    Ok(())
+}
+
+fn validate_acp_workspace(
+    task: &OrchestrationTask,
+    agent_id: &str,
+    capabilities: &CapabilitySnapshot,
+) -> Result<()> {
+    if task.workspace_policy.read_only && !capabilities.can_enforce_read_only {
+        bail!(
+            "worker '{agent_id}' cannot enforce read-only execution; read-only tasks cannot run without proper enforcement"
+        );
+    }
+    if task.workspace_policy.read_only
+        && task.workspace_policy.isolation != WorkspaceIsolation::SharedParent
+    {
+        bail!("worker '{agent_id}' read-only tasks must use the shared parent workspace");
+    }
+    if !task.workspace_policy.read_only
+        && task.workspace_policy.isolation != WorkspaceIsolation::DedicatedWorktree
+    {
+        bail!("worker '{agent_id}' write tasks require a dedicated managed worktree");
+    }
+    if task.workspace_policy.isolation == WorkspaceIsolation::DedicatedWorktree
+        && !capabilities.supports_worktree_isolation
+    {
+        bail!("worker '{agent_id}' is not connected to a managed isolated worktree");
+    }
+    Ok(())
+}
+
+fn is_valid_native_model_identifier(model: &str) -> bool {
+    model
+        .split_once('/')
+        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
 }
 
 impl TaskExecutor for WorkerBroker {
@@ -803,7 +902,7 @@ impl TaskExecutor for WorkerBroker {
                 if let Some(executor) = self.native_executor.clone() {
                     return executor.execute(context);
                 }
-                if let Some(host) = self.hosts.get(&task.target).cloned() {
+                if let Some(host) = self.host_registry.get(&task.target) {
                     return Box::pin(async move {
                         let mut worker = host.create_worker(&task, &context).await?;
                         let metadata = worker.metadata().clone();
@@ -821,7 +920,7 @@ impl TaskExecutor for WorkerBroker {
                 })
             }
             WorkerTarget::Acp { .. } => {
-                let host = match self.hosts.get(&task.target).cloned() {
+                let host = match self.host_registry.get(&task.target) {
                     Some(h) => h,
                     None => {
                         let target = task.target.clone();
@@ -928,7 +1027,7 @@ impl TaskExecutor for WorkerBroker {
         if let Err(error) = self.validate_task_parameters(task) {
             return Box::pin(async move { Err(error) });
         }
-        let Some(host) = self.hosts.get(&task.target).cloned() else {
+        let Some(host) = self.host_registry.get(&task.target) else {
             let target = task.target.clone();
             return Box::pin(async move {
                 bail!("no worker host registered for repair target '{}'", target)

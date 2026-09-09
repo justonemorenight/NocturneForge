@@ -139,6 +139,12 @@ pub trait LanguageModel: Send + Sync {
 
     fn telemetry_id(&self) -> String;
 
+    /// Identifies the authenticated routing scope for optional cache replay.
+    /// Providers without an isolated replay path must leave this unsupported.
+    fn cache_warming_scope(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
     fn api_key(&self, _cx: &App) -> Option<String> {
         None
     }

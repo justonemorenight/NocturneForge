@@ -1429,6 +1429,19 @@ struct OpenAiSubscribedLanguageModel {
 }
 
 impl LanguageModel for OpenAiSubscribedLanguageModel {
+    fn cache_warming_scope(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        if state.account_mutation_in_progress || state.credentials.is_none() {
+            return None;
+        }
+        Some(format!(
+            "{}:{}:{}",
+            state.active_session_id.as_deref()?,
+            state.auth_generation,
+            self.model.id()
+        ))
+    }
+
     fn id(&self) -> LanguageModelId {
         self.id.clone()
     }
@@ -1749,7 +1762,10 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let request_limiter = self.request_limiter.clone();
         let background_executor = cx.background_executor().clone();
 
+        let expected_auth_generation = state.read_with(cx, |state, _| state.auth_generation);
         let future = cx.spawn(async move |cx| {
+            let expected_auth_generation = expected_auth_generation
+                .map_err(LanguageModelCompletionError::Other)?;
             // Mark the whole operation busy up front, including credential
             // refresh and request preparation, so account mutations are
             // blocked for the full lifetime of the stream.
@@ -1757,6 +1773,9 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                 .read_with(&*cx, |state, _| {
                     if state.account_mutation_in_progress {
                         return Err(anyhow!("A ChatGPT account operation is in progress"));
+                    }
+                    if state.auth_generation != expected_auth_generation {
+                        return Err(anyhow!("ChatGPT account changed before request started"));
                     }
                     Ok(state.active_operations.clone())
                 })
@@ -3123,6 +3142,42 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[gpui::test]
+    async fn cache_warming_scope_tracks_account_and_auth_generation(cx: &mut TestAppContext) {
+        let credentials = make_fresh_credentials();
+        let session_id = session_id_for_credentials(&credentials);
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state(http, Some(credentials), cx);
+        state.update(cx, |state, _| {
+            state.active_session_id = Some(session_id);
+        });
+        let catalog_model = ChatGptModel::fallback_models()
+            .into_iter()
+            .next()
+            .expect("fallback catalog must contain a model");
+        let model = cx.read(|cx| create_language_model(catalog_model, &state, cx));
+
+        let initial_scope = cx
+            .read(|cx| model.cache_warming_scope(cx))
+            .expect("authenticated model should expose a warming scope");
+        state.update(cx, |state, _| {
+            state.auth_generation = state.auth_generation.wrapping_add(1);
+        });
+        let next_scope = cx
+            .read(|cx| model.cache_warming_scope(cx))
+            .expect("authenticated model should expose a warming scope");
+        assert_ne!(initial_scope, next_scope);
+
+        state.update(cx, |state, _| {
+            state.account_mutation_in_progress = true;
+        });
+        assert!(cx.read(|cx| model.cache_warming_scope(cx)).is_none());
+    }
 
     #[test]
     fn test_compaction_retry_policy() {

@@ -15,7 +15,7 @@ use crate::{
     pages::{
         open_audio_test_window, render_edit_prediction_setup_page, render_external_agents_page,
         render_llm_providers_page, render_mcp_servers_page, render_sandbox_settings_page,
-        render_skills_setup_page, render_tool_permissions_setup_page,
+        render_skills_setup_page, render_task_models_page, render_tool_permissions_setup_page,
     },
 };
 
@@ -8248,6 +8248,24 @@ fn ai_page(cx: &App) -> SettingsPage {
         let mut items = vec![SettingsPageItem::SectionHeader("Agent Configuration")];
 
         items.extend([
+            SettingsPageItem::SubPageLink(SubPageLink {
+                title: "Task Models".into(),
+                r#type: Default::default(),
+                json_path: Some("agent.native_subagent_roles"),
+                description: Some(
+                    "Choose primary and fallback models for native subagent roles.".into(),
+                ),
+                search_aliases: &[
+                    "fallback model",
+                    "native agent",
+                    "orchestration",
+                    "subagent model",
+                    "task model",
+                ],
+                in_json: false,
+                files: USER,
+                render: render_task_models_page,
+            }),
             SettingsPageItem::SubPageLink(SubPageLink {
                 title: "Skills".into(),
                 r#type: Default::default(),

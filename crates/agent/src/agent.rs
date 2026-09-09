@@ -1,4 +1,5 @@
 pub mod acp_worker;
+pub mod cache_keepalive;
 mod db;
 mod legacy_thread;
 mod native_agent_server;
@@ -56,8 +57,8 @@ use gpui::{
     TaskExt, WeakEntity,
 };
 use language_model::{
-    IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelRegistry,
+    ConfiguredModel, IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelRegistry, SelectedModel,
 };
 use project::{
     AgentId, Project, ProjectItem, ProjectPath, Worktree, WorktreeId,
@@ -70,6 +71,7 @@ use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 use std::any::Any;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::str::FromStr as _;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use util::ResultExt;
@@ -3264,20 +3266,158 @@ pub struct NativeThreadEnvironment {
     acp_thread: WeakEntity<AcpThread>,
 }
 
-impl NativeThreadEnvironment {
-    pub(crate) fn create_subagent_thread(
-        &self,
+struct NativeSubagentRequest {
+    label: String,
+    requested_role: Option<SubagentRole>,
+    model_override: Option<String>,
+    thinking_effort: Option<String>,
+    tool_filter: Option<Vec<SharedString>>,
+}
+
+impl NativeSubagentRequest {
+    fn new(
         label: String,
         requested_role: Option<SubagentRole>,
+        model_override: Option<String>,
+        thinking_effort: Option<String>,
         tool_filter: Option<Vec<SharedString>>,
+    ) -> Self {
+        Self {
+            label,
+            requested_role,
+            model_override,
+            thinking_effort,
+            tool_filter,
+        }
+    }
+}
+
+struct ResolvedNativeSubagentConfiguration {
+    role: Option<SubagentRole>,
+    configured_model: Option<ConfiguredModel>,
+    thinking_effort: Option<String>,
+}
+
+fn resolve_native_subagent_configuration(
+    request: &NativeSubagentRequest,
+    cx: &mut App,
+) -> Result<ResolvedNativeSubagentConfiguration> {
+    let role = resolve_subagent_role_policy(
+        agent_settings::AgentSettings::get_global(cx)
+            .native_subagent_roles
+            .enabled,
+        request.requested_role,
+    );
+    let (model_override, thinking_effort) = match (&request.model_override, role) {
+        (Some(model), _) => (Some(model.clone()), request.thinking_effort.clone()),
+        (None, Some(role)) => {
+            let selection = role.model_selection(
+                &agent_settings::AgentSettings::get_global(cx).native_subagent_roles,
+            );
+            (
+                Some(format!("{}/{}", selection.provider.0, selection.model)),
+                selection.effort,
+            )
+        }
+        (None, None) => (None, request.thinking_effort.clone()),
+    };
+    let configured_model = model_override
+        .as_deref()
+        .map(|model_id| {
+            let selected = SelectedModel::from_str(model_id).map_err(|error| anyhow!(error))?;
+            LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| registry.select_model(&selected, cx))
+                .with_context(|| {
+                    format!("native subagent model '{model_id}' is not configured or available")
+                })
+        })
+        .transpose()?;
+    Ok(ResolvedNativeSubagentConfiguration {
+        role,
+        configured_model,
+        thinking_effort,
+    })
+}
+
+fn validate_subagent_tool_filter(
+    requested_tools: Option<Vec<SharedString>>,
+    available_tools: &HashSet<SharedString>,
+) -> Result<Option<HashSet<SharedString>>> {
+    requested_tools
+        .map(|tool_names| {
+            let mut filter = HashSet::default();
+            for tool_name in tool_names {
+                if available_tools.contains(&tool_name) {
+                    filter.insert(tool_name);
+                } else {
+                    anyhow::bail!(
+                        "Unknown tool `{tool_name}` in `tools`. Available tools: {}",
+                        available_tools
+                            .iter()
+                            .map(SharedString::as_ref)
+                            .sorted()
+                            .join(", ")
+                    );
+                }
+            }
+            anyhow::Ok(filter)
+        })
+        .transpose()
+}
+
+fn build_native_subagent_thread(
+    parent_thread: &Entity<Thread>,
+    label: String,
+    configuration: ResolvedNativeSubagentConfiguration,
+    tool_filter: Option<HashSet<SharedString>>,
+    cx: &mut App,
+) -> Entity<Thread> {
+    cx.new(|cx| {
+        let mut thread = Thread::new_subagent(parent_thread, configuration.role, cx);
+        if let Some(configured_model) = configuration.configured_model {
+            let model = configured_model.model;
+            let supported_efforts = model.supported_effort_levels();
+            let effort = configuration
+                .thinking_effort
+                .filter(|requested| {
+                    supported_efforts
+                        .iter()
+                        .any(|supported| supported.value.as_ref() == requested.as_str())
+                })
+                .or_else(|| {
+                    model
+                        .default_effort_level()
+                        .map(|effort| effort.value.to_string())
+                });
+            thread.set_subagent_model(model, effort, cx);
+        }
+        thread.set_title(label.into(), cx);
+        thread.set_tool_filter(tool_filter);
+        thread
+    })
+}
+
+impl NativeThreadEnvironment {
+    fn create_subagent_thread(
+        &self,
+        request: NativeSubagentRequest,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
-        let parent_thread = parent_thread_entity.read(cx);
-        let current_depth = parent_thread.depth();
-        let parent_session_id = parent_thread.id().clone();
+        let (current_depth, parent_session_id, available_tools) = {
+            let parent_thread = parent_thread_entity.read(cx);
+            (
+                parent_thread.depth(),
+                parent_thread.id().clone(),
+                parent_thread
+                    .enabled_tools(cx)
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+            )
+        };
 
         if current_depth >= MAX_SUBAGENT_DEPTH {
             return Err(anyhow!(
@@ -3286,61 +3426,19 @@ impl NativeThreadEnvironment {
             ));
         }
 
-        let is_chatgpt_subscription = parent_thread
-            .model()
-            .is_some_and(|model| model.provider_id().0.as_ref() == "openai-subscribed");
-        let role = resolve_subagent_role_policy(
-            is_chatgpt_subscription,
-            agent_settings::AgentSettings::get_global(cx)
-                .chatgpt_subagent_roles
-                .enabled,
-            requested_role,
-        )?;
-        // Validate the allowlist before creating anything, so an invalid name
-        // doesn't leave behind an empty subagent thread.
-        let tool_filter = tool_filter
-            .map(|tool_names| {
-                let enabled_tools = parent_thread.enabled_tools(cx);
-                let mut filter = HashSet::default();
-                for tool_name in tool_names {
-                    if enabled_tools.contains_key(tool_name.as_str()) {
-                        filter.insert(tool_name);
-                    } else {
-                        anyhow::bail!(
-                            "Unknown tool `{tool_name}` in `tools`. Available tools: {}",
-                            enabled_tools.keys().join(", ")
-                        );
-                    }
-                }
-                anyhow::Ok(filter)
-            })
-            .transpose()?;
-
-        let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, role, cx);
-            thread.set_title(label.into(), cx);
-            thread.set_tool_filter(tool_filter);
-            thread
-        });
+        let configuration = resolve_native_subagent_configuration(&request, cx)?;
+        let tool_filter = validate_subagent_tool_filter(request.tool_filter, &available_tools)?;
+        let subagent_thread = build_native_subagent_thread(
+            &parent_thread_entity,
+            request.label,
+            configuration,
+            tool_filter,
+            cx,
+        );
 
         let session_id = subagent_thread.read(cx).id().clone();
-
-        let acp_thread = self
-            .agent
-            .update(cx, |agent, cx| -> Result<Entity<AcpThread>> {
-                let project_id = agent
-                    .sessions
-                    .get(&parent_session_id)
-                    .map(|s| s.project_id)
-                    .context("parent session not found")?;
-                let acp_thread = agent.register_session(subagent_thread.clone(), project_id, cx);
-                let parent_session = agent
-                    .sessions
-                    .get_mut(&parent_session_id)
-                    .context("parent session not found")?;
-                parent_session.subagents.push(acp_thread.clone());
-                Ok(acp_thread)
-            })??;
+        let acp_thread =
+            self.register_subagent_session(&parent_session_id, subagent_thread.clone(), cx)?;
 
         let depth = current_depth + 1;
 
@@ -3353,6 +3451,29 @@ impl NativeThreadEnvironment {
         );
 
         self.prompt_subagent(session_id, subagent_thread, acp_thread)
+    }
+
+    fn register_subagent_session(
+        &self,
+        parent_session_id: &acp::SessionId,
+        subagent_thread: Entity<Thread>,
+        cx: &mut App,
+    ) -> Result<Entity<AcpThread>> {
+        self.agent
+            .update(cx, |agent, cx| -> Result<Entity<AcpThread>> {
+                let project_id = agent
+                    .sessions
+                    .get(parent_session_id)
+                    .map(|session| session.project_id)
+                    .context("parent session not found")?;
+                let acp_thread = agent.register_session(subagent_thread, project_id, cx);
+                let parent_session = agent
+                    .sessions
+                    .get_mut(parent_session_id)
+                    .context("parent session not found")?;
+                parent_session.subagents.push(acp_thread.clone());
+                Ok(acp_thread)
+            })?
     }
 
     pub(crate) fn resume_subagent_thread(
@@ -3514,10 +3635,15 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         &self,
         label: String,
         role: Option<SubagentRole>,
+        model_override: Option<String>,
+        thinking_effort: Option<String>,
         tool_filter: Option<Vec<SharedString>>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, role, tool_filter, cx)
+        self.create_subagent_thread(
+            NativeSubagentRequest::new(label, role, model_override, thinking_effort, tool_filter),
+            cx,
+        )
     }
 
     fn resume_subagent(
@@ -3628,6 +3754,18 @@ impl SubagentHandle for NativeSubagentHandle {
         Some(self.subagent_thread.read(cx).cumulative_token_usage())
     }
 
+    fn model_info(&self, cx: &App) -> Option<SubagentModelInfo> {
+        let thread = self.subagent_thread.read(cx);
+        let model = thread.model()?;
+        Some(SubagentModelInfo {
+            provider_id: model.provider_id().0.to_string(),
+            provider_name: model.provider_name().0.to_string(),
+            model_id: model.id().0.to_string(),
+            model_name: model.name().0.to_string(),
+            thinking_effort: thread.thinking_effort().cloned(),
+        })
+    }
+
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
         let thread = self.subagent_thread.clone();
         let acp_thread = self.acp_thread.clone();
@@ -3687,6 +3825,19 @@ impl SubagentHandle for NativeSubagentHandle {
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
                 SubagentPromptResult::Error(message) => Err(anyhow!("{message}")),
             };
+
+            if let Ok(output) = &result {
+                if let Some(envelope) = agent_orchestration::verification_claim_envelope(output) {
+                    thread
+                        .update(cx, |thread, cx| {
+                            thread.strip_last_agent_message_suffix(envelope, cx);
+                        });
+                    acp_thread
+                        .update(cx, |acp_thread, cx| {
+                            acp_thread.strip_last_assistant_message_suffix(envelope, cx);
+                        });
+                }
+            }
 
             parent_thread
                 .update(cx, |parent_thread, cx| {
@@ -6960,10 +7111,20 @@ mod internal_tests {
         };
 
         let first_subagent = cx
-            .update(|cx| environment.create_subagent_thread("first".to_string(), None, None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    NativeSubagentRequest::new("first".to_string(), None, None, None, None),
+                    cx,
+                )
+            })
             .unwrap();
         let second_subagent = cx
-            .update(|cx| environment.create_subagent_thread("second".to_string(), None, None, cx))
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    NativeSubagentRequest::new("second".to_string(), None, None, None, None),
+                    cx,
+                )
+            })
             .unwrap();
         cx.run_until_parked();
 

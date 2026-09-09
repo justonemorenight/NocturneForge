@@ -38,7 +38,6 @@ use db::kvp::KeyValueStore;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
-use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
@@ -158,6 +157,62 @@ impl AgentActivityStatus {
     }
 }
 
+fn format_worker_model(metadata: &agent_orchestration::WorkerMetadata) -> Option<String> {
+    let model = metadata
+        .model_display_name
+        .as_deref()
+        .or(metadata.model.as_deref())?;
+    let provider = metadata
+        .model_provider_display_name
+        .as_deref()
+        .or(metadata.model_provider.as_deref());
+    let mut parts = Vec::with_capacity(3);
+    if let Some(provider) = provider {
+        parts.push(provider.to_string());
+    }
+    parts.push(model.to_string());
+    if let Some(effort) = metadata.thinking_effort.as_deref() {
+        parts.push(effort.to_string());
+    }
+    let mut label = parts.join(" · ");
+    if let Some(previous_model) = metadata.fallback_from_model.as_deref() {
+        label.push_str(" · fallback from ");
+        label.push_str(previous_model);
+        if let Some(reason) = metadata.fallback_reason.as_deref() {
+            label.push_str(": ");
+            label.push_str(reason);
+        }
+    }
+    Some(label)
+}
+
+fn activity_model_label(
+    metadata: Option<&agent_orchestration::WorkerMetadata>,
+    active_model: Option<&str>,
+    thinking_effort: Option<&str>,
+) -> Option<String> {
+    if let Some(label) = metadata.and_then(format_worker_model) {
+        return Some(label);
+    }
+
+    let mut label = active_model?.to_string();
+    if let Some(effort) = thinking_effort {
+        label.push_str(" · ");
+        label.push_str(effort);
+    }
+    if let Some(metadata) = metadata
+        && let Some(previous_model) = metadata.fallback_from_model.as_deref()
+    {
+        label.push_str(" · fallback from ");
+        label.push_str(previous_model);
+        if let Some(reason) = metadata.fallback_reason.as_deref() {
+            label.push_str(": ");
+            label.push_str(reason);
+        }
+    }
+    Some(label)
+}
+
 #[derive(Clone)]
 struct AgentActivityItem {
     runtime_task_id: Option<agent_orchestration::TaskId>,
@@ -176,8 +231,6 @@ struct AgentActivityItem {
     tool_count: Option<u64>,
     requests: Option<u64>,
     tokens: Option<u64>,
-    token_budget: Option<u64>,
-    tool_call_budget: Option<u64>,
     worker: Option<SharedString>,
     mode: Option<SharedString>,
     scope: Option<SharedString>,
@@ -186,6 +239,27 @@ struct AgentActivityItem {
     patch_status: Option<SharedString>,
     verification: Option<agent_orchestration::VerificationResult>,
     last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+    awaiting_plan_approval: bool,
+    has_final_output: bool,
+}
+
+fn agent_activity_status_label(
+    status: AgentActivityStatus,
+    awaiting_plan_approval: bool,
+) -> &'static str {
+    if awaiting_plan_approval {
+        "Awaiting approval"
+    } else {
+        status.label()
+    }
+}
+
+fn should_open_worker_output(
+    has_final_output: bool,
+    has_session: bool,
+    session_is_loaded: bool,
+) -> bool {
+    has_final_output && (!has_session || !session_is_loaded)
 }
 
 fn verification_summary(result: &agent_orchestration::VerificationResult) -> String {
@@ -225,11 +299,11 @@ fn verification_visual(passed: bool) -> (IconName, Color) {
 }
 
 fn verification_citation_link(citation: &str) -> Option<SharedString> {
-    if !agent_orchestration::is_file_line_citation(citation) {
-        return None;
+    if agent_orchestration::is_file_line_citation(citation) {
+        let (path, location) = citation.rsplit_once(':')?;
+        return Some(format!("{path}#L{location}").into());
     }
-    let (path, location) = citation.rsplit_once(':')?;
-    Some(format!("{path}#L{location}").into())
+    agent_orchestration::web_citation_url(citation).map(SharedString::from)
 }
 
 fn effective_verification_criteria(
@@ -997,6 +1071,35 @@ struct EditedBufferOrder {
     membership: HashSet<(EntityId, EntityId)>,
     file_backed_membership: HashSet<EntityId>,
     buffers: Arc<[(Entity<Buffer>, Entity<BufferDiff>)]>,
+}
+
+struct OrchestrationProposalPresentation {
+    task_count: usize,
+    task_summary: String,
+    task_preview: String,
+    approve_label: String,
+}
+
+impl OrchestrationProposalPresentation {
+    fn new(run: &agent_orchestration::RunHandle) -> Self {
+        let task_count = run.plan().tasks.len();
+        let task_labels = run
+            .plan()
+            .tasks
+            .iter()
+            .map(|task| task.label.as_str())
+            .collect::<Vec<_>>();
+        Self {
+            task_count,
+            task_summary: task_labels.join("\n"),
+            task_preview: task_labels.join("  ·  "),
+            approve_label: if task_count == 1 {
+                "Approve & run task".to_string()
+            } else {
+                format!("Approve & run {task_count}")
+            },
+        }
+    }
 }
 
 pub struct ThreadView {
@@ -3732,8 +3835,6 @@ impl ThreadView {
                         tool_count: result.and_then(|result| result.tool_count),
                         requests: result.and_then(|result| result.requests),
                         tokens: result.and_then(|result| result.tokens),
-                        token_budget: None,
-                        tool_call_budget: None,
                         worker: (!agent.is_empty()).then(|| SharedString::from(agent)),
                         mode: None,
                         scope: None,
@@ -3742,6 +3843,8 @@ impl ThreadView {
                         patch_status: None,
                         verification: None,
                         last_activity_at: None,
+                        awaiting_plan_approval: false,
+                        has_final_output: false,
                     });
                 }
                 continue;
@@ -3772,8 +3875,6 @@ impl ThreadView {
                     let mut model = native_thread
                         .as_ref()
                         .and_then(|thread| thread.read(cx).model().map(|model| model.name().0));
-                    let mut token_budget = None;
-                    let mut tool_call_budget = None;
                     let mut current_tool = None;
                     let (tool_count, requests, tokens) = subagent_thread
                         .as_ref()
@@ -3865,8 +3966,6 @@ impl ThreadView {
                             .clone()
                             .map(SharedString::from)
                             .or(model);
-                        token_budget = task.token_budget;
-                        tool_call_budget = task.tool_call_budget;
                         mode = task.mode.clone().map(SharedString::from);
                         scope = task.scope.clone().map(SharedString::from);
                         objective = task.objective.clone().map(SharedString::from);
@@ -3928,8 +4027,6 @@ impl ThreadView {
                         tool_count,
                         requests,
                         tokens,
-                        token_budget,
-                        tool_call_budget,
                         worker: worker_target,
                         mode,
                         scope,
@@ -3938,6 +4035,8 @@ impl ThreadView {
                         patch_status,
                         verification,
                         last_activity_at: None,
+                        awaiting_plan_approval: false,
+                        has_final_output: false,
                     });
                 }
                 continue;
@@ -3998,8 +4097,6 @@ impl ThreadView {
                         tool_count: None,
                         requests: None,
                         tokens: None,
-                        token_budget: None,
-                        tool_call_budget: None,
                         worker: None,
                         mode: None,
                         scope: None,
@@ -4008,6 +4105,8 @@ impl ThreadView {
                         patch_status: None,
                         verification: None,
                         last_activity_at: None,
+                        awaiting_plan_approval: false,
+                        has_final_output: false,
                     });
                 }
                 continue;
@@ -4087,26 +4186,6 @@ impl ThreadView {
                 .and_then(serde_json::Value::as_str)
                 .filter(|message| !message.is_empty())
                 .map(|message| SharedString::from(message.to_owned()));
-            let token_budget = tool_call
-                .raw_input
-                .as_ref()
-                .and_then(|input| input.get("token_budget"))
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| {
-                    tool_call
-                        .raw_input
-                        .as_ref()
-                        .and_then(|input| input.get("tasks"))
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|tasks| {
-                            (tasks.len() == 1)
-                                .then(|| tasks.first())
-                                .flatten()
-                                .and_then(|task| task.get("token_budget"))
-                                .and_then(serde_json::Value::as_u64)
-                        })
-                });
-
             let (current_tool, tool_count, requests, tokens) = subagent_thread
                 .as_ref()
                 .map(|thread| {
@@ -4174,8 +4253,6 @@ impl ThreadView {
                 tool_count,
                 requests,
                 tokens,
-                token_budget,
-                tool_call_budget: None,
                 worker: None,
                 mode: None,
                 scope: None,
@@ -4184,6 +4261,8 @@ impl ThreadView {
                 patch_status: None,
                 verification: None,
                 last_activity_at: None,
+                awaiting_plan_approval: false,
+                has_final_output: false,
             };
 
             if let Some(position) = session_positions.get(&session_id).copied() {
@@ -4222,7 +4301,12 @@ impl ThreadView {
                         ))
                     })
                     .collect::<HashMap<_, _>>();
-                Some((run.task_statuses(), run.plan().tasks.clone(), agents))
+                Some((
+                    run.state(),
+                    run.task_statuses(),
+                    run.plan().tasks.clone(),
+                    agents,
+                ))
             } else {
                 thread.persisted_orchestration_run().map(|run| {
                     let mut agents = HashMap::default();
@@ -4246,11 +4330,16 @@ impl ThreadView {
                             );
                         }
                     }
-                    (run.task_statuses.clone(), run.plan.tasks.clone(), agents)
+                    (
+                        run.state,
+                        run.task_statuses.clone(),
+                        run.plan.tasks.clone(),
+                        agents,
+                    )
                 })
             }
         });
-        if let Some((statuses, tasks, agents)) = orchestration_snapshot {
+        if let Some((run_state, statuses, tasks, agents)) = orchestration_snapshot {
             let fallback_entry_ix = entries
                 .iter()
                 .enumerate()
@@ -4268,10 +4357,18 @@ impl ThreadView {
                     continue;
                 };
                 let activity_status = AgentActivityStatus::from_orchestration_state(status.state);
+                let awaiting_plan_approval = run_state == agent_orchestration::RunState::Proposed
+                    && status.state == agent_orchestration::TaskState::Pending;
                 let metadata = status.worker_metadata.as_ref();
-                let model = metadata
-                    .and_then(|metadata| metadata.model.clone())
-                    .or_else(|| task.model_override.clone())
+                let active_model = status.model.as_deref().or(task.model_override.as_deref());
+                let thinking_effort = if status.model.is_some()
+                    && status.model.as_deref() == task.fallback_model_override.as_deref()
+                {
+                    task.fallback_thinking_effort.as_deref()
+                } else {
+                    task.thinking_effort.as_deref()
+                };
+                let model = activity_model_label(metadata, active_model, thinking_effort)
                     .map(SharedString::from);
                 let mode = metadata
                     .and_then(|metadata| metadata.mode.clone())
@@ -4297,7 +4394,8 @@ impl ThreadView {
                 let wait_reason = status
                     .wait_reason
                     .as_ref()
-                    .map(|reason| SharedString::from(reason.description()));
+                    .map(|reason| SharedString::from(reason.description()))
+                    .or_else(|| status.latest_error.clone().map(SharedString::from));
                 let patch_status = if status.state == agent_orchestration::TaskState::AwaitingApply
                 {
                     Some(SharedString::from("Awaiting apply"))
@@ -4360,12 +4458,12 @@ impl ThreadView {
                     item.tokens = Some(status.tokens_used)
                         .filter(|tokens| *tokens > 0)
                         .or(item.tokens);
-                    item.token_budget = task.token_budget;
-                    item.tool_call_budget = task.tool_call_budget;
                     item.worktree_path = worktree_path;
                     item.patch_status = patch_status;
                     item.verification = status.latest_verification.clone();
                     item.last_activity_at = metadata.and_then(|metadata| metadata.last_activity_at);
+                    item.awaiting_plan_approval = awaiting_plan_approval;
+                    item.has_final_output = status.latest_output.is_some();
                     continue;
                 }
 
@@ -4390,8 +4488,6 @@ impl ThreadView {
                     tool_count: None,
                     requests: None,
                     tokens: Some(status.tokens_used).filter(|tokens| *tokens > 0),
-                    token_budget: task.token_budget,
-                    tool_call_budget: task.tool_call_budget,
                     worker,
                     mode,
                     scope: task.scope.clone().map(SharedString::from),
@@ -4400,6 +4496,8 @@ impl ThreadView {
                     patch_status,
                     verification: status.latest_verification.clone(),
                     last_activity_at: metadata.and_then(|metadata| metadata.last_activity_at),
+                    awaiting_plan_approval,
+                    has_final_output: status.latest_output.is_some(),
                 });
             }
         }
@@ -4796,7 +4894,13 @@ impl ThreadView {
             .count();
         let pending_count = items
             .iter()
-            .filter(|item| item.status == AgentActivityStatus::Pending)
+            .filter(|item| {
+                item.status == AgentActivityStatus::Pending && !item.awaiting_plan_approval
+            })
+            .count();
+        let awaiting_approval_count = items
+            .iter()
+            .filter(|item| item.awaiting_plan_approval)
             .count();
         let awaiting_apply_count = items
             .iter()
@@ -4808,6 +4912,8 @@ impl ThreadView {
             format!("{active_count} active")
         } else if awaiting_apply_count > 0 {
             format!("{awaiting_apply_count} awaiting review")
+        } else if awaiting_approval_count > 0 {
+            format!("{awaiting_approval_count} awaiting approval")
         } else if pending_count > 0 {
             format!("{pending_count} queued")
         } else {
@@ -4895,7 +5001,9 @@ impl ThreadView {
                             let target_task_id = item.runtime_task_id.clone();
                             let entry_ix = item.entry_ix;
                             let status = item.status;
+                            let awaiting_plan_approval = item.awaiting_plan_approval;
                             let patch_reviewable = item.patch_status.is_some();
+                            let has_final_output = item.has_final_output;
                             let can_restart = item.runtime_task_id.as_ref().is_some_and(|task_id| {
                                 self.as_native_thread(cx)
                                     .and_then(|thread| thread.read(cx).orchestration_run().cloned())
@@ -4904,25 +5012,29 @@ impl ThreadView {
                                             && matches!(&task.wait_reason, Some(agent_orchestration::StructuredWaitReason::AwaitingUserInput { .. }))
                                     }))
                             });
-                            let can_cancel = item.runtime_task_id.as_ref().is_some_and(|task_id| {
-                                self.as_native_thread(cx)
-                                    .and_then(|thread| thread.read(cx).orchestration_run().cloned())
-                                    .is_some_and(|run| {
-                                        !run.state().is_terminal()
-                                            && run.task_status(task_id).is_some_and(|task| {
-                                                matches!(
-                                                    task.state,
-                                                    agent_orchestration::TaskState::Pending
-                                                        | agent_orchestration::TaskState::WaitingDependency
-                                                        | agent_orchestration::TaskState::Running
-                                                        | agent_orchestration::TaskState::Verifying
-                                                        | agent_orchestration::TaskState::Repairing
-                                                        | agent_orchestration::TaskState::Retrying
-                                                )
-                                            })
-                                    })
-                            });
-                            let status_label = status.label();
+                            let can_cancel = !awaiting_plan_approval
+                                && item.runtime_task_id.as_ref().is_some_and(|task_id| {
+                                    self.as_native_thread(cx)
+                                        .and_then(|thread| {
+                                            thread.read(cx).orchestration_run().cloned()
+                                        })
+                                        .is_some_and(|run| {
+                                            !run.state().is_terminal()
+                                                && run.task_status(task_id).is_some_and(|task| {
+                                                    matches!(
+                                                        task.state,
+                                                        agent_orchestration::TaskState::Pending
+                                                            | agent_orchestration::TaskState::WaitingDependency
+                                                            | agent_orchestration::TaskState::Running
+                                                            | agent_orchestration::TaskState::Verifying
+                                                            | agent_orchestration::TaskState::Repairing
+                                                            | agent_orchestration::TaskState::Retrying
+                                                    )
+                                                })
+                                        })
+                                });
+                            let status_label =
+                                agent_activity_status_label(status, awaiting_plan_approval);
                             let name = item.name.clone();
                             let metadata = [
                                 Some(item.harness.to_owned()),
@@ -4937,12 +5049,6 @@ impl ThreadView {
                                 item.requests.map(|count| format!("{count} requests")),
                                 item.tokens.map(|tokens| {
                                     format!("{} tokens", crate::humanize_token_count(tokens))
-                                }),
-                                item.token_budget.map(|budget| {
-                                    format!("budget {}", crate::humanize_token_count(budget))
-                                }),
-                                item.tool_call_budget.map(|budget| {
-                                    format!("budget {budget} tool calls")
                                 }),
                                 (item.queued_messages > 0)
                                     .then(|| format!("{} queued messages", item.queued_messages)),
@@ -4959,6 +5065,11 @@ impl ThreadView {
                             });
                             let detail = current_activity
                                 .or(last_activity)
+                                .or_else(|| {
+                                    awaiting_plan_approval.then(|| {
+                                        "Run the plan to start this worker".to_string()
+                                    })
+                                })
                                 .or_else(|| item.last_intent.as_ref().map(ToString::to_string))
                                 .or_else(|| item.objective.as_ref().map(ToString::to_string))
                                 .or_else(|| item.task.as_ref().map(ToString::to_string));
@@ -4998,6 +5109,36 @@ impl ThreadView {
                                                     Color::Muted
                                                 },
                                             ),
+                                        )
+                                        .when_some(
+                                            item.runtime_task_id
+                                                .clone()
+                                                .filter(|_| can_cancel),
+                                            |header, task_id| {
+                                                header.child(
+                                                    IconButton::new(
+                                                        SharedString::from(format!(
+                                                            "cancel-{task_id}"
+                                                        )),
+                                                        IconName::Stop,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .icon_color(Color::Error)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .tooltip(Tooltip::text("Cancel Worker"))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.worker_patch_action(
+                                                                task_id.clone(),
+                                                                WorkerPatchAction::Cancel,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                            },
                                         ),
                                 )
                                 .when(!metadata.is_empty(), |this| {
@@ -5033,13 +5174,6 @@ impl ThreadView {
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.worker_patch_action(task_id.clone(), WorkerPatchAction::Restart, window, cx);
-                                        })))
-                                })
-                                .when_some(item.runtime_task_id.clone().filter(|_| can_cancel), |element, task_id| {
-                                    element.child(Button::new(SharedString::from(format!("cancel-{task_id}")), "Cancel Worker")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Cancel, window, cx);
                                         })))
                                 })
                                 .when_some(item.runtime_task_id.clone().filter(|_| item.worktree_path.is_some()), |element, task_id| {
@@ -5082,10 +5216,17 @@ impl ThreadView {
                                     this.tooltip(Tooltip::text(task))
                                 })
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    let session_is_loaded = target_session_id.as_ref().is_some_and(|session_id| {
+                                        this.server_view
+                                            .read_with(cx, |view, _| view.thread_view(session_id).is_some())
+                                            .unwrap_or(false)
+                                    });
                                     if let Some(task_id) = target_task_id.clone()
-                                        && target_session_id.as_ref().is_none_or(|session_id| {
-                                            this.server_view.read_with(cx, |view, _| view.thread_view(session_id).is_none()).unwrap_or(true)
-                                        })
+                                        && should_open_worker_output(
+                                            has_final_output,
+                                            target_session_id.is_some(),
+                                            session_is_loaded,
+                                        )
                                     {
                                         this.worker_patch_action(task_id, WorkerPatchAction::Output, window, cx);
                                         return;
@@ -5118,28 +5259,94 @@ impl ThreadView {
         run: &agent_orchestration::RunHandle,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let task_count = run.plan().tasks.len();
-        let task_summary = run
-            .plan()
-            .tasks
-            .iter()
-            .map(|task| task.label.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        h_flex()
+        let presentation = OrchestrationProposalPresentation::new(run);
+        let background = cx
+            .theme()
+            .colors()
+            .editor_background
+            .blend(Color::Accent.color(cx).opacity(0.07));
+        v_flex()
             .id("orchestration-runtime-proposal")
-            .p_1()
             .w_full()
+            .px_2()
+            .py_1p5()
             .gap_1()
-            .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
+            .bg(background)
+            .child(self.render_orchestration_proposal_header(&presentation, cx))
             .child(
-                Label::new(format!("Orchestration plan ({task_count} tasks)"))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                Label::new(presentation.task_preview)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .tooltip(Tooltip::text(presentation.task_summary))
+            .into_any_element()
+    }
+
+    fn render_orchestration_proposal_header(
+        &self,
+        presentation: &OrchestrationProposalPresentation,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1p5()
+            .child(
+                Icon::new(IconName::GitBranch)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(
+                        Label::new("Plan ready")
+                            .size(LabelSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "Review and approve before {} {} start",
+                            presentation.task_count,
+                            if presentation.task_count == 1 {
+                                "worker"
+                            } else {
+                                "workers"
+                            }
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
             )
             .child(div().flex_1())
             .child(
-                Button::new("approve-orchestration-runtime", "Run plan")
+                self.render_orchestration_proposal_actions(presentation.approve_label.clone(), cx),
+            )
+            .into_any_element()
+    }
+
+    fn render_orchestration_proposal_actions(
+        &self,
+        approve_label: String,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .gap_1p5()
+            .child(
+                Button::new("cancel-orchestration-runtime", "Cancel")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(thread) = this.as_native_thread(cx) {
+                            thread.update(cx, |thread, cx| {
+                                thread.cancel_orchestration_run(cx);
+                            });
+                        }
+                    })),
+            )
+            .child(
+                Button::new("approve-orchestration-runtime", approve_label)
                     .style(ButtonStyle::Filled)
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -5151,19 +5358,6 @@ impl ThreadView {
                         }
                     })),
             )
-            .child(
-                Button::new("cancel-orchestration-runtime", "Cancel")
-                    .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            thread.update(cx, |thread, cx| {
-                                thread.cancel_orchestration_run(cx);
-                            });
-                        }
-                    })),
-            )
-            .tooltip(Tooltip::text(task_summary))
             .into_any_element()
     }
 
@@ -7091,6 +7285,7 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .children(self.render_cache_warming_control(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .children(self.execution_strategy_selector.clone())
@@ -7331,6 +7526,37 @@ impl ThreadView {
             .is_some_and(|model| model.supports_split_token_display())
     }
 
+    fn native_model_reports_prompt_cache_usage(&self, cx: &App) -> bool {
+        self.as_native_thread(cx).is_some_and(|thread| {
+            thread.read(cx).model().is_some_and(|model| {
+                model.provider_id() == LanguageModelProviderId::new("openai-subscribed")
+            })
+        })
+    }
+
+    fn render_cache_warming_control(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.as_native_thread(cx)?;
+        if !thread
+            .read(cx)
+            .model()
+            .is_some_and(|model| model.cache_warming_scope(cx).is_some())
+        {
+            return None;
+        }
+        let thread_id = thread.read(cx).id().to_string();
+        let enabled = agent::cache_keepalive::enabled_for_thread(&thread_id, cx);
+        let owner = thread.downgrade();
+        let tooltip_id = thread_id.clone();
+        Some(Button::new("cache-warming", if enabled { "Cache: On" } else { "Cache: Off" })
+            .disabled(!AgentSettings::get_global(cx).cache_keepalive)
+            .tooltip(move |window, cx| Tooltip::text(
+                format!("{}\nOpt-in warming consumes usage. Enable agent.cache_keepalive in settings first. Changes apply after the next successful turn.", agent::cache_keepalive::status(&tooltip_id, cx)))(window, cx))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                agent::cache_keepalive::toggle_thread(thread_id.clone(), owner.clone(), cx);
+                cx.notify();
+            })))
+    }
+
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
@@ -7357,14 +7583,11 @@ impl ThreadView {
         let max = crate::humanize_token_count(usage.max_tokens);
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
-        let prompt_cache_usage = self
-            .as_native_thread(cx)
-            .filter(|thread| {
-                thread.read(cx).model().is_some_and(|model| {
-                    model.provider_id() == LanguageModelProviderId::new("openai-subscribed")
-                })
-            })
-            .map(|_| PromptCacheUsageDisplay::new(usage));
+        let prompt_cache_usage = should_render_prompt_cache_usage(
+            self.native_model_reports_prompt_cache_usage(cx),
+            usage,
+        )
+        .then(|| PromptCacheUsageDisplay::new(usage));
 
         let progress_ratio = if usage.max_tokens > 0 {
             usage.used_tokens as f32 / usage.max_tokens as f32
@@ -8483,6 +8706,24 @@ impl ThreadView {
     }
 }
 
+fn has_reported_cache_usage(usage: &acp_thread::TokenUsage) -> bool {
+    [
+        usage.cache_read_input_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cumulative_cache_read_input_tokens,
+        usage.cumulative_cache_creation_input_tokens,
+    ]
+    .into_iter()
+    .any(|tokens| tokens > 0)
+}
+
+fn should_render_prompt_cache_usage(
+    native_cache_supported: bool,
+    usage: &acp_thread::TokenUsage,
+) -> bool {
+    native_cache_supported || has_reported_cache_usage(usage)
+}
+
 #[derive(Clone)]
 struct PromptCacheUsageDisplay {
     latest_hit_rate: String,
@@ -8537,6 +8778,23 @@ fn format_cache_token_breakdown(total: u64, cached: u64, created: u64) -> String
 #[cfg(test)]
 mod prompt_cache_usage_tests {
     use super::*;
+
+    #[test]
+    fn cache_usage_requires_reported_counters() {
+        assert!(!has_reported_cache_usage(&acp_thread::TokenUsage::default()));
+        assert!(should_render_prompt_cache_usage(
+            true,
+            &acp_thread::TokenUsage::default()
+        ));
+        assert!(has_reported_cache_usage(&acp_thread::TokenUsage {
+            cumulative_cache_read_input_tokens: 1,
+            ..Default::default()
+        }));
+        assert!(has_reported_cache_usage(&acp_thread::TokenUsage {
+            cache_creation_input_tokens: 1,
+            ..Default::default()
+        }));
+    }
 
     #[test]
     fn formats_weighted_prompt_cache_usage() {
@@ -13289,7 +13547,7 @@ impl ThreadView {
         allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
-        let mut seen_kinds: ArrayVec<acp::PermissionOptionKind, 3, u8> = ArrayVec::new();
+        let mut seen_kinds = Vec::new();
 
         div()
             .p_1()
@@ -13368,8 +13626,7 @@ impl ThreadView {
                         if !is_first || disabled || seen_kinds.contains(&option.kind) {
                             return this;
                         }
-
-                        seen_kinds.push(option.kind).unwrap();
+                        seen_kinds.push(option.kind);
 
                         this.key_binding(
                             KeyBinding::for_action_in(action, focus_handle, cx)
@@ -16258,6 +16515,53 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn activity_model_label_uses_actual_worker_metadata() {
+        let mut metadata =
+            agent_orchestration::WorkerMetadata::new(agent_orchestration::WorkerTarget::Native);
+        assert_eq!(format_worker_model(&metadata), None);
+
+        metadata.model = Some("gpt-5.6-sol".to_string());
+        metadata.model_display_name = Some("GPT-5.6 Sol".to_string());
+        metadata.model_provider = Some("openai-subscribed".to_string());
+        metadata.model_provider_display_name = Some("ChatGPT".to_string());
+        metadata.thinking_effort = Some("high".to_string());
+        metadata.fallback_from_model = Some("openai-subscribed/gpt-5.6-luna".to_string());
+        metadata.fallback_reason = Some("rate limit".to_string());
+
+        assert_eq!(
+            format_worker_model(&metadata).as_deref(),
+            Some(
+                "ChatGPT · GPT-5.6 Sol · high · fallback from openai-subscribed/gpt-5.6-luna: rate limit"
+            )
+        );
+    }
+
+    #[test]
+    fn activity_model_label_falls_back_to_planned_and_transition_models() {
+        assert_eq!(
+            activity_model_label(None, Some("openai-subscribed/gpt-5.6-luna"), Some("low"))
+                .as_deref(),
+            Some("openai-subscribed/gpt-5.6-luna · low")
+        );
+
+        let mut metadata =
+            agent_orchestration::WorkerMetadata::new(agent_orchestration::WorkerTarget::Native);
+        metadata.fallback_from_model = Some("openai-subscribed/gpt-5.6-luna".to_string());
+        metadata.fallback_reason = Some("provider unavailable".to_string());
+        assert_eq!(
+            activity_model_label(
+                Some(&metadata),
+                Some("zed.dev/claude-sonnet-4"),
+                Some("medium")
+            )
+            .as_deref(),
+            Some(
+                "zed.dev/claude-sonnet-4 · medium · fallback from openai-subscribed/gpt-5.6-luna: provider unavailable"
+            )
+        );
+    }
+
     fn mcp_command(name: &str) -> acp::AvailableCommand {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
@@ -16523,6 +16827,19 @@ mod tests {
             AgentActivityStatus::from_tool_call_status(&ToolCallStatus::Canceled),
             AgentActivityStatus::Canceled
         );
+        assert_eq!(
+            agent_activity_status_label(AgentActivityStatus::Pending, true),
+            "Awaiting approval"
+        );
+        assert_eq!(
+            agent_activity_status_label(AgentActivityStatus::Pending, false),
+            "Pending"
+        );
+        assert!(!should_open_worker_output(false, false, false));
+        assert!(!should_open_worker_output(false, true, false));
+        assert!(should_open_worker_output(true, false, false));
+        assert!(should_open_worker_output(true, true, false));
+        assert!(!should_open_worker_output(true, true, true));
     }
 
     #[test]
@@ -16561,56 +16878,9 @@ mod tests {
             Some("src/main.rs#L12-24")
         );
         assert_eq!(verification_citation_link("src/main.rs"), None);
-    }
-
-    #[test]
-    fn orchestration_plan_budgets_surface_in_activity_item() {
-        let mut task = agent_orchestration::OrchestrationTask::new(
-            agent_orchestration::TaskId::new("task-1"),
-            "Refactor",
-            "Refactor the module",
-        )
-        .with_token_budget(50_000);
-        task.tool_call_budget = Some(10);
-        task.objective = Some("Refactor the module".to_owned());
-
-        let item = AgentActivityItem {
-            runtime_task_id: None,
-            canonical_path: None,
-            queued_messages: 0,
-            entry_ix: 0,
-            session_id: None,
-            name: "Subagent 1".into(),
-            harness: "Native",
-            status: AgentActivityStatus::Running,
-            model: None,
-            role: None,
-            task: None,
-            current_tool: Some(DelegatedTaskToolActivity {
-                name: task.objective.clone().unwrap(),
-                arguments: None,
-            }),
-            last_intent: None,
-            tool_count: None,
-            requests: None,
-            tokens: Some(1_000),
-            token_budget: task.token_budget,
-            tool_call_budget: task.tool_call_budget,
-            worker: None,
-            mode: None,
-            scope: None,
-            objective: None,
-            worktree_path: None,
-            patch_status: None,
-            verification: None,
-            last_activity_at: None,
-        };
-
-        assert_eq!(item.token_budget, Some(50_000));
-        assert_eq!(item.tool_call_budget, Some(10));
         assert_eq!(
-            item.current_tool.as_ref().map(|tool| tool.name.as_str()),
-            Some("Refactor the module")
+            verification_citation_link("https://example.com/pull/1").as_deref(),
+            Some("https://example.com/pull/1")
         );
     }
 

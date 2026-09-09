@@ -12,6 +12,7 @@ use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
 use agent_settings::{UserAgentsMd, UserAgentsTemplate};
 
+use crate::cache_keepalive;
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
     sandbox_worktree_writable_paths, sandboxing_available_for_project,
@@ -20,7 +21,7 @@ use crate::sandboxing::{
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
     AgentAutonomy, AgentExecutionStrategy, AgentProfileId, AgentProfileSettings, AgentSettings,
-    AutoCompactThreshold, COMPACTION_PROMPT, ChatGptSubagentRolesSettings,
+    AutoCompactThreshold, COMPACTION_PROMPT, NativeSubagentRolesSettings,
     SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -78,10 +79,9 @@ const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 2;
-const CHATGPT_SUBSCRIPTION_PROVIDER_ID: &str = "openai-subscribed";
+const DEFAULT_MAX_PARENT_ORCHESTRATION_CONTINUATIONS: usize = 8;
 
-/// A role used by native ChatGPT Subscription subagents.
-/// Other providers keep their existing subagent behavior and ignore this value.
+/// A role used by native subagents.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum SubagentRole {
@@ -91,19 +91,13 @@ pub enum SubagentRole {
 }
 
 pub(crate) fn resolve_subagent_role_policy(
-    is_chatgpt_subscription: bool,
     enabled: bool,
     requested_role: Option<SubagentRole>,
-) -> Result<Option<SubagentRole>> {
-    if !is_chatgpt_subscription || !enabled {
-        return Ok(None);
+) -> Option<SubagentRole> {
+    if !enabled {
+        return None;
     }
-
     requested_role
-        .context(
-            "ChatGPT Subscription subagents require agent_type: explorer, flow-reader, or coding-worker",
-        )
-        .map(Some)
 }
 
 impl SubagentRole {
@@ -115,7 +109,10 @@ impl SubagentRole {
         }
     }
 
-    fn model_selection(self, roles: &ChatGptSubagentRolesSettings) -> LanguageModelSelection {
+    pub(crate) fn model_selection(
+        self,
+        roles: &NativeSubagentRolesSettings,
+    ) -> LanguageModelSelection {
         let configured = match self {
             Self::Explorer => &roles.explorer,
             Self::FlowReader => &roles.flow_reader,
@@ -123,13 +120,28 @@ impl SubagentRole {
         };
 
         LanguageModelSelection {
-            provider: settings::LanguageModelProviderSetting(
-                CHATGPT_SUBSCRIPTION_PROVIDER_ID.to_string(),
-            ),
+            provider: configured.provider.clone(),
             model: configured.model.clone(),
             enable_thinking: true,
             effort: Some(configured.effort.clone()),
             speed: None,
+        }
+    }
+
+    pub(crate) fn fallback_model_selection(
+        self,
+        roles: &NativeSubagentRolesSettings,
+        parent: Option<&LanguageModelSelection>,
+    ) -> Option<LanguageModelSelection> {
+        let configured = match self {
+            Self::Explorer => &roles.explorer,
+            Self::FlowReader => &roles.flow_reader,
+            Self::CodingWorker => &roles.coding_worker,
+        };
+        match &configured.fallback {
+            agent_settings::SubagentFallbackModelSettings::None => None,
+            agent_settings::SubagentFallbackModelSettings::InheritFromParent => parent.cloned(),
+            agent_settings::SubagentFallbackModelSettings::Model(model) => Some(model.clone()),
         }
     }
 
@@ -363,7 +375,14 @@ pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
     Resume,
+    OrchestrationResume(OrchestrationResumeReason),
     Compaction(CompactionInfo),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum OrchestrationResumeReason {
+    GoalIncomplete,
+    RepairMalformedToolCall,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -427,6 +446,20 @@ impl Message {
                 cache: false,
                 reasoning_details: None,
             }],
+            Message::OrchestrationResume(reason) => vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![match reason {
+                    OrchestrationResumeReason::GoalIncomplete => {
+                        "The orchestration goal is still active. Continue the work from the latest evidence. Do not summarize or stop at an intermediate phase. When the goal and its verification are complete, call update_orchestration_goal with action complete before presenting the final response."
+                    }
+                    OrchestrationResumeReason::RepairMalformedToolCall => {
+                        "Your previous response ended with a tool call encoded as plain text, so it was not executed. Reissue that operation through the registered structured tool interface. Continue the active orchestration goal afterward, and call update_orchestration_goal with action complete only when the goal is actually verified."
+                    }
+                }
+                .into()],
+                cache: false,
+                reasoning_details: None,
+            }],
         }
     }
 
@@ -435,13 +468,17 @@ impl Message {
             Message::User(message) => message.to_markdown(),
             Message::Agent(message) => message.to_markdown(),
             Message::Resume => "[resume]\n".into(),
+            Message::OrchestrationResume(_) => "[orchestration resume]\n".into(),
             Message::Compaction(_) => "--- Context Compacted ---\n".into(),
         }
     }
 
     pub fn role(&self) -> Role {
         match self {
-            Message::User(_) | Message::Resume | Message::Compaction(_) => Role::User,
+            Message::User(_)
+            | Message::Resume
+            | Message::OrchestrationResume(_)
+            | Message::Compaction(_) => Role::User,
             Message::Agent(_) => Role::Assistant,
         }
     }
@@ -974,11 +1011,24 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Provider-reported usage accumulated across the subagent session.
     fn cumulative_token_usage(&self, cx: &App) -> Option<language_model::TokenUsage>;
+    /// The model that is actually attached to this subagent session.
+    fn model_info(&self, _cx: &App) -> Option<SubagentModelInfo> {
+        None
+    }
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
     /// Cancels the active subagent turn and resolves after the underlying
     /// provider request has settled.
     fn cancel(&self, cx: &AsyncApp) -> Task<()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentModelInfo {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_id: String,
+    pub model_name: String,
+    pub thinking_effort: Option<String>,
 }
 
 pub trait ThreadEnvironment {
@@ -999,6 +1049,8 @@ pub trait ThreadEnvironment {
         &self,
         label: String,
         role: Option<SubagentRole>,
+        model_override: Option<String>,
+        thinking_effort: Option<String>,
         tool_filter: Option<Vec<SharedString>>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
@@ -1586,6 +1638,7 @@ pub struct Thread {
     tool_filter: Option<HashSet<SharedString>>,
     orchestration_run: Option<agent_orchestration::RunHandle>,
     persisted_orchestration_run: Option<agent_orchestration::PersistedRun>,
+    orchestration_goal: Option<agent_orchestration::GoalController>,
 }
 
 impl Thread {
@@ -1629,7 +1682,7 @@ impl Thread {
             thread.profile_downgraded_for_restricted_workspace = false;
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(
-                &role.model_selection(&AgentSettings::get_global(cx).chatgpt_subagent_roles),
+                &role.model_selection(&AgentSettings::get_global(cx).native_subagent_roles),
                 cx,
             );
         } else if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
@@ -1743,6 +1796,7 @@ impl Thread {
             tool_filter: None,
             orchestration_run: None,
             persisted_orchestration_run: None,
+            orchestration_goal: None,
         }
     }
 
@@ -1846,7 +1900,7 @@ impl Thread {
                         }
                     }
                 }
-                Message::Resume => {}
+                Message::Resume | Message::OrchestrationResume(_) => {}
                 Message::Compaction(info) => {
                     let compaction_id = acp_thread::ContextCompactionId(
                         format!("replay-compaction-{message_ix}").into(),
@@ -2081,6 +2135,17 @@ impl Thread {
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
+        let orchestration_goal = db_thread.orchestration_goal.and_then(|snapshot| {
+            agent_orchestration::GoalController::restore(
+                snapshot,
+                agent_orchestration::GoalControllerConfig::default(),
+            )
+            .inspect_err(|error| {
+                log::warn!("discarding invalid persisted parent orchestration goal: {error:#}")
+            })
+            .ok()
+        });
+
         Self {
             id,
             prompt_id: PromptId::new(),
@@ -2136,6 +2201,7 @@ impl Thread {
             persisted_orchestration_run: db_thread
                 .orchestration_run
                 .map(agent_orchestration::PersistedRun::for_resume),
+            orchestration_goal,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
@@ -2254,6 +2320,10 @@ impl Thread {
                 .as_ref()
                 .map(|run| run.snapshot())
                 .or_else(|| self.persisted_orchestration_run.clone()),
+            orchestration_goal: self
+                .orchestration_goal
+                .as_ref()
+                .map(agent_orchestration::GoalController::snapshot),
         };
 
         cx.background_spawn(async move {
@@ -2342,6 +2412,7 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
+        cache_keepalive::invalidate(&self.id.to_string(), cx);
         let old_usage = self.latest_token_usage();
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model().map(|model| model.as_ref()));
@@ -2363,6 +2434,18 @@ impl Thread {
         }
 
         cx.notify()
+    }
+
+    pub(crate) fn set_subagent_model(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        thinking_effort: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.inherits_parent_model_settings = false;
+        self.set_model(model.clone(), cx);
+        self.set_thinking_enabled(model.supports_thinking(), cx);
+        self.set_thinking_effort(thinking_effort, cx);
     }
 
     pub fn summarization_model(&self) -> Option<&Arc<dyn LanguageModel>> {
@@ -2445,6 +2528,38 @@ impl Thread {
 
     pub fn last_message(&self) -> Option<&Message> {
         self.messages.last().map(std::ops::Deref::deref)
+    }
+
+    pub(crate) fn strip_last_agent_message_suffix(
+        &mut self,
+        suffix: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if suffix.is_empty() {
+            return false;
+        }
+        let Some(Message::Agent(message)) = self.messages.last().map(Arc::as_ref) else {
+            return false;
+        };
+        let mut message = message.clone();
+        let Some(text) = message.content.iter_mut().rev().find_map(|content| {
+            let AgentMessageContent::Text(text) = content else {
+                return None;
+            };
+            text.trim_end().ends_with(suffix).then_some(text)
+        }) else {
+            return false;
+        };
+        let visible_len = text.trim_end().len().saturating_sub(suffix.len());
+        text.truncate(visible_len);
+        let trimmed_len = text.trim_end().len();
+        text.truncate(trimmed_len);
+        if let Some(last_message) = self.messages.last_mut() {
+            *last_message = Arc::new(Message::Agent(message));
+        }
+        self.updated_at = Utc::now();
+        cx.notify();
+        true
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2644,6 +2759,97 @@ impl Thread {
         self.orchestration_run.as_ref()
     }
 
+    pub(crate) fn parent_orchestration_goal(&self) -> Option<agent_orchestration::GoalController> {
+        self.orchestration_goal.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_parent_orchestration_goal_for_test(
+        &mut self,
+        goal: agent_orchestration::GoalController,
+    ) {
+        self.orchestration_goal = Some(goal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_parent_orchestration_goal_for_test(&mut self) -> Result<()> {
+        self.orchestration_goal
+            .as_ref()
+            .ok_or_else(|| anyhow!("no parent orchestration goal is active"))?
+            .mark_achieved()?;
+        Ok(())
+    }
+
+    fn prepare_parent_orchestration_goal(&mut self, resume_existing: bool, cx: &App) {
+        if self.parent_thread_id().is_some()
+            || self.effective_execution_strategy() != AgentExecutionStrategy::Orchestrate
+        {
+            self.orchestration_goal = None;
+            return;
+        }
+        if resume_existing
+            && self.orchestration_goal.as_ref().is_some_and(|goal| {
+                matches!(
+                    goal.snapshot().status,
+                    agent_orchestration::GoalStatus::Active
+                        | agent_orchestration::GoalStatus::Blocked
+                )
+            })
+        {
+            return;
+        }
+        if !self
+            .enabled_tools(cx)
+            .contains_key(UpdateOrchestrationGoalTool::NAME)
+        {
+            self.orchestration_goal = None;
+            return;
+        }
+        let Some(objective) = self
+            .last_user_message()
+            .map(UserMessage::routing_text)
+            .filter(|objective| !objective.trim().is_empty())
+        else {
+            return;
+        };
+        match agent_orchestration::GoalController::new(
+            agent_orchestration::RunId::new(),
+            objective,
+            Vec::new(),
+            agent_orchestration::GoalControllerConfig::default(),
+        ) {
+            Ok(goal) => self.orchestration_goal = Some(goal),
+            Err(error) => log::error!("failed to initialize parent orchestration goal: {error:#}"),
+        }
+    }
+
+    fn orchestration_continuation_reason(&self) -> Option<OrchestrationResumeReason> {
+        let goal = self.orchestration_goal.as_ref()?.snapshot();
+        if goal.status != agent_orchestration::GoalStatus::Active {
+            return None;
+        }
+        let has_malformed_tool_call = self.last_message().is_some_and(|message| {
+            let Message::Agent(message) = message else {
+                return false;
+            };
+            let mut text = String::new();
+            for content in &message.content {
+                if let AgentMessageContent::Text(chunk) = content {
+                    text.push_str(chunk);
+                }
+            }
+            text.trim_end()
+                .rsplit('\n')
+                .next()
+                .is_some_and(|line| line.trim_start().starts_with("call:default_api:"))
+        });
+        Some(if has_malformed_tool_call {
+            OrchestrationResumeReason::RepairMalformedToolCall
+        } else {
+            OrchestrationResumeReason::GoalIncomplete
+        })
+    }
+
     pub fn set_orchestration_run(
         &mut self,
         run: agent_orchestration::RunHandle,
@@ -2816,6 +3022,7 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        cache_keepalive::invalidate(&self.id.to_string(), cx);
         if let Some(run) = self.orchestration_run.clone()
             && !run.state().is_terminal()
         {
@@ -2944,7 +3151,10 @@ impl Thread {
                 Message::User(message) => {
                     self.request_token_usage.remove(&message.id);
                 }
-                Message::Agent(_) | Message::Resume | Message::Compaction(_) => {}
+                Message::Agent(_)
+                | Message::Resume
+                | Message::OrchestrationResume(_)
+                | Message::Compaction(_) => {}
             }
         }
         self.clear_summary();
@@ -3054,6 +3264,7 @@ impl Thread {
         if self.resolved_turn_policy.is_none() {
             self.resolve_turn_policy_for_latest_user_message(cx);
         }
+        self.prepare_parent_orchestration_goal(true, cx);
         self.messages.push(Arc::new(Message::Resume));
         cx.notify();
 
@@ -3093,6 +3304,7 @@ impl Thread {
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
 
         self.resolve_turn_policy_for_latest_user_message(cx);
+        self.prepare_parent_orchestration_goal(false, cx);
 
         log::info!("Thread::send called with model: {}", model.name().0);
         self.advance_prompt_id();
@@ -3118,6 +3330,29 @@ impl Thread {
     }
 
     fn resolve_auto_policy(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        let previous_strategy = self
+            .resolved_turn_policy
+            .as_ref()
+            .map(|policy| policy.strategy);
+        let has_incomplete_plan = self.plan.as_ref().is_some_and(|plan| {
+            plan.entries
+                .iter()
+                .any(|entry| entry.status != NativePlanStatus::Completed)
+        }) || self.proposed_plan.as_ref().is_some_and(|plan| {
+            plan.entries
+                .iter()
+                .any(|entry| entry.status != NativePlanStatus::Completed)
+        });
+        let has_active_orchestration = self.orchestration_goal.as_ref().is_some_and(|goal| {
+            matches!(
+                goal.snapshot().status,
+                agent_orchestration::GoalStatus::Active | agent_orchestration::GoalStatus::Blocked
+            )
+        }) || self
+            .orchestration_run
+            .as_ref()
+            .is_some_and(|run| !run.state().is_terminal());
+
         // Capability detection must use the user's configured tool surface,
         // not the previous turn's resolved profile. Otherwise one Direct turn
         // would hide spawn_agent and make every later Auto turn appear unable
@@ -3129,7 +3364,11 @@ impl Thread {
             agent_orchestration::AutoPolicyContext {
                 work_item_count: 0,
                 available_tool_count: Some(tools.len()),
-                can_orchestrate: tools.contains_key(SpawnAgentTool::NAME),
+                can_orchestrate: tools.contains_key(SpawnAgentTool::NAME)
+                    && tools.contains_key(UpdateOrchestrationGoalTool::NAME),
+                previous_strategy,
+                has_incomplete_plan,
+                has_active_orchestration,
             },
         );
         log::info!(
@@ -3352,6 +3591,7 @@ impl Thread {
         let mut auto_compactions = 0;
         let mut prompt_too_large_compaction_attempted = false;
         let mut skip_auto_compaction = false;
+        let mut orchestration_continuations = 0usize;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
         loop {
@@ -3453,6 +3693,9 @@ impl Thread {
             );
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
+            let cache_capture = cx.update(|cx| {
+                cache_keepalive::record_turn_activity(cx, this.clone(), model.clone(), &request)
+            });
 
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
                 Ok(events) => (events.fuse(), None),
@@ -3631,6 +3874,13 @@ impl Thread {
             }
 
             let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
+            if error.is_none() && !cancelled && end_turn {
+                if let Some(capture) = cache_capture {
+                    capture.confirm(
+                        this.read_with(cx, |thread, _| thread.current_request_token_usage)?,
+                    );
+                }
+            }
 
             for tool_result in early_tool_results {
                 Self::process_tool_result(this, event_stream, cx, tool_result)?;
@@ -3742,6 +3992,30 @@ impl Thread {
                     }
                 })?;
             } else if end_turn {
+                let continuation_reason =
+                    this.read_with(cx, |thread, _| thread.orchestration_continuation_reason())?;
+                if let Some(reason) = continuation_reason {
+                    let maximum_continuations = cx.update(|cx| {
+                        AgentSettings::get_global(cx)
+                            .orchestration
+                            .max_parent_continuations
+                            .unwrap_or(DEFAULT_MAX_PARENT_ORCHESTRATION_CONTINUATIONS)
+                    });
+                    if orchestration_continuations >= maximum_continuations {
+                        return Err(anyhow!(
+                            "Orchestration paused after {maximum_continuations} automatic continuations because the parent goal is still active. Resume the thread to continue, or record a concrete blocker."
+                        ));
+                    }
+                    orchestration_continuations += 1;
+                    this.update(cx, |thread, _| {
+                        thread
+                            .messages
+                            .push(Arc::new(Message::OrchestrationResume(reason)));
+                    })?;
+                    intent = CompletionIntent::UserPrompt;
+                    attempt = 0;
+                    continue;
+                }
                 return Ok(());
             } else {
                 let end_at_boundary =
@@ -4886,7 +5160,10 @@ impl Thread {
             .rev()
             .find_map(|message| match &**message {
                 Message::User(user_message) => Some(user_message),
-                Message::Agent(_) | Message::Resume | Message::Compaction(_) => None,
+                Message::Agent(_)
+                | Message::Resume
+                | Message::OrchestrationResume(_)
+                | Message::Compaction(_) => None,
             })
     }
 
@@ -6503,7 +6780,7 @@ pub(crate) fn messages_to_markdown(messages: &[Arc<Message>]) -> String {
         match &**message {
             Message::User(_) => markdown.push_str("## User\n\n"),
             Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
-            Message::Resume | Message::Compaction(_) => {}
+            Message::Resume | Message::OrchestrationResume(_) | Message::Compaction(_) => {}
         }
         markdown.push_str(&message.to_markdown());
     }
@@ -6543,7 +6820,10 @@ fn extend_request_history_until(
             }
         }
         Message::Compaction(CompactionInfo::ProviderNative { .. }) => {}
-        Message::User(_) | Message::Agent(_) | Message::Resume => {}
+        Message::User(_)
+        | Message::Agent(_)
+        | Message::Resume
+        | Message::OrchestrationResume(_) => {}
     }
 
     for message in &messages[compaction_ix..end_ix] {
@@ -8511,57 +8791,85 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_chatgpt_subscription_subagent_role_policies() {
+    fn test_cross_provider_native_subagent_role_policies() {
         assert_eq!(
             serde_json::to_value(SubagentRole::FlowReader).unwrap(),
             json!("flow-reader")
         );
 
-        let roles = ChatGptSubagentRolesSettings {
+        let roles = NativeSubagentRolesSettings {
             enabled: true,
-            explorer: agent_settings::ChatGptSubagentRoleSettings {
+            explorer: agent_settings::NativeSubagentRoleSettings {
+                provider: settings::LanguageModelProviderSetting("anthropic".to_string()),
                 model: "explorer-model".to_string(),
                 effort: "low".to_string(),
+                fallback: agent_settings::SubagentFallbackModelSettings::InheritFromParent,
             },
-            flow_reader: agent_settings::ChatGptSubagentRoleSettings {
+            flow_reader: agent_settings::NativeSubagentRoleSettings {
+                provider: settings::LanguageModelProviderSetting("google".to_string()),
                 model: "flow-model".to_string(),
                 effort: "medium".to_string(),
+                fallback: agent_settings::SubagentFallbackModelSettings::None,
             },
-            coding_worker: agent_settings::ChatGptSubagentRoleSettings {
+            coding_worker: agent_settings::NativeSubagentRoleSettings {
+                provider: settings::LanguageModelProviderSetting("openai-subscribed".to_string()),
                 model: "worker-model".to_string(),
                 effort: "xhigh".to_string(),
+                fallback: agent_settings::SubagentFallbackModelSettings::None,
             },
         };
         let cases = [
             (
                 SubagentRole::Explorer,
+                "anthropic",
                 "explorer-model",
                 "low",
                 builtin_profiles::ASK,
             ),
             (
                 SubagentRole::FlowReader,
+                "google",
                 "flow-model",
                 "medium",
                 builtin_profiles::ASK,
             ),
             (
                 SubagentRole::CodingWorker,
+                "openai-subscribed",
                 "worker-model",
                 "xhigh",
                 builtin_profiles::WRITE,
             ),
         ];
 
-        for (role, model, effort, profile) in cases {
+        for (role, provider, model, effort, profile) in cases {
             let selection = role.model_selection(&roles);
-            assert_eq!(selection.provider.0, CHATGPT_SUBSCRIPTION_PROVIDER_ID);
+            assert_eq!(selection.provider.0, provider);
             assert_eq!(selection.model, model);
             assert_eq!(selection.effort.as_deref(), Some(effort));
             assert_eq!(role.profile_id().as_str(), profile);
             assert!(!role.allows_tool(CreateThreadTool::NAME));
             assert!(!role.allows_tool(ListAgentsAndModelsTool::NAME));
         }
+
+        let parent = LanguageModelSelection {
+            provider: settings::LanguageModelProviderSetting("parent-provider".to_string()),
+            model: "parent-model".to_string(),
+            enable_thinking: true,
+            effort: Some("high".to_string()),
+            speed: None,
+        };
+        assert_eq!(
+            SubagentRole::Explorer
+                .fallback_model_selection(&roles, Some(&parent))
+                .as_ref(),
+            Some(&parent)
+        );
+        assert!(
+            SubagentRole::FlowReader
+                .fallback_model_selection(&roles, Some(&parent))
+                .is_none()
+        );
 
         for role in [SubagentRole::Explorer, SubagentRole::FlowReader] {
             assert!(role.allows_tool(ReadFileTool::NAME));
@@ -8575,16 +8883,12 @@ mod tests {
         assert!(SubagentRole::CodingWorker.allows_tool(TerminalTool::NAME));
 
         assert_eq!(
-            resolve_subagent_role_policy(true, true, Some(SubagentRole::Explorer)).unwrap(),
+            resolve_subagent_role_policy(true, Some(SubagentRole::Explorer)),
             Some(SubagentRole::Explorer)
         );
-        assert!(resolve_subagent_role_policy(true, true, None).is_err());
+        assert_eq!(resolve_subagent_role_policy(true, None), None);
         assert_eq!(
-            resolve_subagent_role_policy(true, false, Some(SubagentRole::Explorer)).unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_subagent_role_policy(false, true, Some(SubagentRole::Explorer)).unwrap(),
+            resolve_subagent_role_policy(false, Some(SubagentRole::Explorer)),
             None
         );
     }
@@ -8625,6 +8929,29 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn list_orchestration_agents_defers_parent_read_during_tool_dispatch(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let tool = Arc::new(crate::ListOrchestrationAgentsTool::new(thread.downgrade()));
+        let (event_stream, _receiver) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            thread.update(cx, |_, cx| {
+                tool.run(
+                    ToolInput::resolved(crate::ListOrchestrationAgentsInput {}),
+                    event_stream,
+                    cx,
+                )
+            })
+        });
+        assert!(matches!(
+            task.await,
+            Err(crate::OrchestrationControlOutput::Error { error })
+                if error == "no orchestration run is active"
+        ));
+    }
+
+    #[gpui::test]
     async fn auto_routing_injects_the_resolved_strategy_before_completion(cx: &mut TestAppContext) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
@@ -8632,6 +8959,8 @@ mod tests {
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
                 thread.set_model(model, cx);
+                thread
+                    .add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
                 thread.set_execution_policy(
                     AgentExecutionStrategy::Auto,
                     AgentAutonomy::Manual,
@@ -8653,6 +8982,71 @@ mod tests {
                 let system_prompt = request.messages[0].string_contents();
                 assert!(system_prompt.contains("## Automatic execution route"));
                 assert!(system_prompt.contains("## Execution strategy: plan"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn auto_routing_requires_the_complete_orchestration_tool_surface(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread
+                    .add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+                thread.set_execution_policy(
+                    AgentExecutionStrategy::Auto,
+                    AgentAutonomy::Manual,
+                    cx,
+                );
+                assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "Use subagents in parallel to review the codebase",
+                ));
+                thread.resolve_turn_policy_for_latest_user_message(cx);
+                thread.prepare_parent_orchestration_goal(false, cx);
+
+                assert_eq!(
+                    thread.effective_execution_strategy(),
+                    AgentExecutionStrategy::Direct
+                );
+                assert!(thread.parent_orchestration_goal().is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn auto_routing_creates_a_goal_for_broad_orchestration_work(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread
+                    .add_default_tools(Rc::new(crate::tests::FakeThreadEnvironment::default()), cx);
+                thread.set_execution_policy(
+                    AgentExecutionStrategy::Auto,
+                    AgentAutonomy::Manual,
+                    cx,
+                );
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "Phân tích tối ưu codebase cực đoan",
+                ));
+                thread.resolve_turn_policy_for_latest_user_message(cx);
+                thread.prepare_parent_orchestration_goal(false, cx);
+
+                assert_eq!(
+                    thread.effective_execution_strategy(),
+                    AgentExecutionStrategy::Orchestrate
+                );
+                assert!(thread.parent_orchestration_goal().is_some());
             });
         });
     }

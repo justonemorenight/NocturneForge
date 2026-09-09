@@ -33,3 +33,39 @@ Threads are the units shown in the [Threads Sidebar](./parallel-agents.md#thread
 - [Terminal Threads](./terminal-threads.md)
 
 Use [Parallel Agents](./parallel-agents.md) to run and manage multiple threads at once.
+
+## Optional prompt-cache warming
+
+NocturneForge can replay a successful native ChatGPT Subscription request to
+attempt to retain its provider-side prompt cache. This consumes account usage;
+retention and quota savings are not guaranteed. It is off by default.
+
+1. Set `agent.cache_keepalive` to `true` in settings.
+2. In a native ChatGPT Subscription thread, click **Cache: Off** to opt that
+   thread in. The next successful real request arms warming.
+3. Hover the cache control for status and app-session warming usage. Click
+   **Cache: On** to stop. Thread opt-ins are not persisted across app restarts.
+
+`agent.cache_keepalive_config` controls estimated TTL, lead time, idle window,
+attempt limits, estimated input budget, deadline, output limit and capture size.
+Defaults allow at most two attempts per idle period and four attempts per app
+hour, with an estimated one-million-input-token hourly budget. Budgets are shared
+across threads and account switches, and failed or cancelled attempts are not
+refunded. Restarting the app resets the app-session ledger and all thread opt-ins.
+Disabling the global setting also clears every thread opt-in.
+
+Only one warming request runs at a time. New turns, cancellation, model changes
+and thread opt-out invalidate the old capture. Account and settings changes are
+also checked during warming. Captures are memory-only, bounded in size and
+count, and released when their owner disappears or their idle window expires.
+Errors, missing usage, abnormal completions and insufficient cache reuse stop
+warming until another successful real request. Subagents are not warmed.
+
+Warming responses never enter the transcript and never execute tools. Output
+and timeout limits are client-side cancellation guards, **not server-enforced
+billing caps**. Usage for interrupted streams may be incomplete; the status
+explicitly counts these attempts rather than reporting them as free.
+
+External ACP agents, including Claude Code, expose cache statistics when their
+adapter reports them, but are not sent synthetic warming prompts. Their own
+runtime controls their provider requests.

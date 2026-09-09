@@ -638,16 +638,20 @@ impl ListState {
     /// scroll position. Tail following may re-engage when the list is laid out
     /// at the end again.
     pub fn pause_following_tail(&self) {
-        self.0.borrow_mut().follow_state.stop_following();
+        // This is a best-effort interaction hint. Input handlers can run while
+        // list layout is holding the state borrow, so panicking here would take
+        // down the entire application just to preserve a scroll preference.
+        if let Ok(mut state) = self.0.try_borrow_mut() {
+            state.follow_state.stop_following();
+        }
     }
 
     /// Returns whether the list is currently actively following the
     /// tail (snapping to the end on each layout).
     pub fn is_following_tail(&self) -> bool {
-        matches!(
-            self.0.borrow().follow_state,
-            FollowState::Tail { is_following: true }
-        )
+        self.0.try_borrow().is_ok_and(|state| {
+            matches!(state.follow_state, FollowState::Tail { is_following: true })
+        })
     }
 
     /// Scroll the list to the given offset
@@ -2335,6 +2339,26 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 7);
         assert_eq!(offset.offset_in_item, px(40.));
+        assert!(state.is_following_tail());
+    }
+
+    #[test]
+    fn pausing_follow_tail_during_an_active_state_borrow_is_non_fatal() {
+        let state = ListState::new(1, crate::ListAlignment::Top, px(0.));
+        state.set_follow_mode(FollowMode::Tail);
+
+        let active_borrow = state.0.borrow();
+        state.pause_following_tail();
+        drop(active_borrow);
+
+        assert!(state.is_following_tail());
+        state.pause_following_tail();
+        assert!(!state.is_following_tail());
+
+        state.set_follow_mode(FollowMode::Tail);
+        let active_borrow = state.0.borrow_mut();
+        assert!(!state.is_following_tail());
+        drop(active_borrow);
         assert!(state.is_following_tail());
     }
 

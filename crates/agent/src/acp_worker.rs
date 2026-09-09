@@ -12,6 +12,107 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const MAX_ACP_WORKER_OUTPUT_BYTES: usize = agent_orchestration::MAX_INLINE_OUTPUT_BYTES;
+
+struct BoundedTranscript {
+    head: String,
+    tail: String,
+    total_bytes: usize,
+    has_content: bool,
+}
+
+impl BoundedTranscript {
+    fn new() -> Self {
+        Self {
+            head: String::new(),
+            tail: String::new(),
+            total_bytes: 0,
+            has_content: false,
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.has_content {
+            self.push_segment("\n");
+        }
+        self.push_segment(text);
+        self.has_content = true;
+    }
+
+    fn push_segment(&mut self, text: &str) {
+        self.total_bytes = self.total_bytes.saturating_add(text.len());
+
+        let head_remaining = MAX_ACP_WORKER_OUTPUT_BYTES.saturating_sub(self.head.len());
+        if head_remaining > 0 {
+            let mut end = text.len().min(head_remaining);
+            while !text.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            self.head.push_str(&text[..end]);
+        }
+
+        let tail_capacity = MAX_ACP_WORKER_OUTPUT_BYTES / 2;
+        if text.len() >= tail_capacity {
+            let mut start = text.len().saturating_sub(tail_capacity);
+            while !text.is_char_boundary(start) {
+                start = start.saturating_add(1);
+            }
+            self.tail.clear();
+            self.tail.push_str(&text[start..]);
+        } else {
+            self.tail.push_str(text);
+            if self.tail.len() > tail_capacity {
+                let mut remove_bytes = self.tail.len() - tail_capacity;
+                while !self.tail.is_char_boundary(remove_bytes) {
+                    remove_bytes = remove_bytes.saturating_add(1);
+                }
+                self.tail.drain(..remove_bytes);
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.total_bytes <= MAX_ACP_WORKER_OUTPUT_BYTES {
+            return self.head.trim().to_string();
+        }
+
+        let marker = format!("\n\n[truncated from {} bytes]\n\n", self.total_bytes);
+        let available = MAX_ACP_WORKER_OUTPUT_BYTES.saturating_sub(marker.len());
+        let head_limit = available / 2;
+        let tail_limit = available.saturating_sub(head_limit);
+        truncate_end_at_boundary(&mut self.head, head_limit);
+        truncate_start_at_boundary(&mut self.tail, tail_limit);
+        self.head.push_str(&marker);
+        self.head.push_str(&self.tail);
+        self.head.trim().to_string()
+    }
+}
+
+fn truncate_end_at_boundary(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.truncate(end);
+}
+
+fn truncate_start_at_boundary(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut start = text.len() - limit;
+    while !text.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    text.drain(..start);
+}
+
 fn task_prompt(
     task: &agent_orchestration::OrchestrationTask,
     dependencies: &[agent_orchestration::DependencyInput],
@@ -236,6 +337,8 @@ impl WorkerHost for AcpWorkerHost {
         let target = self.target();
         let task_model = task.model_override.clone();
         let task_mode = task.mode.clone();
+        let fallback_from_model = task.active_fallback_from_model.clone();
+        let fallback_reason = task.active_fallback_reason.clone();
         let workspace_policy = task.workspace_policy.clone();
         let capabilities = self.capabilities();
         let app = self.app.clone();
@@ -281,6 +384,8 @@ impl WorkerHost for AcpWorkerHost {
             let mut metadata = WorkerMetadata::new(target);
             metadata.model = task_model;
             metadata.mode = task_mode;
+            metadata.fallback_from_model = fallback_from_model;
+            metadata.fallback_reason = fallback_reason;
             metadata.workspace_policy = workspace_policy;
             metadata.capabilities = capabilities;
             if let Some(worktree) = isolated_worktree {
@@ -314,6 +419,8 @@ impl WorkerHost for AcpWorkerHost {
         let session_id = session_id.clone();
         let task_model = task.model_override.clone();
         let task_mode = task.mode.clone();
+        let fallback_from_model = task.active_fallback_from_model.clone();
+        let fallback_reason = task.active_fallback_reason.clone();
         let workspace_policy = task.workspace_policy.clone();
         let capabilities = self.capabilities();
         let app = self.app.clone();
@@ -376,6 +483,8 @@ impl WorkerHost for AcpWorkerHost {
             let mut metadata = WorkerMetadata::new(target);
             metadata.model = task_model;
             metadata.mode = task_mode;
+            metadata.fallback_from_model = fallback_from_model;
+            metadata.fallback_reason = fallback_reason;
             metadata.workspace_policy = workspace_policy;
             metadata.capabilities = capabilities;
             if let Some(worktree) = isolated_worktree {
@@ -436,21 +545,27 @@ impl WorkerHandle for AcpWorkerHandle {
         prompt_active.store(true, Ordering::SeqCst);
         Box::pin(async move {
             let result = async {
-                metadata.version = connection.agent_version().map(|version| version.to_string());
+                metadata.version = connection
+                    .agent_version()
+                    .map(|version| version.to_string());
                 if let Some(selector) = connection.model_selector(&session_id) {
                     match app.update(|cx| selector.selected_model(cx)).await {
                         Ok(model) => metadata.model = Some(model.id.to_string()),
                         Err(error) => log::debug!("ACP worker model metadata unavailable: {error}"),
                     }
                 }
-                metadata.mode = app.update(|cx| {
-                    connection.session_modes(&session_id, cx)
-                        .map(|modes| modes.current_mode().to_string())
-                }).or(metadata.mode);
-                context.reporter.report_worker_started(Some(session_id.clone()), metadata.clone());
+                metadata.mode = app
+                    .update(|cx| {
+                        connection
+                            .session_modes(&session_id, cx)
+                            .map(|modes| modes.current_mode().to_string())
+                    })
+                    .or(metadata.mode);
+                context
+                    .reporter
+                    .report_worker_started(Some(session_id.clone()), metadata.clone());
                 let message_start_index = app.update(|cx| thread.read(cx).entries().len());
                 let live_metadata = Rc::new(std::cell::RefCell::new(metadata));
-                let (budget_sender, budget_receiver) = async_channel::bounded(1);
                 let _activity_subscription = app.update(|cx| {
                     let reporter = context.reporter.clone();
                     let live_metadata = live_metadata.clone();
@@ -466,21 +581,28 @@ impl WorkerHandle for AcpWorkerHandle {
                                     AcpThreadEvent::EntryUpdated(index) => *index,
                                     _ => thread.entries().len().saturating_sub(1),
                                 };
-                                if index < message_start_index { return; }
-                                if let Some(AgentThreadEntry::ToolCall(tool)) = thread.entries().get(index) {
+                                if index < message_start_index {
+                                    return;
+                                }
+                                if let Some(AgentThreadEntry::ToolCall(tool)) =
+                                    thread.entries().get(index)
+                                {
                                     if seen_tools.insert(tool.id.clone()) {
-                                        if let Err(error) = reporter.report_tool_call_started(
+                                        reporter.report_tool_call_started(
                                             tool.tool_name.as_deref().unwrap_or("external_tool"),
-                                        ) {
-                                            if let Err(send_error) = budget_sender.try_send(error) {
-                                                log::debug!("ACP budget stop already delivered: {send_error}");
-                                            }
-                                        }
+                                        );
                                     }
                                     match &tool.status {
-                                        ToolCallStatus::WaitingForConfirmation { .. } => reporter.set_phase("awaiting_permission"),
-                                        ToolCallStatus::Pending | ToolCallStatus::InProgress => reporter.set_phase("running_tool"),
-                                        _ => { reporter.report_tool_call_finished(); reporter.set_phase("running"); }
+                                        ToolCallStatus::WaitingForConfirmation { .. } => {
+                                            reporter.set_phase("awaiting_permission")
+                                        }
+                                        ToolCallStatus::Pending | ToolCallStatus::InProgress => {
+                                            reporter.set_phase("running_tool")
+                                        }
+                                        _ => {
+                                            reporter.report_tool_call_finished();
+                                            reporter.set_phase("running");
+                                        }
                                     }
                                 }
                             }
@@ -489,39 +611,46 @@ impl WorkerHandle for AcpWorkerHandle {
                             }
                             AcpThreadEvent::SubagentSpawned(child_session) => {
                                 nested_sessions.insert(child_session.clone());
-                                live_metadata.borrow_mut().nested_agent_count = Some(nested_sessions.len() as u64);
+                                live_metadata.borrow_mut().nested_agent_count =
+                                    Some(nested_sessions.len() as u64);
                             }
-                            AcpThreadEvent::ElicitationRequested(_) => reporter.set_phase("awaiting_user"),
-                            AcpThreadEvent::ElicitationResponded(_) | AcpThreadEvent::ToolAuthorizationReceived(_) => reporter.set_phase("running"),
+                            AcpThreadEvent::ElicitationRequested(_) => {
+                                reporter.set_phase("awaiting_user")
+                            }
+                            AcpThreadEvent::ElicitationResponded(_)
+                            | AcpThreadEvent::ToolAuthorizationReceived(_) => {
+                                reporter.set_phase("running")
+                            }
                             _ => return,
                         }
-                        let mut metadata = live_metadata.borrow_mut();
-                        metadata.last_activity_at = Some(chrono::Utc::now());
-                        reporter.report_worker_started(Some(session_id.clone()), metadata.clone());
+                        let metadata = {
+                            let mut metadata = live_metadata.borrow_mut();
+                            metadata.last_activity_at = Some(chrono::Utc::now());
+                            metadata.clone()
+                        };
+                        reporter.report_worker_started(Some(session_id.clone()), metadata);
                     })
                 });
                 let content = acp::ContentBlock::Text(acp::TextContent::new(prompt_text));
-                app.update(|cx| thread.update(cx, |thread, cx| {
-                    thread.push_user_content_block(None, content.clone(), cx);
-                }));
+                app.update(|cx| {
+                    thread.update(cx, |thread, cx| {
+                        thread.push_user_content_block(None, content.clone(), cx);
+                    })
+                });
                 let prompt_request = acp::PromptRequest::new(session_id.clone(), vec![content]);
 
-                let prompt_task = app.update(|cx| connection.prompt(prompt_request, cx));
-                let budget_stop = budget_receiver.recv();
-                futures::pin_mut!(prompt_task, budget_stop);
-                let response = match futures::future::select(prompt_task, budget_stop).await {
-                    futures::future::Either::Left((response, _)) => response?,
-                    futures::future::Either::Right((error, _)) => {
-                        app.update(|cx| connection.cancel(&session_id, cx));
-                        return Err(error.context("ACP budget monitor closed")?.into());
-                    }
-                };
+                let response = app
+                    .update(|cx| connection.prompt(prompt_request, cx))
+                    .await?;
 
                 if response.stop_reason == acp::StopReason::Cancelled {
                     bail!("task execution was cancelled by worker");
                 }
-                anyhow::ensure!(response.stop_reason == acp::StopReason::EndTurn,
-                    "ACP worker did not finish its task: {:?}", response.stop_reason);
+                anyhow::ensure!(
+                    response.stop_reason == acp::StopReason::EndTurn,
+                    "ACP worker did not finish its task: {:?}",
+                    response.stop_reason
+                );
 
                 let tokens_used = response.usage.as_ref().map(|usage| usage.total_tokens);
                 let mut metadata = live_metadata.borrow().clone();
@@ -529,31 +658,45 @@ impl WorkerHandle for AcpWorkerHandle {
                 app.update(|cx| thread.update(cx, |thread, cx| thread.flush_pending_output(cx)));
                 let output_text = app.update(|cx| {
                     let thread = thread.read(cx);
-                    let output = thread
+                    let mut output = BoundedTranscript::new();
+                    for block in thread
                         .entries()
                         .get(message_start_index..)
                         .unwrap_or_default()
                         .iter()
                         .filter_map(|entry| match entry {
-                            acp_thread::AgentThreadEntry::AssistantMessage(message) => Some(message),
+                            acp_thread::AgentThreadEntry::AssistantMessage(message) => {
+                                Some(message)
+                            }
                             _ => None,
                         })
                         .flat_map(|message| &message.chunks)
                         .filter_map(|chunk| match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                            acp_thread::AssistantMessageChunk::Message { block, .. } => {
+                                Some(block.to_markdown(cx))
+                            }
                             acp_thread::AssistantMessageChunk::Thought { .. } => None,
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .trim()
-                        .to_string();
-                    output
+                    {
+                        output.push(&block);
+                    }
+                    output.finish()
                 });
                 if output_text.is_empty() {
                     bail!(
                         "ACP worker completed with status {:?} but produced no assistant output",
                         response.stop_reason
                     );
+                }
+
+                if let Some(verification_envelope) =
+                    agent_orchestration::verification_claim_envelope(&output_text)
+                {
+                    app.update(|cx| {
+                        thread.update(cx, |thread, cx| {
+                            thread.strip_last_assistant_message_suffix(verification_envelope, cx);
+                        });
+                    });
                 }
 
                 let mut output = TaskExecutionOutput::new(output_text).with_session_id(session_id);
@@ -635,6 +778,24 @@ mod tests {
     }
 
     #[test]
+    fn bounded_transcript_retains_utf8_prefix_and_verification_tail() {
+        let verification = format!(
+            "{}{{\"criteria\":[],\"expected_output_satisfied\":true,\"citations\":[]}}{}",
+            agent_orchestration::VERIFICATION_START,
+            agent_orchestration::VERIFICATION_END
+        );
+        let mut output = BoundedTranscript::new();
+        output.push(&"🌙".repeat(MAX_ACP_WORKER_OUTPUT_BYTES));
+        output.push(&verification);
+
+        let output = output.finish();
+        assert!(output.len() <= MAX_ACP_WORKER_OUTPUT_BYTES);
+        assert!(output.starts_with('🌙'));
+        assert!(output.ends_with(&verification));
+        assert!(agent_orchestration::verification_claim_envelope(&output).is_some());
+    }
+
+    #[test]
     fn test_resolve_configured_agent_by_id_and_name() {
         let available = vec![
             (AgentId("omp".into()), Some("Oh My Pi".into())),
@@ -699,7 +860,7 @@ mod tests {
         );
 
         // 2. Feature flag on, but read-only enforcement is false -> rejects read-only task
-        let mut broker_enabled = agent_orchestration::WorkerBroker::new(true);
+        let mut host_registry = agent_orchestration::WorkerHostRegistry::new();
 
         struct MockOmpHost;
         impl WorkerHost for MockOmpHost {
@@ -726,7 +887,9 @@ mod tests {
             }
         }
 
-        broker_enabled.register_host(WorkerTarget::acp("omp"), Rc::new(MockOmpHost));
+        host_registry.register(WorkerTarget::acp("omp"), Rc::new(MockOmpHost));
+        let broker_enabled =
+            agent_orchestration::WorkerBroker::new(true).with_host_registry(host_registry);
 
         // Read-only task must be blocked because OMP cannot enforce read-only
         acp_task.workspace_policy.read_only = true;

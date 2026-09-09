@@ -89,3 +89,41 @@ fn goal_ignores_statuses_for_tasks_outside_its_plan() {
     assert_eq!(snapshot.status, GoalStatus::Failed);
     assert_eq!(snapshot.completed_tasks, 0);
 }
+
+#[test]
+fn parent_goal_requires_explicit_completion() {
+    let controller = GoalController::new(
+        RunId::new(),
+        "finish the parent turn",
+        Vec::new(),
+        GoalControllerConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(controller.snapshot().status, GoalStatus::Active);
+    assert_eq!(
+        controller.mark_achieved().unwrap().status,
+        GoalStatus::Achieved
+    );
+    assert_eq!(
+        controller.mark_achieved().unwrap().status,
+        GoalStatus::Achieved
+    );
+}
+
+#[test]
+fn failed_parent_goal_cannot_be_completed() {
+    let controller = GoalController::new(
+        RunId::new(),
+        "finish the parent turn",
+        Vec::new(),
+        GoalControllerConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        controller.observe(RunState::Failed, &[]).status,
+        GoalStatus::Failed
+    );
+    assert!(controller.mark_achieved().is_err());
+}

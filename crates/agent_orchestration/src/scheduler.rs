@@ -2,7 +2,7 @@ use crate::artifacts::{
     ArtifactKind, ArtifactStore, MAX_DEPENDENCY_ARTIFACTS, MAX_DEPENDENCY_CONTEXT_BYTES,
     MAX_DEPENDENCY_OUTPUT_BYTES, MAX_INLINE_OUTPUT_BYTES, truncate_text,
 };
-use crate::budget::{BudgetExceeded, ExecutionBudget, TaskExecutionReporter};
+use crate::budget::TaskExecutionReporter;
 use crate::cancellation::CancellationTree;
 use crate::context_checkpoint::ContextCheckpointStore;
 use crate::control_plane::AgentControlPlane;
@@ -478,7 +478,7 @@ impl Scheduler {
     }
 
     async fn execute_task_workflow(&self, task_id: TaskId) {
-        let Some(task) = self.plan_graph.task(&task_id).cloned() else {
+        let Some(mut task) = self.plan_graph.task(&task_id).cloned() else {
             return;
         };
         let Some(agent_identity) = self.agent_control_plane.identity_for_task(&task_id) else {
@@ -500,6 +500,17 @@ impl Scheduler {
             .task_registry
             .status(&task_id)
             .and_then(|status| status.active_session_id);
+        if let Some(status) = self.task_registry.status(&task_id)
+            && let Some(metadata) = status.worker_metadata
+            && let Some(previous_model) = metadata.fallback_from_model
+        {
+            task.active_fallback_from_model = Some(previous_model);
+            task.active_fallback_reason = metadata.fallback_reason;
+            if let Some(active_model) = status.model {
+                task.model_override = Some(active_model);
+            }
+        }
+        let mut fallback_applied = task.active_fallback_from_model.is_some();
 
         loop {
             let context_checkpoint = self.context_checkpoints.latest(&agent_identity.path);
@@ -581,8 +592,9 @@ impl Scheduler {
                 .and_then(|status| status.worker_metadata);
 
             let mut worker_metadata = crate::worker::WorkerMetadata::new(task.target.clone());
-            worker_metadata.model = task.model_override.clone();
             worker_metadata.mode = task.mode.clone();
+            worker_metadata.fallback_from_model = task.active_fallback_from_model.clone();
+            worker_metadata.fallback_reason = task.active_fallback_reason.clone();
             worker_metadata.workspace_policy = task.workspace_policy.clone();
             self.task_registry
                 .set_worker_metadata(&task_id, worker_metadata.clone());
@@ -601,16 +613,10 @@ impl Scheduler {
                 attempt,
             });
 
-            let budget = ExecutionBudget {
-                token_budget: task.token_budget,
-                tool_call_budget: task.tool_call_budget,
-                time_budget_secs: task.time_budget_secs,
-            };
             let reporter = TaskExecutionReporter::new(
                 self.run_id.clone(),
                 task_id.clone(),
                 task.model_override.clone().map(Into::into),
-                budget.clone(),
                 Some(self.event_stream.clone()),
             )
             .with_task_registry(self.task_registry.clone())
@@ -650,16 +656,11 @@ impl Scheduler {
                 worker_config: self.config.acp_workers.clone(),
                 background_executor: self.config.background_executor.clone(),
                 run_id: self.run_id.clone(),
-                budget,
                 reporter: reporter.clone(),
             };
 
             let exec_result = self
-                .execute_attempt(
-                    context.clone(),
-                    &task_token,
-                    task.time_budget_secs.or(self.config.task_timeout_secs),
-                )
+                .execute_attempt(context.clone(), &task_token, self.config.task_timeout_secs)
                 .await;
 
             if task_token.is_cancelled() {
@@ -702,7 +703,9 @@ impl Scheduler {
 
             match exec_result {
                 Ok(output) => {
-                    if let Some(metadata) = output.worker_metadata.clone() {
+                    if let Some(mut metadata) = output.worker_metadata.clone() {
+                        metadata.fallback_from_model = task.active_fallback_from_model.clone();
+                        metadata.fallback_reason = task.active_fallback_reason.clone();
                         self.task_registry
                             .set_worker_metadata(&task_id, metadata.clone());
                         self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
@@ -769,8 +772,6 @@ impl Scheduler {
                     });
 
                     let mut tokens = output.tokens_used.unwrap_or(0);
-                    // Budget enforcement: a task that exceeds its budget must
-                    // fail with a typed, non-retryable reason - never complete.
                     let reporter_usage = reporter.usage();
                     tokens = tokens.max(reporter_usage.tokens_used);
                     self.task_registry.update_budget_usage(
@@ -789,77 +790,6 @@ impl Scheduler {
                         tokens_used: cumulative_usage.tokens_used,
                         tool_calls_used: cumulative_usage.tool_calls_used,
                     });
-                    if let Some(budget) = task.token_budget
-                        && cumulative_usage.tokens_used > budget
-                    {
-                        let exceeded = BudgetExceeded::TokenBudgetExceeded {
-                            budget,
-                            used: cumulative_usage.tokens_used,
-                        };
-                        let error = format!(
-                            "token budget of {budget} was exceeded (used {})",
-                            cumulative_usage.tokens_used
-                        );
-                        self.task_registry.complete_attempt(
-                            &task_id,
-                            attempt,
-                            Some(truncate_text(
-                                output.output.clone(),
-                                MAX_INLINE_OUTPUT_BYTES,
-                            )),
-                            Some(tokens),
-                            Some(VerificationResult::fail(
-                                error.clone(),
-                                exceeded.error_class(),
-                            )),
-                        );
-                        self.task_registry.stop_for_budget(&task_id, exceeded);
-                        self.event_stream.emit(RuntimeEvent::TaskFailed {
-                            run_id: self.run_id.clone(),
-                            task_id: task_id.clone(),
-                            error,
-                            retryable: false,
-                        });
-                        self.mark_blocked_dependents(&task_id);
-                        self.cleanup_terminal_worktree(&task_id, attempt).await;
-                        return;
-                    }
-                    if let Some(budget) = task.tool_call_budget
-                        && cumulative_usage.tool_calls_used > budget
-                    {
-                        let exceeded = BudgetExceeded::ToolCallBudgetExceeded {
-                            budget,
-                            used: cumulative_usage.tool_calls_used,
-                        };
-                        let error = format!(
-                            "tool call budget of {budget} was exceeded (used {})",
-                            cumulative_usage.tool_calls_used
-                        );
-                        self.task_registry.complete_attempt(
-                            &task_id,
-                            attempt,
-                            Some(truncate_text(
-                                output.output.clone(),
-                                MAX_INLINE_OUTPUT_BYTES,
-                            )),
-                            Some(tokens),
-                            Some(VerificationResult::fail(
-                                error.clone(),
-                                exceeded.error_class(),
-                            )),
-                        );
-                        self.task_registry.stop_for_budget(&task_id, exceeded);
-                        self.event_stream.emit(RuntimeEvent::TaskFailed {
-                            run_id: self.run_id.clone(),
-                            task_id: task_id.clone(),
-                            error,
-                            retryable: false,
-                        });
-                        self.mark_blocked_dependents(&task_id);
-                        self.cleanup_terminal_worktree(&task_id, attempt).await;
-                        return;
-                    }
-
                     // Verification phase
                     if self.config.verification_policy.verify_outputs
                         && (!task.acceptance_criteria.is_empty()
@@ -876,12 +806,9 @@ impl Scheduler {
                         let mut verified_output = output;
                         let mut attempt_tokens = tokens;
                         let remaining_timeout = || {
-                            task.time_budget_secs
-                                .or(self.config.task_timeout_secs)
-                                .map(|seconds| {
-                                    std::time::Duration::from_secs(seconds)
-                                        .saturating_sub(elapsed())
-                                })
+                            self.config.task_timeout_secs.map(|seconds| {
+                                std::time::Duration::from_secs(seconds).saturating_sub(elapsed())
+                            })
                         };
                         let mut verification = self
                             .run_controlled(
@@ -1068,35 +995,6 @@ impl Scheduler {
                             return;
                         }
 
-                        if let Some(status) = self.task_registry.status(&task_id) {
-                            let usage = status.budget_state;
-                            let stopped_reason = if let Some(budget) = task.token_budget
-                                && usage.tokens_used > budget
-                            {
-                                Some(BudgetExceeded::TokenBudgetExceeded {
-                                    budget,
-                                    used: usage.tokens_used,
-                                })
-                            } else if let Some(budget) = task.tool_call_budget
-                                && usage.tool_calls_used > budget
-                            {
-                                Some(BudgetExceeded::ToolCallBudgetExceeded {
-                                    budget,
-                                    used: usage.tool_calls_used,
-                                })
-                            } else {
-                                None
-                            };
-                            if let Some(stopped_reason) = stopped_reason {
-                                let error = stopped_reason.message();
-                                self.task_registry.stop_for_budget(&task_id, stopped_reason);
-                                verification = VerificationResult::fail(
-                                    error,
-                                    crate::verification::ErrorClass::TokenBudgetExceeded,
-                                );
-                            }
-                        }
-
                         if verification.passed {
                             let duration_ms = elapsed().as_millis() as u64;
                             let verified_tokens = attempt_tokens;
@@ -1231,49 +1129,13 @@ impl Scheduler {
                 Err(error) => {
                     let error_str = error.to_string();
                     let error_class = VerificationPolicy::classify_error(&error_str);
+                    let fallback_model = task.fallback_model_override.clone().filter(|fallback| {
+                        !fallback_applied
+                            && task.model_override.as_deref() != Some(fallback.as_str())
+                            && error_class.is_model_fallback_eligible()
+                            && task.target.is_native()
+                    });
                     let reporter_usage = reporter.usage();
-                    let previous_usage = self
-                        .task_registry
-                        .status(&task_id)
-                        .map(|status| status.budget_state)
-                        .unwrap_or_default();
-                    // Budget-exceeded errors (mid-flight reporter failures) must
-                    // record a typed stop reason and never be retried.
-                    let stopped_reason = if matches!(
-                        error_class,
-                        crate::verification::ErrorClass::TokenBudgetExceeded
-                    ) {
-                        if let Some(budget) = task.token_budget
-                            && previous_usage
-                                .tokens_used
-                                .saturating_add(reporter_usage.tokens_used)
-                                > budget
-                        {
-                            Some(BudgetExceeded::TokenBudgetExceeded {
-                                budget,
-                                used: previous_usage
-                                    .tokens_used
-                                    .saturating_add(reporter_usage.tokens_used),
-                            })
-                        } else if let Some(budget) = task.tool_call_budget
-                            && previous_usage
-                                .tool_calls_used
-                                .saturating_add(reporter_usage.tool_calls)
-                                > budget
-                        {
-                            Some(BudgetExceeded::ToolCallBudgetExceeded {
-                                budget,
-                                used: previous_usage
-                                    .tool_calls_used
-                                    .saturating_add(reporter_usage.tool_calls),
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
                     let external_disconnect = task.target.is_acp()
                         && error_class == crate::verification::ErrorClass::TransientNetwork;
                     let live_status = self.task_registry.status(&task_id);
@@ -1286,7 +1148,9 @@ impl Scheduler {
                     let disconnected_session = live_status
                         .as_ref()
                         .and_then(|status| status.active_session_id.clone());
-                    let should_retry = if external_disconnect {
+                    let should_retry = if fallback_model.is_some() {
+                        true
+                    } else if external_disconnect {
                         (disconnected_session.is_none() || reconnectable)
                             && attempt
                                 <= task
@@ -1307,7 +1171,7 @@ impl Scheduler {
                         error_str.clone(),
                         should_retry,
                         reporter_usage,
-                        stopped_reason,
+                        None,
                     );
                     self.event_stream.emit(RuntimeEvent::TaskFailed {
                         run_id: self.run_id.clone(),
@@ -1315,6 +1179,55 @@ impl Scheduler {
                         error: error_str.clone(),
                         retryable: should_retry,
                     });
+
+                    if let Some(fallback_model) = fallback_model {
+                        self.cancel_active_worker(&task, &task_id).await;
+                        let previous_model = task
+                            .model_override
+                            .clone()
+                            .unwrap_or_else(|| "inherited parent model".to_string());
+                        task.model_override = Some(fallback_model.clone());
+                        task.thinking_effort = task.fallback_thinking_effort.clone();
+                        task.active_fallback_from_model = Some(previous_model.clone());
+                        task.active_fallback_reason = Some(error_class.label().to_string());
+                        fallback_applied = true;
+                        session_id = None;
+                        self.task_registry
+                            .replace_model(&task_id, fallback_model.clone());
+                        let mut transition_metadata = self
+                            .task_registry
+                            .status(&task_id)
+                            .and_then(|status| status.worker_metadata)
+                            .unwrap_or_else(|| {
+                                crate::worker::WorkerMetadata::new(task.target.clone())
+                            });
+                        transition_metadata.model = None;
+                        transition_metadata.model_display_name = None;
+                        transition_metadata.model_provider = None;
+                        transition_metadata.model_provider_display_name = None;
+                        transition_metadata.thinking_effort = None;
+                        transition_metadata.fallback_from_model =
+                            task.active_fallback_from_model.clone();
+                        transition_metadata.fallback_reason = task.active_fallback_reason.clone();
+                        self.task_registry
+                            .set_worker_metadata(&task_id, transition_metadata.clone());
+                        self.event_stream.emit(RuntimeEvent::WorkerMetadataUpdated {
+                            run_id: self.run_id.clone(),
+                            task_id: task_id.clone(),
+                            metadata: transition_metadata,
+                        });
+                        let reason = format!(
+                            "switching from {previous_model} to fallback model {fallback_model}: {error_str}"
+                        );
+                        self.event_stream.emit(RuntimeEvent::TaskRetrying {
+                            run_id: self.run_id.clone(),
+                            task_id: task_id.clone(),
+                            next_attempt: attempt.saturating_add(1),
+                            reason,
+                            delay_ms: 0,
+                        });
+                        continue;
+                    }
 
                     if external_disconnect && disconnected_session.is_some() && !reconnectable {
                         self.task_registry.set_state(&task_id, TaskState::Parked);

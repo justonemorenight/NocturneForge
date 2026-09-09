@@ -214,21 +214,76 @@ pub struct AutoCompactSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
-pub struct ChatGptSubagentRoleContent {
-    /// ChatGPT Subscription model ID used for this role.
+pub struct NativeSubagentRoleContent {
+    /// Native provider used for this role.
+    pub provider: Option<LanguageModelProviderSetting>,
+    /// Model ID used for this role.
     pub model: Option<String>,
     /// Reasoning effort used for this role.
     pub effort: Option<String>,
+    /// Optional fallback used only for provider availability, rate-limit, network,
+    /// or context-window failures. Defaults to the parent model.
+    pub fallback: Option<SubagentFallbackModelContent>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentFallbackStrategy {
+    None,
+    #[default]
+    InheritFromParent,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(untagged)]
+pub enum SubagentFallbackModelContent {
+    Strategy(SubagentFallbackStrategy),
+    Model(LanguageModelSelection),
+}
+
+impl Default for SubagentFallbackModelContent {
+    fn default() -> Self {
+        Self::Strategy(SubagentFallbackStrategy::InheritFromParent)
+    }
 }
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
-pub struct ChatGptSubagentRolesContent {
-    /// Whether native ChatGPT Subscription role routing is enabled.
+pub struct NativeSubagentRolesContent {
+    /// Whether native role routing is enabled.
     pub enabled: Option<bool>,
-    pub explorer: Option<ChatGptSubagentRoleContent>,
-    pub flow_reader: Option<ChatGptSubagentRoleContent>,
-    pub coding_worker: Option<ChatGptSubagentRoleContent>,
+    pub explorer: Option<NativeSubagentRoleContent>,
+    pub flow_reader: Option<NativeSubagentRoleContent>,
+    pub coding_worker: Option<NativeSubagentRoleContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct CacheKeepaliveSettings {
+    /// Estimated retention, not a backend guarantee. Default: 1800 seconds.
+    pub estimated_ttl_seconds: Option<u64>,
+    /// Time before estimated expiry to attempt warming. Default: 120 seconds.
+    pub lead_seconds: Option<u64>,
+    /// Stop warming this long after the last real request. Default: 5400 seconds.
+    pub idle_window_seconds: Option<u64>,
+    /// Maximum warming requests per idle period. Default: 2.
+    pub max_pings: Option<u32>,
+    /// Maximum warming attempts across all threads per app hour. Default: 4.
+    pub max_requests_per_hour: Option<u32>,
+    /// Estimated input-token budget across warming requests per app hour. Default: 1000000.
+    pub max_input_tokens_per_hour: Option<u64>,
+    /// Entire warming request deadline. Default: 30 seconds.
+    pub timeout_seconds: Option<u64>,
+    /// Client-side streamed output limit, not a billing guarantee. Default: 1024 bytes.
+    pub max_output_bytes: Option<usize>,
+    /// Maximum serialized request size. Default: 1048576 bytes.
+    pub max_capture_bytes: Option<usize>,
+    /// Maximum resident thread captures. Default: 8.
+    pub max_captures: Option<usize>,
+    /// Minimum observed cache reuse to continue warming. Default: 90 percent.
+    pub min_cache_hit_percent: Option<u32>,
 }
 
 #[with_fallible_options]
@@ -242,6 +297,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub enable_checkpoints: Option<bool>,
+    /// Whether to allow experimental ChatGPT Subscription cache-warming requests
+    /// while native threads are idle. Warming consumes usage and does not
+    /// guarantee a cache hit. Does not send prompts to ACP agents.
+    ///
+    /// Default: false
+    pub cache_keepalive: Option<bool>,
+    /// Bounds for optional native ChatGPT Subscription cache warming.
+    pub cache_keepalive_config: Option<CacheKeepaliveSettings>,
     /// Whether to show the agent panel button in the status bar.
     ///
     /// Default: true
@@ -284,9 +347,10 @@ pub struct AgentSettingsContent {
     pub default_model: Option<LanguageModelSelection>,
     /// The model to use for subagents spawned via the `spawn_agent` tool. Defaults to the parent agent's model when not specified.
     pub subagent_model: Option<LanguageModelSelection>,
-    /// Native role routing for subagents spawned by ChatGPT Subscription.
+    /// Native role routing for subagents, independent of the parent provider.
     /// When disabled, `subagent_model` and parent-model inheritance behave as before.
-    pub chatgpt_subagent_roles: Option<ChatGptSubagentRolesContent>,
+    #[serde(alias = "chatgpt_subagent_roles")]
+    pub native_subagent_roles: Option<NativeSubagentRolesContent>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -451,6 +515,9 @@ pub struct OrchestrationSettingsContent {
     pub connection_timeout_seconds: Option<u64>,
     /// Time to retain inactive external worker transcripts in memory. Default: 900.
     pub terminal_session_retention_seconds: Option<u64>,
+    /// Maximum automatic parent-turn continuations while an orchestration goal remains active.
+    /// Default: 8.
+    pub max_parent_continuations: Option<usize>,
 }
 
 impl AgentSettingsContent {
