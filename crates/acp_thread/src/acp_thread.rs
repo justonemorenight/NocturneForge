@@ -14,8 +14,8 @@ pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, SharedString, Subscription,
-    Task, TaskExt, WeakEntity,
+    ActivityGuard, AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, SharedString,
+    Subscription, Task, TaskExt, WeakEntity,
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
@@ -31,7 +31,7 @@ use project::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
@@ -2634,6 +2634,7 @@ pub struct AcpThread {
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
     _observe_prompt_capabilities: Task<anyhow::Result<()>>,
+    _idle_sleep_subscriptions: Vec<Subscription>,
     terminals: HashMap<acp::TerminalId, Entity<Terminal>>,
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     /// Session IDs emitted by a batch spawn_agent call, keyed by its tool call.
@@ -2657,6 +2658,14 @@ pub struct AcpThread {
     /// threads update in coarse batches instead of driving the UI cadence used
     /// by the active thread.
     streaming_updates_visible: bool,
+    idle_sleep_prevention: IdleSleepPrevention,
+}
+
+enum IdleSleepPrevention {
+    Inactive,
+    Acquiring { _task: Task<()> },
+    Active { _guard: ActivityGuard },
+    Failed,
 }
 
 struct StreamingTextBuffer {
@@ -2834,6 +2843,24 @@ impl AcpThread {
             }
         });
 
+        let idle_sleep_settings_subscription = cx.observe_global::<SettingsStore>(|this, cx| {
+            this.update_idle_sleep_prevention(cx);
+        });
+        let idle_sleep_event_subscription =
+            cx.subscribe_self(|this, event: &AcpThreadEvent, cx| {
+                if matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::EntriesRemoved(_)
+                        | AcpThreadEvent::ToolAuthorizationRequested(_)
+                        | AcpThreadEvent::ToolAuthorizationReceived(_)
+                        | AcpThreadEvent::ElicitationRequested(_)
+                        | AcpThreadEvent::ElicitationResponded(_)
+                ) {
+                    this.update_idle_sleep_prevention(cx);
+                }
+            });
+
         let git_store = project.read(cx).git_store().clone();
         let _git_store_subscription = cx.subscribe(&git_store, |this, _, event, cx| {
             if matches!(
@@ -2875,6 +2902,10 @@ impl AcpThread {
             prompt_capabilities,
             available_commands: Vec::new(),
             _observe_prompt_capabilities: task,
+            _idle_sleep_subscriptions: vec![
+                idle_sleep_settings_subscription,
+                idle_sleep_event_subscription,
+            ],
             terminals: HashMap::default(),
             pending_terminal_output: HashMap::default(),
             subagent_sessions_by_tool: HashMap::default(),
@@ -2887,6 +2918,7 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             streaming_updates_visible,
+            idle_sleep_prevention: IdleSleepPrevention::Inactive,
         }
     }
 
@@ -5075,6 +5107,38 @@ impl AcpThread {
 
         // Wait for the send task to complete
         cx.background_spawn(turn.send_task)
+    }
+
+    fn update_idle_sleep_prevention(&mut self, cx: &mut Context<Self>) {
+        if !AgentSettings::get_global(cx).prevent_idle_sleep
+            || self.running_turn.is_none()
+            || self.is_waiting_for_confirmation()
+        {
+            self.idle_sleep_prevention = IdleSleepPrevention::Inactive;
+            return;
+        }
+
+        if !matches!(self.idle_sleep_prevention, IdleSleepPrevention::Inactive) {
+            return;
+        }
+
+        let acquisition = cx.prevent_idle_sleep("Agent thread in progress");
+        self.idle_sleep_prevention = IdleSleepPrevention::Acquiring {
+            _task: cx.spawn(async move |thread, cx| {
+                let result = acquisition.await;
+                thread
+                    .update(cx, |thread, _| {
+                        thread.idle_sleep_prevention = match result {
+                            Ok(guard) => IdleSleepPrevention::Active { _guard: guard },
+                            Err(error) => {
+                                log::error!("Failed to prevent idle sleep: {error:#}");
+                                IdleSleepPrevention::Failed
+                            }
+                        };
+                    })
+                    .log_err();
+            }),
+        };
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {

@@ -1,6 +1,6 @@
 use crate::{
-    BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
-    events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
+    BoolExt, MacActivity, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
+    MacWindow, events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
     set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
@@ -28,9 +28,9 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
 };
@@ -43,6 +43,7 @@ use objc::{
     runtime::{Class, Object, Sel},
     sel, sel_impl,
 };
+use objc2_foundation::NSActivityOptions;
 use parking_lot::Mutex;
 use ptr::null_mut;
 use semver::Version;
@@ -975,6 +976,13 @@ impl Platform for MacPlatform {
                 _ => ThermalState::Nominal,
             }
         }
+    }
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Ok(MacActivity::begin(
+            reason,
+            NSActivityOptions::UserInitiated,
+        )))
     }
 
     fn show_system_notification(&self, notification: gpui::SystemNotification) {

@@ -341,6 +341,7 @@ pub struct AgentSettings {
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub terminal_notification_style: AgentNotificationStyle,
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
+    pub prevent_idle_sleep: bool,
     pub single_file_review: bool,
     pub review_control_location: ReviewControlLocation,
     pub experimental_lsp_leases: bool,
@@ -909,6 +910,7 @@ impl Settings for AgentSettings {
             notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
             terminal_notification_style: agent.terminal_notification_style.unwrap_or_default(),
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),
+            prevent_idle_sleep: agent.prevent_idle_sleep.unwrap(),
             single_file_review: agent.single_file_review.unwrap(),
             review_control_location: agent.review_control_location.unwrap(),
             experimental_lsp_leases: agent.experimental_lsp_leases.unwrap_or(false),
@@ -1225,6 +1227,33 @@ mod tests {
     fn test_invalid_regex_returns_none() {
         let result = CompiledRegex::new("[invalid(regex", false);
         assert!(result.is_none());
+    }
+
+    #[gpui::test]
+    fn test_prevent_idle_sleep_defaults_to_true_and_follows_user_settings(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+        assert!(AgentSettings::get_global(cx).prevent_idle_sleep);
+
+        for (content, expected) in [
+            (r#"{"agent": {"prevent_idle_sleep": false}}"#, false),
+            (r#"{"agent": {"prevent_idle_sleep": true}}"#, true),
+            (r#"{"agent": {"prevent_idle_sleep": null}}"#, true),
+            (r#"{"agent": {}}"#, true),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(content, cx)
+                    .expect("user settings should load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).prevent_idle_sleep,
+                expected,
+                "{content}"
+            );
+        }
     }
 
     #[gpui::test]

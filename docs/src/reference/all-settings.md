@@ -5460,6 +5460,16 @@ Run the {#action theme_selector::Toggle} action in the command palette to see a 
 
 Visit [AI Quick Start](../ai/quick-start.md) under the AI section to learn more about AI setup.
 
+### Prevent Idle Sleep
+
+- Description: Whether to keep the system from idle-sleeping while an agent thread is running. See [Keeping the System Awake](../ai/agent-panel.md#prevent-idle-sleep).
+- Setting: `agent.prevent_idle_sleep`
+- Default: `true`
+
+**Options**
+
+`boolean` values
+
 ## Collaboration Panel
 
 - Description: Customizations for the collaboration panel.
