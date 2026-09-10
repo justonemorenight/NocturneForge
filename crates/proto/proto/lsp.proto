@@ -118,62 +118,6 @@ message DocumentHighlight {
   }
 }
 
-message CallHierarchyItem {
-  string name = 1;
-  int32 kind = 2;
-  optional string detail = 3;
-  uint64 buffer_id = 4;
-  uint64 server_id = 5;
-  Anchor range_start = 6;
-  Anchor range_end = 7;
-  Anchor selection_range_start = 8;
-  Anchor selection_range_end = 9;
-  optional bytes data = 10;
-}
-
-message CallHierarchyIncomingCall {
-  CallHierarchyItem from = 1;
-  repeated Location from_ranges = 2;
-}
-
-message CallHierarchyOutgoingCall {
-  CallHierarchyItem to = 1;
-  repeated Location from_ranges = 2;
-}
-
-message PrepareCallHierarchy {
-  uint64 project_id = 1;
-  uint64 buffer_id = 2;
-  Anchor position = 3;
-  repeated VectorClockEntry version = 4;
-}
-
-message PrepareCallHierarchyResponse {
-  repeated CallHierarchyItem items = 1;
-}
-
-message GetIncomingCalls {
-  uint64 project_id = 1;
-  uint64 buffer_id = 2;
-  CallHierarchyItem item = 3;
-  repeated VectorClockEntry version = 4;
-}
-
-message GetIncomingCallsResponse {
-  repeated CallHierarchyIncomingCall calls = 1;
-}
-
-message GetOutgoingCalls {
-  uint64 project_id = 1;
-  uint64 buffer_id = 2;
-  CallHierarchyItem item = 3;
-  repeated VectorClockEntry version = 4;
-}
-
-message GetOutgoingCallsResponse {
-  repeated CallHierarchyOutgoingCall calls = 1;
-}
-
 message GetProjectSymbols {
   uint64 project_id = 1;
   string query = 2;
@@ -300,7 +244,6 @@ message LspExtExpandMacro {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   Anchor position = 3;
-  uint64 server_id = 4;
 }
 
 message LspExtExpandMacroResponse {
@@ -308,28 +251,10 @@ message LspExtExpandMacroResponse {
   string expansion = 2;
 }
 
-message LspExtExpandAbbreviation {
-  uint64 project_id = 1;
-  uint64 buffer_id = 2;
-  string abbreviation = 3;
-  repeated string text = 4;
-  string language = 5;
-  uint64 server_id = 6;
-  bool comment_filter = 7;
-  bool bem_filter = 8;
-  string indent = 9;
-  string base_indent = 10;
-}
-
-message LspExtExpandAbbreviationResponse {
-  optional string expansion = 1;
-}
-
 message LspExtOpenDocs {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   Anchor position = 3;
-  uint64 server_id = 4;
 }
 
 message LspExtOpenDocsResponse {
@@ -340,7 +265,6 @@ message LspExtOpenDocsResponse {
 message LspExtSwitchSourceHeader {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
-  uint64 server_id = 3;
 }
 
 message LspExtSwitchSourceHeaderResponse {
@@ -351,7 +275,6 @@ message LspExtGoToParentModule {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   Anchor position = 3;
-  uint64 server_id = 4;
 }
 
 message LspExtGoToParentModuleResponse {
@@ -443,6 +366,11 @@ message Documentation {
   }
 }
 
+enum MarkupKind {
+  PlainText = 0;
+  Markdown = 1;
+}
+
 message ParameterInformation {
   oneof label {
     string simple = 1;
@@ -508,7 +436,6 @@ message PrepareRenameResponse {
   Anchor end = 3;
   repeated VectorClockEntry version = 4;
   bool only_unprepared_rename_supported = 5;
-  optional uint64 language_server_id = 6;
 }
 
 message PerformRename {
@@ -517,7 +444,6 @@ message PerformRename {
   Anchor position = 3;
   string new_name = 4;
   repeated VectorClockEntry version = 5;
-  optional uint64 language_server_id = 6;
 }
 
 message OnTypeFormatting {
@@ -660,32 +586,6 @@ message GetCodeLensResponse {
 
 message RefreshCodeLens {
   uint64 project_id = 1;
-  optional uint64 server_id = 2;
-}
-
-message RefreshDocumentColors {
-  uint64 project_id = 1;
-  optional uint64 server_id = 2;
-}
-
-message RefreshDocumentLinks {
-  uint64 project_id = 1;
-  optional uint64 server_id = 2;
-}
-
-message RefreshDocumentHighlights {
-  uint64 project_id = 1;
-  optional uint64 server_id = 2;
-}
-
-message RefreshFoldingRanges {
-  uint64 project_id = 1;
-  optional uint64 server_id = 2;
-}
-
-message RefreshDocumentSymbols {
-  uint64 project_id = 1;
-  optional uint64 server_id = 2;
 }
 
 message MarkupContent {
@@ -859,7 +759,6 @@ message TraceMessage {
 
 message RpcMessage {
   Kind kind = 1;
-  optional uint64 elapsed_nanos = 2;
 
   enum Kind {
     RECEIVED = 0;
@@ -1052,9 +951,6 @@ message LspQuery {
     GetDocumentLinks get_document_links = 19;
     GetEditPredictionDefinition get_edit_prediction_definition = 20;
     GetEditPredictionTypeDefinition get_edit_prediction_type_definition = 21;
-    PrepareCallHierarchy prepare_call_hierarchy = 22;
-    GetIncomingCalls get_incoming_calls = 23;
-    GetOutgoingCalls get_outgoing_calls = 24;
   }
 }
 
@@ -1085,9 +981,6 @@ message LspResponse {
     GetDocumentLinksResponse get_document_links_response = 17;
     GetEditPredictionDefinitionResponse get_edit_prediction_definition_response = 18;
     GetEditPredictionTypeDefinitionResponse get_edit_prediction_type_definition_response = 19;
-    PrepareCallHierarchyResponse prepare_call_hierarchy_response = 20;
-    GetIncomingCallsResponse get_incoming_calls_response = 21;
-    GetOutgoingCallsResponse get_outgoing_calls_response = 22;
   }
   uint64 server_id = 7;
 }
@@ -1119,7 +1012,6 @@ message LspExtRunnables {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   optional Anchor position = 3;
-  uint64 server_id = 4;
 }
 
 message LspExtRunnablesResponse {
@@ -1172,8 +1064,6 @@ message LspDiagnostic {
   repeated LspDiagnosticRelatedInformation related_information = 8;
   repeated LspDiagnosticTag tags = 9;
   optional string data = 10;
-  // Set when the message is a MarkupContent rather than a plain string.
-  optional MarkupKind markup_message_kind = 11;
 
   enum Severity {
     None = 0;
