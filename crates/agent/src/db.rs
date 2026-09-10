@@ -101,6 +101,9 @@ pub struct DbThread {
     /// subagent session keeps its original filter.
     #[serde(default)]
     pub tool_filter: Option<Vec<SharedString>>,
+    /// Optional tools discovered through `tool_search` for this thread.
+    #[serde(default)]
+    pub discovered_tools: Vec<SharedString>,
     #[serde(default)]
     pub orchestration_run: Option<agent_orchestration::PersistedRun>,
     #[serde(default)]
@@ -189,6 +192,7 @@ impl SharedThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
+            discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
         }
@@ -417,6 +421,7 @@ impl DbThread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
+            discovered_tools: Vec::new(),
         })
     }
 }
@@ -893,6 +898,7 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
             tool_filter: None,
+            discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
         }

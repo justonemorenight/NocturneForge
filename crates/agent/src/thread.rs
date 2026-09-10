@@ -5,8 +5,9 @@ use crate::{
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
     ListOrchestrationAgentsTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
     SandboxedTerminalTool, SendMessageToAgentTool, SpawnAgentTool, SystemPromptTemplate, Template,
-    Templates, TerminalTool, ToolPermissionDecision, UpdateOrchestrationGoalTool, UpdatePlanTool,
-    WaitForAgentsTool, WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    Templates, TerminalTool, ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool,
+    UpdatePlanTool, WaitForAgentsTool, WebSearchTool, WriteFileTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -1636,6 +1637,9 @@ pub struct Thread {
     /// Snapshot at creation: it does not follow later changes to the
     /// spawner's tools. Persisted so restored sessions keep the filter.
     tool_filter: Option<HashSet<SharedString>>,
+    /// Optional tools discovered through `tool_search` for this thread.
+    /// Persisted so restored sessions can continue with the same tool surface.
+    discovered_tools: HashSet<SharedString>,
     orchestration_run: Option<agent_orchestration::RunHandle>,
     persisted_orchestration_run: Option<agent_orchestration::PersistedRun>,
     orchestration_goal: Option<agent_orchestration::GoalController>,
@@ -1794,6 +1798,7 @@ impl Thread {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
             tool_filter: None,
+            discovered_tools: HashSet::default(),
             orchestration_run: None,
             persisted_orchestration_run: None,
             orchestration_goal: None,
@@ -2209,6 +2214,7 @@ impl Thread {
             tool_filter: db_thread
                 .tool_filter
                 .map(|tools| tools.into_iter().collect()),
+            discovered_tools: db_thread.discovered_tools.into_iter().collect(),
         }
     }
 
@@ -2315,6 +2321,11 @@ impl Thread {
                 tools.sort();
                 tools
             }),
+            discovered_tools: {
+                let mut tools = self.discovered_tools.iter().cloned().collect::<Vec<_>>();
+                tools.sort();
+                tools
+            },
             orchestration_run: self
                 .orchestration_run
                 .as_ref()
@@ -2618,6 +2629,7 @@ impl Thread {
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
+        self.add_tool(ToolSearchTool::new(cx.weak_entity()));
         self.add_tool(UpdatePlanTool::new(cx.weak_entity()));
         if self.depth() == 0 {
             self.add_tool(ListOrchestrationAgentsTool::new(cx.weak_entity()));
@@ -5314,6 +5326,43 @@ impl Thread {
     }
 
     pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+        let mut tools = self.all_enabled_tools(cx);
+        if tools.contains_key(ToolSearchTool::NAME) {
+            tools.retain(|tool_name, _| {
+                Self::is_core_tool(tool_name) || self.discovered_tools.contains(tool_name)
+            });
+        }
+        tools
+    }
+
+    fn is_core_tool(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            ToolSearchTool::NAME
+                | AskUserTool::NAME
+                | DiagnosticsTool::NAME
+                | ApplyCodeActionTool::NAME
+                | FindPathTool::NAME
+                | FindReferencesTool::NAME
+                | GetCodeActionsTool::NAME
+                | GoToDefinitionTool::NAME
+                | GrepTool::NAME
+                | ListDirectoryTool::NAME
+                | ReadFileTool::NAME
+                | RenameTool::NAME
+                | TerminalTool::NAME
+                | UpdatePlanTool::NAME
+                | ListAgentsAndModelsTool::NAME
+                | ListOrchestrationAgentsTool::NAME
+                | SendMessageToAgentTool::NAME
+                | SpawnAgentTool::NAME
+                | UpdateOrchestrationGoalTool::NAME
+                | WaitForAgentsTool::NAME
+                | CreateThreadTool::NAME
+        )
+    }
+
+    fn all_enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
         let Some(model) = self.model() else {
             return BTreeMap::new();
         };
@@ -5438,6 +5487,63 @@ impl Thread {
         if let Some(turn) = self.running_turn.as_mut() {
             turn.tools = tools;
         }
+    }
+
+    pub(crate) fn search_and_enable_tools(
+        &mut self,
+        query: &str,
+        requested_limit: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Result<String> {
+        let query = query.trim().to_lowercase();
+        let limit = requested_limit.unwrap_or(8).clamp(1, 32);
+        let mut matches = self
+            .all_enabled_tools(cx)
+            .into_iter()
+            .filter(|(name, tool)| {
+                query.is_empty()
+                    || name.to_lowercase().contains(&query)
+                    || tool.description().to_lowercase().contains(&query)
+            })
+            .map(|(name, tool)| {
+                let name = name.to_string();
+                let description = tool.description().to_string().replace('\n', " ");
+                let already_enabled =
+                    Self::is_core_tool(&name) || self.discovered_tools.contains(name.as_str());
+                (already_enabled, name, description)
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        matches.truncate(limit);
+
+        if matches.is_empty() {
+            return Ok(if query.is_empty() {
+                "No additional tools are available for this thread.".to_string()
+            } else {
+                format!("No tools matched `{query}`.")
+            });
+        }
+
+        for (_, name, _) in &matches {
+            self.discovered_tools.insert(name.clone().into());
+        }
+        self.refresh_turn_tools(cx);
+        cx.notify();
+
+        let mut output = String::from("Available tools:\n");
+        for (already_enabled, name, description) in matches {
+            let status = if already_enabled {
+                "enabled"
+            } else {
+                "discovered"
+            };
+            writeln!(output, "- `{name}` ({status}): {description}")?;
+        }
+        output.push_str(
+            "Use a discovered tool by calling it directly. Search again when you need another capability.",
+        );
+        Ok(output)
     }
 
     fn tool(&self, name: &str) -> Option<Arc<dyn AnyAgentTool>> {
