@@ -278,6 +278,21 @@ pub struct SequencedRuntimeEvent {
     pub event: RuntimeEvent,
 }
 
+/// A bounded page of runtime events for restart and UI replay.
+///
+/// Replay consumers should persist the last returned sequence and request the
+/// next page instead of loading the complete in-memory history. `gap` is set
+/// when the requested cursor predates the bounded history; consumers must then
+/// rebuild from a run snapshot before applying the returned events.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventReplayPage {
+    pub events: Vec<SequencedRuntimeEvent>,
+    pub next_seq: Option<u64>,
+    pub oldest_seq: Option<u64>,
+    pub latest_seq: Option<u64>,
+    pub gap: bool,
+}
+
 /// A subscription to the event stream together with a per-subscriber flag
 /// that is set when the subscriber's channel overflowed and events were
 /// dropped. When `resync_required` becomes true, the subscriber should replay
@@ -475,6 +490,58 @@ impl RuntimeEventStream {
             .collect()
     }
 
+    /// Returns a bounded page of events after `from_seq`.
+    ///
+    /// The page is limited by both event count and serialized size. At least
+    /// one event is returned when available, even if that event alone exceeds
+    /// `max_bytes`, so callers can always advance their cursor.
+    pub fn history_page(&self, from_seq: u64, limit: usize, max_bytes: usize) -> EventReplayPage {
+        let log = self.event_log.read();
+        let oldest_seq = log.events.front().map(|event| event.seq);
+        let latest_seq = log.events.back().map(|event| event.seq);
+        let gap = oldest_seq.is_some_and(|oldest| from_seq.saturating_add(1) < oldest);
+
+        if limit == 0 || max_bytes == 0 {
+            return EventReplayPage {
+                events: Vec::new(),
+                next_seq: None,
+                oldest_seq,
+                latest_seq,
+                gap,
+            };
+        }
+
+        let mut events = Vec::with_capacity(limit.min(log.events.len()));
+        let mut serialized_bytes: usize = 0;
+        let mut has_more = false;
+        for event in log.events.iter().filter(|event| event.seq > from_seq) {
+            if events.len() >= limit {
+                has_more = true;
+                break;
+            }
+            let event_bytes = serialized_event_size(event);
+            if !events.is_empty() && serialized_bytes.saturating_add(event_bytes) > max_bytes {
+                has_more = true;
+                break;
+            }
+            serialized_bytes = serialized_bytes.saturating_add(event_bytes);
+            events.push(event.clone());
+        }
+
+        let next_seq = if has_more {
+            events.last().map(|event| event.seq)
+        } else {
+            None
+        };
+        EventReplayPage {
+            events,
+            next_seq,
+            oldest_seq,
+            latest_seq,
+            gap,
+        }
+    }
+
     /// Returns the full recorded event history with sequence numbers.
     pub fn history(&self) -> Vec<SequencedRuntimeEvent> {
         let log = self.event_log.read();
@@ -484,5 +551,57 @@ impl RuntimeEventStream {
     /// Returns the sequence number of the next event that will be emitted.
     pub fn latest_seq(&self) -> u64 {
         self.next_seq.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::RunId;
+    use crate::state::RunState;
+
+    fn state_event(run_id: &RunId) -> RuntimeEvent {
+        RuntimeEvent::RunStateChanged {
+            run_id: run_id.clone(),
+            state: RunState::Running,
+        }
+    }
+
+    #[test]
+    fn history_page_respects_count_and_cursor() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        for _ in 0..4 {
+            stream.emit(state_event(&run_id));
+        }
+
+        let first = stream.history_page(0, 2, usize::MAX);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.events[0].seq, 1);
+        assert_eq!(first.events[1].seq, 2);
+        assert_eq!(first.next_seq, Some(2));
+        assert_eq!(first.oldest_seq, Some(1));
+        assert_eq!(first.latest_seq, Some(4));
+        assert!(!first.gap);
+
+        let second = stream.history_page(first.next_seq.unwrap_or(0), 8, usize::MAX);
+        assert_eq!(second.events.len(), 2);
+        assert_eq!(second.events[0].seq, 3);
+        assert_eq!(second.events[1].seq, 4);
+        assert_eq!(second.next_seq, None);
+    }
+
+    #[test]
+    fn history_page_reports_cursor_gap_after_eviction() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        for _ in 0..10_001 {
+            stream.emit(state_event(&run_id));
+        }
+
+        let page = stream.history_page(0, 1, usize::MAX);
+        assert_eq!(page.oldest_seq, Some(2));
+        assert!(page.gap);
+        assert_eq!(page.events.first().map(|event| event.seq), Some(2));
     }
 }
