@@ -1,11 +1,12 @@
 use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
-    CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
-    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    ListOrchestrationAgentsTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
-    SandboxedTerminalTool, SendMessageToAgentTool, SpawnAgentTool, SystemPromptTemplate, Template,
-    Templates, TerminalTool, ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool,
+    CreateDirectoryTool, CreateThreadTool, DEFAULT_TOOL_SEARCH_LIMIT, DbLanguageModel, DbThread,
+    DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
+    GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
+    ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_DESCRIPTION_BYTES, MAX_TOOL_SEARCH_RESULTS,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool,
+    SendMessageToAgentTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
+    TerminalTool, ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool,
     UpdatePlanTool, WaitForAgentsTool, WebSearchTool, WriteFileTool,
     decide_permission_from_settings,
 };
@@ -5496,7 +5497,9 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<String> {
         let query = query.trim().to_lowercase();
-        let limit = requested_limit.unwrap_or(8).clamp(1, 32);
+        let limit = requested_limit
+            .unwrap_or(DEFAULT_TOOL_SEARCH_LIMIT)
+            .clamp(1, MAX_TOOL_SEARCH_RESULTS);
         let mut matches = self
             .all_enabled_tools(cx)
             .into_iter()
@@ -5507,7 +5510,10 @@ impl Thread {
             })
             .map(|(name, tool)| {
                 let name = name.to_string();
-                let description = tool.description().to_string().replace('\n', " ");
+                let description = agent_orchestration::truncate_text(
+                    tool.description().to_string().replace('\n', " "),
+                    MAX_TOOL_SEARCH_DESCRIPTION_BYTES,
+                );
                 let already_enabled =
                     Self::is_core_tool(&name) || self.discovered_tools.contains(name.as_str());
                 (already_enabled, name, description)
