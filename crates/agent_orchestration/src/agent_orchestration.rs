@@ -641,6 +641,12 @@ mod tests {
         let statuses = handle.task_statuses();
         assert_eq!(statuses.len(), 2);
         assert!(statuses.iter().all(|s| s.state == TaskState::Completed));
+        assert!(handle.snapshot().event_log.iter().any(|event| {
+            matches!(
+                &event.event,
+                RuntimeEvent::TaskPhaseChanged { phase, .. } if phase == "quiescing"
+            )
+        }));
     }
 
     #[gpui::test]

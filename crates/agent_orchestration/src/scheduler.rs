@@ -701,8 +701,16 @@ impl Scheduler {
                 return;
             }
 
+            if !self.task_registry.attempt_is_active(&task_id, attempt) {
+                // A worker can resolve after cancellation or a restart. Its
+                // output no longer owns the task slot and must not be
+                // published into the new lifecycle.
+                return;
+            }
+
             match exec_result {
                 Ok(output) => {
+                    reporter.set_phase("quiescing");
                     if let Some(mut metadata) = output.worker_metadata.clone() {
                         metadata.fallback_from_model = task.active_fallback_from_model.clone();
                         metadata.fallback_reason = task.active_fallback_reason.clone();
@@ -829,6 +837,10 @@ impl Scheduler {
                                 task_id: task_id.clone(),
                                 result: verification.clone(),
                             });
+
+                        if !self.task_registry.attempt_is_active(&task_id, attempt) {
+                            return;
+                        }
 
                         if !task_token.is_cancelled()
                             && !verification.passed
@@ -992,6 +1004,10 @@ impl Scheduler {
                             }
                             self.mark_blocked_dependents(&task_id);
                             self.cleanup_terminal_worktree(&task_id, attempt).await;
+                            return;
+                        }
+
+                        if !self.task_registry.attempt_is_active(&task_id, attempt) {
                             return;
                         }
 
