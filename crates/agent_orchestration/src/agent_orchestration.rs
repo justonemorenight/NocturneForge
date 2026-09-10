@@ -41,7 +41,7 @@ pub use control_plane::{
     AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentIdentity,
     AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
 };
-pub use events::{RuntimeEvent, RuntimeEventStream};
+pub use events::{EventReplayPage, RuntimeEvent, RuntimeEventStream};
 pub use execution_limiter::{
     AgentExecutionLimiter, AgentExecutionLimiterConfig, AgentExecutionPermit,
 };
