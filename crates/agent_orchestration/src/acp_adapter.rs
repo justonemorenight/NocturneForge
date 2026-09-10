@@ -73,6 +73,9 @@ impl AcpEventAdapter {
             RuntimeEvent::TaskDispatched {
                 task_id, attempt, ..
             } => Some(format!("Starting task `{task_id}` (attempt {attempt})...")),
+            RuntimeEvent::TaskPhaseChanged { task_id, phase, .. } => {
+                Some(format!("Task `{task_id}` phase: {phase}"))
+            }
             RuntimeEvent::TaskVerifying { task_id, .. } => {
                 Some(format!("Verifying output for task `{task_id}`..."))
             }

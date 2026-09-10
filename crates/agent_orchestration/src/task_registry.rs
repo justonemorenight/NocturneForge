@@ -387,6 +387,19 @@ impl TaskRegistry {
         }
     }
 
+    /// Returns whether an attempt still owns the task's active execution slot.
+    /// Executors can finish asynchronously after cancellation or a restart;
+    /// callers must not publish that stale result as a new task completion.
+    pub fn attempt_is_active(&self, task_id: &TaskId, attempt: u32) -> bool {
+        self.statuses.read().get(task_id).is_some_and(|status| {
+            status.current_attempt == attempt
+                && matches!(
+                    status.state,
+                    TaskState::Running | TaskState::Verifying | TaskState::Repairing
+                )
+        })
+    }
+
     /// Sets or clears the tool currently being invoked by the task.
     pub fn set_current_tool(&self, task_id: &TaskId, tool: Option<impl Into<String>>) {
         let mut statuses = self.statuses.write();
