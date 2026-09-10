@@ -429,10 +429,6 @@ impl HeadlessProject {
                     .log_err();
             }
             LspStoreEvent::LanguageServerUpdate {
-                message: proto::update_language_server::Variant::MetadataUpdated(_),
-                ..
-            } => {}
-            LspStoreEvent::LanguageServerUpdate {
                 language_server_id,
                 name,
                 message,
