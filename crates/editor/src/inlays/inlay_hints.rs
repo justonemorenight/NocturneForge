@@ -1127,7 +1127,7 @@ pub mod tests {
     use multi_buffer::{MultiBuffer, MultiBufferOffset, PathKey};
     use parking_lot::Mutex;
     use pretty_assertions::assert_eq;
-    use project::{CodeAction, FakeFs, InlayId, InvalidationStrategy, LspAction, Project};
+    use project::{CodeAction, FakeFs, InlayId, LspAction, Project};
     use serde_json::json;
     use settings::{AllLanguageSettingsContent, InlayHintSettingsContent, SettingsStore};
     use std::ops::Range;
