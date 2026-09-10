@@ -831,15 +831,16 @@ impl Scheduler {
                                     crate::verification::ErrorClass::FatalError,
                                 )
                             });
-                        self.event_stream
-                            .emit(RuntimeEvent::TaskVerificationResult {
-                                run_id: self.run_id.clone(),
-                                task_id: task_id.clone(),
-                                result: verification.clone(),
-                            });
-
-                        if !self.task_registry.attempt_is_active(&task_id, attempt) {
-                            return;
+                        if !task_token.is_cancelled() {
+                            if !self.task_registry.attempt_is_active(&task_id, attempt) {
+                                return;
+                            }
+                            self.event_stream
+                                .emit(RuntimeEvent::TaskVerificationResult {
+                                    run_id: self.run_id.clone(),
+                                    task_id: task_id.clone(),
+                                    result: verification.clone(),
+                                });
                         }
 
                         if !task_token.is_cancelled()
@@ -862,15 +863,20 @@ impl Scheduler {
                             repair_context.existing_session_id = session_id.clone();
                             repair_context.previous_worker_metadata =
                                 verified_output.worker_metadata.clone();
-                            match self
+                            let repair_result = self
                                 .run_controlled(
                                     self.executor.repair(&task, &feedback, repair_context),
                                     &task_token,
                                     remaining_timeout(),
                                 )
-                                .await
+                                .await;
+                            if !task_token.is_cancelled()
+                                && !self.task_registry.attempt_is_active(&task_id, attempt)
                             {
-                                Ok(repaired_output) => {
+                                return;
+                            }
+                            match repair_result {
+                                Ok(repaired_output) if !task_token.is_cancelled() => {
                                     if let Some(metadata) = repaired_output.worker_metadata.clone()
                                     {
                                         self.task_registry
@@ -934,7 +940,7 @@ impl Scheduler {
                                             tool_calls_used: status.budget_state.tool_calls_used,
                                         });
                                     }
-                                    verification = self
+                                    let repaired_verification = self
                                         .run_controlled(
                                             self.executor.verify(&task, &repaired_output),
                                             &task_token,
@@ -949,15 +955,23 @@ impl Scheduler {
                                                 crate::verification::ErrorClass::FatalError,
                                             )
                                         });
-                                    verified_output = repaired_output;
-                                    self.event_stream
-                                        .emit(RuntimeEvent::TaskVerificationResult {
-                                            run_id: self.run_id.clone(),
-                                            task_id: task_id.clone(),
-                                            result: verification.clone(),
-                                        });
+                                    if !task_token.is_cancelled() {
+                                        if !self.task_registry.attempt_is_active(&task_id, attempt)
+                                        {
+                                            return;
+                                        }
+                                        verification = repaired_verification;
+                                        verified_output = repaired_output;
+                                        self.event_stream.emit(
+                                            RuntimeEvent::TaskVerificationResult {
+                                                run_id: self.run_id.clone(),
+                                                task_id: task_id.clone(),
+                                                result: verification.clone(),
+                                            },
+                                        );
+                                    }
                                 }
-                                Err(error) => {
+                                Err(error) if !task_token.is_cancelled() => {
                                     verification = VerificationResult::fail(
                                         format!("repair failed: {error}"),
                                         crate::verification::ErrorClass::FatalError,
@@ -969,6 +983,7 @@ impl Scheduler {
                                             result: verification.clone(),
                                         });
                                 }
+                                _ => {}
                             }
                         }
 

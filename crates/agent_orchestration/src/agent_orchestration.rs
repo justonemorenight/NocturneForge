@@ -1168,6 +1168,17 @@ mod tests {
                     TaskState::Failed
                 })
             );
+            let verification_event_count = handle
+                .snapshot()
+                .event_log
+                .iter()
+                .filter(|event| matches!(event.event, RuntimeEvent::TaskVerificationResult { .. }))
+                .count();
+            assert_eq!(
+                verification_event_count,
+                usize::from(repair),
+                "cancelled stages must not publish a synthetic verification result"
+            );
         }
     }
 
