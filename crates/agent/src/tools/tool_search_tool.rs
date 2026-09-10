@@ -11,6 +11,9 @@ pub(crate) const DEFAULT_TOOL_SEARCH_LIMIT: usize = 8;
 pub(crate) const MAX_TOOL_SEARCH_RESULTS: usize = 32;
 pub(crate) const MAX_TOOL_SEARCH_DESCRIPTION_BYTES: usize = 512;
 
+/// Searches the optional tool catalog and enables matching tools for the next
+/// model request. Use this before calling a capability that is not already in
+/// the current tool list.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ToolSearchToolInput {
     /// A tool name or capability to search for. An empty query lists the most
