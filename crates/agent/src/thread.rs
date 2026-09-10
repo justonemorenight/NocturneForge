@@ -3,12 +3,12 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DEFAULT_TOOL_SEARCH_LIMIT, DbLanguageModel, DbThread,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
     GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_DESCRIPTION_BYTES, MAX_TOOL_SEARCH_RESULTS,
-    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool,
-    SendMessageToAgentTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool,
-    UpdatePlanTool, WaitForAgentsTool, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_RESULTS, MovePathTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, SandboxedTerminalTool, SendMessageToAgentTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
+    ToolSearchTool, UpdateOrchestrationGoalTool, UpdatePlanTool, WaitForAgentsTool, WebSearchTool,
+    WriteFileTool, bounded_tool_description, decide_permission_from_settings,
+    tool_search_relevance,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -5503,24 +5503,29 @@ impl Thread {
         let mut matches = self
             .all_enabled_tools(cx)
             .into_iter()
-            .filter(|(name, tool)| {
-                query.is_empty()
-                    || name.to_lowercase().contains(&query)
-                    || tool.description().to_lowercase().contains(&query)
-            })
-            .map(|(name, tool)| {
+            .filter_map(|(name, tool)| {
                 let name = name.to_string();
-                let description = agent_orchestration::truncate_text(
-                    tool.description().to_string().replace('\n', " "),
-                    MAX_TOOL_SEARCH_DESCRIPTION_BYTES,
-                );
                 let already_enabled =
                     Self::is_core_tool(&name) || self.discovered_tools.contains(name.as_str());
-                (already_enabled, name, description)
+                if query.is_empty() && already_enabled {
+                    return None;
+                }
+
+                let description = bounded_tool_description(&tool.description());
+                let normalized_name = name.to_lowercase();
+                let normalized_description = description.to_lowercase();
+                let relevance =
+                    tool_search_relevance(&normalized_name, &normalized_description, &query)?;
+                Some((relevance, already_enabled, name, description))
             })
             .collect::<Vec<_>>();
 
-        matches.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
         matches.truncate(limit);
 
         if matches.is_empty() {
@@ -5531,14 +5536,14 @@ impl Thread {
             });
         }
 
-        for (_, name, _) in &matches {
+        for (_, _, name, _) in &matches {
             self.discovered_tools.insert(name.clone().into());
         }
         self.refresh_turn_tools(cx);
         cx.notify();
 
         let mut output = String::from("Available tools:\n");
-        for (already_enabled, name, description) in matches {
+        for (_, already_enabled, name, description) in matches {
             let status = if already_enabled {
                 "enabled"
             } else {

@@ -6571,6 +6571,25 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
     });
 }
 
+fn assert_empty_tool_search_discovers_optional_tool(
+    thread: &Entity<Thread>,
+    cx: &mut TestAppContext,
+) {
+    let discovery = thread
+        .update(cx, |thread, cx| {
+            thread.search_and_enable_tools("", Some(1), cx)
+        })
+        .expect("search available tools");
+    assert!(
+        discovery.contains("(discovered)"),
+        "an empty search should prioritize an optional tool: {discovery}"
+    );
+    assert!(
+        !discovery.contains("(enabled)"),
+        "already-visible core tools should not consume empty-search results: {discovery}"
+    );
+}
+
 #[gpui::test]
 async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     init_test(cx);
@@ -6663,6 +6682,8 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     );
     model.end_last_completion_stream();
     cx.run_until_parked();
+
+    assert_empty_tool_search_discovers_optional_tool(&thread, cx);
 
     thread
         .update(cx, |thread, cx| {

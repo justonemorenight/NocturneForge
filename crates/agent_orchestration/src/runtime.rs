@@ -355,7 +355,7 @@ impl RunHandle {
     }
 
     pub fn subscribe(&self) -> EventSubscription {
-        self.event_stream.subscribe_with_replay()
+        self.event_stream.subscribe_from(0)
     }
 
     pub fn subscribe_live(&self) -> EventSubscription {

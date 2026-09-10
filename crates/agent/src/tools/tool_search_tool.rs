@@ -11,6 +11,38 @@ pub(crate) const DEFAULT_TOOL_SEARCH_LIMIT: usize = 8;
 pub(crate) const MAX_TOOL_SEARCH_RESULTS: usize = 32;
 pub(crate) const MAX_TOOL_SEARCH_DESCRIPTION_BYTES: usize = 512;
 
+pub(crate) fn bounded_tool_description(description: &str) -> String {
+    let mut bounded =
+        String::with_capacity(description.len().min(MAX_TOOL_SEARCH_DESCRIPTION_BYTES));
+    for character in description.chars() {
+        if bounded.len().saturating_add(character.len_utf8()) > MAX_TOOL_SEARCH_DESCRIPTION_BYTES {
+            break;
+        }
+        bounded.push(if character == '\n' { ' ' } else { character });
+    }
+    bounded
+}
+
+pub(crate) fn tool_search_relevance(
+    normalized_name: &str,
+    normalized_description: &str,
+    query: &str,
+) -> Option<u8> {
+    if query.is_empty() {
+        Some(0)
+    } else if normalized_name == query {
+        Some(1)
+    } else if normalized_name.starts_with(query) {
+        Some(2)
+    } else if normalized_name.contains(query) {
+        Some(3)
+    } else if normalized_description.contains(query) {
+        Some(4)
+    } else {
+        None
+    }
+}
+
 /// Searches the optional tool catalog and enables matching tools for the next
 /// model request. Use this before calling a capability that is not already in
 /// the current tool list.
@@ -83,5 +115,38 @@ impl AgentTool for ToolSearchTool {
             event_stream.update_fields(acp::ToolCallUpdateFields::new().title("Tools discovered"));
             Ok(result)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_description_normalizes_without_splitting_unicode() {
+        let description = format!("first line\n{}", "🦀".repeat(256));
+        let bounded = bounded_tool_description(&description);
+
+        assert!(bounded.len() <= MAX_TOOL_SEARCH_DESCRIPTION_BYTES);
+        assert!(bounded.starts_with("first line "));
+        assert!(!bounded.contains('\n'));
+    }
+
+    #[test]
+    fn relevance_prefers_names_over_descriptions() {
+        assert_eq!(
+            tool_search_relevance("edit_file", "write code", "edit_file"),
+            Some(1)
+        );
+        assert_eq!(
+            tool_search_relevance("edit_file", "write code", "edit"),
+            Some(2)
+        );
+        assert_eq!(
+            tool_search_relevance("streaming_edit", "write code", "edit"),
+            Some(3)
+        );
+        assert_eq!(tool_search_relevance("other", "edit code", "edit"), Some(4));
+        assert_eq!(tool_search_relevance("other", "read code", "edit"), None);
     }
 }

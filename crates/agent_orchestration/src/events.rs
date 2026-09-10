@@ -320,6 +320,8 @@ struct Subscriber {
 const MAX_EVENT_HISTORY: usize = 10_000;
 const MAX_EVENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const SUBSCRIBER_CAPACITY: usize = 256;
+const MAX_SUBSCRIPTION_REPLAY_EVENTS: usize = SUBSCRIBER_CAPACITY;
+const MAX_SUBSCRIPTION_REPLAY_BYTES: usize = 512 * 1024;
 
 #[derive(Default)]
 struct EventLog {
@@ -376,20 +378,17 @@ impl RuntimeEventStream {
         Self {
             event_log: Arc::new(RwLock::new(event_log)),
             subscribers: Arc::new(RwLock::new(Vec::new())),
-            next_seq: Arc::new(AtomicU64::new(max_seq + 1)),
+            next_seq: Arc::new(AtomicU64::new(max_seq.saturating_add(1))),
         }
     }
 
     /// Emits an event with the next sequence number to all active subscribers
     /// and stores it in the bounded event log.
     pub fn emit(&self, event: RuntimeEvent) {
+        let mut log = self.event_log.write();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let sequenced = SequencedRuntimeEvent { seq, event };
-
-        {
-            let mut log = self.event_log.write();
-            log.push(sequenced.clone());
-        }
+        log.push(sequenced.clone());
 
         let mut subscribers = self.subscribers.write();
         subscribers.retain(
@@ -422,7 +421,9 @@ impl RuntimeEventStream {
     }
 
     /// Creates a subscription that replays all past events and continues with
-    /// live events.
+    /// live events. Kept for compatibility with consumers that explicitly need
+    /// the complete retained history; runtime UI callers should prefer
+    /// `subscribe_from`.
     pub fn subscribe_with_replay(&self) -> EventSubscription {
         let log = self.event_log.read();
         let capacity = log.events.len().saturating_add(SUBSCRIBER_CAPACITY).max(1);
@@ -449,15 +450,33 @@ impl RuntimeEventStream {
 
     /// Creates a subscription that replays only events with `seq > from_seq`
     /// and continues with live events. Used by subscribers recovering from a
-    /// detected gap.
+    /// detected gap. Replay is capped independently from the retained event
+    /// history. If the cursor is stale or the tail exceeds that cap, no partial
+    /// history is enqueued and `resync_required` is set so the consumer can
+    /// rebuild from a snapshot while already subscribed to future events.
     pub fn subscribe_from(&self, from_seq: u64) -> EventSubscription {
         let log = self.event_log.read();
-        let replay = log
+        let cursor_gap = log
             .events
-            .iter()
-            .filter(|event| event.seq > from_seq)
-            .cloned()
-            .collect::<Vec<_>>();
+            .front()
+            .is_some_and(|event| from_seq.saturating_add(1) < event.seq);
+        let mut replay = Vec::new();
+        let mut replay_bytes = 0usize;
+        let mut resync = cursor_gap;
+        if !cursor_gap {
+            for event in log.events.iter().filter(|event| event.seq > from_seq) {
+                let event_bytes = serialized_event_size(event);
+                if replay.len() >= MAX_SUBSCRIPTION_REPLAY_EVENTS
+                    || replay_bytes.saturating_add(event_bytes) > MAX_SUBSCRIPTION_REPLAY_BYTES
+                {
+                    replay.clear();
+                    resync = true;
+                    break;
+                }
+                replay_bytes = replay_bytes.saturating_add(event_bytes);
+                replay.push(event.clone());
+            }
+        }
         let capacity = replay.len().saturating_add(SUBSCRIBER_CAPACITY).max(1);
         let (sender, receiver) = async_channel::bounded(capacity);
         for event in &replay {
@@ -466,7 +485,7 @@ impl RuntimeEventStream {
                 break;
             }
         }
-        let resync_required = Arc::new(AtomicBool::new(false));
+        let resync_required = Arc::new(AtomicBool::new(resync));
         let mut subscribers = self.subscribers.write();
         subscribers.push(Subscriber {
             sender,
@@ -603,5 +622,76 @@ mod tests {
         assert_eq!(page.oldest_seq, Some(2));
         assert!(page.gap);
         assert_eq!(page.events.first().map(|event| event.seq), Some(2));
+    }
+
+    #[test]
+    fn subscribe_from_replays_a_small_tail() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        for _ in 0..4 {
+            stream.emit(state_event(&run_id));
+        }
+
+        let subscription = stream.subscribe_from(1);
+        assert!(!subscription.resync_required.load(Ordering::SeqCst));
+        let replayed = (0..3)
+            .map(|_| subscription.receiver.try_recv().expect("replayed event"))
+            .map(|event| event.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, vec![2, 3, 4]);
+        assert!(subscription.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscribe_from_requests_resync_instead_of_enqueuing_a_large_tail() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        for _ in 0..=MAX_SUBSCRIPTION_REPLAY_EVENTS {
+            stream.emit(state_event(&run_id));
+        }
+
+        let subscription = stream.subscribe_from(0);
+        assert!(subscription.resync_required.load(Ordering::SeqCst));
+        assert!(subscription.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscribe_from_requests_resync_for_an_evicted_cursor() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        for _ in 0..=MAX_EVENT_HISTORY {
+            stream.emit(state_event(&run_id));
+        }
+
+        let subscription = stream.subscribe_from(0);
+        assert!(subscription.resync_required.load(Ordering::SeqCst));
+        assert!(subscription.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_emit_preserves_sequence_order() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::new();
+        let mut emitters = Vec::new();
+        for _ in 0..4 {
+            let stream = stream.clone();
+            let run_id = run_id.clone();
+            emitters.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    stream.emit(state_event(&run_id));
+                }
+            }));
+        }
+        for emitter in emitters {
+            emitter.join().expect("event emitter");
+        }
+
+        let history = stream.history();
+        assert_eq!(history.len(), 2_000);
+        assert!(
+            history
+                .windows(2)
+                .all(|events| events[1].seq == events[0].seq + 1)
+        );
     }
 }
