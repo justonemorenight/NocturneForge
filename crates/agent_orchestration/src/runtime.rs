@@ -6,7 +6,7 @@ use crate::context_checkpoint::{
 use crate::control_plane::{
     AgentControlPlane, AgentControlPlaneConfig, AgentMessage, AgentMessageKind, AgentPath,
 };
-use crate::events::{EventSubscription, RuntimeEvent, RuntimeEventStream};
+use crate::events::{EventReplayPage, EventSubscription, RuntimeEvent, RuntimeEventStream};
 use crate::executor::TaskExecutor;
 use crate::goal_controller::{GoalController, GoalControllerConfig, GoalSnapshot};
 use crate::ids::{RunId, TaskId};
@@ -360,6 +360,19 @@ impl RunHandle {
 
     pub fn subscribe_live(&self) -> EventSubscription {
         self.event_stream.subscribe()
+    }
+
+    /// Replays a bounded event page after `from_seq`. Consumers should use the
+    /// returned cursor for the next request and rebuild from `snapshot()` when
+    /// the page reports a history gap.
+    pub fn replay_events(&self, from_seq: u64, limit: usize, max_bytes: usize) -> EventReplayPage {
+        self.event_stream.history_page(from_seq, limit, max_bytes)
+    }
+
+    /// Subscribes to live events while replaying only the requested cursor.
+    /// This avoids forcing a restored UI to enqueue the entire bounded log.
+    pub fn subscribe_from(&self, from_seq: u64) -> EventSubscription {
+        self.event_stream.subscribe_from(from_seq)
     }
 
     pub fn approve(&self) -> Result<()> {
