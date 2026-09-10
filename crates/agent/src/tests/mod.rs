@@ -6653,8 +6653,25 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         tool_names.iter().any(|t| t == ReadFileTool::NAME),
         "expected non-LSP tools to still be exposed, got: {tool_names:?}"
     );
+    assert!(
+        tool_names.iter().any(|t| t == ToolSearchTool::NAME),
+        "expected tool_search to be exposed, got: {tool_names:?}"
+    );
+    assert!(
+        !tool_names.iter().any(|t| t == EditFileTool::NAME),
+        "edit_file should be lazy until discovered, got: {tool_names:?}"
+    );
     model.end_last_completion_stream();
     cx.run_until_parked();
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.search_and_enable_tools(EditFileTool::NAME, Some(1), cx)
+        })
+        .unwrap();
+    thread.read_with(cx, |thread, cx| {
+        assert!(thread.enabled_tools(cx).contains_key(EditFileTool::NAME));
+    });
 
     // Enable the `lsp-tool` flag and send another message; the LSP tools
     // should now appear in the completion request.

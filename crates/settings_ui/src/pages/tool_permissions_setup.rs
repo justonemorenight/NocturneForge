@@ -1432,6 +1432,9 @@ mod tests {
             "wait_for_agents",
             // Progress-only state update with no external side effects.
             "update_plan",
+            // Search only changes the model-visible tool surface; it has no
+            // external side effects and does not require permission rules.
+            "tool_search",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();
