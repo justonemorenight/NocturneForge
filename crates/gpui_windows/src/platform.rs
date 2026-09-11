@@ -112,6 +112,9 @@ impl WindowsPlatformState {
 
 struct PowerRequest {
     handle: HANDLE,
+    // `PowerCreateRequest` retains a pointer into the reason string for the
+    // lifetime of the handle, so the UTF-16 buffer must outlive the request.
+    _reason: Vec<u16>,
 }
 
 unsafe impl Send for PowerRequest {}
@@ -134,7 +137,10 @@ impl PowerRequest {
                 .log_err();
             return Err(error).context("Failed to set the Windows power request");
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            _reason: reason,
+        })
     }
 }
 
