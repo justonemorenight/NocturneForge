@@ -63,7 +63,7 @@ async fn test_diagnostic_batches_skip_paths_without_worktrees(cx: &mut TestAppCo
                                     lsp::Position::new(0, 3),
                                 ),
                                 severity: Some(lsp::DiagnosticSeverity::ERROR),
-                                message: lsp::DiagnosticMessage::from(message),
+                                message: message.to_string(),
                                 ..lsp::Diagnostic::default()
                             })
                             .collect(),
