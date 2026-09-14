@@ -11249,7 +11249,9 @@ mod tests {
 
         // Send first message (turn_id=1) - handler will block
         let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
+        cx.run_until_parked();
         assert_eq!(thread.read_with(cx, |t, _| t.turn_id), 1);
+        assert_eq!(cx.active_idle_sleep_preventions(), 1);
         let permission_task = thread
             .update(cx, |thread, cx| {
                 thread.request_tool_call_authorization(
@@ -11260,6 +11262,7 @@ mod tests {
                 )
             })
             .unwrap();
+        assert_eq!(cx.active_idle_sleep_preventions(), 0);
 
         // Send second message (turn_id=2) while first is still blocked
         // This calls cancel() which takes turn 1's running_turn and sets turn 2's
@@ -11302,6 +11305,7 @@ mod tests {
             !running_turn_after_second,
             "second turn completing should clear running_turn"
         );
+        assert_eq!(cx.active_idle_sleep_preventions(), 0);
     }
 
     #[gpui::test]
@@ -11997,6 +12001,7 @@ mod tests {
             ThreadStatus::Generating,
             "thread should be generating while the handler is parked"
         );
+        assert_eq!(cx.active_idle_sleep_preventions(), 1);
 
         // Replace the in-flight send_task with a no-op. Dropping the original
         // Task cancels its inner future, which drops `tx` without ever calling
@@ -12017,6 +12022,7 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+        assert_eq!(cx.active_idle_sleep_preventions(), 0);
     }
 
     #[gpui::test]
