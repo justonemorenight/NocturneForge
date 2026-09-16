@@ -4,7 +4,7 @@ use acp_thread::{
     ThreadStatus,
 };
 use agent_client_protocol::schema::v1 as acp;
-use agent_settings::AgentProfileId;
+use agent_settings::{AgentProfileId, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT};
 use anyhow::Result;
 use client::{Client, RefreshLlmTokenListener, UserStore};
 use collections::IndexMap;
@@ -9186,4 +9186,485 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
     // Thinking should now be enabled.
     assert!(model_b_completions[0].thinking_allowed);
+}
+
+#[gpui::test]
+async fn test_subagent_auto_compaction(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("subagent task prompt", cx);
+    test.tool_round(900_000, cx);
+
+    let request = test.compaction_request();
+    assert_eq!(request.thread_id, Some(test.handle.id().to_string()));
+    assert_eq!(
+        request.messages.last().unwrap().string_contents(),
+        COMPACTION_PROMPT
+    );
+    test.fail_compaction(
+        http_client::StatusCode::SERVICE_UNAVAILABLE,
+        Some(Duration::from_secs(3)),
+        cx,
+    );
+    test.assert_running(cx);
+    assert_eq!(test.model.pending_completions(), Vec::new());
+    cx.executor()
+        .advance_clock(crate::maximum_retry_delay_with_jitter(Duration::from_secs(
+            3,
+        )));
+    cx.run_until_parked();
+    let retry_request = test.compaction_request();
+    assert_eq!(retry_request.messages, request.messages);
+    let request = retry_request;
+
+    test.model
+        .send_completion_stream_text_chunk(&request, "subagent summary");
+    test.model.end_completion_stream(&request);
+    cx.run_until_parked();
+
+    let request = test.model.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+    assert_eq!(request.thread_id, Some(test.handle.id().to_string()));
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role != Role::System)
+            .map(|message| message.string_contents())
+            .take(2)
+            .collect::<Vec<_>>(),
+        vec![
+            "subagent task prompt",
+            "The previous conversation was compacted. Use this summary as context:\n\nsubagent summary",
+        ],
+    );
+    test.model
+        .send_completion_stream_text_chunk(&request, "subagent answer");
+    test.model.end_completion_stream(&request);
+    assert_eq!(send.await.unwrap(), "subagent answer");
+    test.assert_stopped(cx);
+
+    let handle = cx
+        .update(|cx| {
+            test.environment
+                .resume_subagent_thread(test.handle.id(), cx)
+        })
+        .unwrap();
+    assert_eq!(handle.id(), test.handle.id());
+    let send = cx.update(|cx| handle.send("follow-up task".to_string(), &cx.to_async()));
+    cx.run_until_parked();
+    let request = test.model.pending_completions().pop().unwrap();
+    assert_eq!(request.intent, Some(CompletionIntent::Subagent));
+    assert_eq!(
+        request.messages.last().unwrap().string_contents(),
+        "follow-up task"
+    );
+    test.model
+        .send_completion_stream_text_chunk(&request, "follow-up answer");
+    test.model.end_completion_stream(&request);
+    assert_eq!(send.await.unwrap(), "follow-up answer");
+    test.assert_stopped(cx);
+
+    for use_tool in [false, true] {
+        let send = test.send("refused follow-up", cx);
+        if use_tool {
+            test.tool_round(0, cx);
+        }
+        test.model
+            .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(
+                StopReason::Refusal,
+            ));
+        test.model.end_last_completion_stream();
+        assert_eq!(
+            send.await.unwrap_err().to_string(),
+            "The agent refused to process that prompt. Try again."
+        );
+        test.assert_stopped(cx);
+    }
+}
+
+#[gpui::test]
+async fn test_subagent_compaction_respects_settings_and_context_window(cx: &mut TestAppContext) {
+    for (enabled, max_tokens, max_output_tokens, input_tokens) in [
+        (true, 1_000_000, None, 899_999),
+        (false, 1_000_000, None, 799_999),
+        (true, 79_999, None, 63_999),
+        (true, 100_000, Some(20_001), 79_999),
+    ] {
+        let test = SubagentCompactionTest::new(cx).await;
+        test.configure_compaction(enabled, max_tokens, max_output_tokens, cx);
+        let send = test.send("subagent task prompt", cx);
+        test.tool_round(input_tokens, cx);
+        let request = test.model.pending_completions().pop().unwrap();
+        assert_eq!(request.intent, Some(CompletionIntent::ToolResults));
+        test.assert_running(cx);
+        test.model
+            .send_completion_stream_text_chunk(&request, "subagent answer");
+        test.model.end_completion_stream(&request);
+        assert_eq!(send.await.unwrap(), "subagent answer");
+        test.assert_stopped(cx);
+    }
+}
+
+#[gpui::test]
+async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint(
+    cx: &mut TestAppContext,
+) {
+    for provider_error in [false, true] {
+        let test = SubagentCompactionTest::new_with_files(json!({".git": {}}), cx).await;
+        test.configure_compaction(false, 1_000_000, None, cx);
+        let mut send = test.send("subagent task prompt", cx);
+        let repository = test.thread.read_with(cx, |thread, cx| {
+            thread
+                .project()
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .active_repository()
+                .unwrap()
+        });
+        let (resume_checkpoint, checkpoint_gate) = oneshot::channel::<()>();
+        let checkpoint_job = repository.update(cx, |repository, _| {
+            repository.send_job("hold checkpoint", None, move |_, _| checkpoint_gate)
+        });
+        test.model
+            .send_last_completion_stream_text_chunk("partial work");
+        if provider_error {
+            test.model.send_last_completion_stream_error(
+                LanguageModelCompletionError::from_http_status(
+                    LanguageModelProviderName::new("test"),
+                    http_client::StatusCode::BAD_REQUEST,
+                    "terminal provider error".to_string(),
+                    None,
+                ),
+            );
+        }
+        test.model.end_last_completion_stream();
+        cx.run_until_parked();
+
+        test.thread
+            .read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+        assert!((&mut send).now_or_never().is_none());
+        repository.read_with(cx, |repository, _| {
+            let queue = repository.job_debug_queue().to_debug_value();
+            assert_eq!(
+                queue["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|job| job["description"] == "checkpoint" && job["status"] == "Pending")
+                    .count(),
+                1,
+            );
+        });
+        test.thread.update(cx, |thread, cx| {
+            assert!(thread.is_turn_complete());
+            cx.emit(TokenUsageUpdated(Some(acp_thread::TokenUsage {
+                max_tokens: 1_000_000,
+                used_tokens: 800_000,
+                input_tokens: 800_000,
+                ..acp_thread::TokenUsage::default()
+            })));
+        });
+        cx.run_until_parked();
+        assert!((&mut send).now_or_never().is_none());
+        test.parent.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_subagent_ids(cx), vec![test.handle.id()]);
+        });
+
+        resume_checkpoint.send(()).unwrap();
+        checkpoint_job.await.unwrap().unwrap();
+        if provider_error {
+            assert_eq!(
+                send.await.unwrap_err().to_string(),
+                concat!(
+                    "terminal provider error\n\n",
+                    "Partial subagent output (last 3 messages, up to 4096 characters each):\n\n",
+                    "partial work",
+                ),
+            );
+        } else {
+            assert_eq!(send.await.unwrap(), "partial work");
+        }
+        test.assert_stopped(cx);
+        assert_eq!(test.model.pending_completions(), Vec::new());
+    }
+}
+
+#[gpui::test]
+async fn test_subagent_compaction_exhausts_transient_retries(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("subagent task prompt", cx);
+    test.tool_round(950_000, cx);
+    for request_index in 0..5 {
+        test.fail_compaction(
+            http_client::StatusCode::SERVICE_UNAVAILABLE,
+            Some(Duration::from_secs(3)),
+            cx,
+        );
+        assert_eq!(test.model.pending_completions(), Vec::new());
+        if request_index < 4 {
+            test.assert_running(cx);
+            cx.executor()
+                .advance_clock(crate::maximum_retry_delay_with_jitter(Duration::from_secs(
+                    3,
+                )));
+            cx.run_until_parked();
+        }
+    }
+    assert_eq!(
+        send.await.unwrap_err().to_string(),
+        concat!(
+            "Automatic context compaction failed: compaction provider error\n\n",
+            "Partial subagent output (last 3 messages, up to 4096 characters each):\n\n",
+            "partial work",
+        ),
+    );
+    test.assert_stopped(cx);
+    test.assert_no_compaction(cx).await;
+    cx.executor()
+        .advance_clock(crate::maximum_retry_delay_with_jitter(Duration::from_secs(
+            3,
+        )));
+    cx.run_until_parked();
+    assert_eq!(test.model.pending_completions(), Vec::new());
+}
+
+#[gpui::test]
+async fn test_subagent_compaction_parent_cancellation(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let send = test.send("subagent task prompt", cx);
+    test.tool_round(950_000, cx);
+    let request = test.compaction_request();
+    test.model
+        .send_completion_stream_text_chunk(&request, "partial summary");
+    cx.run_until_parked();
+    assert!(!test.model.is_completion_stream_closed(&request));
+    test.parent.update(cx, |thread, cx| thread.cancel(cx)).await;
+    assert_eq!(send.await.unwrap_err().to_string(), "User canceled");
+    cx.run_until_parked();
+    assert!(test.model.is_completion_stream_closed(&request));
+    test.assert_stopped(cx);
+    test.assert_no_compaction(cx).await;
+    test.model.end_completion_stream(&request);
+    cx.run_until_parked();
+    assert_eq!(test.model.pending_completions(), Vec::new());
+}
+
+#[gpui::test]
+async fn test_subagent_compaction_error_propagation(cx: &mut TestAppContext) {
+    for provider_error in [false, true] {
+        let test = SubagentCompactionTest::new(cx).await;
+        let send = test.send("subagent task prompt", cx);
+        test.tool_round(950_000, cx);
+        let error = if provider_error {
+            test.fail_compaction(http_client::StatusCode::BAD_REQUEST, None, cx);
+            "compaction provider error"
+        } else {
+            test.model.end_completion_stream(&test.compaction_request());
+            "Compaction produced an empty summary"
+        };
+        assert_eq!(
+            send.await.unwrap_err().to_string(),
+            format!(
+                "Automatic context compaction failed: {error}\n\n\
+                 Partial subagent output (last 3 messages, up to 4096 characters each):\n\n\
+                 partial work"
+            )
+        );
+        test.assert_stopped(cx);
+        test.assert_no_compaction(cx).await;
+        assert_eq!(test.model.pending_completions(), Vec::new());
+    }
+}
+
+struct SubagentCompactionTest {
+    _agent: Entity<NativeAgent>,
+    _acp_thread: Entity<AcpThread>,
+    parent: Entity<Thread>,
+    thread: Entity<Thread>,
+    environment: NativeThreadEnvironment,
+    handle: Rc<dyn SubagentHandle>,
+    model: Arc<FakeLanguageModel>,
+}
+
+impl SubagentCompactionTest {
+    async fn new(cx: &mut TestAppContext) -> Self {
+        Self::new_with_files(json!({}), cx).await
+    }
+
+    async fn new_with_files(files: serde_json::Value, cx: &mut TestAppContext) -> Self {
+        init_test(cx);
+        cx.update(|cx| {
+            LanguageModelRegistry::test(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.auto_compact.enabled = true;
+            settings.auto_compact.threshold = AutoCompactThreshold::Percentage(0.9);
+            for profile in settings.profiles.values_mut() {
+                profile
+                    .tools
+                    .insert(EchoTool::NAME.to_string().into(), true);
+            }
+            AgentSettings::override_global(settings, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), files).await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+        let store = cx.new(ThreadStore::new);
+        let agent = cx.update(|cx| NativeAgent::new(store, Templates::new(), fs, cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+        let acp_thread = cx
+            .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+        let model = Arc::new(FakeLanguageModel::default());
+        parent.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+        let handle = cx
+            .update(|cx| environment.create_subagent_thread(
+                NativeSubagentRequest::new("subagent".to_string(), None, None, None, None),
+                cx,
+            ))
+            .unwrap();
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&handle.id()).unwrap().thread.clone()
+        });
+        thread.update(cx, |thread, _| thread.add_tool(EchoTool));
+        cx.run_until_parked();
+        Self {
+            _agent: agent,
+            _acp_thread: acp_thread,
+            parent,
+            thread,
+            environment,
+            handle,
+            model,
+        }
+    }
+
+    fn configure_compaction(
+        &self,
+        enabled: bool,
+        max_tokens: u64,
+        max_output_tokens: Option<u64>,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.auto_compact.enabled = enabled;
+            AgentSettings::override_global(settings, cx);
+        });
+        self.model.set_max_token_count(max_tokens);
+        self.model.set_max_output_tokens(max_output_tokens);
+    }
+
+    fn send(&self, message: &str, cx: &mut TestAppContext) -> Task<Result<String>> {
+        let send = cx.update(|cx| self.handle.send(message.to_string(), &cx.to_async()));
+        cx.run_until_parked();
+        send
+    }
+
+    fn update_usage(&self, input_tokens: u64, cx: &mut TestAppContext) {
+        self.model
+            .send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+                TokenUsage {
+                    input_tokens,
+                    ..TokenUsage::default()
+                },
+            ));
+        cx.run_until_parked();
+    }
+
+    fn tool_round(&self, input_tokens: u64, cx: &mut TestAppContext) {
+        self.model
+            .send_last_completion_stream_text_chunk("partial work");
+        self.update_usage(input_tokens, cx);
+        self.assert_running(cx);
+        self.model
+            .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+                LanguageModelToolUse {
+                    id: "echo_1".into(),
+                    name: EchoTool::NAME.into(),
+                    raw_input: r#"{"text":"tool output"}"#.to_string(),
+                    input: language_model::LanguageModelToolUseInput::Json(
+                        json!({"text": "tool output"}),
+                    ),
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            ));
+        self.model.end_last_completion_stream();
+        cx.run_until_parked();
+    }
+
+    fn compaction_request(&self) -> LanguageModelRequest {
+        let mut requests = self.model.pending_completions();
+        assert_eq!(requests.len(), 1);
+        let request = requests.pop().unwrap();
+        assert_eq!(
+            request.intent,
+            Some(CompletionIntent::ThreadContextSummarization)
+        );
+        request
+    }
+
+    fn fail_compaction(
+        &self,
+        status: http_client::StatusCode,
+        retry_after: Option<Duration>,
+        cx: &mut TestAppContext,
+    ) {
+        let request = self.compaction_request();
+        self.model
+            .send_completion_stream_text_chunk(&request, "failed summary");
+        self.model.send_completion_stream_error(
+            &request,
+            LanguageModelCompletionError::from_http_status(
+                LanguageModelProviderName::new("test"),
+                status,
+                "compaction provider error".to_string(),
+                retry_after,
+            ),
+        );
+        self.model.end_completion_stream(&request);
+        cx.run_until_parked();
+    }
+
+    async fn assert_no_compaction(&self, cx: &mut TestAppContext) {
+        let saved = self
+            .thread
+            .read_with(cx, |thread, cx| thread.to_db(cx))
+            .await;
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| matches!(&***message, Message::Compaction(_)))
+                .count(),
+            0
+        );
+    }
+
+    fn assert_running(&self, cx: &mut TestAppContext) {
+        self.parent.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_subagent_ids(cx), vec![self.handle.id()])
+        });
+        self.thread
+            .read_with(cx, |thread, _| assert!(!thread.is_turn_complete()));
+    }
+
+    fn assert_stopped(&self, cx: &mut TestAppContext) {
+        self.parent.read_with(cx, |thread, cx| {
+            assert_eq!(thread.running_subagent_ids(cx), Vec::new())
+        });
+        self.thread
+            .read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
+    }
 }
