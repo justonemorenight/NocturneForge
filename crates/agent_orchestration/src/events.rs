@@ -2,8 +2,9 @@ use crate::artifacts::Artifact;
 use crate::context_checkpoint::ContextCheckpoint;
 use crate::control_plane::{AgentIdentity, AgentMessage, AgentPath};
 use crate::goal_controller::GoalSnapshot;
-use crate::ids::{PlanId, RunId, TaskId};
+use crate::ids::{CorrelationId, EventId, PlanId, RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
+use crate::projection::RunActivityProjection;
 use crate::residency::AgentResidencyRecord;
 use crate::state::RunState;
 use crate::verification::VerificationResult;
@@ -11,7 +12,7 @@ use crate::worker::{StructuredWaitReason, WorkerMetadata};
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentExecutionPolicy;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -87,6 +88,14 @@ pub enum RuntimeEvent {
         run_id: RunId,
         task_id: TaskId,
         wave_index: usize,
+    },
+    TaskStateChanged {
+        run_id: RunId,
+        task_id: TaskId,
+        previous_state: crate::state::TaskState,
+        state: crate::state::TaskState,
+        reason: String,
+        attempt: u32,
     },
     TaskDispatched {
         run_id: RunId,
@@ -174,7 +183,18 @@ pub enum RuntimeEvent {
         error: String,
         retryable: bool,
     },
+    TaskAttemptFailed {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt: u32,
+        error: String,
+    },
     TaskCancelled {
+        run_id: RunId,
+        task_id: TaskId,
+        reason: String,
+    },
+    TaskCancellationRequested {
         run_id: RunId,
         task_id: TaskId,
         reason: String,
@@ -241,6 +261,7 @@ impl RuntimeEvent {
             | Self::AgentResidencyChanged { run_id, .. }
             | Self::GoalUpdated { run_id, .. }
             | Self::TaskScheduled { run_id, .. }
+            | Self::TaskStateChanged { run_id, .. }
             | Self::TaskDispatched { run_id, .. }
             | Self::TaskPhaseChanged { run_id, .. }
             | Self::TaskProgress { run_id, .. }
@@ -256,7 +277,9 @@ impl RuntimeEvent {
             | Self::TaskRetrying { run_id, .. }
             | Self::TaskCompleted { run_id, .. }
             | Self::TaskFailed { run_id, .. }
+            | Self::TaskAttemptFailed { run_id, .. }
             | Self::TaskCancelled { run_id, .. }
+            | Self::TaskCancellationRequested { run_id, .. }
             | Self::TaskAwaitingApply { run_id, .. }
             | Self::TaskWaitReasonChanged { run_id, .. }
             | Self::WorkerMetadataUpdated { run_id, .. }
@@ -275,7 +298,19 @@ impl RuntimeEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SequencedRuntimeEvent {
     pub seq: u64,
+    #[serde(default)]
+    pub event_id: EventId,
+    #[serde(default = "default_event_timestamp")]
+    pub occurred_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<CorrelationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<EventId>,
     pub event: RuntimeEvent,
+}
+
+fn default_event_timestamp() -> DateTime<Utc> {
+    std::time::SystemTime::UNIX_EPOCH.into()
 }
 
 /// A bounded page of runtime events for restart and UI replay.
@@ -304,12 +339,36 @@ pub struct EventSubscription {
     pub resync_required: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+pub struct RuntimeEventContext {
+    correlation_id: CorrelationId,
+    latest_event_id: Arc<Mutex<Option<EventId>>>,
+}
+
+impl RuntimeEventContext {
+    pub fn new(correlation_id: CorrelationId) -> Self {
+        Self {
+            correlation_id,
+            latest_event_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
+
+    pub fn latest_event_id(&self) -> Option<EventId> {
+        self.latest_event_id.lock().clone()
+    }
+}
+
 /// Pub/sub event stream manager for broadcasting and recording runtime events.
 #[derive(Clone)]
 pub struct RuntimeEventStream {
     event_log: Arc<RwLock<EventLog>>,
     subscribers: Arc<RwLock<Vec<Subscriber>>>,
     next_seq: Arc<AtomicU64>,
+    activity_projection: Arc<RwLock<Option<RunActivityProjection>>>,
 }
 
 struct Subscriber {
@@ -365,13 +424,17 @@ impl RuntimeEventStream {
             event_log: Arc::new(RwLock::new(EventLog::default())),
             subscribers: Arc::new(RwLock::new(Vec::new())),
             next_seq: Arc::new(AtomicU64::new(1)),
+            activity_projection: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn from_history(history: Vec<SequencedRuntimeEvent>) -> Self {
         let mut event_log = EventLog::default();
         let mut max_seq = 0;
-        for event in history {
+        for mut event in history {
+            if event.event_id.is_empty() {
+                event.event_id = EventId::from_sequence(event.event.run_id(), event.seq);
+            }
             max_seq = max_seq.max(event.seq);
             event_log.push(event);
         }
@@ -379,15 +442,54 @@ impl RuntimeEventStream {
             event_log: Arc::new(RwLock::new(event_log)),
             subscribers: Arc::new(RwLock::new(Vec::new())),
             next_seq: Arc::new(AtomicU64::new(max_seq.saturating_add(1))),
+            activity_projection: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn install_activity_projection(&self, projection: RunActivityProjection) {
+        *self.activity_projection.write() = Some(projection);
+    }
+
+    pub fn activity_projection(&self) -> Option<RunActivityProjection> {
+        self.activity_projection.read().clone()
     }
 
     /// Emits an event with the next sequence number to all active subscribers
     /// and stores it in the bounded event log.
-    pub fn emit(&self, event: RuntimeEvent) {
+    pub fn emit(&self, event: RuntimeEvent) -> EventId {
+        self.emit_with_context(event, None, None)
+    }
+
+    pub fn emit_in_context(&self, event: RuntimeEvent, context: &RuntimeEventContext) -> EventId {
+        let mut latest_event_id = context.latest_event_id.lock();
+        let event_id = self.emit_with_context(
+            event,
+            Some(context.correlation_id.clone()),
+            latest_event_id.clone(),
+        );
+        *latest_event_id = Some(event_id.clone());
+        event_id
+    }
+
+    pub fn emit_with_context(
+        &self,
+        event: RuntimeEvent,
+        correlation_id: Option<CorrelationId>,
+        caused_by: Option<EventId>,
+    ) -> EventId {
         let mut log = self.event_log.write();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let sequenced = SequencedRuntimeEvent { seq, event };
+        let sequenced = SequencedRuntimeEvent {
+            event_id: EventId::from_sequence(event.run_id(), seq),
+            seq,
+            occurred_at: Utc::now(),
+            correlation_id,
+            caused_by,
+            event,
+        };
+        if let Some(projection) = self.activity_projection.write().as_mut() {
+            projection.apply(&sequenced);
+        }
         log.push(sequenced.clone());
 
         let mut subscribers = self.subscribers.write();
@@ -403,6 +505,7 @@ impl RuntimeEventStream {
                 Err(async_channel::TrySendError::Closed(_)) => false,
             },
         );
+        sequenced.event_id
     }
 
     /// Creates a subscription channel that receives all future events.
@@ -693,5 +796,50 @@ mod tests {
                 .windows(2)
                 .all(|events| events[1].seq == events[0].seq + 1)
         );
+    }
+
+    #[test]
+    fn legacy_envelopes_receive_compatible_defaults() -> anyhow::Result<()> {
+        let run_id = RunId::from_string("run-legacy");
+        let value = serde_json::json!({
+            "seq": 7,
+            "event": {
+                "type": "run_state_changed",
+                "run_id": run_id,
+                "state": "running"
+            }
+        });
+
+        let envelope: SequencedRuntimeEvent = serde_json::from_value(value)?;
+        assert!(envelope.event_id.is_empty());
+        assert_eq!(envelope.occurred_at, default_event_timestamp());
+
+        let stream = RuntimeEventStream::from_history(vec![envelope]);
+        let restored = stream.history();
+        assert_eq!(restored[0].event_id.to_string(), "run-legacy:7");
+        Ok(())
+    }
+
+    #[test]
+    fn event_context_builds_a_single_causal_chain() {
+        let stream = RuntimeEventStream::new();
+        let run_id = RunId::from_string("run-causal");
+        let context = RuntimeEventContext::new(CorrelationId::from_string("attempt-1"));
+
+        let first_id = stream.emit_in_context(state_event(&run_id), &context);
+        let second_id = stream.emit_in_context(state_event(&run_id), &context);
+        let history = stream.history();
+
+        assert_eq!(
+            history[0].correlation_id.as_ref(),
+            Some(context.correlation_id())
+        );
+        assert!(history[0].caused_by.is_none());
+        assert_eq!(
+            history[1].correlation_id.as_ref(),
+            Some(context.correlation_id())
+        );
+        assert_eq!(history[1].caused_by.as_ref(), Some(&first_id));
+        assert_eq!(context.latest_event_id(), Some(second_id));
     }
 }

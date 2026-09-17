@@ -5,6 +5,10 @@ use crate::commit_context_menu::{
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
+use crate::git_identity::{
+    ConfigureGitIdentityModal, GitIdentity, GitIdentitySource, build_commit_identity_menu,
+    identity_from_config,
+};
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
@@ -925,30 +929,6 @@ struct CommitMessageContextSummary {
 }
 
 impl CommitMessageContextSummary {
-    fn has_warning(&self) -> bool {
-        self.history.failed > 0
-            || self.history.timed_out > 0
-            || self.skill_name.is_some() && !self.skill_loaded
-    }
-
-    fn compact_label(&self) -> String {
-        let history_label = if self.history.attempted == 0 {
-            "History none".to_string()
-        } else if self.history.repository.is_empty() && self.history.timed_out > 0 {
-            "History timeout".to_string()
-        } else if self.history.failed > 0 || self.history.timed_out > 0 {
-            format!("History {} · partial", self.history.resolved)
-        } else {
-            format!("History {}", self.history.resolved)
-        };
-        let skill_label = match (&self.skill_name, self.skill_loaded) {
-            (Some(name), true) => format!("Skill {name}"),
-            (Some(_), false) => "Skill unavailable".to_string(),
-            (None, _) => "No skill".to_string(),
-        };
-        format!("{history_label} · {skill_label}")
-    }
-
     fn tooltip(&self) -> String {
         let skill = match (&self.skill_name, self.skill_loaded) {
             (Some(name), true) => format!("{name} (loaded)"),
@@ -1101,6 +1081,11 @@ pub struct GitPanel {
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
     changes_actions_menu_handle: PopoverMenuHandle<ContextMenu>,
     remote_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    commit_identity: Option<GitIdentity>,
+    commit_identity_loading: bool,
+    commit_identity_reload_pending: bool,
+    commit_identity_task: Option<Task<()>>,
+    identity_menu_handle: PopoverMenuHandle<ContextMenu>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1290,10 +1275,22 @@ impl GitPanel {
             let scroll_handle = UniformListScrollHandle::new();
 
             let mut was_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+            let mut was_commit_identities = ProjectSettings::get_global(cx)
+                .git
+                .commit_identities
+                .clone();
             let _settings_subscription = cx.observe_global::<SettingsStore>(move |_, cx| {
                 let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+                let commit_identities = ProjectSettings::get_global(cx)
+                    .git
+                    .commit_identities
+                    .clone();
                 if was_ai_enabled != is_ai_enabled {
                     was_ai_enabled = is_ai_enabled;
+                    cx.notify();
+                }
+                if was_commit_identities != commit_identities {
+                    was_commit_identities = commit_identities;
                     cx.notify();
                 }
             });
@@ -1328,6 +1325,11 @@ impl GitPanel {
                     }
                     GitStoreEvent::GlobalConfigurationUpdated => {
                         this.git_access = None;
+                        if !this.commit_identity_loading {
+                            this.reload_commit_identity(cx);
+                        } else {
+                            this.commit_identity_reload_pending = true;
+                        }
                         this.schedule_update(window, cx);
                     }
                     GitStoreEvent::IndexWriteError(error) => {
@@ -1405,6 +1407,11 @@ impl GitPanel {
                 commit_menu_handle: PopoverMenuHandle::default(),
                 changes_actions_menu_handle: PopoverMenuHandle::default(),
                 remote_action_menu_handle: PopoverMenuHandle::default(),
+                commit_identity: None,
+                commit_identity_loading: false,
+                commit_identity_reload_pending: false,
+                commit_identity_task: None,
+                identity_menu_handle: PopoverMenuHandle::default(),
             };
 
             this.schedule_update(window, cx);
@@ -5209,6 +5216,243 @@ impl GitPanel {
         }
     }
 
+    fn reload_commit_identity(&mut self, cx: &mut Context<Self>) {
+        self.commit_identity_reload_pending = false;
+        if !self.project.read(cx).is_local() {
+            self.commit_identity_task.take();
+            self.commit_identity = None;
+            self.commit_identity_loading = false;
+            cx.notify();
+            return;
+        }
+        let Some(repository) = self.active_repository.clone() else {
+            self.commit_identity_task.take();
+            self.commit_identity = None;
+            self.commit_identity_loading = false;
+            cx.notify();
+            return;
+        };
+        let repository_id = repository.entity_id();
+        let path = repository.read(cx).work_directory_abs_path.clone();
+        let project = self.project.clone();
+        self.commit_identity_loading = true;
+        self.commit_identity_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let effective_task = project.read_with(cx, |project, cx| {
+                    project.git_config(
+                        path.clone(),
+                        vec!["--null".to_string(), "--list".to_string()],
+                        cx,
+                    )
+                });
+                let local_task = project.read_with(cx, |project, cx| {
+                    project.git_config(
+                        path,
+                        vec![
+                            "--local".to_string(),
+                            "--null".to_string(),
+                            "--list".to_string(),
+                        ],
+                        cx,
+                    )
+                });
+                futures::future::try_join(effective_task, local_task).await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.active_repository.as_ref().map(Entity::entity_id) != Some(repository_id) {
+                    return;
+                }
+                this.commit_identity_loading = false;
+                match result {
+                    Ok((effective, local)) => {
+                        this.commit_identity = identity_from_config(&effective, &local);
+                    }
+                    Err(error) => {
+                        this.commit_identity = None;
+                        this.show_error_toast("load Git identity", error, cx);
+                    }
+                }
+                cx.notify();
+                this.reload_commit_identity_if_pending(cx);
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    pub(crate) fn apply_commit_identity(
+        &mut self,
+        name: String,
+        email: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let repository_id = repository.entity_id();
+        let path = repository.read(cx).work_directory_abs_path.clone();
+        let project = self.project.clone();
+        let selected_identity = GitIdentity {
+            name: name.clone().into(),
+            email: email.clone().into(),
+            source: GitIdentitySource::Repository,
+        };
+        self.commit_identity_loading = true;
+        self.commit_identity_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let name_task = project.read_with(cx, |project, cx| {
+                    project.git_config(
+                        path.clone(),
+                        vec![
+                            "--local".to_string(),
+                            "--replace-all".to_string(),
+                            "user.name".to_string(),
+                            name,
+                        ],
+                        cx,
+                    )
+                });
+                name_task.await?;
+                let email_task = project.read_with(cx, |project, cx| {
+                    project.git_config(
+                        path,
+                        vec![
+                            "--local".to_string(),
+                            "--replace-all".to_string(),
+                            "user.email".to_string(),
+                            email,
+                        ],
+                        cx,
+                    )
+                });
+                email_task.await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.active_repository.as_ref().map(Entity::entity_id) != Some(repository_id) {
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        this.commit_identity = Some(selected_identity);
+                        this.commit_identity_loading = false;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.commit_identity_loading = false;
+                        this.show_error_toast("configure Git identity", error, cx);
+                        cx.notify();
+                    }
+                }
+                this.reload_commit_identity_if_pending(cx);
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    pub(crate) fn use_inherited_commit_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let repository_id = repository.entity_id();
+        let path = repository.read(cx).work_directory_abs_path.clone();
+        let project = self.project.clone();
+        self.commit_identity_loading = true;
+        self.commit_identity_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let local_task = project.read_with(cx, |project, cx| {
+                    project.git_config(
+                        path.clone(),
+                        vec![
+                            "--local".to_string(),
+                            "--null".to_string(),
+                            "--list".to_string(),
+                        ],
+                        cx,
+                    )
+                });
+                let local = local_task.await?;
+                let local_entries = crate::git_identity::parse_git_config_list(&local);
+                for key in ["user.name", "user.email"] {
+                    if local_entries
+                        .iter()
+                        .any(|(entry_key, _)| entry_key.eq_ignore_ascii_case(key))
+                    {
+                        let unset_task = project.read_with(cx, |project, cx| {
+                            project.git_config(
+                                path.clone(),
+                                vec![
+                                    "--local".to_string(),
+                                    "--unset-all".to_string(),
+                                    key.to_string(),
+                                ],
+                                cx,
+                            )
+                        });
+                        unset_task.await?;
+                    }
+                }
+                let effective_task = project.read_with(cx, |project, cx| {
+                    project.git_config(path, vec!["--null".to_string(), "--list".to_string()], cx)
+                });
+                effective_task.await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                if this.active_repository.as_ref().map(Entity::entity_id) != Some(repository_id) {
+                    return;
+                }
+                match result {
+                    Ok(effective) => {
+                        this.commit_identity = identity_from_config(&effective, "");
+                        this.commit_identity_loading = false;
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.commit_identity_loading = false;
+                        this.show_error_toast("restore inherited Git identity", error, cx);
+                        cx.notify();
+                    }
+                }
+                this.reload_commit_identity_if_pending(cx);
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn reload_commit_identity_if_pending(&mut self, cx: &mut Context<Self>) {
+        if !self.commit_identity_reload_pending {
+            return;
+        }
+        self.commit_identity_reload_pending = false;
+        let git_panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            git_panel
+                .update(cx, |git_panel, cx| git_panel.reload_commit_identity(cx))
+                .log_err();
+        });
+    }
+
+    pub(crate) fn open_configure_commit_identity(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git_panel = cx.weak_entity();
+        let fs = self.fs.clone();
+        let current_identity = self.commit_identity.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    ConfigureGitIdentityModal::new(git_panel, fs, current_identity, window, cx)
+                });
+            })
+            .log_err();
+    }
+
     pub fn load_local_committer(&mut self, cx: &Context<Self>) {
         if self.local_committer_task.is_none() {
             self.local_committer_task = Some(cx.spawn(async move |this, cx| {
@@ -5542,6 +5786,11 @@ impl GitPanel {
             }
         }
         self.active_repository = new_active_repository;
+        if active_repository_changed
+            || (!self.commit_identity_loading && self.commit_identity.is_none())
+        {
+            self.reload_commit_identity(cx);
+        }
         self.reopen_commit_buffer(window, cx);
         if self.active_tab == GitPanelTab::History {
             self.load_commit_history(cx);
@@ -6463,67 +6712,31 @@ impl GitPanel {
             .map(ToOwned::to_owned)
     }
 
-    fn render_commit_message_context_chip(&self, cx: &Context<Self>) -> AnyElement {
+    fn commit_message_context_tooltip(&self, cx: &Context<Self>) -> String {
         if self.commit_message_context_loading {
             let configured_skill = self
                 .configured_commit_message_skill(cx)
                 .as_deref()
                 .unwrap_or("none")
                 .to_string();
-            return Chip::new("Loading context…")
-                .icon(IconName::Info)
-                .icon_color(Color::Muted)
-                .label_color(Color::Muted)
-                .truncate()
-                .tooltip(move |_window, cx| {
-                    Tooltip::simple(
-                        format!(
-                            "Loading Git history, commit skill, project rules, and diff context\nConfigured skill: {configured_skill}"
-                        ),
-                        cx,
-                    )
-                })
-                .into_any_element();
+            return format!(
+                "Loading Git history, commit skill, project rules, and diff context\nConfigured skill: {configured_skill}"
+            );
         }
 
         if let Some(summary) = self.commit_message_context_summary.as_ref() {
-            let tooltip = summary.tooltip();
-            let (icon, color) = if summary.has_warning() {
-                (IconName::Warning, Color::Warning)
-            } else {
-                (IconName::Check, Color::Success)
-            };
-            return Chip::new(summary.compact_label())
-                .icon(icon)
-                .icon_color(color)
-                .label_color(color)
-                .truncate()
-                .tooltip(move |_window, cx| Tooltip::simple(tooltip.clone(), cx))
-                .into_any_element();
+            return summary.tooltip();
         }
 
         let configured_skill = self.configured_commit_message_skill(cx);
-        let (label, tooltip) = if let Some(skill) = configured_skill {
-            (
-                format!("History pending · Skill {skill}"),
-                format!(
-                    "Git history and commit skill status will be shown after generation\nConfigured skill: {skill}"
-                ),
+        if let Some(skill) = configured_skill {
+            format!(
+                "Git history and commit skill status will be shown after generation\nConfigured skill: {skill}"
             )
         } else {
-            (
-                "History pending · No skill".to_string(),
-                "Git history status will be shown after generation\nNo commit skill is configured"
-                    .to_string(),
-            )
-        };
-        Chip::new(label)
-            .icon(IconName::Info)
-            .icon_color(Color::Muted)
-            .label_color(Color::Muted)
-            .truncate()
-            .tooltip(move |_window, cx| Tooltip::simple(tooltip.clone(), cx))
-            .into_any_element()
+            "Git history status will be shown after generation\nNo commit skill is configured"
+                .to_string()
+        }
     }
 
     pub(crate) fn render_generate_commit_message_button(
@@ -6535,6 +6748,7 @@ impl GitPanel {
         }
 
         if self.generate_commit_message_task.is_some() {
+            let context_tooltip = self.commit_message_context_tooltip(cx);
             return Some(
                 h_flex()
                     .min_w_0()
@@ -6544,7 +6758,14 @@ impl GitPanel {
                             .icon_color(Color::Error)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Tinted(TintColor::Error))
-                            .tooltip(Tooltip::text("Cancel Commit Message Generation"))
+                            .tooltip(move |_window, cx| {
+                                Tooltip::simple(
+                                    format!(
+                                        "Cancel Commit Message Generation\n\n{context_tooltip}"
+                                    ),
+                                    cx,
+                                )
+                            })
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.generate_commit_message_task.take();
                                 cx.notify();
@@ -6555,7 +6776,6 @@ impl GitPanel {
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(self.render_commit_message_context_chip(cx))
                     .into_any_element(),
             );
         }
@@ -6589,6 +6809,7 @@ impl GitPanel {
                 configured.model.id().0
             )
         });
+        let context_tooltip = self.commit_message_context_tooltip(cx);
 
         let button = ButtonLike::new_rounded_left("generate-commit-message")
             .layer(ElevationIndex::ModalSurface)
@@ -6620,7 +6841,10 @@ impl GitPanel {
                 if !can_commit {
                     Tooltip::simple("No Changes to Commit", cx)
                 } else if let Some(model) = effective_model_tooltip.as_deref() {
-                    Tooltip::simple(format!("Generate Commit Message\n{model}"), cx)
+                    Tooltip::simple(
+                        format!("Generate Commit Message\n{model}\n\n{context_tooltip}"),
+                        cx,
+                    )
                 } else {
                     Tooltip::for_action_in(
                         "Generate Commit Message",
@@ -6719,9 +6943,7 @@ impl GitPanel {
         Some(
             h_flex()
                 .min_w_0()
-                .gap_1()
                 .child(SplitButton::new(button, model_menu.into_any_element()))
-                .child(self.render_commit_message_context_chip(cx))
                 .into_any_element(),
         )
     }
@@ -6767,6 +6989,55 @@ impl GitPanel {
                     .into_any_element(),
             )
         }
+    }
+
+    fn render_commit_identity_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let identity = self.commit_identity.clone();
+        let trigger_label = identity
+            .as_ref()
+            .map(GitIdentity::initials)
+            .unwrap_or_else(|| "?".into());
+        let tooltip = identity
+            .as_ref()
+            .map(GitIdentity::tooltip)
+            .unwrap_or_else(|| {
+                "No Git commit identity is configured\nChoose an identity before committing".into()
+            });
+        let trigger = Button::new("git-commit-identity-trigger", trigger_label)
+            .size(ButtonSize::Compact)
+            .style(ButtonStyle::Subtle)
+            .start_icon(Icon::new(IconName::Person).size(IconSize::Small))
+            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::Small))
+            .loading(self.commit_identity_loading)
+            .disabled(self.active_repository.is_none() || !self.project.read(cx).is_local())
+            .aria_label("Git commit identity")
+            .aria_value(
+                identity
+                    .as_ref()
+                    .map(|identity| format!("{} <{}>", identity.name, identity.email))
+                    .unwrap_or_else(|| "Not configured".to_string()),
+            );
+
+        let configured_identities = ProjectSettings::get_global(cx)
+            .git
+            .commit_identities
+            .clone();
+        let git_panel = cx.weak_entity();
+
+        PopoverMenu::new("git-commit-identity-menu")
+            .trigger_with_tooltip(trigger, move |_window, cx| {
+                Tooltip::simple(tooltip.clone(), cx)
+            })
+            .with_handle(self.identity_menu_handle.clone())
+            .menu(move |window, cx| {
+                let configured_identities = configured_identities.clone();
+                let identity = identity.clone();
+                let git_panel = git_panel.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    build_commit_identity_menu(menu, configured_identities, identity, git_panel)
+                }))
+            })
+            .anchor(Anchor::TopRight)
     }
 
     fn render_git_commit_menu(
@@ -7223,16 +7494,33 @@ impl GitPanel {
             })
             .justify_between()
             .child(
-                h_flex().gap_0p5().child(commit_editor_toggle).child(
-                    self.render_generate_commit_message_button(cx)
-                        .unwrap_or_else(|| div().into_any_element()),
-                ),
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .gap_0p5()
+                    .child(div().flex_none().child(commit_editor_toggle))
+                    .child(
+                        div().min_w_0().flex_shrink_1().overflow_hidden().child(
+                            self.render_generate_commit_message_button(cx)
+                                .unwrap_or_else(|| div().into_any_element()),
+                        ),
+                    ),
             )
             .child(
                 h_flex()
+                    .min_w_0()
+                    .flex_shrink_1()
                     .gap_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_shrink_1()
+                            .overflow_hidden()
+                            .child(self.render_commit_identity_selector(cx)),
+                    )
                     .children(enable_coauthors)
-                    .child(self.render_commit_button(cx)),
+                    .child(div().flex_none().child(self.render_commit_button(cx))),
             );
 
         let footer = v_flex()

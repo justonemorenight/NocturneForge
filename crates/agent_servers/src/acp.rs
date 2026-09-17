@@ -11,6 +11,7 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines,
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet, IndexMap, IndexSet};
+use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
 use futures::io::BufReader;
@@ -856,7 +857,11 @@ fn connect_client_future(
         )
 }
 
-fn client_capabilities_for_agent(agent_id: &AgentId, read_only: bool) -> acp::ClientCapabilities {
+fn client_capabilities_for_agent(
+    agent_id: &AgentId,
+    read_only: bool,
+    beta_features_enabled: bool,
+) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
@@ -866,18 +871,21 @@ fn client_capabilities_for_agent(agent_id: &AgentId, read_only: bool) -> acp::Cl
         meta.insert(PARAMETERIZED_MODEL_PICKER_META_KEY.into(), true.into());
     }
 
+    let mut session_capabilities = acp::ClientSessionCapabilities::new().config_options(
+        acp::SessionConfigOptionsCapabilities::new()
+            .boolean(acp::BooleanConfigOptionCapabilities::new()),
+    );
+    if beta_features_enabled {
+        session_capabilities = session_capabilities.compaction(acp::CompactionCapabilities::new());
+    }
+
     acp::ClientCapabilities::new()
         .fs(acp::FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(!read_only))
         .terminal(true)
         .auth(acp::AuthCapabilities::new().terminal(true))
-        .session(
-            acp::ClientSessionCapabilities::new().config_options(
-                acp::SessionConfigOptionsCapabilities::new()
-                    .boolean(acp::BooleanConfigOptionCapabilities::new()),
-            ),
-        )
+        .session(session_capabilities)
         .elicitation(
             acp::ElicitationCapabilities::new()
                 .form(acp::ElicitationFormCapabilities::new())
@@ -1124,10 +1132,15 @@ impl AcpConnection {
             }
         });
 
+        let beta_features_enabled = cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>());
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(&agent_id, client_read_only))
+                    .client_capabilities(client_capabilities_for_agent(
+                        &agent_id,
+                        client_read_only,
+                        beta_features_enabled,
+                    ))
                     .client_info(
                         acp::Implementation::new("zed", version)
                             .title(release_channel.map(ToOwned::to_owned)),
@@ -3020,7 +3033,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _, FeatureFlagAppExt as _};
+    use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};
     use settings::Settings as _;
 
     #[test]
@@ -3070,7 +3083,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         init_feature_flags_test(cx);
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false, false);
         let elicitation = capabilities
             .elicitation
             .expect("elicitation should always be advertised");
@@ -3336,7 +3349,7 @@ mod tests {
 
     #[test]
     fn cursor_client_capabilities_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID), false);
+        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID), false, false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -3351,7 +3364,7 @@ mod tests {
 
     #[test]
     fn non_cursor_client_capabilities_do_not_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false, false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -3361,7 +3374,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_include_boolean_config_options() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false, false);
 
         assert!(
             capabilities
@@ -3370,6 +3383,22 @@ mod tests {
                 .and_then(|config_options| config_options.boolean)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn client_capabilities_only_include_compaction_with_acp_beta() {
+        for (beta_enabled, expected_compaction) in
+            [(false, None), (true, Some(serde_json::json!({})))]
+        {
+            let capabilities =
+                client_capabilities_for_agent(&AgentId::new("codex-acp"), false, beta_enabled);
+            let capabilities =
+                serde_json::to_value(capabilities).expect("client capabilities should serialize");
+            let session = capabilities
+                .get("session")
+                .expect("session capabilities should be advertised");
+            assert_eq!(session.get("compaction"), expected_compaction.as_ref());
+        }
     }
 
     #[gpui::test]

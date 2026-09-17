@@ -299,6 +299,17 @@ impl LanguageModel for CopilotChatLanguageModel {
         self.model.max_token_count()
     }
 
+    fn max_input_tokens(&self) -> u64 {
+        self.model
+            .max_prompt_tokens()
+            .unwrap_or_else(|| self.model.max_token_count())
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        let limit = self.model.max_output_tokens() as u64;
+        (limit > 0).then_some(limit)
+    }
+
     fn stream_completion(
         &self,
         request: LanguageModelRequest,

@@ -1,4 +1,4 @@
-use crate::events::{RuntimeEvent, RuntimeEventStream};
+use crate::events::{RuntimeEvent, RuntimeEventContext, RuntimeEventStream};
 use crate::ids::{RunId, TaskId};
 use crate::task_registry::TaskRegistry;
 use crate::worker::WorkerMetadata;
@@ -85,6 +85,7 @@ pub struct TaskExecutionReporter {
     message: Arc<RwLock<Option<Arc<str>>>>,
     progress_percent: Arc<RwLock<Option<f32>>>,
     event_stream: Option<RuntimeEventStream>,
+    event_context: Option<RuntimeEventContext>,
     task_registry: Option<TaskRegistry>,
     attempt: Option<u32>,
 }
@@ -109,6 +110,7 @@ impl TaskExecutionReporter {
             message: Arc::new(RwLock::new(None)),
             progress_percent: Arc::new(RwLock::new(None)),
             event_stream,
+            event_context: None,
             task_registry: None,
             attempt: None,
         }
@@ -121,6 +123,11 @@ impl TaskExecutionReporter {
 
     pub fn for_attempt(mut self, attempt: u32) -> Self {
         self.attempt = Some(attempt);
+        self
+    }
+
+    pub fn with_event_context(mut self, event_context: RuntimeEventContext) -> Self {
+        self.event_context = Some(event_context);
         self
     }
 
@@ -157,6 +164,27 @@ impl TaskExecutionReporter {
 
     pub fn usage(&self) -> BudgetUsage {
         *self.usage.read()
+    }
+
+    fn cumulative_usage(&self) -> BudgetUsage {
+        let current = self.usage();
+        let Some(status) = self
+            .task_registry
+            .as_ref()
+            .and_then(|registry| registry.status(&self.task_id))
+        else {
+            return current;
+        };
+        BudgetUsage {
+            tokens_used: status
+                .budget_state
+                .tokens_used
+                .saturating_add(current.tokens_used),
+            tool_calls: status
+                .budget_state
+                .tool_calls_used
+                .saturating_add(current.tool_calls),
+        }
     }
 
     pub fn phase(&self) -> Option<String> {
@@ -259,7 +287,7 @@ impl TaskExecutionReporter {
                 .write()
                 .replace(percent.clamp(0.0, 100.0));
         }
-        let usage = self.usage.read();
+        let usage = self.cumulative_usage();
         self.emit(RuntimeEvent::TaskProgress {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
@@ -307,7 +335,7 @@ impl TaskExecutionReporter {
     }
 
     fn emit_budget_update(&self) {
-        let usage = self.usage.read();
+        let usage = self.cumulative_usage();
         self.emit(RuntimeEvent::TaskBudgetUpdated {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
@@ -321,7 +349,11 @@ impl TaskExecutionReporter {
             return;
         }
         if let Some(stream) = &self.event_stream {
-            stream.emit(event);
+            if let Some(context) = &self.event_context {
+                stream.emit_in_context(event, context);
+            } else {
+                stream.emit(event);
+            }
         }
     }
 }
@@ -387,5 +419,75 @@ mod tests {
                 .status(&task_id)
                 .is_some_and(|status| status.current_tool.is_none())
         );
+    }
+
+    #[test]
+    fn reporter_emits_cumulative_usage_across_attempts() {
+        let run_id = RunId::new();
+        let task_id = TaskId::new("worker");
+        let registry = TaskRegistry::new();
+        let event_stream = RuntimeEventStream::new();
+        registry.register_task(task_id.clone());
+        let first_attempt = registry.start_attempt(&task_id, None);
+        registry.fail_attempt_with_usage(
+            &task_id,
+            first_attempt,
+            "retry".to_string(),
+            true,
+            BudgetUsage {
+                tokens_used: 10,
+                tool_calls: 2,
+            },
+            None,
+        );
+
+        let second_attempt = registry.start_attempt(&task_id, None);
+        let subscription = event_stream.subscribe();
+        let reporter = TaskExecutionReporter::new(run_id, task_id, None, Some(event_stream))
+            .with_task_registry(registry)
+            .for_attempt(second_attempt);
+
+        reporter.report_tokens(5);
+
+        let event = subscription.receiver.try_recv().expect("budget update");
+        assert!(matches!(
+            event.event,
+            RuntimeEvent::TaskBudgetUpdated {
+                tokens_used: 15,
+                tool_calls_used: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reporter_events_extend_the_attempt_causal_chain() {
+        let run_id = RunId::new();
+        let task_id = TaskId::new("worker");
+        let event_stream = RuntimeEventStream::new();
+        let event_context = RuntimeEventContext::new(crate::ids::CorrelationId::new());
+        let root_event_id = event_stream.emit_in_context(
+            RuntimeEvent::TaskDispatched {
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+                session_id: None,
+                attempt: 1,
+            },
+            &event_context,
+        );
+        let reporter =
+            TaskExecutionReporter::new(run_id, task_id, None, Some(event_stream.clone()))
+                .with_event_context(event_context.clone());
+
+        reporter.set_phase("running");
+        reporter.report_progress("reading files", Some(25.0));
+
+        let history = event_stream.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].caused_by.as_ref(), Some(&root_event_id));
+        assert_eq!(history[2].caused_by.as_ref(), Some(&history[1].event_id));
+        assert!(history.iter().all(|event| {
+            event.correlation_id.as_ref() == Some(event_context.correlation_id())
+        }));
     }
 }

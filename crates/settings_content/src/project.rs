@@ -594,6 +594,16 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+    /// Commit identities available from the Git panel. Selecting one writes
+    /// its name and email to the current repository's local Git config.
+    #[serde(default)]
+    pub commit_identities: Vec<GitCommitIdentityContent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct GitCommitIdentityContent {
+    pub name: String,
+    pub email: String,
 }
 
 #[with_fallible_options]

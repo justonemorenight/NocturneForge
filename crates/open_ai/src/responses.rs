@@ -50,6 +50,18 @@ pub struct Request {
 }
 
 impl Request {
+    pub fn into_count_tokens_request(self) -> CountTokensRequest {
+        CountTokensRequest {
+            model: self.model,
+            instructions: self.instructions,
+            input: self.input,
+            tools: self.tools,
+            tool_choice: self.tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
+            reasoning: self.reasoning,
+        }
+    }
+
     pub fn into_compact_request(self) -> CompactRequest {
         CompactRequest {
             model: self.model,
@@ -72,6 +84,23 @@ impl Request {
             prompt_cache_key: self.prompt_cache_key,
         }
     }
+}
+
+/// Structured input for counting, including images and tool definitions.
+#[derive(Serialize, Debug)]
+pub struct CountTokensRequest {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    pub input: ResponseInput,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
 }
 
 #[derive(Serialize, Debug)]
@@ -838,6 +867,35 @@ pub async fn compact_codex_response_with_body(
     compact_response_with_body(client, provider_name, api_url, api_key, body, extra_headers).await
 }
 
+/// Counts structured input, including images and tools, without generating output.
+pub async fn count_input_tokens(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: CountTokensRequest,
+    extra_headers: &CustomHeaders,
+) -> Result<u64, RequestError> {
+    #[derive(Deserialize)]
+    struct CountTokensResponse {
+        input_tokens: u64,
+    }
+
+    let body =
+        serde_json::to_string(&request).map_err(|error| RequestError::Other(error.into()))?;
+    let response: CountTokensResponse = response_with_body(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        "/responses/input_tokens",
+        body,
+        extra_headers,
+    )
+    .await?;
+    Ok(response.input_tokens)
+}
+
 async fn compact_response_with_request<Response: DeserializeOwned>(
     client: &dyn HttpClient,
     provider_name: &str,
@@ -859,9 +917,30 @@ async fn compact_response_with_body<Response: DeserializeOwned>(
     body: String,
     extra_headers: &CustomHeaders,
 ) -> Result<Response, RequestError> {
+    response_with_body(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        "/responses/compact",
+        body,
+        extra_headers,
+    )
+    .await
+}
+
+async fn response_with_body<Response: DeserializeOwned>(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    route: &str,
+    body: String,
+    extra_headers: &CustomHeaders,
+) -> Result<Response, RequestError> {
     let request = HttpRequest::builder()
         .method(Method::POST)
-        .uri(format!("{api_url}/responses/compact"))
+        .uri(format!("{api_url}{route}"))
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()))
         .extra_headers(extra_headers)
@@ -1131,6 +1210,56 @@ mod tests {
     use language_model_core::OPEN_AI_PROVIDER_ID;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn count_input_tokens_posts_structured_input() {
+        let http_client = FakeHttpClient::create(|mut request| async move {
+            assert_eq!(request.method(), Method::POST);
+            assert_eq!(
+                request.uri(),
+                "https://api.openai.com/v1/responses/input_tokens"
+            );
+            assert_eq!(request.headers()["Authorization"], "Bearer secret");
+            let mut body = String::new();
+            request.body_mut().read_to_string(&mut body).await?;
+            let body: Value = serde_json::from_str(&body)?;
+            assert_eq!(body["model"], "gpt-5.4");
+            assert_eq!(body["input"][0]["content"][0]["text"], "Count this");
+            assert!(body.get("max_output_tokens").is_none());
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from(r#"{"input_tokens":321}"#))?)
+        });
+        let request = CountTokensRequest {
+            model: "gpt-5.4".to_string(),
+            instructions: None,
+            input: ResponseInput::new(
+                vec![json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Count this"}]
+                })],
+                Vec::new(),
+            ),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+        };
+
+        assert_eq!(
+            block_on(count_input_tokens(
+                http_client.as_ref(),
+                "OpenAI",
+                "https://api.openai.com/v1",
+                "secret",
+                request,
+                &CustomHeaders::default(),
+            ))
+            .unwrap(),
+            321
+        );
+    }
 
     #[test]
     fn compact_response_posts_supported_request_fields() {

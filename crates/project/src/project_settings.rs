@@ -499,6 +499,14 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: String,
+    /// Commit identities offered by the Git panel.
+    pub commit_identities: Vec<GitCommitIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitIdentity {
+    pub name: String,
+    pub email: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -714,6 +722,18 @@ impl Settings for ProjectSettings {
                 .worktree_directory
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
+            commit_identities: git
+                .commit_identities
+                .iter()
+                .filter_map(|identity| {
+                    let name = identity.name.trim();
+                    let email = identity.email.trim();
+                    (!name.is_empty() && !email.is_empty()).then(|| GitCommitIdentity {
+                        name: name.to_owned(),
+                        email: email.to_owned(),
+                    })
+                })
+                .collect(),
         };
         Self {
             context_servers: project

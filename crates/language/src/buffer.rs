@@ -147,7 +147,7 @@ pub struct TreeSitterData {
     brackets_by_chunks: Mutex<HashMap<usize, Vec<BracketMatch<usize>>>>,
 }
 
-const MAX_ROWS_IN_A_CHUNK: u32 = 50;
+pub(crate) const MAX_ROWS_IN_A_CHUNK: u32 = 50;
 
 impl TreeSitterData {
     fn clear(&mut self, snapshot: &text::BufferSnapshot) {
@@ -3445,6 +3445,7 @@ impl Buffer {
 
             snapshot.text = new_text.snapshot.clone();
             snapshot.syntax = syntax;
+            snapshot.tree_sitter_data = Arc::new(TreeSitterData::new(&snapshot.text));
 
             EditedBufferSnapshot {
                 text: new_text,

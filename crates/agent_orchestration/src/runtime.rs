@@ -12,9 +12,11 @@ use crate::goal_controller::{GoalController, GoalControllerConfig, GoalSnapshot}
 use crate::ids::{RunId, TaskId};
 use crate::persistence::PersistedRun;
 use crate::plan_graph::{OrchestrationPlan, OrchestrationTask, PlanGraph};
+use crate::projection::RunActivityProjection;
 use crate::residency::{AgentResidencyConfig, AgentResidencyManager, AgentResidencyRecord};
 use crate::scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 use crate::state::{RunState, TaskState, TaskStatus};
+use crate::task_mutation::TaskMutationGateway;
 use crate::task_registry::TaskRegistry;
 use crate::worker::StructuredWaitReason;
 use crate::worktree_isolation::IsolatedWorktree;
@@ -109,6 +111,7 @@ pub struct RunHandle {
     run_id: RunId,
     plan_graph: PlanGraph,
     task_registry: TaskRegistry,
+    task_mutations: TaskMutationGateway,
     agent_control_plane: AgentControlPlane,
     context_checkpoints: ContextCheckpointStore,
     residency: AgentResidencyManager,
@@ -153,6 +156,19 @@ impl RunHandle {
 
     pub fn task_statuses(&self) -> Vec<TaskStatus> {
         self.task_registry.all_statuses()
+    }
+
+    pub fn activity_projection(&self) -> RunActivityProjection {
+        self.event_stream.activity_projection().unwrap_or_else(|| {
+            RunActivityProjection::from_snapshot(
+                self.run_id.clone(),
+                self.state(),
+                self.plan().clone(),
+                self.task_statuses(),
+                Some(&self.agent_control_plane.snapshot()),
+                self.last_event_seq(),
+            )
+        })
     }
 
     pub fn agent_control_plane(&self) -> &AgentControlPlane {
@@ -402,8 +418,11 @@ impl RunHandle {
             if !status.state.is_terminal()
                 && !self.patch_operations.lock().contains(&status.task_id)
             {
-                self.task_registry
-                    .set_state(&status.task_id, TaskState::Cancelled);
+                self.task_mutations.transition(
+                    &status.task_id,
+                    TaskState::Cancelled,
+                    reason.description(),
+                );
                 self.event_stream.emit(RuntimeEvent::TaskCancelled {
                     run_id: self.run_id.clone(),
                     task_id: status.task_id,
@@ -429,14 +448,19 @@ impl RunHandle {
             return;
         }
         self.cancellation_tree.cancel_task(task_id, reason.clone());
-        if self
+        let cancelled_immediately = self
             .task_status(task_id)
             .is_some_and(|status| !status.state.is_active())
-            && !self.patch_operations.lock().contains(task_id)
-        {
-            self.task_registry.set_state(task_id, TaskState::Cancelled);
+            && !self.patch_operations.lock().contains(task_id);
+        if cancelled_immediately {
+            self.task_mutations
+                .transition(task_id, TaskState::Cancelled, reason.description());
             for blocked in self.plan_graph.blocked_by_failure(task_id) {
-                self.task_registry.set_state(&blocked, TaskState::Blocked);
+                self.task_mutations.transition(
+                    &blocked,
+                    TaskState::Blocked,
+                    format!("dependency '{task_id}' was cancelled"),
+                );
             }
             if self.control.state() == RunState::AwaitingApply {
                 if let Err(error) = self.control.transition(RunState::Running) {
@@ -444,11 +468,20 @@ impl RunHandle {
                 }
             }
         }
-        self.event_stream.emit(RuntimeEvent::TaskCancelled {
-            run_id: self.run_id.clone(),
-            task_id: task_id.clone(),
-            reason: reason.description().to_string(),
-        });
+        if cancelled_immediately {
+            self.event_stream.emit(RuntimeEvent::TaskCancelled {
+                run_id: self.run_id.clone(),
+                task_id: task_id.clone(),
+                reason: reason.description().to_string(),
+            });
+        } else {
+            self.event_stream
+                .emit(RuntimeEvent::TaskCancellationRequested {
+                    run_id: self.run_id.clone(),
+                    task_id: task_id.clone(),
+                    reason: reason.description().to_string(),
+                });
+        }
     }
 
     pub fn pause(&self) {
@@ -490,7 +523,7 @@ impl RunHandle {
             !self.state().is_terminal(),
             "cannot restart a task in a terminal run"
         );
-        if !self.task_registry.restart_parked_task(task_id) {
+        if !self.task_mutations.restart_parked_task(task_id) {
             return Ok(false);
         }
         self.event_stream.emit(RuntimeEvent::TaskWaitReasonChanged {
@@ -628,7 +661,7 @@ impl RunHandle {
             .await
         {
             let error = format!("{error:#}");
-            self.task_registry.park_worktree_verification_failed(
+            self.task_mutations.park_worktree_verification_failed(
                 task_id,
                 error.clone(),
                 worktree_path.clone(),
@@ -666,7 +699,7 @@ impl RunHandle {
             .await
         {
             let error = format!("{error:#}");
-            self.task_registry
+            self.task_mutations
                 .park_apply_conflict(task_id, error.clone(), worktree_path.clone());
             let wait_reason = crate::worker::StructuredWaitReason::ApplyConflict {
                 error: error.clone(),
@@ -702,7 +735,7 @@ impl RunHandle {
             } else {
                 None
             };
-            self.task_registry.park_verification_failed(
+            self.task_mutations.park_verification_failed(
                 task_id,
                 error.clone(),
                 worktree_path.clone(),
@@ -735,7 +768,7 @@ impl RunHandle {
                 "parent post-apply verification failed; parent checkout was rolled back and worktree retained: {error}"
             );
         }
-        if !self.task_registry.mark_applied(task_id) {
+        if !self.task_mutations.mark_applied(task_id) {
             anyhow::bail!(
                 "task '{}' changed state while its patch was being applied",
                 task_id
@@ -818,7 +851,7 @@ impl RunHandle {
         if let Some(metadata) = status.worker_metadata.clone() {
             self.clear_worktree_metadata(task_id, metadata);
         }
-        if !self.task_registry.mark_rejected(task_id, reason.clone()) {
+        if !self.task_mutations.mark_rejected(task_id, reason.clone()) {
             anyhow::bail!(
                 "task '{}' changed state while its worktree was being removed",
                 task_id
@@ -826,8 +859,11 @@ impl RunHandle {
         }
         let blocked = self.plan_graph.blocked_by_failure(task_id);
         for blocked_id in blocked {
-            self.task_registry
-                .set_state(&blocked_id, TaskState::Blocked);
+            self.task_mutations.transition(
+                &blocked_id,
+                TaskState::Blocked,
+                format!("dependency '{task_id}' was rejected"),
+            );
         }
         self.event_stream.emit(RuntimeEvent::TaskCancelled {
             run_id: self.run_id.clone(),
@@ -944,6 +980,15 @@ impl OrchestrationRuntime {
         };
         let control = RuntimeControl::new(initial_state);
 
+        event_stream.install_activity_projection(RunActivityProjection::from_snapshot(
+            run_id.clone(),
+            initial_state,
+            plan.clone(),
+            Vec::new(),
+            Some(&agent_control_plane.snapshot()),
+            0,
+        ));
+
         event_stream.emit(RuntimeEvent::RunCreated {
             run_id: run_id.clone(),
             plan_id: plan.id.clone(),
@@ -997,6 +1042,7 @@ impl OrchestrationRuntime {
         );
 
         let handle = RunHandle {
+            task_mutations: scheduler.task_mutations(),
             run_id,
             plan_graph,
             task_registry,
@@ -1063,6 +1109,26 @@ impl OrchestrationRuntime {
         let cancellation_tree = Arc::new(CancellationTree::new());
         let persisted_policy = persisted.policy;
         let event_stream = RuntimeEventStream::from_history(persisted.event_log.clone());
+        let mut restored_statuses = persisted.task_statuses.clone();
+        for status in &mut restored_statuses {
+            if status.state == TaskState::Parked
+                && matches!(
+                    status.wait_reason,
+                    Some(crate::worker::StructuredWaitReason::AwaitingWorkerReconnect { .. })
+                )
+            {
+                status.state = TaskState::Interrupted;
+                status.wait_reason = None;
+            }
+        }
+        event_stream.install_activity_projection(RunActivityProjection::from_snapshot(
+            run_id.clone(),
+            persisted.state,
+            persisted.plan.clone(),
+            restored_statuses.clone(),
+            persisted.agent_control_plane.as_ref(),
+            persisted.last_event_seq,
+        ));
         let agent_control_plane = match persisted.agent_control_plane.clone() {
             Some(snapshot) => AgentControlPlane::restore(snapshot, config.control_plane.clone())?,
             None => AgentControlPlane::from_plan(&persisted.plan, config.control_plane.clone())?,
@@ -1096,16 +1162,7 @@ impl OrchestrationRuntime {
         let control = RuntimeControl::new(persisted.state);
 
         // Restore task statuses and attempts
-        for mut status in persisted.task_statuses {
-            if status.state == TaskState::Parked
-                && matches!(
-                    status.wait_reason,
-                    Some(crate::worker::StructuredWaitReason::AwaitingWorkerReconnect { .. })
-                )
-            {
-                status.state = TaskState::Interrupted;
-                status.wait_reason = None;
-            }
+        for status in restored_statuses {
             task_registry.restore_status(status);
         }
         for (task_id, attempts) in persisted.task_attempts {
@@ -1133,6 +1190,7 @@ impl OrchestrationRuntime {
         );
 
         let handle = RunHandle {
+            task_mutations: scheduler.task_mutations(),
             run_id,
             plan_graph,
             task_registry,

@@ -134,3 +134,22 @@ impl fmt::Display for CorrelationId {
         write!(f, "{}", self.0)
     }
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct EventId(pub String);
+
+impl EventId {
+    pub fn from_sequence(run_id: &RunId, sequence: u64) -> Self {
+        Self(format!("{}:{sequence}", run_id.as_str()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}

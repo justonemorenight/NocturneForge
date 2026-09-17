@@ -4235,18 +4235,20 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
     fake_model.end_last_completion_stream();
     cx.run_until_parked();
 
+    let tool_call_id = scoped_tool_call_id(1, &"1".into());
+
     let tool_call = expect_tool_call(&mut events).await;
     assert_eq!(
         tool_call,
-        acp::ToolCall::new("1", "Echo")
+        acp::ToolCall::new(tool_call_id.clone(), "Echo")
+            .name("echo")
             .raw_input(json!({}))
-            .meta(acp::Meta::from_iter([("tool_name".into(), "echo".into())]))
     );
     let update = expect_tool_call_update_fields(&mut events).await;
     assert_eq!(
         update,
         acp::ToolCallUpdate::new(
-            "1",
+            tool_call_id.clone(),
             acp::ToolCallUpdateFields::new()
                 .title("Echo")
                 .kind(acp::ToolKind::Other)
@@ -4257,7 +4259,7 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
     assert_eq!(
         update,
         acp::ToolCallUpdate::new(
-            "1",
+            tool_call_id.clone(),
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress)
         )
     );
@@ -4265,7 +4267,7 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
     assert_eq!(
         update,
         acp::ToolCallUpdate::new(
-            "1",
+            tool_call_id,
             acp::ToolCallUpdateFields::new()
                 .status(acp::ToolCallStatus::Completed)
                 .raw_output("Hello!")

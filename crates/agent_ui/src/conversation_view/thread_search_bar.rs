@@ -1033,9 +1033,10 @@ fn collect_markdowns(
                         .content
                         .iter()
                         .filter_map(|content| match content {
-                            ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
-                                Some(markdown.clone())
-                            }
+                            ToolCallContent::ContentBlock(
+                                ContentBlock::Markdown { markdown }
+                                | ContentBlock::Unsupported { markdown, .. },
+                            ) => Some(markdown.clone()),
                             ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
                                 markdown: Some(markdown),
                                 ..
@@ -1056,15 +1057,15 @@ fn collect_markdowns(
         AgentThreadEntry::CompletedPlan(entries) => {
             out.extend(entries.iter().map(|e| e.content.clone()))
         }
-        AgentThreadEntry::ContextCompaction(compaction)
-            if entry_view_state.is_compaction_expanded(entry_ix) =>
-        {
-            if let Some(summary) = &compaction.summary {
-                out.push(summary.clone());
-            }
-        }
+        AgentThreadEntry::ContextCompaction(compaction) => out.extend(
+            compaction
+                .summary
+                .iter()
+                .filter_map(|content| content.markdown().cloned())
+                .chain(compaction.error.iter().cloned())
+                .filter(|_| entry_view_state.is_compaction_expanded(entry_ix)),
+        ),
         AgentThreadEntry::Elicitation(_) => {}
-        AgentThreadEntry::ContextCompaction(_) => {}
     }
     out
 }
