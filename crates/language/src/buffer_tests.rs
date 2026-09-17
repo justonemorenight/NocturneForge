@@ -4619,3 +4619,42 @@ fn test_formatted_chunks(cx: &mut gpui::App) {
         }
     }
 }
+
+#[gpui::test]
+async fn test_snapshot_with_edits_refreshes_chunk_highlights(cx: &mut TestAppContext) {
+    cx.update(|cx| init_settings(cx, |_| {}));
+
+    let language = rust_lang();
+    let row = "fn replacement() {}\n";
+    let replacement = row.repeat(crate::buffer::MAX_ROWS_IN_A_CHUNK as usize + 1);
+    let original =
+        cx.new(|cx| Buffer::local("fn original() {}\n", cx).with_language(language.clone(), cx));
+    let expected =
+        cx.new(|cx| Buffer::local(replacement.clone(), cx).with_language(language.clone(), cx));
+    cx.run_until_parked();
+
+    let edited = original
+        .update(cx, |buffer, cx| {
+            buffer.snapshot_with_edits([(0..buffer.len(), replacement.clone())], cx)
+        })
+        .await;
+    let edited_snapshot = edited.snapshot();
+    let expected_snapshot = expected.read_with(cx, |buffer, _| buffer.snapshot());
+    let collect_highlights = |snapshot: &BufferSnapshot| {
+        snapshot
+            .chunks(
+                0..snapshot.len(),
+                LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+            )
+            .map(|chunk| (chunk.text.to_string(), chunk.syntax_highlight_id))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        collect_highlights(edited_snapshot),
+        collect_highlights(&expected_snapshot)
+    );
+}

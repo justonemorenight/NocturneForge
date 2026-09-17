@@ -5,6 +5,7 @@ use crate::events::SequencedRuntimeEvent;
 use crate::goal_controller::GoalSnapshot;
 use crate::ids::{PlanId, RunId, TaskId};
 use crate::plan_graph::{OrchestrationPlan, OrchestrationTask};
+use crate::projection::RunActivityProjection;
 use crate::residency::AgentResidencySnapshot;
 use crate::state::{RunState, TaskAttempt, TaskState, TaskStatus};
 use agent_settings::AgentExecutionPolicy;
@@ -46,6 +47,17 @@ pub struct PersistedRun {
 }
 
 impl PersistedRun {
+    pub fn activity_projection(&self) -> RunActivityProjection {
+        RunActivityProjection::from_snapshot(
+            self.run_id.clone(),
+            self.state,
+            self.plan.clone(),
+            self.task_statuses.clone(),
+            self.agent_control_plane.as_ref(),
+            self.last_event_seq,
+        )
+    }
+
     pub fn new(
         run_id: RunId,
         plan: OrchestrationPlan,

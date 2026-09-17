@@ -64,19 +64,18 @@ impl std::fmt::Display for MaxOutputTokensError {
 
 impl std::error::Error for MaxOutputTokensError {}
 
-/// Key used in ACP ToolCall meta to store the tool's programmatic name.
-/// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
+/// Legacy ACP metadata key used before tool calls had a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
-/// Helper to extract tool name from ACP meta
+/// Extracts a tool name from the legacy ACP metadata field.
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
     meta.as_ref()
-        .and_then(|m| m.get(TOOL_NAME_META_KEY))
-        .and_then(|v| v.as_str())
-        .map(|s| SharedString::from(s.to_owned()))
+        .and_then(|meta| meta.get(TOOL_NAME_META_KEY))
+        .and_then(|value| value.as_str())
+        .map(|name| SharedString::from(name.to_owned()))
 }
 
-/// Helper to create meta with tool name
+/// Creates ACP metadata containing the legacy tool-name field.
 pub fn meta_with_tool_name(tool_name: &str) -> acp::Meta {
     acp::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
 }
@@ -747,11 +746,26 @@ impl ElicitationStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextCompactionId(pub Arc<str>);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextCompactionStatus {
     InProgress,
     Completed,
+    Failed,
     Canceled,
+    Other(Arc<str>),
+}
+
+impl From<acp::CompactionStatus> for ContextCompactionStatus {
+    fn from(status: acp::CompactionStatus) -> Self {
+        match status {
+            acp::CompactionStatus::InProgress => Self::InProgress,
+            acp::CompactionStatus::Completed => Self::Completed,
+            acp::CompactionStatus::Failed => Self::Failed,
+            acp::CompactionStatus::Cancelled => Self::Canceled,
+            acp::CompactionStatus::Other(status) => Self::Other(status.into()),
+            _ => Self::Other("unknown".into()),
+        }
+    }
 }
 
 /// A point in the thread where the conversation history was compacted to free
@@ -761,14 +775,65 @@ pub enum ContextCompactionStatus {
 pub struct ContextCompaction {
     pub id: ContextCompactionId,
     pub status: ContextCompactionStatus,
-    /// The compaction summary, streamed in as the model produces it. This is
-    /// `None` for provider-native compaction, which produces no summary to show.
-    pub summary: Option<Entity<Markdown>>,
+    pub error: Option<Entity<Markdown>>,
+    pub summary: Vec<ContentBlock>,
 }
 
 impl ContextCompaction {
     pub fn is_in_progress(&self) -> bool {
         self.status == ContextCompactionStatus::InProgress
+    }
+
+    fn apply_update(
+        &mut self,
+        update: acp::CompactionUpdate,
+        language_registry: &Arc<LanguageRegistry>,
+        path_style: PathStyle,
+        cx: &mut App,
+    ) {
+        self.status = update.status.into();
+        match update.summary {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => self.summary.clear(),
+            MaybeUndefined::Value(blocks) => {
+                self.summary.clear();
+                for block in blocks {
+                    self.append_summary(block, language_registry, path_style, cx);
+                }
+            }
+        }
+        match update.error {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => self.error = None,
+            MaybeUndefined::Value(error) => {
+                if let Some(markdown) = &self.error {
+                    markdown.update(cx, |markdown, cx| markdown.reset(error.into(), cx));
+                } else {
+                    self.error = Some(cx.new(|cx| Markdown::new_text(error.into(), cx)));
+                }
+            }
+        }
+    }
+
+    fn append_summary(
+        &mut self,
+        content: acp::ContentBlock,
+        language_registry: &Arc<LanguageRegistry>,
+        path_style: PathStyle,
+        cx: &mut App,
+    ) {
+        if let acp::ContentBlock::Text(text) = &content
+            && let Some(ContentBlock::Markdown { markdown }) = self.summary.last()
+        {
+            markdown.update(cx, |markdown, cx| markdown.append(&text.text, cx));
+        } else {
+            self.summary.push(ContentBlock::new_tool_call_content(
+                content,
+                language_registry,
+                path_style,
+                cx,
+            ));
+        }
     }
 }
 
@@ -777,6 +842,7 @@ pub struct ContextCompactionUpdate {
     pub id: ContextCompactionId,
     pub summary_delta: String,
     pub status: Option<ContextCompactionStatus>,
+    pub error: Option<String>,
 }
 
 impl AgentThreadEntry {
@@ -805,7 +871,27 @@ impl AgentThreadEntry {
                 }
                 md
             }
-            Self::ContextCompaction(_) => "--- Context Compacted ---\n\n".to_string(),
+            Self::ContextCompaction(compaction) => {
+                let status = match &compaction.status {
+                    ContextCompactionStatus::InProgress => "In Progress",
+                    ContextCompactionStatus::Completed => "Completed",
+                    ContextCompactionStatus::Failed => "Failed",
+                    ContextCompactionStatus::Canceled => "Canceled",
+                    ContextCompactionStatus::Other(status) => status,
+                };
+                let mut markdown =
+                    format!("## Context Compaction ({})\n\n", MarkdownEscaped(status));
+                for block in &compaction.summary {
+                    markdown.push_str(block.to_markdown(cx));
+                    markdown.push_str("\n\n");
+                }
+                if let Some(error) = &compaction.error {
+                    markdown.push_str("**Error:** ");
+                    markdown.push_str(&MarkdownEscaped(error.read(cx).source()).to_string());
+                    markdown.push_str("\n\n");
+                }
+                markdown
+            }
         }
     }
 
@@ -854,6 +940,7 @@ impl AgentThreadEntry {
 pub struct ToolCall {
     pub id: acp::ToolCallId,
     pub label: Entity<Markdown>,
+    title: Option<SharedString>,
     pub kind: acp::ToolKind,
     pub content: Vec<ToolCallContent>,
     pub status: ToolCallStatus,
@@ -942,15 +1029,8 @@ impl ToolCall {
         terminals: &HashMap<acp::TerminalId, Entity<Terminal>>,
         cx: &mut App,
     ) -> Result<Self> {
-        let title = if tool_call.kind == acp::ToolKind::Execute {
-            tool_call.title
-        } else if tool_call.kind == acp::ToolKind::Edit {
-            MarkdownEscaped(tool_call.title.as_str()).to_string()
-        } else if let Some((first_line, _)) = tool_call.title.split_once("\n") {
-            first_line.to_owned() + "…"
-        } else {
-            tool_call.title
-        };
+        let title =
+            Some(SharedString::from(tool_call.title)).filter(|title| !title.trim().is_empty());
         let mut content = Vec::with_capacity(tool_call.content.len());
         for item in tool_call.content {
             if let Some(item) = ToolCallContent::from_acp(
@@ -969,7 +1049,10 @@ impl ToolCall {
             .as_ref()
             .and_then(|input| markdown_for_raw_output(input, &language_registry, cx));
 
-        let tool_name = tool_name_from_meta(&tool_call.meta);
+        let tool_name = tool_call
+            .name
+            .map(SharedString::from)
+            .or_else(|| tool_name_from_meta(&tool_call.meta));
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
         let sandbox_authorization_details =
@@ -978,15 +1061,18 @@ impl ToolCall {
             sandbox_fallback_authorization_details_from_meta(&tool_call.meta);
         let sandbox_not_applied = sandbox_not_applied_from_meta(&tool_call.meta);
 
-        let label = if tool_call.kind == acp::ToolKind::Execute {
-            cx.new(|cx| Markdown::new_text(title.into(), cx))
-        } else {
-            cx.new(|cx| Markdown::new(title.into(), Some(language_registry.clone()), None, cx))
-        };
+        let label = Self::new_label(
+            title.as_ref(),
+            tool_name.as_ref(),
+            tool_call.kind,
+            language_registry,
+            cx,
+        );
 
         let result = Self {
             id: tool_call.tool_call_id,
             label,
+            title,
             kind: tool_call.kind,
             content,
             locations: tool_call.locations,
@@ -1004,6 +1090,46 @@ impl ToolCall {
         Ok(result)
     }
 
+    fn label_text(
+        title: Option<&SharedString>,
+        tool_name: Option<&SharedString>,
+        kind: acp::ToolKind,
+    ) -> SharedString {
+        let Some(title) = title else {
+            return tool_name
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "Tool call".into());
+        };
+
+        if kind == acp::ToolKind::Execute {
+            title.clone()
+        } else if kind == acp::ToolKind::Edit {
+            MarkdownEscaped(title).to_string().into()
+        } else if let Some((first_line, _)) = title.split_once('\n') {
+            (first_line.to_owned() + "…").into()
+        } else {
+            title.clone()
+        }
+    }
+
+    fn new_label(
+        title: Option<&SharedString>,
+        tool_name: Option<&SharedString>,
+        kind: acp::ToolKind,
+        language_registry: Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Entity<Markdown> {
+        let text = Self::label_text(title, tool_name, kind);
+        cx.new(|cx| {
+            if title.is_none() || kind == acp::ToolKind::Execute {
+                Markdown::new_text(text, cx)
+            } else {
+                Markdown::new(text, Some(language_registry), None, cx)
+            }
+        })
+    }
+
     fn update_fields(
         &mut self,
         fields: acp::ToolCallUpdateFields,
@@ -1017,6 +1143,7 @@ impl ToolCall {
             kind,
             status,
             title,
+            name,
             content,
             locations,
             raw_input,
@@ -1024,12 +1151,22 @@ impl ToolCall {
             ..
         } = fields;
 
+        let was_plain_text = self.title.is_none() || self.kind == acp::ToolKind::Execute;
+        let mut label_changed = title.is_some() || kind.is_some();
         if let Some(kind) = kind {
             self.kind = kind;
         }
 
         if let Some(status) = status {
             self.update_acp_status(status);
+        }
+
+        if let Some(tool_name) = name.map(SharedString::from) {
+            self.tool_name = Some(tool_name);
+            label_changed = true;
+        } else if self.tool_name.is_none() {
+            self.tool_name = tool_name_from_meta(&meta);
+            label_changed |= self.tool_name.is_some();
         }
 
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
@@ -1050,24 +1187,34 @@ impl ToolCall {
         }
 
         if let Some(title) = title {
-            if self.kind == acp::ToolKind::Execute {
+            self.title = Some(SharedString::from(title)).filter(|title| !title.trim().is_empty());
+            if self.kind == acp::ToolKind::Execute
+                && let Some(title) = &self.title
+            {
                 for terminal in self.terminals() {
                     terminal.update(cx, |terminal, cx| {
-                        terminal.update_command_label(&title, cx);
+                        terminal.update_command_label(title, cx);
                     });
                 }
             }
-            self.label.update(cx, |label, cx| {
-                if self.kind == acp::ToolKind::Execute {
-                    label.replace(title, cx);
-                } else if self.kind == acp::ToolKind::Edit {
-                    label.replace(MarkdownEscaped(&title).to_string(), cx)
-                } else if let Some((first_line, _)) = title.split_once("\n") {
-                    label.replace(first_line.to_owned() + "…", cx);
-                } else {
-                    label.replace(title, cx);
+        }
+        if label_changed {
+            let is_plain_text = self.title.is_none() || self.kind == acp::ToolKind::Execute;
+            if was_plain_text != is_plain_text {
+                self.label = Self::new_label(
+                    self.title.as_ref(),
+                    self.tool_name.as_ref(),
+                    self.kind,
+                    language_registry.clone(),
+                    cx,
+                );
+            } else {
+                let text =
+                    Self::label_text(self.title.as_ref(), self.tool_name.as_ref(), self.kind);
+                if self.label.read(cx).source() != text.as_ref() {
+                    self.label.update(cx, |label, cx| label.replace(text, cx));
                 }
-            });
+            }
         }
 
         if let Some(content) = content {
@@ -1297,11 +1444,13 @@ impl ToolCall {
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
-        let mut markdown = format!(
-            "**Tool Call: {}**\nStatus: {}\n\n",
-            self.label.read(cx).source(),
-            self.status
-        );
+        let label = self.label.read(cx).source();
+        let label = if self.title.is_none() {
+            MarkdownEscaped(label).to_string()
+        } else {
+            label.to_string()
+        };
+        let mut markdown = format!("**Tool Call: {}**\nStatus: {}\n\n", label, self.status);
         for content in &self.content {
             markdown.push_str(content.to_markdown(cx).as_str());
             markdown.push_str("\n\n");
@@ -1812,6 +1961,10 @@ pub enum ContentBlock {
         image: Arc<gpui::Image>,
         dimensions: Option<gpui::Size<u32>>,
     },
+    Unsupported {
+        content: acp::ContentBlock,
+        markdown: Entity<Markdown>,
+    },
 }
 
 impl ContentBlock {
@@ -1845,8 +1998,23 @@ impl ContentBlock {
         path_style: PathStyle,
         cx: &mut App,
     ) -> Self {
+        Self::new_output(block, language_registry, path_style, cx)
+    }
+
+    pub fn new_output(
+        block: acp::ContentBlock,
+        language_registry: &Arc<LanguageRegistry>,
+        path_style: PathStyle,
+        cx: &mut App,
+    ) -> Self {
         match block {
-            acp::ContentBlock::Resource(resource) => {
+            acp::ContentBlock::Resource(resource)
+                if matches!(
+                    &resource.resource,
+                    acp::EmbeddedResourceResource::TextResourceContents(_)
+                        | acp::EmbeddedResourceResource::BlobResourceContents(_)
+                ) =>
+            {
                 if let Some((image, dimensions)) = Self::decode_embedded_resource_image(&resource) {
                     Self::Image { image, dimensions }
                 } else {
@@ -1855,7 +2023,34 @@ impl ContentBlock {
                     Self::EmbeddedResource { resource, markdown }
                 }
             }
-            block => Self::new(block, language_registry, path_style, cx),
+            acp::ContentBlock::Image(image) => {
+                if let Some((image, dimensions)) = Self::decode_image(&image) {
+                    Self::Image { image, dimensions }
+                } else {
+                    Self::Unsupported {
+                        content: acp::ContentBlock::Image(image),
+                        markdown: Self::create_markdown(
+                            "Image content could not be displayed.".into(),
+                            language_registry,
+                            cx,
+                        ),
+                    }
+                }
+            }
+            block @ (acp::ContentBlock::Text(_) | acp::ContentBlock::ResourceLink(_)) => {
+                Self::new(block, language_registry, path_style, cx)
+            }
+            content => {
+                let description = if matches!(&content, acp::ContentBlock::Audio(_)) {
+                    "Audio content is not supported."
+                } else {
+                    "This content is not supported."
+                };
+                Self::Unsupported {
+                    content,
+                    markdown: Self::create_markdown(description.into(), language_registry, cx),
+                }
+            }
         }
     }
 
@@ -1904,6 +2099,11 @@ impl ContentBlock {
             (ContentBlock::Image { .. }, _) => {
                 let new_content = Self::block_string_contents(&block, path_style);
                 let combined = format!("`Image`\n{}", new_content);
+                *self = Self::create_markdown_block(combined, language_registry, cx);
+            }
+            (ContentBlock::Unsupported { markdown, .. }, _) => {
+                let new_content = Self::block_string_contents(&block, path_style);
+                let combined = format!("{}\n{}", markdown.read(cx).source(), new_content);
                 *self = Self::create_markdown_block(combined, language_registry, cx);
             }
         }
@@ -2039,7 +2239,9 @@ impl ContentBlock {
 
     pub fn text_content<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
         match self {
-            ContentBlock::Markdown { markdown } => Some(markdown.read(cx).source()),
+            ContentBlock::Markdown { markdown } | ContentBlock::Unsupported { markdown, .. } => {
+                Some(markdown.read(cx).source())
+            }
             ContentBlock::EmbeddedResource { resource, .. } => match &resource.resource {
                 acp::EmbeddedResourceResource::TextResourceContents(text) => Some(&text.text),
                 acp::EmbeddedResourceResource::BlobResourceContents(_) => None,
@@ -2119,7 +2321,9 @@ impl ContentBlock {
     pub fn visible_content(&self, cx: &App) -> bool {
         match self {
             ContentBlock::Empty => false,
-            ContentBlock::Markdown { markdown } => !markdown.read(cx).source().trim().is_empty(),
+            ContentBlock::Markdown { markdown } | ContentBlock::Unsupported { markdown, .. } => {
+                !markdown.read(cx).source().trim().is_empty()
+            }
             ContentBlock::EmbeddedResource { resource, markdown } => match markdown {
                 Some(markdown) => !markdown.read(cx).source().trim().is_empty(),
                 None => !Self::embedded_resource_text(resource).trim().is_empty(),
@@ -2162,7 +2366,9 @@ impl ContentBlock {
     pub fn to_markdown<'a>(&'a self, cx: &'a App) -> &'a str {
         match self {
             ContentBlock::Empty => "",
-            ContentBlock::Markdown { markdown } => markdown.read(cx).source(),
+            ContentBlock::Markdown { markdown } | ContentBlock::Unsupported { markdown, .. } => {
+                markdown.read(cx).source()
+            }
             ContentBlock::EmbeddedResource { resource, markdown } => {
                 if let Some(markdown) = markdown {
                     markdown.read(cx).source()
@@ -2178,7 +2384,9 @@ impl ContentBlock {
     pub fn markdown(&self) -> Option<&Entity<Markdown>> {
         match self {
             ContentBlock::Empty => None,
-            ContentBlock::Markdown { markdown } => Some(markdown),
+            ContentBlock::Markdown { markdown } | ContentBlock::Unsupported { markdown, .. } => {
+                Some(markdown)
+            }
             ContentBlock::EmbeddedResource { markdown, .. } => markdown.as_ref(),
             ContentBlock::ResourceLink { .. } => None,
             ContentBlock::Image { .. } => None,
@@ -3300,6 +3508,12 @@ impl AcpThread {
             acp::SessionUpdate::Plan(plan) => {
                 self.update_plan(plan, cx);
             }
+            acp::SessionUpdate::CompactionUpdate(update) => {
+                self.upsert_context_compaction_update(update, cx);
+            }
+            acp::SessionUpdate::CompactionSummaryChunk(chunk) => {
+                self.append_context_compaction_summary(chunk, cx);
+            }
             acp::SessionUpdate::SessionInfoUpdate(info_update) => {
                 if let MaybeUndefined::Value(title) = info_update.title {
                     let had_provisional = self.provisional_title.take().is_some();
@@ -3860,12 +4074,76 @@ impl AcpThread {
         }
     }
 
+    fn upsert_context_compaction_update(
+        &mut self,
+        update: acp::CompactionUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let id = ContextCompactionId(update.compaction_id.0.clone());
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+
+        if let Some((entry_index, compaction)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(entry_index, entry)| match entry {
+                    AgentThreadEntry::ContextCompaction(compaction) if compaction.id == id => {
+                        Some((entry_index, compaction))
+                    }
+                    _ => None,
+                })
+        {
+            compaction.apply_update(update, &language_registry, path_style, cx);
+            cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+            return;
+        }
+
+        let mut compaction = ContextCompaction {
+            id,
+            status: update.status.clone().into(),
+            error: None,
+            summary: Vec::new(),
+        };
+        compaction.apply_update(update, &language_registry, path_style, cx);
+        self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
+    }
+
+    fn append_context_compaction_summary(
+        &mut self,
+        chunk: acp::CompactionSummaryChunk,
+        cx: &mut Context<Self>,
+    ) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        if let Some((entry_index, compaction)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(entry_index, entry)| match entry {
+                    AgentThreadEntry::ContextCompaction(compaction)
+                        if compaction.id.0 == chunk.compaction_id.0
+                            && compaction.is_in_progress() =>
+                    {
+                        Some((entry_index, compaction))
+                    }
+                    _ => None,
+                })
+        {
+            compaction.append_summary(chunk.content, &language_registry, path_style, cx);
+            cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
+        }
+    }
+
     pub fn update_context_compaction(
         &mut self,
         update: ContextCompactionUpdate,
         cx: &mut Context<Self>,
     ) {
         let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
         let Some((ix, compaction)) =
             self.entries
                 .iter_mut()
@@ -3880,24 +4158,19 @@ impl AcpThread {
         };
 
         if !update.summary_delta.is_empty() {
-            if compaction.summary.is_none() {
-                compaction.summary = Some(cx.new(|cx| {
-                    Markdown::new(
-                        update.summary_delta.into(),
-                        Some(language_registry),
-                        None,
-                        cx,
-                    )
-                }));
-            } else if let Some(summary) = compaction.summary.clone() {
-                summary.update(cx, |markdown, cx| {
-                    markdown.append(&update.summary_delta, cx)
-                });
-            }
+            compaction.append_summary(
+                acp::ContentBlock::Text(acp::TextContent::new(update.summary_delta)),
+                &language_registry,
+                path_style,
+                cx,
+            );
         }
 
         if let Some(status) = update.status {
             compaction.status = status;
+        }
+        if let Some(error) = update.error {
+            compaction.error = Some(cx.new(|cx| Markdown::new_text(error.into(), cx)));
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
@@ -3990,6 +4263,7 @@ impl AcpThread {
                 let failed_tool_call = ToolCall {
                     id: update.id().clone(),
                     label: cx.new(|cx| Markdown::new("Tool call not found".into(), None, None, cx)),
+                    title: Some("Tool call not found".into()),
                     kind: acp::ToolKind::Fetch,
                     content: vec![ToolCallContent::ContentBlock(ContentBlock::new(
                         "Tool call not found".into(),
@@ -6119,6 +6393,182 @@ mod tests {
         assert_eq!(source_without_trimmed_suffix("Kết quả 🌙", suffix), None);
     }
 
+    #[gpui::test]
+    fn test_tool_call_label_fallback(cx: &mut TestAppContext) {
+        use markdown::parser::{MarkdownEvent, MarkdownTag};
+
+        init_test(cx);
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        for (call, expected, has_strong_text) in [
+            (
+                acp::ToolCall::new("tool", "Reading **file**").name("read_file"),
+                "Reading **file**",
+                true,
+            ),
+            (acp::ToolCall::new("tool", ""), "Tool call", false),
+            (
+                acp::ToolCall::new("tool", "\n\t ").name(" \t"),
+                "Tool call",
+                false,
+            ),
+            (
+                acp::ToolCall::new("tool", "").name("**mcp__tool**"),
+                "**mcp__tool**",
+                false,
+            ),
+            (
+                acp::ToolCall::new("tool", "").meta(meta_with_tool_name("legacy_tool")),
+                "legacy_tool",
+                false,
+            ),
+        ] {
+            let call = cx.update(|cx| {
+                ToolCall::from_acp(
+                    call,
+                    ToolCallStatus::Pending,
+                    languages.clone(),
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("tool call should convert")
+            });
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let label = call.label.read(cx);
+                assert_eq!(label.source(), expected);
+                assert_eq!(
+                    label.parsed_markdown().events().iter().any(|(_, event)| {
+                        matches!(event, MarkdownEvent::Start(MarkdownTag::Strong))
+                    }),
+                    has_strong_text
+                );
+                if call.title.is_none() {
+                    assert_eq!(
+                        call.to_markdown(cx),
+                        format!(
+                            "**Tool Call: {}**\nStatus: Pending\n\n",
+                            MarkdownEscaped(expected)
+                        )
+                    );
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn test_tool_call_label_updates_preserve_titles(cx: &mut TestAppContext) {
+        use markdown::parser::{MarkdownEvent, MarkdownTag};
+
+        init_test(cx);
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        let mut call = cx.update(|cx| {
+            ToolCall::from_acp(
+                acp::ToolCall::new("tool", ""),
+                ToolCallStatus::Pending,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("tool call should convert")
+        });
+        for (update, expected, has_strong_text) in [
+            (
+                acp::ToolCallUpdateFields::new().name("**tool_name**"),
+                "**tool_name**",
+                false,
+            ),
+            (
+                acp::ToolCallUpdateFields::new().title("**Readable title**"),
+                "**Readable title**",
+                true,
+            ),
+            (
+                acp::ToolCallUpdateFields::new().name("renamed_tool"),
+                "**Readable title**",
+                true,
+            ),
+            (
+                acp::ToolCallUpdateFields::new().title("\n\t "),
+                "renamed_tool",
+                false,
+            ),
+        ] {
+            cx.update(|cx| {
+                call.update_fields(
+                    update,
+                    None,
+                    languages.clone(),
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("tool label update should apply");
+            });
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let label = call.label.read(cx);
+                assert_eq!(label.source(), expected);
+                assert_eq!(
+                    label.parsed_markdown().events().iter().any(|(_, event)| {
+                        matches!(event, MarkdownEvent::Start(MarkdownTag::Strong))
+                    }),
+                    has_strong_text
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn test_tool_call_name_precedence_and_updates(cx: &mut TestAppContext) {
+        init_test(cx);
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        let mut call = cx.update(|cx| {
+            ToolCall::from_acp(
+                acp::ToolCall::new("tool", "Tool call")
+                    .name("canonical")
+                    .meta(meta_with_tool_name("legacy")),
+                ToolCallStatus::Pending,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("tool call should convert")
+        });
+        assert_eq!(call.tool_name.as_deref(), Some("canonical"));
+
+        cx.update(|cx| {
+            call.update_fields(
+                acp::ToolCallUpdateFields::new(),
+                Some(meta_with_tool_name("stale_legacy")),
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("legacy update should apply");
+        });
+        assert_eq!(call.tool_name.as_deref(), Some("canonical"));
+
+        cx.update(|cx| {
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().name("renamed"),
+                Some(meta_with_tool_name("ignored_legacy")),
+                languages,
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("canonical name update should apply");
+        });
+        assert_eq!(call.tool_name.as_deref(), Some("renamed"));
+    }
+
     #[test]
     fn command_category_meta_round_trips() {
         // Exhaustive list of variants. The match below has no wildcard arm, so
@@ -7696,7 +8146,8 @@ mod tests {
                             ContextCompaction {
                                 id: ContextCompactionId("c1".into()),
                                 status: ContextCompactionStatus::Completed,
-                                summary: None,
+                                error: None,
+                                summary: Vec::new(),
                             },
                             cx,
                         );
@@ -10749,6 +11200,9 @@ mod tests {
                         ContentBlock::Image { .. } => {
                             panic!("Expected markdown content, got image")
                         }
+                        ContentBlock::Unsupported { .. } => {
+                            panic!("Expected markdown content, got unsupported content")
+                        }
                     }
                 } else {
                     panic!("Expected ContentBlock, got: {:?}", tool_call.content[0]);
@@ -11426,7 +11880,8 @@ mod tests {
                                 ContextCompaction {
                                     id: compaction_id,
                                     status: ContextCompactionStatus::InProgress,
-                                    summary: None,
+                                    error: None,
+                                    summary: Vec::new(),
                                 },
                                 cx,
                             );
@@ -11794,7 +12249,8 @@ mod tests {
                 ContextCompaction {
                     id: ContextCompactionId("compaction-1".into()),
                     status: ContextCompactionStatus::InProgress,
-                    summary: None,
+                    error: None,
+                    summary: Vec::new(),
                 },
                 cx,
             );
@@ -11828,6 +12284,83 @@ mod tests {
                 .expect("token_usage should be restored by the next usage update");
             assert_eq!(usage.used_tokens, 1000);
             assert_eq!(usage.max_tokens, 10000);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_acp_context_compaction_updates_preserve_timeline_and_details(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                        "compaction-1",
+                        acp::CompactionStatus::InProgress,
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::CompactionSummaryChunk(acp::CompactionSummaryChunk::new(
+                        "compaction-1",
+                        acp::ContentBlock::Text(acp::TextContent::new("retained ")),
+                    )),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::CompactionUpdate(
+                        acp::CompactionUpdate::new(
+                            "compaction-1",
+                            acp::CompactionStatus::Completed,
+                        )
+                        .summary(vec![
+                            acp::ContentBlock::Text(acp::TextContent::new("retained context")),
+                            acp::ContentBlock::Audio(acp::AudioContent::new(
+                                "YXVkaW8=",
+                                "audio/wav",
+                            )),
+                        ]),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let [AgentThreadEntry::ContextCompaction(compaction)] = thread.entries() else {
+                panic!("expected one compaction entry");
+            };
+            assert_eq!(compaction.status, ContextCompactionStatus::Completed);
+            assert_eq!(compaction.summary.len(), 2);
+            assert_eq!(compaction.summary[0].to_markdown(cx), "retained context");
+            assert!(matches!(
+                &compaction.summary[1],
+                ContentBlock::Unsupported {
+                    content: acp::ContentBlock::Audio(_),
+                    ..
+                }
+            ));
+            assert_eq!(
+                compaction.summary[1].to_markdown(cx),
+                "Audio content is not supported."
+            );
+            assert!(!thread.is_compacting());
         });
     }
 

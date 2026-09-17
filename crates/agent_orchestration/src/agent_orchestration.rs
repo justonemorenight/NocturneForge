@@ -13,10 +13,12 @@ pub mod ids;
 pub mod persistence;
 pub mod plan_graph;
 pub mod planner;
+pub mod projection;
 pub mod residency;
 pub mod runtime;
 pub mod scheduler;
 pub mod state;
+pub mod task_mutation;
 pub mod task_registry;
 pub mod verification;
 pub mod worker;
@@ -41,7 +43,9 @@ pub use control_plane::{
     AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentIdentity,
     AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
 };
-pub use events::{EventReplayPage, RuntimeEvent, RuntimeEventStream};
+pub use events::{
+    EventReplayPage, RuntimeEvent, RuntimeEventContext, RuntimeEventStream, SequencedRuntimeEvent,
+};
 pub use execution_limiter::{
     AgentExecutionLimiter, AgentExecutionLimiterConfig, AgentExecutionPermit,
 };
@@ -51,10 +55,11 @@ pub use executor::{
 pub use goal_controller::{
     GoalBlocker, GoalController, GoalControllerConfig, GoalSnapshot, GoalStatus,
 };
-pub use ids::{CorrelationId, PlanId, RunId, TaskId};
+pub use ids::{CorrelationId, EventId, PlanId, RunId, TaskId};
 pub use persistence::{PERSISTENCE_SCHEMA_VERSION, PersistedRun};
 pub use plan_graph::{GraphValidationError, OrchestrationPlan, OrchestrationTask, PlanGraph};
 pub use planner::{OrchestrationPlanner, PlanProposal};
+pub use projection::{ActivityAgentProjection, RunActivityProjection};
 pub use residency::{
     AgentResidencyConfig, AgentResidencyLease, AgentResidencyManager, AgentResidencyRecord,
     AgentResidencySnapshot, AgentResidencyState,
@@ -62,6 +67,7 @@ pub use residency::{
 pub use runtime::{OrchestrationRuntime, RunHandle, RuntimeConfig, RuntimeLaunchDisposition};
 pub use scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 pub use state::{RunState, TaskAttempt, TaskState, TaskStatus};
+pub use task_mutation::TaskMutationGateway;
 pub use task_registry::TaskRegistry;
 pub use verification::{
     CriterionClaim, ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START,
@@ -641,12 +647,33 @@ mod tests {
         let statuses = handle.task_statuses();
         assert_eq!(statuses.len(), 2);
         assert!(statuses.iter().all(|s| s.state == TaskState::Completed));
-        assert!(handle.snapshot().event_log.iter().any(|event| {
+        let event_log = handle.snapshot().event_log;
+        assert!(event_log.iter().any(|event| {
             matches!(
                 &event.event,
                 RuntimeEvent::TaskPhaseChanged { phase, .. } if phase == "quiescing"
             )
         }));
+        let correlation_id = event_log
+            .iter()
+            .find_map(|event| match &event.event {
+                RuntimeEvent::TaskDispatched { task_id, .. }
+                    if task_id == &TaskId::new("task-1") =>
+                {
+                    event.correlation_id.clone()
+                }
+                _ => None,
+            })
+            .expect("task attempt has a correlation id");
+        let attempt_events = event_log
+            .iter()
+            .filter(|event| event.correlation_id.as_ref() == Some(&correlation_id))
+            .collect::<Vec<_>>();
+        assert!(attempt_events.len() >= 4);
+        assert!(attempt_events[0].caused_by.is_none());
+        for events in attempt_events.windows(2) {
+            assert_eq!(events[1].caused_by.as_ref(), Some(&events[0].event_id));
+        }
     }
 
     #[gpui::test]

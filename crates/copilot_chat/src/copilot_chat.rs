@@ -266,6 +266,11 @@ impl Model {
         self.capabilities.limits.max_context_window_tokens as u64
     }
 
+    pub fn max_prompt_tokens(&self) -> Option<u64> {
+        let limit = self.capabilities.limits.max_prompt_tokens;
+        (limit > 0).then_some(limit)
+    }
+
     pub fn max_output_tokens(&self) -> usize {
         self.capabilities.limits.max_output_tokens
     }
@@ -1278,7 +1283,9 @@ mod tests {
 
         assert_eq!(schema.data.len(), 2);
         assert_eq!(schema.data[0].id, "gpt-4");
+        assert_eq!(schema.data[0].max_prompt_tokens(), Some(32_768));
         assert_eq!(schema.data[1].id, "claude-3.7-sonnet");
+        assert_eq!(schema.data[1].max_prompt_tokens(), Some(90_000));
     }
 
     #[test]

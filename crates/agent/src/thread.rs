@@ -1642,6 +1642,7 @@ pub struct Thread {
     /// Persisted so restored sessions can continue with the same tool surface.
     discovered_tools: HashSet<SharedString>,
     orchestration_run: Option<agent_orchestration::RunHandle>,
+    orchestration_event_task: Option<Task<()>>,
     persisted_orchestration_run: Option<agent_orchestration::PersistedRun>,
     orchestration_goal: Option<agent_orchestration::GoalController>,
 }
@@ -1801,6 +1802,7 @@ impl Thread {
             tool_filter: None,
             discovered_tools: HashSet::default(),
             orchestration_run: None,
+            orchestration_event_task: None,
             persisted_orchestration_run: None,
             orchestration_goal: None,
         }
@@ -1899,6 +1901,7 @@ impl Thread {
                                 self.replay_tool_call(
                                     tool_use,
                                     assistant_message.tool_results.get(&tool_use.id),
+                                    message_ix,
                                     &stream,
                                     cx,
                                 );
@@ -1937,6 +1940,7 @@ impl Thread {
         &self,
         tool_use: &LanguageModelToolUse,
         tool_result: Option<&LanguageModelToolResult>,
+        owning_message_ix: usize,
         stream: &ThreadEventStream,
         cx: &mut Context<Self>,
     ) {
@@ -1947,6 +1951,7 @@ impl Thread {
             return;
         }
 
+        let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use.id);
         let output = tool_result
             .as_ref()
             .and_then(|result| result.output.clone());
@@ -1988,7 +1993,8 @@ impl Thread {
             stream
                 .0
                 .unbounded_send(Ok(ThreadEvent::ToolCall(
-                    acp::ToolCall::new(tool_use.id.to_string(), tool_use.name.to_string())
+                    acp::ToolCall::new(tool_call_id.clone(), tool_use.name.to_string())
+                        .name(tool_use.name.to_string())
                         .status(status)
                         .raw_input(tool_use.input.to_display_json()),
                 )))
@@ -1999,7 +2005,7 @@ impl Thread {
             if let Some(content) = replay_content {
                 fields = fields.content(content);
             }
-            stream.update_tool_call_fields(&tool_use.id, fields, None);
+            stream.update_tool_call_fields(&tool_call_id, fields, None);
             return;
         };
 
@@ -2008,11 +2014,11 @@ impl Thread {
         };
         let title = tool.initial_title(input.clone(), cx);
         let kind = tool.kind();
-        stream.send_tool_call(&tool_use.id, &tool_use.name, title, kind, input.clone());
+        stream.send_tool_call(&tool_call_id, &tool_use.name, title, kind, input.clone());
 
         if let Some(content) = replay_content {
             stream.update_tool_call_fields(
-                &tool_use.id,
+                &tool_call_id,
                 acp::ToolCallUpdateFields::new().content(content),
                 None,
             );
@@ -2023,6 +2029,7 @@ impl Thread {
             let (_cancellation_tx, cancellation_rx) = watch::channel(false);
             let tool_event_stream = ToolCallEventStream::new(
                 tool_use.id.clone(),
+                tool_call_id.clone(),
                 stream.clone(),
                 Some(self.project.read(cx).fs().clone()),
                 cancellation_rx,
@@ -2033,7 +2040,7 @@ impl Thread {
         }
 
         stream.update_tool_call_fields(
-            &tool_use.id,
+            &tool_call_id,
             acp::ToolCallUpdateFields::new()
                 .status(status)
                 .raw_output(output),
@@ -2204,6 +2211,7 @@ impl Thread {
             running_subagents: Vec::new(),
             inherits_parent_model_settings,
             orchestration_run: None,
+            orchestration_event_task: None,
             persisted_orchestration_run: db_thread
                 .orchestration_run
                 .map(agent_orchestration::PersistedRun::for_resume),
@@ -2876,7 +2884,27 @@ impl Thread {
                 "superseded by another orchestration run".to_string(),
             ));
         }
+        let subscription = run.subscribe_live();
         self.orchestration_run = Some(run);
+        self.orchestration_event_task = Some(cx.spawn(async move |this, cx| {
+            while let Ok(event) = subscription.receiver.recv().await {
+                let terminal = match event.event {
+                    agent_orchestration::RuntimeEvent::RunCompleted { .. }
+                    | agent_orchestration::RuntimeEvent::RunFailed { .. }
+                    | agent_orchestration::RuntimeEvent::RunCancelled { .. } => true,
+                    agent_orchestration::RuntimeEvent::RunStateChanged { state, .. } => {
+                        state.is_terminal()
+                    }
+                    _ => false,
+                };
+                if this.update(cx, |_thread, cx| cx.notify()).is_err() {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+        }));
         self.updated_at = Utc::now();
         cx.notify();
     }
@@ -2942,6 +2970,7 @@ impl Thread {
         let (_cancellation_tx, cancellation_rx) = watch::channel(false);
         let event_stream = ToolCallEventStream::new(
             "resume_orchestration".into(),
+            acp::ToolCallId::new("resume_orchestration"),
             ThreadEventStream(events_tx),
             Some(self.project.read(cx).fs().clone()),
             cancellation_rx,
@@ -3128,7 +3157,12 @@ impl Thread {
         let Some(model) = self.model() else {
             return;
         };
-        let input_tokens = tokens.unwrap_or(0).max(model.max_token_count());
+        let input_capacity = compaction_input_capacity(
+            model.max_input_tokens(),
+            model.max_total_tokens(),
+            model.max_output_tokens(),
+        );
+        let input_tokens = tokens.unwrap_or(0).max(input_capacity);
         let Some(last_user_message) = self.last_user_message() else {
             return;
         };
@@ -3183,6 +3217,16 @@ impl Thread {
 
     pub fn cumulative_token_usage(&self) -> language_model::TokenUsage {
         self.cumulative_token_usage
+    }
+
+    /// Maximum input after reserving the selected model's output allowance.
+    pub fn input_token_capacity(&self) -> Option<u64> {
+        let model = self.model()?;
+        Some(compaction_input_capacity(
+            model.max_input_tokens(),
+            model.max_total_tokens(),
+            model.max_output_tokens(),
+        ))
     }
 
     pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
@@ -3714,9 +3758,9 @@ impl Thread {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
             };
-            let mut tool_results: FuturesUnordered<Task<LanguageModelToolResult>> =
+            let mut tool_results: FuturesUnordered<Task<(usize, LanguageModelToolResult)>> =
                 FuturesUnordered::new();
-            let mut early_tool_results: Vec<LanguageModelToolResult> = Vec::new();
+            let mut early_tool_results: Vec<(usize, LanguageModelToolResult)> = Vec::new();
             let mut cancelled = false;
             let mut had_refusal = false;
             loop {
@@ -3724,6 +3768,7 @@ impl Thread {
                 let first_event = futures::select! {
                     event = events.next().fuse() => event,
                     tool_result = futures::StreamExt::select_next_some(&mut tool_results) => {
+                        let (owning_message_ix, tool_result) = tool_result;
                         let is_error = tool_result.is_error;
                         let is_still_streaming = this
                             .read_with(cx, |this, _cx| {
@@ -3734,7 +3779,7 @@ impl Thread {
                             })
                             .unwrap_or(false);
 
-                        early_tool_results.push(tool_result);
+                        early_tool_results.push((owning_message_ix, tool_result));
 
                         // Only break if the tool errored and we are still
                         // streaming the input of the tool. If the tool errored
@@ -3895,11 +3940,11 @@ impl Thread {
                 }
             }
 
-            for tool_result in early_tool_results {
-                Self::process_tool_result(this, event_stream, cx, tool_result)?;
+            for (owning_message_ix, tool_result) in early_tool_results {
+                Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
             }
-            while let Some(tool_result) = tool_results.next().await {
-                Self::process_tool_result(this, event_stream, cx, tool_result)?;
+            while let Some((owning_message_ix, tool_result)) = tool_results.next().await {
+                Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
             }
 
             this.update(cx, |this, cx| {
@@ -4089,9 +4134,11 @@ impl Thread {
                 .cloned()
                 .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
             let mut request = this.build_completion_request(intent, cx)?;
-            let max_input_tokens = model
-                .max_token_count()
-                .saturating_sub(model.max_output_tokens().unwrap_or_default());
+            let max_input_tokens = compaction_input_capacity(
+                model.max_input_tokens(),
+                model.max_total_tokens(),
+                model.max_output_tokens(),
+            );
             let hard_request_target =
                 max_input_tokens.saturating_mul(REQUEST_TOKEN_ESTIMATE_SAFETY_PERCENT) / 100;
             fit_latest_tool_outputs_to_token_budget(
@@ -4212,6 +4259,9 @@ impl Thread {
         operation: CompactionOperation,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
+        if *cancellation_rx.borrow() {
+            return Ok(ControlFlow::Break(()));
+        }
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(
             compaction_id.clone(),
@@ -4239,10 +4289,7 @@ impl Thread {
                 return Ok(ControlFlow::Break(()));
             }
             Err(error) => {
-                event_stream.update_context_compaction_status(
-                    compaction_id,
-                    acp_thread::ContextCompactionStatus::Canceled,
-                );
+                event_stream.fail_context_compaction(compaction_id, &error);
                 return Err(error);
             }
         };
@@ -4255,18 +4302,18 @@ impl Thread {
             return Ok(ControlFlow::Break(()));
         }
 
-        if let Err(error) = this.update(cx, |this, cx| {
-            let insertion_ix = target.resolve(&this.messages)?;
-            mode.install(&mut this.messages, insertion_ix, compaction)?;
-            this.updated_at = Utc::now();
-            this.clear_summary();
-            cx.notify();
-            anyhow::Ok(())
-        })? {
-            event_stream.update_context_compaction_status(
-                compaction_id,
-                acp_thread::ContextCompactionStatus::Canceled,
-            );
+        if let Err(error) = this
+            .update(cx, |this, cx| {
+                let insertion_ix = target.resolve(&this.messages)?;
+                mode.install(&mut this.messages, insertion_ix, compaction)?;
+                this.updated_at = Utc::now();
+                this.clear_summary();
+                cx.notify();
+                anyhow::Ok(())
+            })
+            .and_then(|result| result)
+        {
+            event_stream.fail_context_compaction(compaction_id, &error);
             return Err(error);
         }
 
@@ -4413,6 +4460,10 @@ impl Thread {
         publish_summary: bool,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        if *cancellation_rx.borrow() {
+            log::debug!("Compaction cancelled before request started");
+            return Ok(None);
+        }
         let stream = futures::select! {
             result = model.stream_completion(request, cx).fuse() => result,
             _ = cancellation_rx.changed().fuse() => {
@@ -4488,12 +4539,13 @@ impl Thread {
         this: &WeakEntity<Thread>,
         event_stream: &ThreadEventStream,
         cx: &mut AsyncApp,
+        owning_message_ix: usize,
         tool_result: LanguageModelToolResult,
     ) -> Result<(), anyhow::Error> {
         log::debug!("Tool finished {:?}", tool_result);
 
         event_stream.update_tool_call_fields(
-            &tool_result.tool_use_id,
+            &scoped_tool_call_id(owning_message_ix, &tool_result.tool_use_id),
             acp::ToolCallUpdateFields::new()
                 .status(if tool_result.is_error {
                     acp::ToolCallStatus::Failed
@@ -4570,7 +4622,7 @@ impl Thread {
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
-    ) -> Result<Option<Task<LanguageModelToolResult>>> {
+    ) -> Result<Option<Task<(usize, LanguageModelToolResult)>>> {
         log::trace!("Handling streamed completion event: {:?}", event);
         use LanguageModelCompletionEvent::*;
 
@@ -4693,9 +4745,10 @@ impl Thread {
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
-    ) -> Option<Task<LanguageModelToolResult>> {
+    ) -> Option<Task<(usize, LanguageModelToolResult)>> {
         cx.notify();
 
+        let owning_message_ix = self.messages.len();
         let tool = self.tool(tool_use.name.as_ref());
         let mut title = SharedString::from(&tool_use.name);
         let mut kind = acp::ToolKind::Other;
@@ -4706,17 +4759,20 @@ impl Thread {
             kind = tool.kind();
         }
 
-        self.send_or_update_tool_use(&tool_use, title, kind, event_stream);
+        self.send_or_update_tool_use(&tool_use, title, kind, owning_message_ix, event_stream);
 
         let Some(tool) = tool else {
             let content = format!("No tool named {} exists", tool_use.name);
-            return Some(Task::ready(LanguageModelToolResult {
-                content: vec![LanguageModelToolResultContent::Text(Arc::from(content))],
-                tool_use_id: tool_use.id,
-                tool_name: tool_use.name,
-                is_error: true,
-                output: None,
-            }));
+            return Some(Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(content))],
+                    tool_use_id: tool_use.id,
+                    tool_name: tool_use.name,
+                    is_error: true,
+                    output: None,
+                },
+            )));
         };
 
         // Agent tools are JSON-schema tools. Custom text-tool deltas are rejected
@@ -4724,15 +4780,18 @@ impl Thread {
         let input = match tool_use.input.clone().into_json() {
             Ok(input) => input,
             Err(error) => {
-                return Some(Task::ready(LanguageModelToolResult {
-                    content: vec![LanguageModelToolResultContent::Text(Arc::from(
-                        error.to_string(),
-                    ))],
-                    tool_use_id: tool_use.id,
-                    tool_name: tool_use.name,
-                    is_error: true,
-                    output: None,
-                }));
+                return Some(Task::ready((
+                    owning_message_ix,
+                    LanguageModelToolResult {
+                        content: vec![LanguageModelToolResultContent::Text(Arc::from(
+                            error.to_string(),
+                        ))],
+                        tool_use_id: tool_use.id,
+                        tool_name: tool_use.name,
+                        is_error: true,
+                        output: None,
+                    },
+                )));
             }
         };
 
@@ -4757,6 +4816,7 @@ impl Thread {
                     tool_input,
                     tool_use.id,
                     tool_use.name,
+                    owning_message_ix,
                     event_stream,
                     cancellation_rx,
                     cx,
@@ -4783,6 +4843,7 @@ impl Thread {
             tool_input,
             tool_use.id,
             tool_use.name,
+            owning_message_ix,
             event_stream,
             cancellation_rx,
             cx,
@@ -4795,10 +4856,11 @@ impl Thread {
         tool_input: ToolInput<serde_json::Value>,
         tool_use_id: LanguageModelToolUseId,
         tool_name: Arc<str>,
+        owning_message_ix: usize,
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
-    ) -> Task<LanguageModelToolResult> {
+    ) -> Task<(usize, LanguageModelToolResult)> {
         // A workspace can become restricted after a thread has already started.
         // Tools that aren't allowed in restricted workspaces must never run in
         // that state, even though they were exposed to the model earlier.
@@ -4808,20 +4870,25 @@ impl Thread {
                 cx,
             )
         {
-            return Task::ready(LanguageModelToolResult {
-                tool_use_id,
-                tool_name,
-                is_error: true,
-                content: vec![LanguageModelToolResultContent::Text(Arc::from(
-                    "workspace has become restricted",
-                ))],
-                output: None,
-            });
+            return Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    tool_use_id,
+                    tool_name,
+                    is_error: true,
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(
+                        "workspace has become restricted",
+                    ))],
+                    output: None,
+                },
+            ));
         }
 
         let fs = self.project.read(cx).fs().clone();
+        let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use_id);
         let tool_event_stream = ToolCallEventStream::new(
             tool_use_id.clone(),
+            tool_call_id,
             event_stream.clone(),
             Some(fs),
             cancellation_rx,
@@ -4877,13 +4944,16 @@ impl Thread {
                 Err(output) => (true, output),
             };
 
-            LanguageModelToolResult {
-                tool_use_id,
-                tool_name,
-                is_error,
-                content: output.llm_output,
-                output: Some(output.raw_output),
-            }
+            (
+                owning_message_ix,
+                LanguageModelToolResult {
+                    tool_use_id,
+                    tool_name,
+                    is_error,
+                    content: output.llm_output,
+                    output: Some(output.raw_output),
+                },
+            )
         })
     }
 
@@ -4896,7 +4966,8 @@ impl Thread {
         event_stream: &ThreadEventStream,
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
-    ) -> Option<Task<LanguageModelToolResult>> {
+    ) -> Option<Task<(usize, LanguageModelToolResult)>> {
+        let owning_message_ix = self.messages.len();
         let tool_use = LanguageModelToolUse {
             id: tool_use_id,
             name: tool_name,
@@ -4909,6 +4980,7 @@ impl Thread {
             &tool_use,
             SharedString::from(&tool_use.name),
             acp::ToolKind::Other,
+            owning_message_ix,
             event_stream,
         );
 
@@ -4916,13 +4988,16 @@ impl Thread {
 
         let Some(tool) = tool else {
             let content = format!("No tool named {} exists", tool_use.name);
-            return Some(Task::ready(LanguageModelToolResult {
-                content: vec![LanguageModelToolResultContent::Text(Arc::from(content))],
-                tool_use_id: tool_use.id,
-                tool_name: tool_use.name,
-                is_error: true,
-                output: None,
-            }));
+            return Some(Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(content))],
+                    tool_use_id: tool_use.id,
+                    tool_name: tool_use.name,
+                    is_error: true,
+                    output: None,
+                },
+            )));
         };
 
         let error_message = format!("Error parsing input JSON: {json_parse_error}");
@@ -4945,6 +5020,7 @@ impl Thread {
             tool_input,
             tool_use.id,
             tool_use.name,
+            owning_message_ix,
             event_stream,
             cancellation_rx,
             cx,
@@ -4956,8 +5032,11 @@ impl Thread {
         tool_use: &LanguageModelToolUse,
         title: SharedString,
         kind: acp::ToolKind,
+        owning_message_ix: usize,
         event_stream: &ThreadEventStream,
     ) {
+        let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use.id);
+
         // Ensure the last message ends in the current tool use
         let last_message = self.pending_message();
 
@@ -4973,7 +5052,7 @@ impl Thread {
 
         if !has_tool_use {
             event_stream.send_tool_call(
-                &tool_use.id,
+                &tool_call_id,
                 &tool_use.name,
                 title,
                 kind,
@@ -4984,7 +5063,7 @@ impl Thread {
                 .push(AgentMessageContent::ToolUse(tool_use.clone()));
         } else {
             event_stream.update_tool_call_fields(
-                &tool_use.id,
+                &tool_call_id,
                 acp::ToolCallUpdateFields::new()
                     .title(title.as_str())
                     .kind(kind)
@@ -5815,7 +5894,7 @@ impl Thread {
         let model = self.model()?;
         let auto_compact = AgentSettings::get_global(cx).auto_compact;
         let max_tokens = model.max_token_count();
-        let max_input_tokens = max_tokens.saturating_sub(model.max_output_tokens().unwrap_or(0));
+        let max_input_tokens = self.input_token_capacity()?;
         let tokens_before = self
             .latest_request_token_usage()
             .map(|usage| total_input_tokens(usage).saturating_add(usage.output_tokens));
@@ -5855,10 +5934,7 @@ impl Thread {
             return None;
         }
 
-        let model = self.model()?;
-        let max_token_count = model.max_token_count();
-        let max_input_tokens =
-            max_token_count.saturating_sub(model.max_output_tokens().unwrap_or(0));
+        let max_input_tokens = self.input_token_capacity()?;
         // Models with a small context window don't leave enough headroom for a
         // compaction pass; the UI warns the user about the token limit instead.
         if max_input_tokens < MIN_COMPACTION_CONTEXT_WINDOW {
@@ -5922,9 +5998,11 @@ impl Thread {
         let model = self
             .model()
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-        let max_input_tokens = model
-            .max_token_count()
-            .saturating_sub(model.max_output_tokens().unwrap_or_default());
+        let max_input_tokens = compaction_input_capacity(
+            model.max_input_tokens(),
+            model.max_total_tokens(),
+            model.max_output_tokens(),
+        );
         if max_input_tokens < MIN_COMPACTION_CONTEXT_WINDOW {
             return Ok(None);
         }
@@ -6327,6 +6405,17 @@ fn total_input_tokens(usage: language_model::TokenUsage) -> u64 {
         .saturating_add(usage.cache_read_input_tokens)
 }
 
+/// Reserves output without subtracting it from an independent input ceiling.
+fn compaction_input_capacity(
+    input_limit: u64,
+    combined_limit: Option<u64>,
+    output_limit: Option<u64>,
+) -> u64 {
+    combined_limit.map_or(input_limit, |combined| {
+        input_limit.min(combined.saturating_sub(output_limit.unwrap_or(0)))
+    })
+}
+
 fn auto_compact_threshold_token_count(
     threshold: AutoCompactThreshold,
     max_token_count: u64,
@@ -6567,9 +6656,11 @@ enum CompactionRunStatus {
 }
 
 fn compaction_request_byte_budget(model: &dyn LanguageModel) -> usize {
-    let max_input_tokens = model
-        .max_token_count()
-        .saturating_sub(model.max_output_tokens().unwrap_or_default());
+    let max_input_tokens = compaction_input_capacity(
+        model.max_input_tokens(),
+        model.max_total_tokens(),
+        model.max_output_tokens(),
+    );
     let byte_budget = max_input_tokens
         .saturating_mul(COMPACTION_REQUEST_BYTES_PER_TOKEN)
         .saturating_mul(COMPACTION_REQUEST_HEADROOM_PERCENT)
@@ -7412,6 +7503,16 @@ where
     }
 }
 
+/// Provider-issued tool-use IDs can repeat across request/response cycles, so
+/// scope the ACP-facing ID to the owning message while retaining the raw ID for
+/// model-facing tool results.
+pub(crate) fn scoped_tool_call_id(
+    message_ix: usize,
+    tool_use_id: &LanguageModelToolUseId,
+) -> acp::ToolCallId {
+    acp::ToolCallId::new(format!("{message_ix}:{tool_use_id}"))
+}
+
 #[derive(Clone)]
 struct ThreadEventStream(mpsc::UnboundedSender<Result<ThreadEvent>>);
 
@@ -7436,7 +7537,7 @@ impl ThreadEventStream {
 
     fn send_tool_call(
         &self,
-        id: &LanguageModelToolUseId,
+        id: &acp::ToolCallId,
         tool_name: &str,
         title: SharedString,
         kind: acp::ToolKind,
@@ -7454,27 +7555,27 @@ impl ThreadEventStream {
     }
 
     fn initial_tool_call(
-        id: &LanguageModelToolUseId,
+        id: &acp::ToolCallId,
         tool_name: &str,
         title: String,
         kind: acp::ToolKind,
         input: serde_json::Value,
     ) -> acp::ToolCall {
-        acp::ToolCall::new(id.to_string(), title)
+        acp::ToolCall::new(id.clone(), title)
+            .name(tool_name)
             .kind(kind)
             .raw_input(input)
-            .meta(acp_thread::meta_with_tool_name(tool_name))
     }
 
     fn update_tool_call_fields(
         &self,
-        tool_use_id: &LanguageModelToolUseId,
+        tool_call_id: &acp::ToolCallId,
         fields: acp::ToolCallUpdateFields,
         meta: Option<acp::Meta>,
     ) {
         self.0
             .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
-                acp::ToolCallUpdate::new(tool_use_id.to_string(), fields)
+                acp::ToolCallUpdate::new(tool_call_id.clone(), fields)
                     .meta(meta)
                     .into(),
             )))
@@ -7483,12 +7584,12 @@ impl ThreadEventStream {
 
     fn resolve_tool_call_authorization(
         &self,
-        tool_use_id: &LanguageModelToolUseId,
+        tool_call_id: &acp::ToolCallId,
         outcome: acp_thread::SelectedPermissionOutcome,
     ) {
         self.0
             .unbounded_send(Ok(ThreadEvent::ToolCallAuthorizationResolved {
-                tool_call_id: acp::ToolCallId::new(tool_use_id.to_string()),
+                tool_call_id: tool_call_id.clone(),
                 outcome,
             }))
             .ok();
@@ -7508,7 +7609,8 @@ impl ThreadEventStream {
                 acp_thread::ContextCompaction {
                     id,
                     status,
-                    summary: None,
+                    error: None,
+                    summary: Vec::new(),
                 },
             )))
             .ok();
@@ -7525,6 +7627,7 @@ impl ThreadEventStream {
                     id,
                     summary_delta: summary_delta.to_string(),
                     status: None,
+                    error: None,
                 },
             )))
             .ok();
@@ -7541,6 +7644,20 @@ impl ThreadEventStream {
                     id,
                     summary_delta: String::new(),
                     status: Some(status),
+                    error: None,
+                },
+            )))
+            .ok();
+    }
+
+    fn fail_context_compaction(&self, id: acp_thread::ContextCompactionId, error: &anyhow::Error) {
+        self.0
+            .unbounded_send(Ok(ThreadEvent::ContextCompactionUpdate(
+                acp_thread::ContextCompactionUpdate {
+                    id,
+                    summary_delta: String::new(),
+                    status: Some(acp_thread::ContextCompactionStatus::Failed),
+                    error: Some(format!("{error:#}")),
                 },
             )))
             .ok();
@@ -7579,6 +7696,7 @@ pub(crate) enum SandboxFallbackDecision {
 #[derive(Clone)]
 pub struct ToolCallEventStream {
     tool_use_id: LanguageModelToolUseId,
+    tool_call_id: acp::ToolCallId,
     stream: ThreadEventStream,
     fs: Option<Arc<dyn Fs>>,
     cancellation_rx: watch::Receiver<bool>,
@@ -7610,6 +7728,7 @@ impl ToolCallEventStream {
 
         let stream = ToolCallEventStream::new(
             "test_id".into(),
+            acp::ToolCallId::new("0:test_id"),
             ThreadEventStream(events_tx),
             None,
             cancellation_rx,
@@ -7627,6 +7746,7 @@ impl ToolCallEventStream {
 
         let stream = ToolCallEventStream::new(
             "test_id".into(),
+            acp::ToolCallId::new("0:test_id"),
             ThreadEventStream(events_tx),
             None,
             cancellation_rx,
@@ -7649,6 +7769,7 @@ impl ToolCallEventStream {
 
     fn new(
         tool_use_id: LanguageModelToolUseId,
+        tool_call_id: acp::ToolCallId,
         stream: ThreadEventStream,
         fs: Option<Arc<dyn Fs>>,
         cancellation_rx: watch::Receiver<bool>,
@@ -7657,6 +7778,7 @@ impl ToolCallEventStream {
     ) -> Self {
         Self {
             tool_use_id,
+            tool_call_id,
             stream,
             fs,
             cancellation_rx,
@@ -7712,9 +7834,13 @@ impl ToolCallEventStream {
         &self.tool_use_id
     }
 
+    pub fn tool_call_id(&self) -> &acp::ToolCallId {
+        &self.tool_call_id
+    }
+
     pub fn update_fields(&self, fields: acp::ToolCallUpdateFields) {
         self.stream
-            .update_tool_call_fields(&self.tool_use_id, fields, None);
+            .update_tool_call_fields(&self.tool_call_id, fields, None);
     }
 
     pub fn update_fields_with_meta(
@@ -7723,12 +7849,12 @@ impl ToolCallEventStream {
         meta: Option<acp::Meta>,
     ) {
         self.stream
-            .update_tool_call_fields(&self.tool_use_id, fields, meta);
+            .update_tool_call_fields(&self.tool_call_id, fields, meta);
     }
 
     pub fn resolve_authorization(&self, outcome: acp_thread::SelectedPermissionOutcome) {
         self.stream
-            .resolve_tool_call_authorization(&self.tool_use_id, outcome);
+            .resolve_tool_call_authorization(&self.tool_call_id, outcome);
     }
 
     pub fn update_diff(&self, diff: Entity<acp_thread::Diff>) {
@@ -7736,7 +7862,7 @@ impl ToolCallEventStream {
             .0
             .unbounded_send(Ok(ThreadEvent::ToolCallUpdate(
                 acp_thread::ToolCallUpdateDiff {
-                    id: acp::ToolCallId::new(self.tool_use_id.to_string()),
+                    id: self.tool_call_id.clone(),
                     diff,
                 }
                 .into(),
@@ -7935,7 +8061,7 @@ impl ToolCallEventStream {
 
         let fs = self.fs.clone();
         let stream = self.stream.clone();
-        let tool_use_id = self.tool_use_id.clone();
+        let tool_call_id = self.tool_call_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
         let auto_allow_outcome = match auto_resolve_permission_outcome(&options, true) {
@@ -7949,7 +8075,7 @@ impl ToolCallEventStream {
                 .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                     ToolCallAuthorization {
                         tool_call: acp::ToolCallUpdate::new(
-                            tool_use_id.to_string(),
+                            tool_call_id.clone(),
                             // Leave the title untouched so the card keeps
                             // showing the command (matching the fallback flow).
                             acp::ToolCallUpdateFields::new(),
@@ -8002,7 +8128,7 @@ impl ToolCallEventStream {
                         )) {
                             drop(response_rx);
                             stream.resolve_tool_call_authorization(
-                                &tool_use_id,
+                                &tool_call_id,
                                 auto_allow_outcome.clone(),
                             );
                             return Ok(());
@@ -8241,7 +8367,7 @@ impl ToolCallEventStream {
 
         let fs = self.fs.clone();
         let stream = self.stream.clone();
-        let tool_use_id = self.tool_use_id.clone();
+        let tool_call_id = self.tool_call_id.clone();
         let sandbox_grants = self.sandbox_grants.clone();
         let thread = self.thread.clone();
         cx.spawn(async move |cx| {
@@ -8256,7 +8382,7 @@ impl ToolCallEventStream {
                         // they're approving to run unsandboxed. The reason is
                         // surfaced separately by the fallback details / warning.
                         tool_call: acp::ToolCallUpdate::new(
-                            tool_use_id.to_string(),
+                            tool_call_id.clone(),
                             acp::ToolCallUpdateFields::new(),
                         )
                         .meta(
@@ -8348,7 +8474,7 @@ impl ToolCallEventStream {
     ) -> Task<Result<acp::PermissionOptionId>> {
         let options = acp_thread::PermissionOptions::Flat(options);
         let stream = self.stream.clone();
-        let tool_use_id = self.tool_use_id.clone();
+        let tool_call_id = self.tool_call_id.clone();
         cx.spawn(async move |_cx| {
             let mut fields = acp::ToolCallUpdateFields::new();
             if let Some(title) = title {
@@ -8363,7 +8489,7 @@ impl ToolCallEventStream {
                 .0
                 .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                     ToolCallAuthorization {
-                        tool_call: acp::ToolCallUpdate::new(tool_use_id.to_string(), fields),
+                        tool_call: acp::ToolCallUpdate::new(tool_call_id.clone(), fields),
                         options,
                         response: response_tx,
                         context: None,
@@ -8397,14 +8523,14 @@ impl ToolCallEventStream {
         cx: &mut App,
     ) -> Task<Result<acp::CreateElicitationResponse>> {
         let stream = self.stream.clone();
-        let tool_use_id = self.tool_use_id.clone();
+        let tool_call_id = self.tool_call_id.clone();
         cx.spawn(async move |_cx| {
             let (response_tx, response_rx) = oneshot::channel();
             if let Err(error) =
                 stream
                     .0
                     .unbounded_send(Ok(ThreadEvent::Elicitation(ElicitationRequest {
-                        tool_call_id: acp::ToolCallId::new(tool_use_id.to_string()),
+                        tool_call_id,
                         message,
                         schema,
                         response: response_tx,
@@ -8453,7 +8579,7 @@ impl ToolCallEventStream {
 
         let fs = self.fs.clone();
         let stream = self.stream.clone();
-        let tool_use_id = self.tool_use_id.clone();
+        let tool_call_id = self.tool_call_id.clone();
         let auto_resolution_outcomes = if check_settings.is_some() {
             match (
                 auto_resolve_permission_outcome(&options, true),
@@ -8472,7 +8598,7 @@ impl ToolCallEventStream {
                 .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                     ToolCallAuthorization {
                         tool_call: acp::ToolCallUpdate::new(
-                            tool_use_id.to_string(),
+                            tool_call_id.clone(),
                             acp::ToolCallUpdateFields::new().title(title),
                         ),
                         options,
@@ -8532,7 +8658,7 @@ impl ToolCallEventStream {
                             ToolPermissionDecision::Allow => {
                                 drop(response_rx);
                                 stream.resolve_tool_call_authorization(
-                                    &tool_use_id,
+                                    &tool_call_id,
                                     auto_allow_outcome.clone(),
                                 );
                                 return Ok(());
@@ -8540,7 +8666,7 @@ impl ToolCallEventStream {
                             ToolPermissionDecision::Deny(reason) => {
                                 drop(response_rx);
                                 stream.resolve_tool_call_authorization(
-                                    &tool_use_id,
+                                    &tool_call_id,
                                     auto_deny_outcome.clone(),
                                 );
                                 return Err(anyhow!(reason));
@@ -8858,6 +8984,55 @@ mod tests {
     use language_model::LanguageModelToolUseId;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use serde_json::json;
+
+    #[test]
+    fn compaction_capacity_respects_prompt_and_combined_limits() {
+        assert_eq!(
+            compaction_input_capacity(90_000, Some(200_000), Some(16_384)),
+            90_000
+        );
+        assert_eq!(
+            compaction_input_capacity(128_000, Some(128_000), Some(64_000)),
+            64_000
+        );
+        assert_eq!(
+            compaction_input_capacity(90_000, None, Some(64_000)),
+            90_000
+        );
+        assert_eq!(
+            compaction_input_capacity(2_000, Some(2_000), Some(3_000)),
+            0
+        );
+        assert_eq!(
+            compaction_input_capacity(128_000, Some(128_000), None),
+            128_000
+        );
+    }
+
+    #[gpui::test]
+    async fn failed_compaction_event_includes_error() {
+        let (sender, mut receiver) = mpsc::unbounded();
+        let event_stream = ThreadEventStream(sender);
+        let compaction_id = acp_thread::ContextCompactionId("failed-compaction".into());
+
+        event_stream.fail_context_compaction(
+            compaction_id.clone(),
+            &anyhow!("provider rejected compaction"),
+        );
+
+        let event = receiver.next().await;
+        assert!(matches!(
+            event,
+            Some(Ok(ThreadEvent::ContextCompactionUpdate(
+                acp_thread::ContextCompactionUpdate {
+                    id,
+                    status: Some(acp_thread::ContextCompactionStatus::Failed),
+                    error: Some(error),
+                    ..
+                }
+            ))) if id == compaction_id && error == "provider rejected compaction"
+        ));
+    }
 
     #[test]
     fn native_plan_validation_rejects_empty_steps() {
@@ -9861,6 +10036,44 @@ mod tests {
                     },
                 );
 
+                assert_eq!(thread.compaction_message_target_ix(cx), Some(1));
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_threshold_uses_independent_input_limit(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let mut model = FakeLanguageModel::default();
+        model.set_max_token_count(200_000);
+        model.set_max_input_tokens(80_000);
+        model.set_max_output_tokens(Some(40_000));
+        let model = Arc::new(model);
+        let user_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.9),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.messages.push(user_text_message(
+                    user_message_id.clone(),
+                    "near input limit",
+                ));
+                thread.request_token_usage.insert(
+                    user_message_id,
+                    language_model::TokenUsage {
+                        input_tokens: 72_000,
+                        ..Default::default()
+                    },
+                );
+
+                assert_eq!(thread.input_token_capacity(), Some(80_000));
                 assert_eq!(thread.compaction_message_target_ix(cx), Some(1));
             });
         });
@@ -11604,7 +11817,7 @@ mod tests {
 
         let (_cancellation_tx, cancellation_rx) = watch::channel(false);
 
-        let result = cx
+        let (_owning_message_ix, result) = cx
             .update(|cx| {
                 thread.update(cx, |thread, cx| {
                     // Call the function under test
