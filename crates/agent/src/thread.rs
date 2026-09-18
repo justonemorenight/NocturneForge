@@ -5448,6 +5448,7 @@ impl Thread {
 
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
+            prompt_cache_key: None,
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(completion_intent),
             messages,
