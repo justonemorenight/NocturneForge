@@ -1,0 +1,16 @@
+Use a fork for a focused, independent follow-up to an already established feature
+when keeping it here would accumulate unrelated correction history. Decide from
+task independence, not a fixed number of messages or an estimated token saving.
+Stay in this conversation for small changes, interdependent debugging, and final
+integration or review. Use spawn_agent for work whose results you need to collect.
+
+The checkpoint is the previous user turn. The current turn is not inherited;
+include its relevant requirements explicitly in the fork prompt. State the goal,
+scope, acceptance criteria, and why a fork is appropriate. Inherited history is
+background context, not permission to repeat old actions or control old workers.
+
+Tell the user which independent conversation was opened. Do not claim completion,
+automatic result merging, isolated files, or lower token cost. Sharing a worktree
+shares all file changes. A new worktree starts at HEAD without uncommitted edits.
+Avoid overlapping writes; do not keep modifying files delegated to a fork.
+Use the tool permission prompt directly; do not also ask_user for the same approval.

@@ -5047,6 +5047,58 @@ impl AgentPanelSiblingHost {
     pub(crate) fn new(panel: WeakEntity<AgentPanel>, window: gpui::AnyWindowHandle) -> Self {
         Self { panel, window }
     }
+
+    async fn open_native_fork(
+        panel: WeakEntity<AgentPanel>,
+        window: gpui::AnyWindowHandle,
+        snapshot: Arc<agent::DbThread>,
+        options: CreateThreadOptions,
+        cx: &mut gpui::AsyncApp,
+    ) -> Result<acp::SessionId> {
+        let snapshot =
+            Arc::try_unwrap(snapshot).map_err(|_| anyhow!("Fork snapshot is already in use"))?;
+        let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+        let (store, paths) = panel.read_with(cx, |panel, cx| {
+            let paths = PathList::new(
+                &panel
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>(),
+            );
+            (panel.thread_store.clone(), paths)
+        })?;
+        store
+            .update(cx, |store, cx| {
+                store.save_thread(session_id.clone(), snapshot, paths, cx)
+            })
+            .await?;
+        window.update(cx, |_root, window, cx| {
+            panel.update(cx, |panel, cx| {
+                let selected_agent = panel.selected_agent.clone();
+                let thread = panel.create_agent_thread_inner(
+                    Agent::NativeAgent,
+                    None,
+                    None,
+                    Some(session_id.clone()),
+                    None,
+                    options.title,
+                    options.initial_content,
+                    None,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                panel.set_selected_agent_and_persist(selected_agent, cx);
+                let thread_id = thread.conversation_view.read(cx).thread_id;
+                panel
+                    .retained_threads
+                    .insert(thread_id, thread.conversation_view);
+            })
+        })??;
+        Ok(session_id)
+    }
 }
 
 struct PreparedOrchestrationWorkspace {
@@ -5273,6 +5325,12 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
         let panel = self.panel.clone();
         let window = self.window;
         cx.spawn(async move |cx| {
+            anyhow::ensure!(
+                request.fork_snapshot.is_none()
+                    || (request.agent_id.as_deref() == Some(agent::ZED_AGENT_ID.as_ref())
+                        && request.model.is_none()),
+                "Conversation forks must retain their native agent and model"
+            );
             let agent_choice = match request.agent_id.as_deref() {
                 None => None,
                 Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
@@ -5388,6 +5446,21 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             // call regardless of which panel ends up the target.
             let target_window = window;
 
+            if let Some(snapshot) = request.fork_snapshot {
+                let session_id = Self::open_native_fork(
+                    target_panel, target_window, snapshot, options, cx,
+                ).await?;
+                if request.use_new_worktree {
+                    let warning = worktree_warning.get_or_insert_with(String::new);
+                    warning.push_str(" The new worktree starts at HEAD; uncommitted source changes were not copied. Recheck the current files before editing.");
+                }
+                return Ok(agent::SiblingThreadInfo {
+                    session_id: Some(session_id), title,
+                    agent_id: agent::ZED_AGENT_ID.to_string(), model: None,
+                    warning: worktree_warning,
+                });
+            }
+
             // We deliberately don't wait for the new thread's session to
             // become available here: there are currently no agent tools that
             // operate on sibling threads by session ID, so requiring one would
@@ -5408,6 +5481,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             })??;
 
             Ok(agent::SiblingThreadInfo {
+                session_id: None,
                 title,
                 agent_id: resolved_agent_id.0.to_string(),
                 model: request.model,
@@ -12013,6 +12087,7 @@ mod tests {
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
             title: source_title.clone(),
+            fork_origin: None,
             messages: Vec::new(),
             updated_at: Utc::now(),
             detailed_summary: None,

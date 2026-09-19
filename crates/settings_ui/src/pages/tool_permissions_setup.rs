@@ -21,6 +21,12 @@ const SETTINGS_DISCLAIMER: &str = "Note: custom tool permissions only apply to t
 /// Tools that support permission rules
 const TOOLS: &[ToolInfo] = &[
     ToolInfo {
+        id: "fork_thread",
+        name: "Fork Conversation",
+        description: "Start a focused native conversation from the previous turn",
+        regex_explanation: "Patterns are matched against the fork's task prompt. Direct mode and forks of forks always require confirmation.",
+    },
+    ToolInfo {
         id: "terminal",
         name: "Terminal",
         description: "Commands executed in the terminal",
@@ -303,6 +309,7 @@ fn get_tool_render_fn(
 ) -> fn(&SettingsWindow, &ScrollHandle, &mut Window, &mut Context<SettingsWindow>) -> AnyElement {
     match tool_id {
         "terminal" => render_terminal_tool_config,
+        "fork_thread" => render_fork_thread_tool_config,
         "edit_file" => render_edit_file_tool_config,
         "write_file" => render_write_file_tool_config,
         "delete_path" => render_delete_path_tool_config,
@@ -1381,6 +1388,7 @@ macro_rules! tool_config_page_fn {
 }
 
 tool_config_page_fn!(render_terminal_tool_config, "terminal");
+tool_config_page_fn!(render_fork_thread_tool_config, "fork_thread");
 tool_config_page_fn!(render_edit_file_tool_config, "edit_file");
 tool_config_page_fn!(render_write_file_tool_config, "write_file");
 tool_config_page_fn!(render_delete_path_tool_config, "delete_path");

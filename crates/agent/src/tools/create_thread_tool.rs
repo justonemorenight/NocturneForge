@@ -153,6 +153,7 @@ impl AgentTool for CreateThreadTool {
 
             let title: SharedString = input.title.clone().into();
             let request = SiblingThreadRequest {
+                fork_snapshot: None,
                 title: title.clone(),
                 prompt: input.prompt,
                 agent_id: input.agent,
