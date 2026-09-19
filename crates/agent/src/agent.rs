@@ -1,5 +1,6 @@
 pub mod acp_worker;
 pub mod cache_keepalive;
+mod conversation_fork;
 mod db;
 mod legacy_thread;
 mod native_agent_server;
@@ -17,6 +18,7 @@ mod tools;
 
 pub use acp_worker::{AcpWorkerHandle, AcpWorkerHost, resolve_configured_agent};
 use context_server::ContextServerId;
+pub use conversation_fork::ForkOrigin;
 pub use db::*;
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
@@ -3481,6 +3483,7 @@ impl NativeThreadEnvironment {
         session_id: acp::SessionId,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
+        let parent_id = self.thread.read_with(cx, |thread, _| thread.id().clone())?;
         let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
             let session = agent
                 .sessions
@@ -3492,6 +3495,11 @@ impl NativeThreadEnvironment {
                 .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
             anyhow::Ok((session.thread.clone(), acp_thread))
         })??;
+
+        anyhow::ensure!(
+            subagent_thread.read(cx).parent_thread_id().as_ref() == Some(&parent_id),
+            "Subagent session {session_id} belongs to another conversation"
+        );
 
         let depth = subagent_thread.read(cx).depth();
 

@@ -53,6 +53,8 @@ impl From<&DbThreadMetadata> for acp_thread::AgentSessionInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbThread {
     pub title: SharedString,
+    #[serde(default)]
+    pub fork_origin: Option<crate::ForkOrigin>,
     pub messages: Vec<Arc<DbMessage>>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -171,6 +173,7 @@ impl SharedThread {
     pub fn to_db_thread(self) -> DbThread {
         DbThread {
             title: format!("🔗 {}", self.title).into(),
+            fork_origin: None,
             messages: self.messages,
             updated_at: self.updated_at,
             detailed_summary: None,
@@ -393,6 +396,7 @@ impl DbThread {
         }
 
         Ok(Self {
+            fork_origin: None,
             title: thread.summary,
             messages,
             updated_at: thread.updated_at,
@@ -877,6 +881,7 @@ mod tests {
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
             title: title.to_string().into(),
+            fork_origin: None,
             messages: Vec::new(),
             updated_at,
             detailed_summary: None,

@@ -2,13 +2,13 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DEFAULT_TOOL_SEARCH_LIMIT, DbLanguageModel, DbThread,
     DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool,
-    GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool,
-    ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_RESULTS, MovePathTool, ProjectSnapshot,
-    ReadFileTool, RenameTool, SandboxedTerminalTool, SendMessageToAgentTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
-    ToolSearchTool, UpdateOrchestrationGoalTool, UpdatePlanTool, WaitForAgentsTool, WebSearchTool,
-    WriteFileTool, bounded_tool_description, decide_permission_from_settings,
-    tool_search_relevance,
+    ForkThreadTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_RESULTS, MovePathTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SendMessageToAgentTool,
+    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool, UpdatePlanTool,
+    WaitForAgentsTool, WebSearchTool, WriteFileTool, bounded_tool_description,
+    decide_permission_from_settings, tool_search_relevance,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -164,7 +164,7 @@ impl SubagentRole {
     fn allows_tool(self, tool_name: &str) -> bool {
         if matches!(
             tool_name,
-            CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME
+            CreateThreadTool::NAME | ForkThreadTool::NAME | ListAgentsAndModelsTool::NAME
         ) {
             return false;
         }
@@ -1106,6 +1106,7 @@ pub trait ThreadEnvironment {
 /// A request to create a new sibling thread.
 #[derive(Debug, Clone)]
 pub struct SiblingThreadRequest {
+    pub fork_snapshot: Option<Arc<DbThread>>,
     /// A short title for the new thread, shown in the sidebar.
     pub title: SharedString,
     /// The initial prompt to send to the new thread.
@@ -1129,6 +1130,7 @@ pub struct SiblingThreadRequest {
 /// Information returned when a sibling thread is successfully created.
 #[derive(Debug, Clone)]
 pub struct SiblingThreadInfo {
+    pub session_id: Option<acp::SessionId>,
     /// The title assigned to the thread.
     pub title: SharedString,
     /// The agent ID used for the thread.
@@ -1567,6 +1569,7 @@ pub enum NativePlanStatus {
 
 pub struct Thread {
     id: acp::SessionId,
+    fork_origin: Option<crate::ForkOrigin>,
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
     title: Option<SharedString>,
@@ -1757,6 +1760,7 @@ impl Thread {
             title_generation_error: None,
             pending_summary_generation: None,
             summary: None,
+            fork_origin: None,
             messages: Vec::new(),
             user_store: project.read(cx).user_store(),
             running_turn: None,
@@ -1886,9 +1890,15 @@ impl Thread {
     ) -> mpsc::UnboundedReceiver<Result<ThreadEvent>> {
         let (tx, rx) = mpsc::unbounded();
         let stream = ThreadEventStream(tx);
+        let mut inherited = false;
         for (message_ix, message) in self.messages.iter().enumerate() {
             match &**message {
-                Message::User(user_message) => stream.send_user_message(user_message),
+                Message::User(user_message) => {
+                    inherited = self.fork_origin.as_ref().is_some_and(|origin| {
+                        origin.inherited_user_message_ids.contains(&user_message.id)
+                    });
+                    stream.send_user_message(user_message);
+                }
                 Message::Agent(assistant_message) => {
                     for content in &assistant_message.content {
                         match content {
@@ -1902,6 +1912,7 @@ impl Thread {
                                     tool_use,
                                     assistant_message.tool_results.get(&tool_use.id),
                                     message_ix,
+                                    inherited,
                                     &stream,
                                     cx,
                                 );
@@ -1941,6 +1952,7 @@ impl Thread {
         tool_use: &LanguageModelToolUse,
         tool_result: Option<&LanguageModelToolResult>,
         owning_message_ix: usize,
+        inherited: bool,
         stream: &ThreadEventStream,
         cx: &mut Context<Self>,
     ) {
@@ -1965,6 +1977,34 @@ impl Thread {
                     acp::ToolCallStatus::Completed
                 }
             });
+
+        if inherited {
+            // Live tool names and replay metadata can attach source workers to
+            // the fork's Activity Center. Render a historical result instead.
+            let name = format!("historical_{}", tool_use.name);
+            stream.send_tool_call(
+                &tool_call_id,
+                &name,
+                format!("History: {}", tool_use.name).into(),
+                acp::ToolKind::Other,
+                serde_json::json!({"historical_input": tool_use.input.to_display_json()}),
+            );
+            let content = tool_result
+                .map(|result| {
+                    vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+                        acp::TextContent::new(result.text_contents()),
+                    ))]
+                })
+                .unwrap_or_default();
+            stream.update_tool_call_fields(
+                &tool_call_id,
+                acp::ToolCallUpdateFields::new()
+                    .status(status)
+                    .content(content),
+                None,
+            );
+            return;
+        }
 
         // Recorded tool calls use the model-facing name, so a terminal call is
         // always keyed as `terminal` and resolves to the non-sandboxed
@@ -2171,6 +2211,7 @@ impl Thread {
             title_generation_error: None,
             pending_summary_generation: None,
             summary: db_thread.detailed_summary,
+            fork_origin: db_thread.fork_origin,
             messages: db_thread.messages,
             user_store: project.read(cx).user_store(),
             running_turn: None,
@@ -2299,6 +2340,7 @@ impl Thread {
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         let mut thread = DbThread {
+            fork_origin: self.fork_origin.clone(),
             title: self.title().unwrap_or_default(),
             messages: self.messages.clone(),
             updated_at: self.updated_at,
@@ -2351,6 +2393,27 @@ impl Thread {
             thread.initial_project_snapshot = initial_project_snapshot;
             thread
         })
+    }
+
+    pub(crate) fn fork_requires_confirmation(&self) -> bool {
+        self.fork_origin.is_some()
+            || !matches!(
+                self.execution_strategy,
+                AgentExecutionStrategy::Auto | AgentExecutionStrategy::Orchestrate
+            )
+    }
+
+    pub(crate) fn fork_snapshot(&self, title: String, cx: &App) -> Result<Task<Result<DbThread>>> {
+        anyhow::ensure!(self.depth() == 0, "Subagents cannot fork conversations");
+        anyhow::ensure!(
+            self.execution_strategy != AgentExecutionStrategy::Plan,
+            "Leave Plan mode before starting a fork"
+        );
+        let snapshot = self.to_db(cx);
+        let id = self.id.clone();
+        Ok(cx.background_spawn(async move {
+            crate::conversation_fork::prepare_fork(snapshot.await, id, title)
+        }))
     }
 
     /// Create a snapshot of the current project state including git information and unsaved buffers.
@@ -2675,6 +2738,7 @@ impl Thread {
         // to the model is gated by `CreateThreadToolFeatureFlag` in
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
+        self.add_tool(ForkThreadTool::new(cx.weak_entity(), environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));
     }
 
@@ -3193,9 +3257,15 @@ impl Thread {
             return Err(anyhow!("Message not found"));
         };
 
+        if let Some(origin) = &mut self.fork_origin {
+            origin.inherited_message_count = origin.inherited_message_count.min(position);
+        }
         for message in self.messages.drain(position..) {
             match &*message {
                 Message::User(message) => {
+                    if let Some(origin) = &mut self.fork_origin {
+                        origin.inherited_user_message_ids.remove(&message.id);
+                    }
                     self.request_token_usage.remove(&message.id);
                 }
                 Message::Agent(_)
@@ -5439,6 +5509,7 @@ impl Thread {
                 | UpdateOrchestrationGoalTool::NAME
                 | WaitForAgentsTool::NAME
                 | CreateThreadTool::NAME
+                | ForkThreadTool::NAME
         )
     }
 
@@ -9141,6 +9212,7 @@ mod tests {
             assert_eq!(selection.effort.as_deref(), Some(effort));
             assert_eq!(role.profile_id().as_str(), profile);
             assert!(!role.allows_tool(CreateThreadTool::NAME));
+            assert!(!role.allows_tool(ForkThreadTool::NAME));
             assert!(!role.allows_tool(ListAgentsAndModelsTool::NAME));
         }
 
@@ -9366,6 +9438,12 @@ mod tests {
             UpdatePlanTool::NAME,
             acp::ToolKind::Other
         ));
+        // Direct can propose a fork, but the tool enforces confirmation.
+        assert!(execution_tool_profile_allows(
+            profile,
+            ForkThreadTool::NAME,
+            acp::ToolKind::Other
+        ));
     }
 
     #[test]
@@ -9386,6 +9464,7 @@ mod tests {
             (TerminalTool::NAME, acp::ToolKind::Execute),
             (SpawnAgentTool::NAME, acp::ToolKind::Other),
             (CreateThreadTool::NAME, acp::ToolKind::Other),
+            (ForkThreadTool::NAME, acp::ToolKind::Other),
         ] {
             assert!(!execution_tool_profile_allows(profile, name, kind));
         }
@@ -11516,6 +11595,75 @@ mod tests {
             Some(retry_after)
         );
         assert_eq!(strategy.delay_after(&error, MAX_RETRY_ATTEMPTS + 1), None);
+    }
+
+    #[gpui::test]
+    async fn test_fork_policy_and_historical_replay(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let baseline_id = ClientUserMessageId::new();
+        let mut events = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.execution_strategy = AgentExecutionStrategy::Direct;
+                assert!(thread.fork_requires_confirmation());
+                thread.execution_strategy = AgentExecutionStrategy::Auto;
+                assert!(!thread.fork_requires_confirmation());
+                thread.execution_strategy = AgentExecutionStrategy::Orchestrate;
+                assert!(!thread.fork_requires_confirmation());
+                thread.execution_strategy = AgentExecutionStrategy::Plan;
+                assert!(thread.fork_snapshot("blocked".into(), cx).is_err());
+                thread.execution_strategy = AgentExecutionStrategy::Auto;
+                thread.fork_origin = Some(crate::ForkOrigin {
+                    session_id: acp::SessionId::new("source"),
+                    checkpoint_user_message_id: baseline_id.clone(),
+                    inherited_message_count: 2,
+                    inherited_user_message_ids: [baseline_id.clone()].into_iter().collect(),
+                });
+                assert!(thread.fork_requires_confirmation());
+                let tool_message = || {
+                    let tool_use = LanguageModelToolUse {
+                        id: "call".into(),
+                        name: "spawn_agent".into(),
+                        raw_input: "{}".into(),
+                        input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    };
+                    Arc::new(Message::Agent(AgentMessage {
+                        content: vec![AgentMessageContent::ToolUse(tool_use.clone())],
+                        tool_results: [(
+                            tool_use.id.clone(),
+                            LanguageModelToolResult {
+                                tool_use_id: tool_use.id,
+                                tool_name: "spawn_agent".into(),
+                                is_error: false,
+                                content: vec!["historical worker result".into()],
+                                output: Some(json!({"session_id":"source-worker"})),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        reasoning_details: None,
+                    }))
+                };
+                thread.messages = vec![
+                    user_text_message(baseline_id, "baseline"),
+                    Arc::new(Message::Compaction(CompactionInfo::Summary(
+                        "inserted later".into(),
+                    ))),
+                    tool_message(),
+                    user_text_message(ClientUserMessageId::new(), "fork task"),
+                    tool_message(),
+                ];
+                thread.replay(cx)
+            })
+        });
+        let mut names = Vec::new();
+        while let Some(event) = events.next().await {
+            if let ThreadEvent::ToolCall(call) = event.unwrap() {
+                names.push(call.name.unwrap());
+            }
+        }
+        assert_eq!(names, vec!["historical_spawn_agent", "spawn_agent"]);
     }
 
     #[gpui::test]
