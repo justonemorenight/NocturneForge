@@ -5,13 +5,13 @@ use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
 use gpui::{App, AsyncApp, Context, Entity, SharedString, Task, WeakEntity};
 use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest};
-use language_model::chat_completion::ChatCompletionEventMapper;
 use language_model::{
     LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelEffortLevel, LanguageModelId, LanguageModelName, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelRequest, LanguageModelToolChoice,
     ProviderErrorCategory, RateLimiter,
 };
+use open_ai::completion::OpenAiEventMapper;
 use open_ai::{ReasoningEffort, ResponseStreamEvent};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -568,7 +568,7 @@ impl LanguageModel for SuperGrokLanguageModel {
         let completions = self.stream_open_ai_completion(request, cx);
         let executor = cx.background_executor().clone();
         async move {
-            let mapper = ChatCompletionEventMapper::new();
+            let mapper = OpenAiEventMapper::new();
             Ok(language_model::stream_in_background(
                 mapper.map_stream(completions.await?).boxed(),
                 executor,
