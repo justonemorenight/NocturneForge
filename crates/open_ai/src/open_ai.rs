@@ -440,6 +440,20 @@ impl Model {
             | Self::Custom { .. } => false,
         }
     }
+
+    /// Returns whether this model supports mid-conversation reasoning effort
+    /// changes via `configuration_update` input items to preserve prompt caching.
+    pub fn supports_configuration_update(&self) -> bool {
+        model_supports_configuration_update(self.id())
+    }
+}
+
+/// Returns whether a given model ID supports mid-conversation reasoning effort
+/// changes via `configuration_update` input items to preserve prompt caching.
+/// Supported on GPT-6 Astra family and compatible endpoints.
+pub fn model_supports_configuration_update(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("astra") || id.starts_with("gpt-6") || id.contains("fable")
 }
 
 #[cfg(test)]
@@ -658,6 +672,19 @@ mod tests {
             .expect("prompt_tokens_details should be present");
         assert_eq!(details.cached_tokens, Some(0));
         assert_eq!(details.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn test_supports_configuration_update_capability() {
+        assert!(super::model_supports_configuration_update("gpt-6-astra"));
+        assert!(super::model_supports_configuration_update("openai/gpt-6-astra"));
+        assert!(super::model_supports_configuration_update("gpt-6"));
+        assert!(super::model_supports_configuration_update("claude-fable-5.1"));
+
+        assert!(!super::model_supports_configuration_update("gpt-5.6-sol"));
+        assert!(!super::model_supports_configuration_update("gpt-5.6-terra"));
+        assert!(!super::model_supports_configuration_update("gpt-4o"));
+        assert!(!super::model_supports_configuration_update("o3"));
     }
 }
 

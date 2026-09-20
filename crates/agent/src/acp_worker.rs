@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use futures::future::LocalBoxFuture;
 use gpui::{App, AsyncApp, Entity};
 use project::{AgentId, Project};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -252,9 +253,50 @@ pub struct AcpWorkerHost {
     app: AsyncApp,
     thread_observer: Option<Rc<dyn Fn(Entity<AcpThread>, &mut App)>>,
     process_lease: Option<Rc<WorkerProcessLease>>,
+    active_deliveries: ActiveAcpDeliveries,
 }
 
 struct WorkerProcessLease(Rc<dyn AgentConnection>);
+
+const MAX_PENDING_ACP_DELIVERIES: usize = 128;
+
+#[derive(Debug)]
+struct AcpWorkerDelivery {
+    message: String,
+    interrupt: bool,
+}
+
+struct AcpWorkerDeliveryState {
+    sender: async_channel::Sender<AcpWorkerDelivery>,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+type ActiveAcpDeliveries =
+    Arc<parking_lot::RwLock<HashMap<acp::SessionId, AcpWorkerDeliveryState>>>;
+
+fn register_delivery_channel(
+    active_deliveries: &ActiveAcpDeliveries,
+    session_id: acp::SessionId,
+) -> Result<(
+    async_channel::Receiver<AcpWorkerDelivery>,
+    ActiveAcpDeliveries,
+    Arc<AtomicBool>,
+)> {
+    let (sender, receiver) = async_channel::bounded(MAX_PENDING_ACP_DELIVERIES);
+    let cancel_requested = Arc::new(AtomicBool::new(false));
+    match active_deliveries.write().entry(session_id.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => {
+            bail!("ACP worker session '{session_id}' already has an active turn owner");
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(AcpWorkerDeliveryState {
+                sender,
+                cancel_requested: cancel_requested.clone(),
+            });
+        }
+    }
+    Ok((receiver, active_deliveries.clone(), cancel_requested))
+}
 
 impl Drop for WorkerProcessLease {
     fn drop(&mut self) {
@@ -276,6 +318,7 @@ impl AcpWorkerHost {
             app: cx.to_async(),
             thread_observer: None,
             process_lease: None,
+            active_deliveries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -344,6 +387,7 @@ impl WorkerHost for AcpWorkerHost {
         let app = self.app.clone();
         let thread_observer = self.thread_observer.clone();
         let process_lease = self.process_lease.clone();
+        let active_deliveries = self.active_deliveries.clone();
 
         Box::pin(async move {
             let session_task =
@@ -393,6 +437,8 @@ impl WorkerHost for AcpWorkerHost {
                 metadata.baseline_commit = Some(worktree.baseline_commit);
             }
 
+            let (delivery_receiver, active_deliveries, cancel_requested) =
+                register_delivery_channel(&active_deliveries, session_id.clone())?;
             Ok(Box::new(AcpWorkerHandle {
                 connection,
                 session_id,
@@ -400,6 +446,9 @@ impl WorkerHost for AcpWorkerHost {
                 metadata,
                 app,
                 prompt_active: Arc::new(AtomicBool::new(false)),
+                cancel_requested,
+                delivery_receiver,
+                active_deliveries,
                 _process_lease: process_lease,
             }) as Box<dyn WorkerHandle>)
         })
@@ -426,6 +475,7 @@ impl WorkerHost for AcpWorkerHost {
         let app = self.app.clone();
         let thread_observer = self.thread_observer.clone();
         let process_lease = self.process_lease.clone();
+        let active_deliveries = self.active_deliveries.clone();
 
         Box::pin(async move {
             if !connection.supports_resume_session() && !connection.supports_load_session() {
@@ -492,6 +542,8 @@ impl WorkerHost for AcpWorkerHost {
                 metadata.baseline_commit = Some(worktree.baseline_commit);
             }
 
+            let (delivery_receiver, active_deliveries, cancel_requested) =
+                register_delivery_channel(&active_deliveries, session_id.clone())?;
             Ok(Box::new(AcpWorkerHandle {
                 connection,
                 session_id,
@@ -499,8 +551,45 @@ impl WorkerHost for AcpWorkerHost {
                 metadata,
                 app,
                 prompt_active: Arc::new(AtomicBool::new(false)),
+                cancel_requested,
+                delivery_receiver,
+                active_deliveries,
                 _process_lease: process_lease,
             }) as Box<dyn WorkerHandle>)
+        })
+    }
+
+    fn cancel(&self, session_id: acp::SessionId) -> LocalBoxFuture<'static, Result<()>> {
+        let connection = self.connection.clone();
+        let app = self.app.clone();
+        let cancel_requested = self.active_deliveries.clone();
+        Box::pin(async move {
+            if let Some(state) = cancel_requested.read().get(&session_id) {
+                state.cancel_requested.store(true, Ordering::SeqCst);
+            }
+            app.update(|cx| connection.cancel(&session_id, cx));
+            Ok(())
+        })
+    }
+
+    fn deliver_message(
+        &self,
+        session_id: acp::SessionId,
+        message: String,
+        interrupt: bool,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        let active_deliveries = self.active_deliveries.clone();
+        Box::pin(async move {
+            let sender = active_deliveries
+                .read()
+                .get(&session_id)
+                .map(|state| state.sender.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ACP worker session '{session_id}' has no active turn owner")
+                })?;
+            sender
+                .try_send(AcpWorkerDelivery { message, interrupt })
+                .map_err(|error| anyhow::anyhow!("failed to message ACP worker: {error}"))
         })
     }
 }
@@ -514,7 +603,226 @@ pub struct AcpWorkerHandle {
     metadata: WorkerMetadata,
     app: AsyncApp,
     prompt_active: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
+    delivery_receiver: async_channel::Receiver<AcpWorkerDelivery>,
+    active_deliveries: ActiveAcpDeliveries,
     _process_lease: Option<Rc<WorkerProcessLease>>,
+}
+
+fn setup_activity_subscription(
+    thread: &Entity<AcpThread>,
+    message_start_index: usize,
+    session_id: acp::SessionId,
+    live_metadata: Rc<std::cell::RefCell<WorkerMetadata>>,
+    reporter: agent_orchestration::TaskExecutionReporter,
+    cx: &mut App,
+) -> gpui::Subscription {
+    let mut seen_tools = std::collections::HashSet::new();
+    let mut finished_tools = std::collections::HashSet::new();
+    let mut nested_sessions = std::collections::HashSet::new();
+    cx.subscribe(thread, move |thread, event, cx| {
+        use acp_thread::{AcpThreadEvent, AgentThreadEntry, ToolCallStatus};
+        match event {
+            AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
+                let thread = thread.read(cx);
+                let index = match event {
+                    AcpThreadEvent::EntryUpdated(index) => *index,
+                    _ => thread.entries().len().saturating_sub(1),
+                };
+                if index < message_start_index {
+                    return;
+                }
+                if let Some(AgentThreadEntry::ToolCall(tool)) = thread.entries().get(index) {
+                    if seen_tools.insert(tool.id.clone()) {
+                        reporter.report_tool_call_started(
+                            tool.tool_name.as_deref().unwrap_or("external_tool"),
+                        );
+                    }
+                    match &tool.status {
+                        ToolCallStatus::WaitingForConfirmation { .. } => {
+                            reporter.set_phase("awaiting_permission")
+                        }
+                        ToolCallStatus::Pending | ToolCallStatus::InProgress => {
+                            reporter.set_phase("running_tool")
+                        }
+                        ToolCallStatus::Completed
+                        | ToolCallStatus::Failed
+                        | ToolCallStatus::Rejected
+                        | ToolCallStatus::Canceled => {
+                            if finished_tools.insert(tool.id.clone()) {
+                                reporter.report_tool_call_finished();
+                                reporter.set_phase("running");
+                            }
+                        }
+                    }
+                }
+            }
+            AcpThreadEvent::ModeUpdated(mode) => {
+                live_metadata.borrow_mut().mode = Some(mode.to_string());
+            }
+            AcpThreadEvent::SubagentSpawned(child_session) => {
+                nested_sessions.insert(child_session.clone());
+                live_metadata.borrow_mut().nested_agent_count = Some(nested_sessions.len() as u64);
+            }
+            AcpThreadEvent::ElicitationRequested(_) => reporter.set_phase("awaiting_user"),
+            AcpThreadEvent::ElicitationResponded(_)
+            | AcpThreadEvent::ToolAuthorizationReceived(_) => reporter.set_phase("running"),
+            _ => return,
+        }
+        let metadata = {
+            let mut metadata = live_metadata.borrow_mut();
+            metadata.last_activity_at = Some(chrono::Utc::now());
+            metadata.clone()
+        };
+        reporter.report_worker_started(Some(session_id.clone()), metadata);
+    })
+}
+
+async fn run_single_prompt_turn(
+    connection: &Rc<dyn AgentConnection>,
+    session_id: &acp::SessionId,
+    thread: &Entity<AcpThread>,
+    prompt_text: &str,
+    delivery_receiver: &async_channel::Receiver<AcpWorkerDelivery>,
+    deferred_messages: &mut Vec<String>,
+    interrupt_requested: &mut bool,
+    app: &AsyncApp,
+) -> Result<acp::PromptResponse> {
+    let content = acp::ContentBlock::Text(acp::TextContent::new(prompt_text));
+    app.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, content.clone(), cx);
+        })
+    });
+    let prompt_request = acp::PromptRequest::new(session_id.clone(), vec![content]);
+    let mut prompt_task = Box::pin(app.update(|cx| connection.prompt(prompt_request, cx)));
+
+    let response = loop {
+        let delivery = delivery_receiver.recv();
+        futures::pin_mut!(delivery);
+        match futures::future::select(prompt_task.as_mut(), delivery).await {
+            futures::future::Either::Left((response, _)) => break response?,
+            futures::future::Either::Right((delivery, _)) => {
+                let delivery = delivery.map_err(|error| {
+                    anyhow::anyhow!("ACP worker delivery channel closed: {error}")
+                })?;
+                deferred_messages.push(delivery.message);
+                if delivery.interrupt && !*interrupt_requested {
+                    *interrupt_requested = true;
+                    app.update(|cx| connection.cancel(session_id, cx));
+                }
+            }
+        }
+    };
+
+    while let Ok(delivery) = delivery_receiver.try_recv() {
+        deferred_messages.push(delivery.message);
+        if delivery.interrupt {
+            *interrupt_requested = true;
+        }
+    }
+
+    Ok(response)
+}
+
+struct TurnLoopOutcome {
+    last_response: acp::PromptResponse,
+    tokens_used: Option<u64>,
+}
+
+async fn run_turn_execution_loop(
+    connection: &Rc<dyn AgentConnection>,
+    session_id: &acp::SessionId,
+    thread: &Entity<AcpThread>,
+    initial_prompt: String,
+    delivery_receiver: &async_channel::Receiver<AcpWorkerDelivery>,
+    cancel_requested: &Arc<AtomicBool>,
+    app: &AsyncApp,
+) -> Result<TurnLoopOutcome> {
+    let mut next_prompt = initial_prompt;
+    let mut deferred_messages = Vec::new();
+    let mut total_tokens = 0_u64;
+    let mut has_usage = false;
+
+    let last_response = loop {
+        let mut interrupt_requested = false;
+        let response = run_single_prompt_turn(
+            connection,
+            session_id,
+            thread,
+            &next_prompt,
+            delivery_receiver,
+            &mut deferred_messages,
+            &mut interrupt_requested,
+            app,
+        )
+        .await?;
+
+        // Account for usage immediately after each prompt response, before processing its stop reason
+        if let Some(usage) = response.usage.as_ref() {
+            has_usage = true;
+            total_tokens = total_tokens.saturating_add(usage.total_tokens);
+        }
+
+        if cancel_requested.load(Ordering::SeqCst) {
+            bail!("ACP worker task was cancelled");
+        }
+
+        if response.stop_reason == acp::StopReason::Cancelled && interrupt_requested {
+            if deferred_messages.is_empty() {
+                bail!("ACP worker turn was interrupted without a follow-up message");
+            }
+            next_prompt = deferred_messages.join("\n\n");
+            deferred_messages.clear();
+            continue;
+        }
+
+        anyhow::ensure!(
+            response.stop_reason == acp::StopReason::EndTurn,
+            "ACP worker did not finish its task: {:?}",
+            response.stop_reason
+        );
+
+        if !deferred_messages.is_empty() {
+            next_prompt = deferred_messages.join("\n\n");
+            deferred_messages.clear();
+            continue;
+        }
+
+        break response;
+    };
+
+    Ok(TurnLoopOutcome {
+        last_response,
+        tokens_used: has_usage.then_some(total_tokens),
+    })
+}
+
+fn extract_assistant_output(
+    thread: &Entity<AcpThread>,
+    message_start_index: usize,
+    cx: &mut App,
+) -> String {
+    let thread = thread.read(cx);
+    let mut output = BoundedTranscript::new();
+    for block in thread
+        .entries()
+        .get(message_start_index..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| match entry {
+            acp_thread::AgentThreadEntry::AssistantMessage(message) => Some(message),
+            _ => None,
+        })
+        .flat_map(|message| &message.chunks)
+        .filter_map(|chunk| match chunk {
+            acp_thread::AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+            acp_thread::AssistantMessageChunk::Thought { .. } => None,
+        })
+    {
+        output.push(&block);
+    }
+    output.finish()
 }
 
 impl WorkerHandle for AcpWorkerHandle {
@@ -539,9 +847,12 @@ impl WorkerHandle for AcpWorkerHandle {
         let thread = self.thread.clone();
         let app = self.app.clone();
         let prompt_active = self.prompt_active.clone();
+        let cancel_requested = self.cancel_requested.clone();
+        let delivery_receiver = self.delivery_receiver.clone();
         let prompt_text = task_prompt(&context.task, &context.dependency_inputs);
         let mut metadata = self.metadata.clone();
 
+        cancel_requested.store(false, Ordering::SeqCst);
         prompt_active.store(true, Ordering::SeqCst);
         Box::pin(async move {
             let result = async {
@@ -567,125 +878,36 @@ impl WorkerHandle for AcpWorkerHandle {
                 let message_start_index = app.update(|cx| thread.read(cx).entries().len());
                 let live_metadata = Rc::new(std::cell::RefCell::new(metadata));
                 let _activity_subscription = app.update(|cx| {
-                    let reporter = context.reporter.clone();
-                    let live_metadata = live_metadata.clone();
-                    let session_id = session_id.clone();
-                    let mut seen_tools = std::collections::HashSet::new();
-                    let mut nested_sessions = std::collections::HashSet::new();
-                    cx.subscribe(&thread, move |thread, event, cx| {
-                        use acp_thread::{AcpThreadEvent, AgentThreadEntry, ToolCallStatus};
-                        match event {
-                            AcpThreadEvent::NewEntry | AcpThreadEvent::EntryUpdated(_) => {
-                                let thread = thread.read(cx);
-                                let index = match event {
-                                    AcpThreadEvent::EntryUpdated(index) => *index,
-                                    _ => thread.entries().len().saturating_sub(1),
-                                };
-                                if index < message_start_index {
-                                    return;
-                                }
-                                if let Some(AgentThreadEntry::ToolCall(tool)) =
-                                    thread.entries().get(index)
-                                {
-                                    if seen_tools.insert(tool.id.clone()) {
-                                        reporter.report_tool_call_started(
-                                            tool.tool_name.as_deref().unwrap_or("external_tool"),
-                                        );
-                                    }
-                                    match &tool.status {
-                                        ToolCallStatus::WaitingForConfirmation { .. } => {
-                                            reporter.set_phase("awaiting_permission")
-                                        }
-                                        ToolCallStatus::Pending | ToolCallStatus::InProgress => {
-                                            reporter.set_phase("running_tool")
-                                        }
-                                        _ => {
-                                            reporter.report_tool_call_finished();
-                                            reporter.set_phase("running");
-                                        }
-                                    }
-                                }
-                            }
-                            AcpThreadEvent::ModeUpdated(mode) => {
-                                live_metadata.borrow_mut().mode = Some(mode.to_string());
-                            }
-                            AcpThreadEvent::SubagentSpawned(child_session) => {
-                                nested_sessions.insert(child_session.clone());
-                                live_metadata.borrow_mut().nested_agent_count =
-                                    Some(nested_sessions.len() as u64);
-                            }
-                            AcpThreadEvent::ElicitationRequested(_) => {
-                                reporter.set_phase("awaiting_user")
-                            }
-                            AcpThreadEvent::ElicitationResponded(_)
-                            | AcpThreadEvent::ToolAuthorizationReceived(_) => {
-                                reporter.set_phase("running")
-                            }
-                            _ => return,
-                        }
-                        let metadata = {
-                            let mut metadata = live_metadata.borrow_mut();
-                            metadata.last_activity_at = Some(chrono::Utc::now());
-                            metadata.clone()
-                        };
-                        reporter.report_worker_started(Some(session_id.clone()), metadata);
-                    })
+                    setup_activity_subscription(
+                        &thread,
+                        message_start_index,
+                        session_id.clone(),
+                        live_metadata.clone(),
+                        context.reporter.clone(),
+                        cx,
+                    )
                 });
-                let content = acp::ContentBlock::Text(acp::TextContent::new(prompt_text));
-                app.update(|cx| {
-                    thread.update(cx, |thread, cx| {
-                        thread.push_user_content_block(None, content.clone(), cx);
-                    })
-                });
-                let prompt_request = acp::PromptRequest::new(session_id.clone(), vec![content]);
 
-                let response = app
-                    .update(|cx| connection.prompt(prompt_request, cx))
-                    .await?;
+                let outcome = run_turn_execution_loop(
+                    &connection,
+                    &session_id,
+                    &thread,
+                    prompt_text,
+                    &delivery_receiver,
+                    &cancel_requested,
+                    &app,
+                )
+                .await?;
 
-                if response.stop_reason == acp::StopReason::Cancelled {
-                    bail!("task execution was cancelled by worker");
-                }
-                anyhow::ensure!(
-                    response.stop_reason == acp::StopReason::EndTurn,
-                    "ACP worker did not finish its task: {:?}",
-                    response.stop_reason
-                );
-
-                let tokens_used = response.usage.as_ref().map(|usage| usage.total_tokens);
                 let mut metadata = live_metadata.borrow().clone();
-                metadata.capabilities.can_report_usage = tokens_used.is_some();
+                metadata.capabilities.can_report_usage = outcome.tokens_used.is_some();
                 app.update(|cx| thread.update(cx, |thread, cx| thread.flush_pending_output(cx)));
-                let output_text = app.update(|cx| {
-                    let thread = thread.read(cx);
-                    let mut output = BoundedTranscript::new();
-                    for block in thread
-                        .entries()
-                        .get(message_start_index..)
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|entry| match entry {
-                            acp_thread::AgentThreadEntry::AssistantMessage(message) => {
-                                Some(message)
-                            }
-                            _ => None,
-                        })
-                        .flat_map(|message| &message.chunks)
-                        .filter_map(|chunk| match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block, .. } => {
-                                Some(block.to_markdown(cx))
-                            }
-                            acp_thread::AssistantMessageChunk::Thought { .. } => None,
-                        })
-                    {
-                        output.push(&block);
-                    }
-                    output.finish()
-                });
+                let output_text =
+                    app.update(|cx| extract_assistant_output(&thread, message_start_index, cx));
                 if output_text.is_empty() {
                     bail!(
                         "ACP worker completed with status {:?} but produced no assistant output",
-                        response.stop_reason
+                        outcome.last_response.stop_reason
                     );
                 }
 
@@ -701,7 +923,7 @@ impl WorkerHandle for AcpWorkerHandle {
 
                 let mut output = TaskExecutionOutput::new(output_text).with_session_id(session_id);
 
-                output.tokens_used = tokens_used;
+                output.tokens_used = outcome.tokens_used;
                 output.worker_metadata = Some(metadata);
                 Ok(output)
             }
@@ -716,8 +938,10 @@ impl WorkerHandle for AcpWorkerHandle {
         let session_id = self.session_id.clone();
         let app = self.app.clone();
         let prompt_active = self.prompt_active.clone();
+        let cancel_requested = self.cancel_requested.clone();
 
         Box::pin(async move {
+            cancel_requested.store(true, Ordering::SeqCst);
             app.update(|cx| {
                 connection.cancel(&session_id, cx);
             });
@@ -745,13 +969,20 @@ impl WorkerHandle for AcpWorkerHandle {
         session_id: &acp::SessionId,
         context: TaskExecutionContext,
     ) -> LocalBoxFuture<'static, Result<TaskExecutionOutput>> {
-        self.session_id = session_id.clone();
+        if self.session_id != *session_id {
+            let session_id = session_id.clone();
+            let current_id = self.session_id.clone();
+            return Box::pin(async move {
+                bail!("cannot resume session '{session_id}' on worker handle for '{current_id}'")
+            });
+        }
         self.execute(context)
     }
 }
 
 impl Drop for AcpWorkerHandle {
     fn drop(&mut self) {
+        self.active_deliveries.write().remove(&self.session_id);
         if self.prompt_active.swap(false, Ordering::SeqCst) {
             let connection = self.connection.clone();
             let session_id = self.session_id.clone();
@@ -907,5 +1138,45 @@ mod tests {
         acp_task.workspace_policy.isolation =
             agent_orchestration::WorkspaceIsolation::DedicatedWorktree;
         assert!(broker_enabled.validate_task_parameters(&acp_task).is_ok());
+    }
+
+    #[test]
+    fn acp_delivery_registry_serializes_session_ownership() {
+        let active_deliveries = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let session_id = acp::SessionId::new("session-1");
+        let (receiver, active_deliveries, _cancel_requested) =
+            register_delivery_channel(&active_deliveries, session_id.clone()).expect("register");
+
+        let sender = active_deliveries
+            .read()
+            .get(&session_id)
+            .map(|state| state.sender.clone())
+            .expect("registered sender");
+        sender
+            .try_send(AcpWorkerDelivery {
+                message: "continue with the tests".to_string(),
+                interrupt: true,
+            })
+            .expect("send delivery");
+        let delivery = receiver.try_recv().expect("receive delivery");
+        assert_eq!(delivery.message, "continue with the tests");
+        assert!(delivery.interrupt);
+
+        assert!(register_delivery_channel(&active_deliveries, session_id.clone()).is_err());
+        let sender = active_deliveries
+            .read()
+            .get(&session_id)
+            .map(|state| state.sender.clone())
+            .expect("original sender should remain registered");
+        sender
+            .try_send(AcpWorkerDelivery {
+                message: "original worker is still reachable".to_string(),
+                interrupt: false,
+            })
+            .expect("send through original channel");
+        assert_eq!(
+            receiver.try_recv().expect("original receiver").message,
+            "original worker is still reachable"
+        );
     }
 }

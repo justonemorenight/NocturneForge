@@ -2742,6 +2742,8 @@ fn run_multi_workspace_sidebar_visual_tests(
                             sandbox_grants: Default::default(),
                             tool_filter: None,
                             orchestration_run: None,
+                            orchestration_goal: None,
+                            pending_edits: Vec::new(),
                         },
                         path_list,
                         cx,

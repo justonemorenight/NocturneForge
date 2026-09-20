@@ -177,6 +177,12 @@ impl CaptureState {
         if self.generation != generation {
             return;
         }
+        if outcome.cancelled {
+            self.phase = Phase::Waiting;
+            self.reason = None;
+            self.last_touch = now;
+            return;
+        }
         if let Some(error) = &outcome.error {
             self.pause(error);
         } else if !outcome.saw_usage
@@ -286,10 +292,26 @@ impl Capture {
                 .unwrap_or(false)
     }
 
-    fn idle(&self, cx: &App) -> bool {
-        self.owner
+    fn idle(
+        &self,
+        cx: &App,
+        affinity: &str,
+        enabled_threads: &[(String, WeakEntity<crate::Thread>)],
+    ) -> bool {
+        if !self
+            .owner
             .read_with(cx, |thread, _| thread.is_turn_complete())
             .unwrap_or(false)
+        {
+            return false;
+        }
+        !enabled_threads.iter().any(|(_, owner)| {
+            owner
+                .read_with(cx, |thread, _| {
+                    thread.prompt_cache_affinity() == affinity && !thread.is_turn_complete()
+                })
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -301,7 +323,7 @@ struct Registry {
 }
 
 struct PendingPing {
-    thread_id: String,
+    affinity: String,
     generation: Uuid,
     model: Arc<dyn LanguageModel>,
     request: LanguageModelRequest,
@@ -315,12 +337,20 @@ impl Registry {
         self.enabled_threads.clear();
     }
 
-    fn insert(&mut self, thread_id: String, capture: Capture) {
-        self.captures.retain(|(id, _)| id != &thread_id);
+    fn insert(&mut self, affinity: String, capture: Capture) {
+        self.captures.retain(|(id, _)| id != &affinity);
         while self.captures.len() >= capture.config.max_captures {
             self.captures.remove(0);
         }
-        self.captures.push((thread_id, capture));
+        self.captures.push((affinity, capture));
+    }
+
+    fn interrupt_ping(&mut self, affinity: &str) {
+        if let Some((_, capture)) = self.captures.iter_mut().find(|(id, _)| id == affinity) {
+            if let Some(abort) = capture.abort.take() {
+                abort.abort();
+            }
+        }
     }
 
     fn next_ping(&mut self, cx: &App, config: &Config, now: Instant) -> Option<PendingPing> {
@@ -335,7 +365,7 @@ impl Registry {
         self.captures
             .sort_by_key(|(_, capture)| capture.state.last_touch);
         for (id, capture) in &mut self.captures {
-            if !capture.idle(cx) || !capture.state.due(now, config) {
+            if !capture.idle(cx, id, &self.enabled_threads) || !capture.state.due(now, config) {
                 continue;
             }
             if !self.ledger.reserve(
@@ -354,7 +384,7 @@ impl Registry {
             let (abort, cancellation) = future::AbortHandle::new_pair();
             capture.abort = Some(abort);
             return Some(PendingPing {
-                thread_id: id.clone(),
+                affinity: id.clone(),
                 generation: capture.state.generation,
                 model: capture.model.clone(),
                 request: capture.request.clone(),
@@ -372,7 +402,7 @@ impl Registry {
         if let Some((_, capture)) = self
             .captures
             .iter_mut()
-            .find(|(id, _)| id == &pending.thread_id)
+            .find(|(id, _)| id == &pending.affinity)
         {
             if capture.state.generation == pending.generation {
                 capture.abort = None;
@@ -393,7 +423,7 @@ impl Global for GlobalKeepAlive {}
 
 pub struct RequestCapture {
     registry: Weak<Mutex<Registry>>,
-    thread_id: String,
+    affinity: String,
     generation: Uuid,
     confirmed: bool,
 }
@@ -405,7 +435,7 @@ impl RequestCapture {
                 .lock()
                 .captures
                 .iter_mut()
-                .find(|(id, _)| id == &self.thread_id)
+                .find(|(id, _)| id == &self.affinity)
             {
                 if capture.state.generation == self.generation {
                     let input = usage
@@ -434,19 +464,30 @@ impl Drop for RequestCapture {
         }
         if let Some(registry) = self.registry.upgrade() {
             registry.lock().captures.retain(|(id, capture)| {
-                id != &self.thread_id || capture.state.generation != self.generation
+                id != &self.affinity || capture.state.generation != self.generation
             });
         }
     }
 }
 
-pub fn invalidate(thread_id: &str, cx: &App) {
+pub fn invalidate(target: &str, cx: &App) {
     if let Some(global) = cx.try_global::<GlobalKeepAlive>() {
         global
             .registry
             .lock()
             .captures
-            .retain(|(id, _)| id != thread_id);
+            .retain(|(affinity, capture)| {
+                if affinity == target || capture.request.thread_id.as_deref() == Some(target) {
+                    return false;
+                }
+                let matches_owner = capture
+                    .owner
+                    .read_with(cx, |thread, _| {
+                        thread.id().0.as_ref() == target || thread.prompt_cache_affinity() == target
+                    })
+                    .unwrap_or(false);
+                !matches_owner
+            });
     }
 }
 
@@ -462,27 +503,84 @@ pub fn enabled_for_thread(thread_id: &str, cx: &App) -> bool {
         })
 }
 
+fn thread_affinity(id: &str, owner: &WeakEntity<crate::Thread>, cx: &App) -> String {
+    owner
+        .read_with(cx, |thread, _| thread.prompt_cache_affinity())
+        .unwrap_or_else(|_| id.to_string())
+}
+
 pub fn toggle_thread(thread_id: String, owner: WeakEntity<crate::Thread>, cx: &App) {
     let Some(global) = cx.try_global::<GlobalKeepAlive>() else {
         return;
     };
     let mut registry = global.registry.lock();
-    registry.captures.retain(|(id, _)| id != &thread_id);
+    let affinity = thread_affinity(&thread_id, &owner, cx);
     registry
         .enabled_threads
         .retain(|(_, owner)| owner.upgrade().is_some());
-    if registry
+
+    let was_enabled = registry
         .enabled_threads
         .iter()
-        .any(|(id, _)| id == &thread_id)
-    {
+        .any(|(id, _)| id == &thread_id);
+
+    if was_enabled {
         registry.enabled_threads.retain(|(id, _)| id != &thread_id);
+        // Drop captures owned by the disabled thread so remaining forks or threads can capture anew.
+        registry.captures.retain(|(_id, capture)| {
+            let owned_by_disabled = capture.request.thread_id.as_deref() == Some(&thread_id)
+                || capture
+                    .owner
+                    .read_with(cx, |thread, _| thread.id().0.as_ref() == thread_id)
+                    .unwrap_or(false);
+            !owned_by_disabled
+        });
     } else {
-        if registry.enabled_threads.len() >= Config::current(cx).max_captures {
-            let (removed, _) = registry.enabled_threads.remove(0);
-            registry.captures.retain(|(id, _)| id != &removed);
+        let affinity_already_enabled = registry
+            .enabled_threads
+            .iter()
+            .any(|(id, owner)| thread_affinity(id, owner, cx) == affinity);
+
+        if !affinity_already_enabled {
+            let mut unique_affinities: Vec<String> = Vec::new();
+            for (id, owner) in &registry.enabled_threads {
+                let aff = thread_affinity(id, owner, cx);
+                if !unique_affinities.contains(&aff) {
+                    unique_affinities.push(aff);
+                }
+            }
+            if unique_affinities.len() >= Config::current(cx).max_captures {
+                if let Some(oldest_affinity) = unique_affinities.first().cloned() {
+                    registry
+                        .enabled_threads
+                        .retain(|(id, owner)| thread_affinity(id, owner, cx) != oldest_affinity);
+                    registry.captures.retain(|(id, capture)| {
+                        if id == &oldest_affinity {
+                            return false;
+                        }
+                        let capture_affinity = capture
+                            .owner
+                            .read_with(cx, |thread, _| thread.prompt_cache_affinity())
+                            .unwrap_or_else(|_| {
+                                capture.request.thread_id.clone().unwrap_or_default()
+                            });
+                        capture_affinity != oldest_affinity
+                    });
+                }
+            }
         }
-        registry.enabled_threads.push((thread_id, owner));
+        registry.enabled_threads.push((thread_id.clone(), owner));
+    }
+    let still_enabled_for_affinity = registry
+        .enabled_threads
+        .iter()
+        .any(|(id, owner)| thread_affinity(id, owner, cx) == affinity);
+    if !still_enabled_for_affinity {
+        registry.captures.retain(|(id, capture)| {
+            id != &affinity
+                && id != &thread_id
+                && capture.request.thread_id.as_deref() != Some(&thread_id)
+        });
     }
 }
 
@@ -501,10 +599,23 @@ pub fn status(thread_id: &str, cx: &App) -> String {
     {
         return "Cache warming: Off for this thread".into();
     }
+    let owner_affinity = registry
+        .enabled_threads
+        .iter()
+        .find(|(id, _)| id == thread_id)
+        .and_then(|(_, owner)| {
+            owner
+                .read_with(cx, |thread, _| thread.prompt_cache_affinity())
+                .ok()
+        });
     let state = registry
         .captures
         .iter()
-        .find(|(id, _)| id == thread_id)
+        .find(|(id, capture)| {
+            id == thread_id
+                || Some(id.as_str()) == owner_affinity.as_deref()
+                || capture.request.thread_id.as_deref() == Some(thread_id)
+        })
         .map(|(_, capture)| {
             capture
                 .state
@@ -536,10 +647,11 @@ pub fn record_turn_activity(
         return None;
     }
     let thread_id = request.thread_id.clone()?;
-    invalidate(&thread_id, cx);
-    if !enabled_for_thread(&thread_id, cx) {
-        return None;
-    }
+    let affinity = request
+        .prompt_cache_key
+        .clone()
+        .unwrap_or_else(|| thread_id.clone());
+
     if model.provider_id().0.as_ref() != "openai-subscribed"
         || owner
             .read_with(cx, |thread, _| thread.is_subagent())
@@ -547,6 +659,12 @@ pub fn record_turn_activity(
     {
         return None;
     }
+    if !enabled_for_thread(&thread_id, cx) {
+        return None;
+    }
+
+    // Family activity interrupts any active ping for this affinity without discarding confirmed captures.
+    global.registry.lock().interrupt_ping(&affinity);
     let scope = model.cache_warming_scope(cx)?;
     let config = Config::current(cx);
     if config.max_pings == 0 || config.max_requests_per_hour == 0 {
@@ -559,12 +677,12 @@ pub fn record_turn_activity(
     let state = CaptureState::new(Instant::now());
     let guard = RequestCapture {
         registry: Arc::downgrade(&global.registry),
-        thread_id: thread_id.clone(),
+        affinity: affinity.clone(),
         generation: state.generation,
         confirmed: false,
     };
     global.registry.lock().insert(
-        thread_id,
+        affinity,
         Capture {
             owner,
             scope,
@@ -602,12 +720,13 @@ fn pending_valid(pending: &PendingPing, cx: &App) -> bool {
         return false;
     }
     cx.try_global::<GlobalKeepAlive>().is_some_and(|global| {
-        global.registry.lock().captures.iter().any(|(id, capture)| {
-            id == &pending.thread_id
+        let registry = global.registry.lock();
+        registry.captures.iter().any(|(id, capture)| {
+            id == &pending.affinity
                 && capture.state.generation == pending.generation
                 && capture.state.phase == Phase::Warming
                 && capture.valid(cx)
-                && capture.idle(cx)
+                && capture.idle(cx, &pending.affinity, &registry.enabled_threads)
         })
     })
 }
@@ -633,7 +752,7 @@ async fn ticker(cx: &mut AsyncApp) {
         let Some(cancellation) = pending.cancellation.take() else {
             continue;
         };
-        let error = {
+        let (error, cancelled) = {
             let monitor_context = cx.clone();
             let validity = async {
                 loop {
@@ -658,12 +777,15 @@ async fn ticker(cx: &mut AsyncApp) {
             );
             futures::pin_mut!(validity, ping);
             match future::select(validity, ping).await {
-                future::Either::Left(_) => Some("Session or settings changed".to_owned()),
-                future::Either::Right((Ok(result), _)) => result.err(),
-                future::Either::Right((Err(_), _)) => Some("Cache warming cancelled".into()),
+                future::Either::Left(_) => (Some("Session or settings changed".to_owned()), true),
+                future::Either::Right((Ok(result), _)) => (result.err(), false),
+                future::Either::Right((Err(_), _)) => {
+                    (Some("Cache warming cancelled".into()), true)
+                }
             }
         };
         outcome.error = error;
+        outcome.cancelled = cancelled;
         cx.update(|cx| {
             if let Some(global) = cx.try_global::<GlobalKeepAlive>() {
                 global
@@ -680,6 +802,7 @@ struct PingOutcome {
     usage: TokenUsage,
     saw_usage: bool,
     error: Option<String>,
+    cancelled: bool,
 }
 
 async fn run_ping_stream(
@@ -754,6 +877,7 @@ async fn run_ping_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1 as acp;
     use gpui::AppContext as _;
 
     fn warm_outcome() -> PingOutcome {
@@ -765,6 +889,7 @@ mod tests {
             },
             saw_usage: true,
             error: None,
+            cancelled: false,
         }
     }
 
@@ -1057,7 +1182,7 @@ mod tests {
         registry.lock().insert("test".into(), capture);
         let guard = RequestCapture {
             registry: Arc::downgrade(&registry),
-            thread_id: "test".into(),
+            affinity: "test".into(),
             generation,
             confirmed: false,
         };
@@ -1074,7 +1199,7 @@ mod tests {
         assert_eq!(registry.lock().captures.len(), 1);
         drop(RequestCapture {
             registry: Arc::downgrade(&registry),
-            thread_id: "test".into(),
+            affinity: "test".into(),
             generation: newer_generation,
             confirmed: false,
         });
@@ -1096,5 +1221,337 @@ mod tests {
         ));
         assert!(task.await.error.is_some());
         model.end_last_completion_stream();
+    }
+    #[gpui::test]
+    async fn test_cache_keepalive_deduplicates_by_prompt_cache_affinity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(settings::init);
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(std::path::Path::new("/cache-test"), serde_json::json!({}))
+            .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/cache-test")], cx).await;
+        let project_context = cx.new(|_| prompt_store::ProjectContext::default());
+        let server_store = project.read_with(cx, |project, _| project.context_server_store());
+        let server_registry =
+            cx.new(|cx| crate::tools::ContextServerRegistry::new(server_store, cx));
+        let model: Arc<dyn LanguageModel> =
+            Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+        let root_thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                project_context.clone(),
+                server_registry.clone(),
+                crate::Templates::new(),
+                Some(model.clone()),
+                cx,
+            )
+        });
+        let fork_thread = cx.new(|cx| {
+            crate::Thread::new(
+                project,
+                project_context,
+                server_registry,
+                crate::Templates::new(),
+                Some(model.clone()),
+                cx,
+            )
+        });
+
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let affinity = "shared-root-affinity".to_string();
+
+        let (abort1, _) = future::AbortHandle::new_pair();
+        let capture1 = Capture {
+            owner: root_thread.downgrade(),
+            scope: "test".into(),
+            model: model.clone(),
+            request: LanguageModelRequest {
+                thread_id: Some("root-id".into()),
+                prompt_cache_key: Some(affinity.clone()),
+                ..Default::default()
+            },
+            state: CaptureState::new(Instant::now()),
+            config: Config::default(),
+            abort: Some(abort1),
+        };
+        registry.lock().insert(affinity.clone(), capture1);
+        assert_eq!(registry.lock().captures.len(), 1);
+
+        let (abort2, _) = future::AbortHandle::new_pair();
+        let capture2 = Capture {
+            owner: fork_thread.downgrade(),
+            scope: "test".into(),
+            model: model.clone(),
+            request: LanguageModelRequest {
+                thread_id: Some("fork-id".into()),
+                prompt_cache_key: Some(affinity.clone()),
+                ..Default::default()
+            },
+            state: CaptureState::new(Instant::now()),
+            config: Config::default(),
+            abort: Some(abort2),
+        };
+        registry.lock().insert(affinity, capture2);
+        // Shared affinity replaces previous capture so root and fork do not create competing captures.
+        assert_eq!(registry.lock().captures.len(), 1);
+        assert_eq!(
+            registry.lock().captures[0].1.request.thread_id.as_deref(),
+            Some("fork-id")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagent_activity_does_not_discard_root_cache_capture(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().cache_keepalive = Some(true);
+            });
+            cx.set_global(settings_store);
+            language_model::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            std::path::Path::new("/subagent-cache-test"),
+            serde_json::json!({}),
+        )
+        .await;
+        let project =
+            project::Project::test(fs, [std::path::Path::new("/subagent-cache-test")], cx).await;
+        let project_context = cx.new(|_| prompt_store::ProjectContext::default());
+        let server_store = project.read_with(cx, |project, _| project.context_server_store());
+        let server_registry =
+            cx.new(|cx| crate::tools::ContextServerRegistry::new(server_store, cx));
+        let model: Arc<dyn LanguageModel> =
+            Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+        let root_thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                project_context.clone(),
+                server_registry.clone(),
+                crate::Templates::new(),
+                Some(model.clone()),
+                cx,
+            )
+        });
+        let subagent_thread = cx.update(|cx| {
+            cx.new(|cx| {
+                crate::Thread::new_subagent(
+                    &root_thread,
+                    Some(crate::SubagentRole::CodingWorker),
+                    cx,
+                )
+            })
+        });
+
+        let root_id = root_thread.read_with(cx, |thread, _| thread.id().to_string());
+        cx.update(|cx| {
+            init(cx);
+            toggle_thread(root_id.clone(), root_thread.downgrade(), cx);
+        });
+
+        let registry = cx.read(|cx| cx.global::<GlobalKeepAlive>().registry.clone());
+        let affinity = root_thread.read_with(cx, |thread, _| thread.prompt_cache_affinity());
+
+        let (abort, _) = future::AbortHandle::new_pair();
+        let capture = Capture {
+            owner: root_thread.downgrade(),
+            scope: "test".into(),
+            model: model.clone(),
+            request: LanguageModelRequest {
+                thread_id: Some(root_thread.read_with(cx, |thread, _| thread.id().to_string())),
+                prompt_cache_key: Some(affinity.clone()),
+                ..Default::default()
+            },
+            state: CaptureState::new(Instant::now()),
+            config: Config::default(),
+            abort: Some(abort),
+        };
+        registry.lock().insert(affinity.clone(), capture);
+        assert_eq!(registry.lock().captures.len(), 1);
+
+        // Now subagent runs turn activity with the root's affinity
+        let subagent_request = LanguageModelRequest {
+            thread_id: Some("subagent-id".into()),
+            prompt_cache_key: Some(affinity.clone()),
+            ..Default::default()
+        };
+        let guard = cx.update(|cx| {
+            record_turn_activity(cx, subagent_thread.downgrade(), model, &subagent_request)
+        });
+        // Subagent request is excluded from capturing, but must NOT wipe out root's capture!
+        assert!(guard.is_none());
+        assert_eq!(registry.lock().captures.len(), 1);
+        assert_eq!(
+            registry.lock().captures[0].1.request.thread_id.as_deref(),
+            Some(root_id.as_str())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_disabling_owner_drops_capture_while_fork_retains_affinity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().cache_keepalive = Some(true);
+            });
+            cx.set_global(settings_store);
+            language_model::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            std::path::Path::new("/fork-cache-test"),
+            serde_json::json!({}),
+        )
+        .await;
+        let project =
+            project::Project::test(fs, [std::path::Path::new("/fork-cache-test")], cx).await;
+        let project_context = cx.new(|_| prompt_store::ProjectContext::default());
+        let server_store = project.read_with(cx, |project, _| project.context_server_store());
+        let server_registry =
+            cx.new(|cx| crate::tools::ContextServerRegistry::new(server_store, cx));
+        let model: Arc<dyn LanguageModel> =
+            Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+        let root_thread = cx.new(|cx| {
+            crate::Thread::new(
+                project.clone(),
+                project_context.clone(),
+                server_registry.clone(),
+                crate::Templates::new(),
+                Some(model.clone()),
+                cx,
+            )
+        });
+        let fork_thread = cx.new(|cx| {
+            crate::Thread::new(
+                project,
+                project_context,
+                server_registry,
+                crate::Templates::new(),
+                Some(model.clone()),
+                cx,
+            )
+        });
+
+        let root_id = root_thread.read_with(cx, |t, _| t.id().to_string());
+        let fork_id = fork_thread.read_with(cx, |t, _| t.id().to_string());
+
+        // Make fork_thread inherit root_thread's prompt cache affinity
+        cx.update(|cx| {
+            fork_thread.update(cx, |fork, _| {
+                fork.fork_origin = Some(crate::ForkOrigin {
+                    session_id: acp::SessionId::new("source"),
+                    root_session_id: Some(acp::SessionId::new(root_id.clone())),
+                    checkpoint_user_message_id: acp_thread::ClientUserMessageId::new(),
+                    inherited_message_count: 0,
+                    inherited_user_message_ids: collections::HashSet::default(),
+                });
+            });
+            init(cx);
+            toggle_thread(root_id.clone(), root_thread.downgrade(), cx);
+            toggle_thread(fork_id.clone(), fork_thread.downgrade(), cx);
+        });
+
+        let registry = cx.read(|cx| cx.global::<GlobalKeepAlive>().registry.clone());
+        let affinity = root_thread.read_with(cx, |t, _| t.prompt_cache_affinity());
+
+        // Root captures
+        let capture = Capture {
+            owner: root_thread.downgrade(),
+            scope: "test".into(),
+            model: model.clone(),
+            request: LanguageModelRequest {
+                thread_id: Some(root_id.clone()),
+                prompt_cache_key: Some(affinity.clone()),
+                ..Default::default()
+            },
+            state: CaptureState::new(Instant::now()),
+            config: Config::default(),
+            abort: None,
+        };
+        registry.lock().insert(affinity.clone(), capture);
+        assert_eq!(registry.lock().captures.len(), 1);
+
+        // Now toggle off root_thread
+        cx.update(|cx| {
+            toggle_thread(root_id.clone(), root_thread.downgrade(), cx);
+        });
+
+        // The capture owned by root must be dropped, even though fork is still enabled for that affinity
+        assert!(registry.lock().captures.is_empty());
+        // Fork is still enabled
+        assert!(cx.read(|cx| enabled_for_thread(&fork_id, cx)));
+    }
+
+    #[gpui::test]
+    async fn test_max_captures_counts_affinity_families_not_threads(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().cache_keepalive = Some(true);
+            });
+            cx.set_global(settings_store);
+            language_model::init(cx);
+        });
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            std::path::Path::new("/family-cache-test"),
+            serde_json::json!({}),
+        )
+        .await;
+        let project =
+            project::Project::test(fs, [std::path::Path::new("/family-cache-test")], cx).await;
+        let project_context = cx.new(|_| prompt_store::ProjectContext::default());
+        let server_store = project.read_with(cx, |project, _| project.context_server_store());
+        let server_registry =
+            cx.new(|cx| crate::tools::ContextServerRegistry::new(server_store, cx));
+        let model: Arc<dyn LanguageModel> =
+            Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+
+        let mut threads = Vec::new();
+        for _ in 0..5 {
+            let t = cx.new(|cx| {
+                crate::Thread::new(
+                    project.clone(),
+                    project_context.clone(),
+                    server_registry.clone(),
+                    crate::Templates::new(),
+                    Some(model.clone()),
+                    cx,
+                )
+            });
+            threads.push(t);
+        }
+
+        // Thread 0, 1, 2 share affinity
+        let root_id = threads[0].read_with(cx, |t, _| t.id().to_string());
+        for i in 1..=2 {
+            let root_id = root_id.clone();
+            cx.update(|cx| {
+                threads[i].update(cx, |fork, _| {
+                    fork.fork_origin = Some(crate::ForkOrigin {
+                        session_id: acp::SessionId::new("source"),
+                        root_session_id: Some(acp::SessionId::new(root_id)),
+                        checkpoint_user_message_id: acp_thread::ClientUserMessageId::new(),
+                        inherited_message_count: 0,
+                        inherited_user_message_ids: collections::HashSet::default(),
+                    });
+                });
+            });
+        }
+
+        cx.update(init);
+        for i in 0..=2 {
+            let id = threads[i].read_with(cx, |t, _| t.id().to_string());
+            cx.update(|cx| toggle_thread(id, threads[i].downgrade(), cx));
+        }
+
+        let registry = cx.read(|cx| cx.global::<GlobalKeepAlive>().registry.clone());
+        assert_eq!(registry.lock().enabled_threads.len(), 3);
     }
 }

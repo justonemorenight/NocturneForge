@@ -110,6 +110,14 @@ pub struct DbThread {
     pub orchestration_run: Option<agent_orchestration::PersistedRun>,
     #[serde(default)]
     pub orchestration_goal: Option<agent_orchestration::GoalSnapshot>,
+    #[serde(default)]
+    pub pending_edits: Vec<DbPendingEdit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbPendingEdit {
+    pub path: PathBuf,
+    pub base_text: String,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -198,6 +206,7 @@ impl SharedThread {
             discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
+            pending_edits: Vec::new(),
         }
     }
 
@@ -420,6 +429,7 @@ impl DbThread {
             thinking_effort: None,
             orchestration_run: None,
             orchestration_goal: None,
+            pending_edits: Vec::new(),
             draft_prompt: None,
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
@@ -906,6 +916,7 @@ mod tests {
             discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
+            pending_edits: Vec::new(),
         }
     }
 
@@ -1209,6 +1220,7 @@ mod tests {
             parent_thread_id: parent_id.clone(),
             depth: 1,
             role: None,
+            root_session_id: None,
         });
 
         let mut grandchild_thread = make_thread(
@@ -1219,6 +1231,7 @@ mod tests {
             parent_thread_id: child_id.clone(),
             depth: 2,
             role: None,
+            root_session_id: None,
         });
 
         let unrelated_thread = make_thread(
@@ -1260,6 +1273,7 @@ mod tests {
             parent_thread_id: parent_id.clone(),
             depth: 2,
             role: Some(crate::SubagentRole::FlowReader),
+            root_session_id: None,
         });
 
         database

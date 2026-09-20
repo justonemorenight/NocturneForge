@@ -100,6 +100,7 @@ use zeroize::Zeroize;
 /// dependencies. Each repository has its own sequential worker, so without a
 /// project-wide bound their initial status scans can still saturate CPU and IO.
 const MAX_CONCURRENT_REPOSITORY_SCANS: usize = 8;
+const MAX_CONCURRENT_BLOB_READS: usize = 16;
 
 pub struct GitStore {
     state: GitStoreState,
@@ -116,6 +117,7 @@ pub struct GitStore {
     buffer_ids_by_index_text_buffer_id: HashMap<BufferId, BufferId>,
     shared_diffs: HashMap<proto::PeerId, HashMap<BufferId, SharedDiffs>>,
     scan_semaphore: Arc<Semaphore>,
+    blob_read_semaphore: Arc<Semaphore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -531,6 +533,7 @@ pub struct Repository {
     /// Shared by all repositories in this project. Only background status scans
     /// acquire it; explicit user Git operations keep their existing priority.
     scan_semaphore: Arc<Semaphore>,
+    blob_read_semaphore: Arc<Semaphore>,
     /// Waits for scan capacity before placing a status scan on this repository's
     /// serial worker. This prevents a throttled background scan from blocking
     /// explicit user Git operations queued behind it.
@@ -808,6 +811,7 @@ impl GitStore {
             diffs: HashMap::default(),
             buffer_ids_by_index_text_buffer_id: HashMap::default(),
             scan_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPOSITORY_SCANS)),
+            blob_read_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_READS)),
         }
     }
 
@@ -2576,6 +2580,7 @@ impl GitStore {
         let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
         let git_store = cx.weak_entity();
         let scan_semaphore = self.scan_semaphore.clone();
+        let blob_read_semaphore = self.blob_read_semaphore.clone();
         let repo = cx.new(|cx| {
             let mut repo = Repository::local(
                 id,
@@ -2588,6 +2593,7 @@ impl GitStore {
                 is_trusted,
                 git_store,
                 scan_semaphore,
+                blob_read_semaphore,
                 cx,
             );
             if let Some(updates_tx) = updates_tx.as_ref() {
@@ -3043,6 +3049,7 @@ impl GitStore {
 
             let mut repo_subscription = None;
             let scan_semaphore = this.scan_semaphore.clone();
+            let blob_read_semaphore = this.blob_read_semaphore.clone();
             let repo = this.repositories.entry(id).or_insert_with(|| {
                 let git_store = cx.weak_entity();
                 let repo = cx.new(|cx| {
@@ -3056,6 +3063,7 @@ impl GitStore {
                         client,
                         git_store,
                         scan_semaphore,
+                        blob_read_semaphore,
                         cx,
                     )
                 });
@@ -5913,6 +5921,7 @@ impl Repository {
         is_trusted: bool,
         git_store: WeakEntity<GitStore>,
         scan_semaphore: Arc<Semaphore>,
+        blob_read_semaphore: Arc<Semaphore>,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = RepositorySnapshot::empty(
@@ -5928,6 +5937,7 @@ impl Repository {
             this: cx.weak_entity(),
             git_store,
             scan_semaphore,
+            blob_read_semaphore,
             scan_wait_task: None,
             scan_in_flight: false,
             scan_requested: false,
@@ -5963,6 +5973,7 @@ impl Repository {
         client: AnyProtoClient,
         git_store: WeakEntity<GitStore>,
         scan_semaphore: Arc<Semaphore>,
+        blob_read_semaphore: Arc<Semaphore>,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = RepositorySnapshot::empty(
@@ -5985,6 +5996,7 @@ impl Repository {
             commit_message_buffer: None,
             git_store,
             scan_semaphore,
+            blob_read_semaphore,
             scan_wait_task: None,
             scan_in_flight: false,
             scan_requested: false,
@@ -9678,7 +9690,9 @@ impl Repository {
     fn load_blob_content(&self, oid: Oid, cx: &App) -> Task<Result<String>> {
         let repository_id = self.snapshot.id;
         let repository_state = self.repository_state.clone();
+        let blob_read_semaphore = self.blob_read_semaphore.clone();
         cx.background_spawn(async move {
+            let _permit = blob_read_semaphore.acquire_arc().await;
             match repository_state.await.map_err(|err| anyhow::anyhow!(err))? {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                     backend.load_blob_content(oid).await

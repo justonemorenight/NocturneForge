@@ -6434,6 +6434,90 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn test_edit_tools_follow_profile_and_subagent_edits_reach_parent_review(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({ "file.txt": "original" }))
+        .await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+    let environment = Rc::new(FakeThreadEnvironment::default());
+
+    let parent_thread = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model),
+            cx,
+        );
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+    let write_subagent = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&parent_thread, None, cx);
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+
+    for thread in [&parent_thread, &write_subagent] {
+        thread.read_with(cx, |thread, cx| {
+            let tools = thread.enabled_tools(cx);
+            assert!(tools.contains_key(ToolSearchTool::NAME));
+            assert!(tools.contains_key(EditFileTool::NAME));
+            assert!(tools.contains_key(WriteFileTool::NAME));
+        });
+    }
+
+    let file_path = project
+        .read_with(cx, |project, cx| {
+            project.find_project_path("test/file.txt", cx)
+        })
+        .unwrap();
+    let buffer = project
+        .update(cx, |project, cx| project.open_buffer(file_path, cx))
+        .await
+        .unwrap();
+    let subagent_action_log = write_subagent.read_with(cx, |thread, _| thread.action_log().clone());
+    cx.update(|cx| {
+        subagent_action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        buffer.update(cx, |buffer, cx| buffer.set_text("edited by subagent", cx));
+        subagent_action_log.update(cx, |log, cx| log.buffer_edited(buffer, cx));
+    });
+    cx.run_until_parked();
+
+    let parent_action_log = parent_thread.read_with(cx, |thread, _| thread.action_log().clone());
+    parent_action_log.read_with(cx, |log, cx| {
+        assert_eq!(log.changed_buffers(cx).count(), 1);
+    });
+
+    parent_thread.update(cx, |thread, cx| {
+        thread.set_profile(AgentProfileId("ask".into()), cx);
+    });
+    let ask_subagent = cx.new(|cx| {
+        let mut thread = Thread::new_subagent(&parent_thread, None, cx);
+        thread.add_default_tools(environment, cx);
+        thread
+    });
+    for thread in [&parent_thread, &ask_subagent] {
+        thread.read_with(cx, |thread, cx| {
+            let tools = thread.enabled_tools(cx);
+            assert!(tools.contains_key(ReadFileTool::NAME));
+            assert!(!tools.contains_key(EditFileTool::NAME));
+            assert!(!tools.contains_key(WriteFileTool::NAME));
+        });
+    }
+}
+
+#[gpui::test]
 async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -6550,6 +6634,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
             parent_thread_id: acp::SessionId::new("parent-id"),
             depth: MAX_SUBAGENT_DEPTH - 1,
             role: None,
+            root_session_id: None,
         });
         thread
     });
@@ -6678,23 +6763,16 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         tool_names.iter().any(|t| t == ToolSearchTool::NAME),
         "expected tool_search to be exposed, got: {tool_names:?}"
     );
-    assert!(
-        !tool_names.iter().any(|t| t == EditFileTool::NAME),
-        "edit_file should be lazy until discovered, got: {tool_names:?}"
-    );
+    for name in [EditFileTool::NAME, WriteFileTool::NAME] {
+        assert!(
+            tool_names.iter().any(|tool_name| tool_name == name),
+            "expected {name} in the initial write-profile request, got: {tool_names:?}"
+        );
+    }
     model.end_last_completion_stream();
     cx.run_until_parked();
 
     assert_empty_tool_search_discovers_optional_tool(&thread, cx);
-
-    thread
-        .update(cx, |thread, cx| {
-            thread.search_and_enable_tools(EditFileTool::NAME, Some(1), cx)
-        })
-        .unwrap();
-    thread.read_with(cx, |thread, cx| {
-        assert!(thread.enabled_tools(cx).contains_key(EditFileTool::NAME));
-    });
 
     // Enable the `lsp-tool` flag and send another message; the LSP tools
     // should now appear in the completion request.

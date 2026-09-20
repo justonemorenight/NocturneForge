@@ -41,7 +41,7 @@ use futures::{
 use futures::{StreamExt, stream};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EventEmitter, ReadGlobal as _, SharedString, Task,
-    WeakEntity,
+    TaskExt as _, WeakEntity,
 };
 use heck::ToSnakeCase as _;
 use language_model::{
@@ -319,6 +319,18 @@ pub struct SubagentContext {
     /// through the role-aware spawn flow.
     #[serde(default)]
     pub role: Option<SubagentRole>,
+
+    /// Root thread ID used for cache affinity
+    #[serde(default)]
+    pub root_session_id: Option<acp::SessionId>,
+}
+
+impl SubagentContext {
+    pub fn root_session_id(&self) -> &acp::SessionId {
+        self.root_session_id
+            .as_ref()
+            .unwrap_or(&self.parent_thread_id)
+    }
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -1569,7 +1581,7 @@ pub enum NativePlanStatus {
 
 pub struct Thread {
     id: acp::SessionId,
-    fork_origin: Option<crate::ForkOrigin>,
+    pub(crate) fork_origin: Option<crate::ForkOrigin>,
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
     title: Option<SharedString>,
@@ -1680,10 +1692,13 @@ impl Thread {
             action_log,
             cx,
         );
+        let parent = parent_thread.read(cx);
+        let root_session_id = parent.root_session_id();
         thread.subagent_context = Some(SubagentContext {
-            parent_thread_id: parent_thread.read(cx).id().clone(),
-            depth: parent_thread.read(cx).depth() + 1,
+            parent_thread_id: parent.id().clone(),
+            depth: parent.depth() + 1,
             role,
+            root_session_id: Some(root_session_id),
         });
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(role) = role {
@@ -1854,6 +1869,20 @@ impl Thread {
 
     pub fn id(&self) -> &acp::SessionId {
         &self.id
+    }
+
+    pub fn root_session_id(&self) -> acp::SessionId {
+        if let Some(subagent_context) = &self.subagent_context {
+            subagent_context.root_session_id().clone()
+        } else if let Some(fork_origin) = &self.fork_origin {
+            fork_origin.root_session_id().clone()
+        } else {
+            self.id.clone()
+        }
+    }
+
+    pub fn prompt_cache_affinity(&self) -> String {
+        self.root_session_id().to_string()
     }
 
     // Only used by Seatbelt-style sandboxes (macOS); Linux relies on bwrap's
@@ -2187,6 +2216,7 @@ impl Thread {
         );
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let pending_edits = db_thread.pending_edits.clone();
 
         let orchestration_goal = db_thread.orchestration_goal.and_then(|snapshot| {
             agent_orchestration::GoalController::restore(
@@ -2199,7 +2229,7 @@ impl Thread {
             .ok()
         });
 
-        Self {
+        let thread = Self {
             id,
             prompt_id: PromptId::new(),
             title: if db_thread.title.is_empty() {
@@ -2265,7 +2295,32 @@ impl Thread {
                 .tool_filter
                 .map(|tools| tools.into_iter().collect()),
             discovered_tools: db_thread.discovered_tools.into_iter().collect(),
+        };
+        if !pending_edits.is_empty() {
+            let project = thread.project.clone();
+            let action_log = thread.action_log.clone();
+            cx.spawn(async move |_this, cx| {
+                for edit in pending_edits {
+                    let Some(path) = project
+                        .read_with(cx, |project, cx| project.find_project_path(&edit.path, cx))
+                    else {
+                        continue;
+                    };
+                    let Ok(buffer) = project
+                        .update(cx, |project, cx| project.open_buffer(path, cx))
+                        .await
+                    else {
+                        continue;
+                    };
+                    action_log.update(cx, |log, cx| {
+                        log.restore_pending_edit(buffer, edit.base_text, cx);
+                    });
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
         }
+        thread
     }
 
     pub fn sandbox_status(&self, cx: &App) -> Option<(ThreadSandbox, ThreadSandbox)> {
@@ -2339,6 +2394,13 @@ impl Thread {
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
+        let pending_edits = self
+            .action_log
+            .read(cx)
+            .pending_edits(cx)
+            .into_iter()
+            .map(|(path, base_text)| crate::db::DbPendingEdit { path, base_text })
+            .collect();
         let mut thread = DbThread {
             fork_origin: self.fork_origin.clone(),
             title: self.title().unwrap_or_default(),
@@ -2386,6 +2448,7 @@ impl Thread {
                 .orchestration_goal
                 .as_ref()
                 .map(agent_orchestration::GoalController::snapshot),
+            pending_edits,
         };
 
         cx.background_spawn(async move {
@@ -2495,7 +2558,7 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
-        cache_keepalive::invalidate(&self.id.to_string(), cx);
+        cache_keepalive::invalidate(&self.prompt_cache_affinity(), cx);
         let old_usage = self.latest_token_usage();
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model().map(|model| model.as_ref()));
@@ -2693,11 +2756,14 @@ impl Thread {
         ));
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
-        self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
-        self.add_tool(SandboxedTerminalTool::new(
-            self.project.clone(),
-            environment.clone(),
-        ));
+        self.add_tool(
+            TerminalTool::new(self.project.clone(), environment.clone())
+                .with_action_log(self.action_log.clone()),
+        );
+        self.add_tool(
+            SandboxedTerminalTool::new(self.project.clone(), environment.clone())
+                .with_action_log(self.action_log.clone()),
+        );
         self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
@@ -3128,7 +3194,7 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        cache_keepalive::invalidate(&self.id.to_string(), cx);
+        cache_keepalive::invalidate(&self.prompt_cache_affinity(), cx);
         if let Some(run) = self.orchestration_run.clone()
             && !run.state().is_terminal()
         {
@@ -4298,6 +4364,11 @@ impl Thread {
                         "Prompt is too large and there is no earlier context that can be compacted"
                     )
                 })?;
+            if insertion_ix == 0 {
+                return Err(anyhow!(
+                    "The initial prompt exceeds the model context window and cannot be compacted."
+                ));
+            }
             let target = CompactionTarget::new(&this.messages, insertion_ix)?;
             let operation = this.compaction_operation(cx)?;
             this.current_request_token_usage = TokenUsage::default();
@@ -5448,7 +5519,7 @@ impl Thread {
 
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
-            prompt_cache_key: None,
+            prompt_cache_key: Some(self.prompt_cache_affinity()),
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(completion_intent),
             messages,
@@ -5494,6 +5565,7 @@ impl Thread {
                 | AskUserTool::NAME
                 | DiagnosticsTool::NAME
                 | ApplyCodeActionTool::NAME
+                | EditFileTool::NAME
                 | FindPathTool::NAME
                 | FindReferencesTool::NAME
                 | GetCodeActionsTool::NAME
@@ -5504,6 +5576,7 @@ impl Thread {
                 | RenameTool::NAME
                 | TerminalTool::NAME
                 | UpdatePlanTool::NAME
+                | WriteFileTool::NAME
                 | ListAgentsAndModelsTool::NAME
                 | ListOrchestrationAgentsTool::NAME
                 | SendMessageToAgentTool::NAME
@@ -6129,8 +6202,13 @@ impl Thread {
             .unwrap_or(self.messages.len());
 
         if insertion_ix == 0 {
+            let safe_input_tokens =
+                max_input_tokens.saturating_mul(REQUEST_TOKEN_ESTIMATE_SAFETY_PERCENT) / 100;
+            if estimated_tokens <= safe_input_tokens {
+                return Ok(None);
+            }
             return Err(anyhow!(
-                "Automatic compaction has no historical context to summarize"
+                "The initial prompt exceeds the model context window and cannot be compacted."
             ));
         }
 
@@ -9874,6 +9952,91 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_compaction_allows_first_pending_user_message_within_safe_budget(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_max_token_count(100_000);
+
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.75),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "initial prompt",
+                ));
+
+                assert_eq!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::UserPrompt,
+                            75_000,
+                            false,
+                            cx,
+                        )
+                        .unwrap(),
+                    None
+                );
+                assert_eq!(
+                    thread
+                        .compaction_target_ix_for_request(
+                            CompletionIntent::UserPrompt,
+                            95_000,
+                            false,
+                            cx,
+                        )
+                        .unwrap(),
+                    None
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_rejects_oversized_first_prompt(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_max_token_count(100_000);
+
+        cx.update(|cx| {
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: AutoCompactThreshold::Percentage(0.75),
+                },
+            );
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "initial prompt",
+                ));
+
+                let error = thread
+                    .compaction_target_ix_for_request(
+                        CompletionIntent::UserPrompt,
+                        95_001,
+                        false,
+                        cx,
+                    )
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("exceeds the model context window"));
+                assert!(error.contains("cannot be compacted"));
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn test_compaction_threshold_ignores_usage_before_latest_compaction(
         cx: &mut TestAppContext,
     ) {
@@ -10366,6 +10529,41 @@ mod tests {
                 assert!(matches!(&*thread.messages[3], Message::User(_)));
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_recover_from_prompt_too_large_rejects_initial_prompt(cx: &mut TestAppContext) {
+        let (thread, event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model, cx);
+                thread.messages.push(user_text_message(
+                    ClientUserMessageId::new(),
+                    "initial prompt",
+                ));
+            });
+        });
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            let event_stream = event_stream.clone();
+            async move |mut cx| {
+                Thread::recover_from_prompt_too_large(
+                    &thread,
+                    &event_stream,
+                    cancel_rx,
+                    CompletionIntent::UserPrompt,
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        let error = task.await.unwrap_err().to_string();
+        assert!(error.contains("exceeds the model context window"));
+        assert!(error.contains("cannot be compacted"));
     }
 
     #[gpui::test]
@@ -11616,6 +11814,7 @@ mod tests {
                 thread.execution_strategy = AgentExecutionStrategy::Auto;
                 thread.fork_origin = Some(crate::ForkOrigin {
                     session_id: acp::SessionId::new("source"),
+                    root_session_id: None,
                     checkpoint_user_message_id: baseline_id.clone(),
                     inherited_message_count: 2,
                     inherited_user_message_ids: [baseline_id.clone()].into_iter().collect(),
@@ -12036,5 +12235,72 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+    #[test]
+    fn test_subagent_context_serde_defaults_root_session_id() {
+        let legacy_json = serde_json::json!({
+            "parent_thread_id": "parent-123",
+            "depth": 1,
+            "role": null
+        });
+        let context: SubagentContext = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            context.root_session_id(),
+            &acp::SessionId::new("parent-123")
+        );
+
+        let explicit_json = serde_json::json!({
+            "parent_thread_id": "parent-123",
+            "depth": 2,
+            "role": null,
+            "root_session_id": "root-abc"
+        });
+        let explicit_context: SubagentContext = serde_json::from_value(explicit_json).unwrap();
+        assert_eq!(
+            explicit_context.root_session_id(),
+            &acp::SessionId::new("root-abc")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cache_affinity_inheritance_and_completion_request(cx: &mut gpui::TestAppContext) {
+        let (root_thread, _stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| {
+            root_thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+            });
+        });
+        let root_id = root_thread.read_with(cx, |thread, _| thread.id().clone());
+        let root_affinity = root_thread.read_with(cx, |thread, _| thread.prompt_cache_affinity());
+        assert_eq!(root_affinity, root_id.to_string());
+
+        let subagent_thread = cx.update(|cx| {
+            cx.new(|cx| Thread::new_subagent(&root_thread, Some(SubagentRole::CodingWorker), cx))
+        });
+
+        let subagent_affinity =
+            subagent_thread.read_with(cx, |thread, _| thread.prompt_cache_affinity());
+        assert_eq!(subagent_affinity, root_id.to_string());
+
+        let request = root_thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            request.prompt_cache_key.as_deref(),
+            Some(root_id.0.as_ref())
+        );
+
+        let subagent_request = subagent_thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            subagent_request.prompt_cache_key.as_deref(),
+            Some(root_id.0.as_ref())
+        );
     }
 }

@@ -6,9 +6,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForkOrigin {
     pub session_id: acp::SessionId,
+    #[serde(default)]
+    pub root_session_id: Option<acp::SessionId>,
     pub checkpoint_user_message_id: acp_thread::ClientUserMessageId,
     pub inherited_message_count: usize,
     pub inherited_user_message_ids: collections::HashSet<acp_thread::ClientUserMessageId>,
+}
+
+impl ForkOrigin {
+    pub fn root_session_id(&self) -> &acp::SessionId {
+        self.root_session_id.as_ref().unwrap_or(&self.session_id)
+    }
 }
 
 pub(crate) fn prepare_fork(
@@ -51,9 +59,15 @@ pub(crate) fn prepare_fork(
             }
         }
     }
+    let root_session_id = snapshot
+        .fork_origin
+        .as_ref()
+        .map(|origin| origin.root_session_id().clone())
+        .unwrap_or_else(|| source_session_id.clone());
     snapshot.messages.truncate(boundary);
     snapshot.fork_origin = Some(ForkOrigin {
         session_id: source_session_id,
+        root_session_id: Some(root_session_id),
         checkpoint_user_message_id: checkpoint,
         inherited_message_count: boundary,
         inherited_user_message_ids: snapshot
@@ -80,6 +94,7 @@ pub(crate) fn prepare_fork(
     snapshot.discovered_tools.clear();
     snapshot.orchestration_run = None;
     snapshot.orchestration_goal = None;
+    snapshot.pending_edits.clear();
     Ok(snapshot)
 }
 
@@ -153,6 +168,10 @@ mod tests {
         source.discovered_tools = vec!["terminal".into()];
         source.tool_filter = Some(vec!["read_file".into()]);
         source.thinking_effort = Some("high".into());
+        source.pending_edits.push(crate::db::DbPendingEdit {
+            path: "/tmp/file.rs".into(),
+            base_text: "before".into(),
+        });
         let fork = prepare_fork(source, acp::SessionId::new("parent"), "focused".into()).unwrap();
         assert!(fork.detailed_summary.is_none());
         assert!(fork.sandboxed_terminal_temp_dir.is_none());
@@ -161,6 +180,7 @@ mod tests {
         assert!(fork.discovered_tools.is_empty());
         assert_eq!(fork.tool_filter, Some(vec!["read_file".into()]));
         assert_eq!(fork.thinking_effort.as_deref(), Some("high"));
+        assert!(fork.pending_edits.is_empty());
     }
 
     #[test]
@@ -235,5 +255,72 @@ mod tests {
             baseline.id
         );
         assert_eq!(fork.messages.len(), 4);
+    }
+    #[test]
+    fn nested_fork_preserves_root_affinity() {
+        let messages = vec![user(), answer("first turn"), user(), answer("second turn")];
+        let root = snapshot(messages);
+        let first_fork = prepare_fork(
+            root,
+            acp::SessionId::new("root-session"),
+            "first branch".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            first_fork.fork_origin.as_ref().unwrap().session_id,
+            acp::SessionId::new("root-session")
+        );
+        assert_eq!(
+            first_fork.fork_origin.as_ref().unwrap().root_session_id(),
+            &acp::SessionId::new("root-session")
+        );
+
+        let mut first_fork = first_fork;
+        first_fork
+            .messages
+            .extend([user(), answer("in first fork"), user()]);
+        let second_fork = prepare_fork(
+            first_fork,
+            acp::SessionId::new("fork-1-session"),
+            "second branch".into(),
+        )
+        .unwrap();
+        let second_origin = second_fork.fork_origin.as_ref().unwrap();
+        assert_eq!(
+            second_origin.session_id,
+            acp::SessionId::new("fork-1-session")
+        );
+        assert_eq!(
+            second_origin.root_session_id(),
+            &acp::SessionId::new("root-session")
+        );
+    }
+
+    #[test]
+    fn legacy_fork_origin_deserialization_defaults_root_to_parent() {
+        let legacy_json = serde_json::json!({
+            "session_id": "legacy-parent",
+            "checkpoint_user_message_id": ClientUserMessageId::new(),
+            "inherited_message_count": 2,
+            "inherited_user_message_ids": []
+        });
+        let legacy_origin: ForkOrigin = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy_origin.root_session_id(),
+            &acp::SessionId::new("legacy-parent")
+        );
+
+        let mut legacy_snapshot = snapshot(vec![user(), answer("restored"), user()]);
+        legacy_snapshot.fork_origin = Some(legacy_origin);
+        let derived_fork = prepare_fork(
+            legacy_snapshot,
+            acp::SessionId::new("resumed-fork"),
+            "derived".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            derived_fork.fork_origin.as_ref().unwrap().root_session_id(),
+            &acp::SessionId::new("legacy-parent")
+        );
     }
 }

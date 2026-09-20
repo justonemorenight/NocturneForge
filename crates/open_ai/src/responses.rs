@@ -337,6 +337,20 @@ pub enum ResponseInputItem {
     Reasoning(ResponseReasoningInputItem),
     Compaction(ResponseCompactionItem),
     CompactionTrigger,
+    ConfigurationUpdate(ResponseConfigurationUpdateItem),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseConfigurationReasoning {
+    pub effort: ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseConfigurationUpdateItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponseConfigurationReasoning>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1642,6 +1656,42 @@ mod tests {
             ),
             prompt_cache_key: Some("thread-123".to_string()),
             service_tier: Some(ServiceTier::Priority),
+        }
+    }
+
+    #[test]
+    fn test_response_configuration_update_item_serialization_round_trip() {
+        let item = ResponseInputItem::ConfigurationUpdate(ResponseConfigurationUpdateItem {
+            id: None,
+            reasoning: Some(ResponseConfigurationReasoning {
+                effort: ReasoningEffort::High,
+            }),
+        });
+
+        let serialized = serde_json::to_value(&item).expect("serialization should succeed");
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "type": "configuration_update",
+                "reasoning": {
+                    "effort": "high"
+                }
+            })
+        );
+
+        let deserialized: ResponseInputItem =
+            serde_json::from_value(serialized).expect("deserialization should succeed");
+        match deserialized {
+            ResponseInputItem::ConfigurationUpdate(update) => {
+                assert_eq!(
+                    update.reasoning,
+                    Some(ResponseConfigurationReasoning {
+                        effort: ReasoningEffort::High
+                    })
+                );
+                assert_eq!(update.id, None);
+            }
+            _ => panic!("expected ConfigurationUpdate variant"),
         }
     }
 }

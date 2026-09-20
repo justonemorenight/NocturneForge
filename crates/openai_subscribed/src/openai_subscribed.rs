@@ -1286,6 +1286,10 @@ impl ChatGptModel {
         true
     }
 
+    pub fn supports_configuration_update(&self) -> bool {
+        open_ai::model_supports_configuration_update(&self.id)
+    }
+
     pub fn supports_priority(&self) -> bool {
         self.supports_priority
     }
@@ -1797,6 +1801,18 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     "ChatGPT account changed while preparing request"
                 )));
             }
+            let effective_reasoning_effort = if request.thinking_allowed {
+                request
+                    .thinking_effort
+                    .as_deref()
+                    .and_then(|effort| effort.parse::<ReasoningEffort>().ok())
+                    .filter(|effort| *effort != ReasoningEffort::None)
+                    .or(default_reasoning_effort)
+            } else if supports_none_reasoning_effort {
+                Some(ReasoningEffort::None)
+            } else {
+                None
+            };
             let mut responses_request = into_open_ai_response_with_account_scope(
                 request,
                 &model_id,
@@ -1842,13 +1858,14 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     }
                 })
                 .await
-                .map(|stream| (stream, account_scope, operation_guard))
+                .map(|stream| (stream, account_scope, operation_guard, effective_reasoning_effort))
         });
 
         async move {
-            let (stream, account_scope, operation_guard) = future.await?;
+            let (stream, account_scope, operation_guard, effective_reasoning_effort) = future.await?;
             let mapper =
-                OpenAiResponseEventMapper::new_with_account_scope(PROVIDER_ID, account_scope);
+                OpenAiResponseEventMapper::new_with_account_scope(PROVIDER_ID, account_scope)
+                    .with_effective_reasoning_effort(effective_reasoning_effort);
             let stream = language_model::stream_in_background(
                 mapper.map_stream(stream.boxed()).boxed(),
                 background_executor.clone(),

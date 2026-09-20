@@ -1,3 +1,4 @@
+use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use futures::FutureExt as _;
@@ -228,6 +229,7 @@ impl From<SandboxedTerminalToolInput> for TerminalToolRequest {
 pub struct TerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    action_log: Option<Entity<ActionLog>>,
 }
 
 impl TerminalTool {
@@ -235,13 +237,20 @@ impl TerminalTool {
         Self {
             project,
             environment,
+            action_log: None,
         }
+    }
+
+    pub fn with_action_log(mut self, action_log: Entity<ActionLog>) -> Self {
+        self.action_log = Some(action_log);
+        self
     }
 }
 
 pub struct SandboxedTerminalTool {
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    action_log: Option<Entity<ActionLog>>,
 }
 
 impl SandboxedTerminalTool {
@@ -249,7 +258,13 @@ impl SandboxedTerminalTool {
         Self {
             project,
             environment,
+            action_log: None,
         }
+    }
+
+    pub fn with_action_log(mut self, action_log: Entity<ActionLog>) -> Self {
+        self.action_log = Some(action_log);
+        self
     }
 }
 
@@ -286,6 +301,7 @@ impl AgentTool for TerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.action_log.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -328,6 +344,7 @@ impl AgentTool for SandboxedTerminalTool {
             run_terminal_tool(
                 self.project.clone(),
                 self.environment.clone(),
+                self.action_log.clone(),
                 input.into(),
                 event_stream,
                 cx,
@@ -379,6 +396,7 @@ fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
 async fn run_terminal_tool(
     project: Entity<Project>,
     environment: Rc<dyn ThreadEnvironment>,
+    action_log: Option<Entity<ActionLog>>,
     input: TerminalToolRequest,
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
@@ -408,6 +426,33 @@ async fn run_terminal_tool(
         })?;
 
     authorize.await.map_err(|e| e.to_string())?;
+
+    let tracked_terminal_buffers = if let Some(action_log) = &action_log {
+        let buffers = cx.update(|cx| project.read(cx).opened_buffers(cx));
+        let fs = cx.update(|cx| project.read(cx).fs().clone());
+        let mut tracked = Vec::new();
+        for buffer in buffers {
+            let Some(path) = cx.update(|cx| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .and_then(|file| file.as_local())
+                    .map(|file| file.abs_path(cx))
+            }) else {
+                continue;
+            };
+            let Ok(contents) = fs.load(&path).await else {
+                continue;
+            };
+            cx.update(|cx| {
+                action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            });
+            tracked.push((buffer, path, contents));
+        }
+        tracked
+    } else {
+        Vec::new()
+    };
 
     let want_fs_write_all = sandboxing && sandbox_input.allow_fs_write_all == Some(true);
     let want_unsandboxed = sandboxing && sandbox_input.unsandboxed == Some(true);
@@ -931,6 +976,34 @@ async fn run_terminal_tool(
         output_byte_limit,
     );
     let notes = sandbox_note.into_iter().collect::<Vec<_>>();
+    if let Some(action_log) = action_log {
+        let fs = cx.update(|cx| project.read(cx).fs().clone());
+        let mut buffers = Vec::new();
+        for (buffer, path, previous_contents) in tracked_terminal_buffers {
+            if fs
+                .load(&path)
+                .await
+                .is_ok_and(|contents| contents != previous_contents)
+            {
+                buffers.push(buffer);
+            }
+        }
+        if !buffers.is_empty() {
+            project
+                .update(cx, |project, cx| {
+                    project.reload_buffers(buffers.iter().cloned().collect(), false, cx)
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            cx.update(|cx| {
+                action_log.update(cx, |log, cx| {
+                    for buffer in buffers {
+                        log.buffer_edited(buffer, cx);
+                    }
+                });
+            });
+        }
+    }
     Ok(if notes.is_empty() {
         result
     } else {

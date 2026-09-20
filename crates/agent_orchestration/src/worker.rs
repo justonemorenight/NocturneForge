@@ -651,6 +651,21 @@ pub trait WorkerHost: 'static {
         task: &OrchestrationTask,
         context: &TaskExecutionContext,
     ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>>;
+
+    /// Cancel an active turn for an externally hosted worker.
+    fn cancel(&self, _session_id: acp::SessionId) -> LocalBoxFuture<'static, Result<()>> {
+        Box::pin(async { bail!("cancellation is not supported by this worker host") })
+    }
+
+    /// Deliver a deferred or interrupting message to an externally hosted worker.
+    fn deliver_message(
+        &self,
+        _session_id: acp::SessionId,
+        _message: String,
+        _interrupt: bool,
+    ) -> LocalBoxFuture<'static, Result<()>> {
+        Box::pin(async { bail!("active messaging is not supported by this worker host") })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -966,7 +981,22 @@ impl TaskExecutor for WorkerBroker {
         {
             return executor.cancel(task, session_id);
         }
-        Box::pin(async { Ok(()) })
+        if let WorkerTarget::Acp { .. } = &task.target
+            && let Some(host) = self.host_registry.get(&task.target)
+        {
+            if !host.capabilities().can_cancel {
+                let target = task.target.clone();
+                return Box::pin(async move {
+                    bail!("cancellation is not supported for worker target '{target}'")
+                });
+            }
+            if let Some(session_id) = session_id {
+                return host.cancel(session_id);
+            }
+            return Box::pin(async { Ok(()) });
+        }
+        let target = task.target.clone();
+        Box::pin(async move { bail!("cancellation is not supported for worker target '{target}'") })
     }
 
     fn deliver_message(
@@ -980,6 +1010,11 @@ impl TaskExecutor for WorkerBroker {
             && let Some(executor) = self.native_executor.clone()
         {
             return executor.deliver_message(task, session_id, message, interrupt);
+        }
+        if let WorkerTarget::Acp { .. } = &task.target
+            && let Some(host) = self.host_registry.get(&task.target)
+        {
+            return host.deliver_message(session_id, message, interrupt);
         }
         let target = task.target.clone();
         Box::pin(
@@ -1055,5 +1090,100 @@ impl TaskExecutor for WorkerBroker {
             .await?;
             execute_external_worker(worker, repair_context).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UnimplementedHost;
+    impl WorkerHost for UnimplementedHost {
+        fn target(&self) -> WorkerTarget {
+            WorkerTarget::acp("unimplemented")
+        }
+        fn capabilities(&self) -> CapabilitySnapshot {
+            CapabilitySnapshot {
+                can_cancel: false,
+                ..CapabilitySnapshot::omp_default()
+            }
+        }
+        fn create_worker(
+            &self,
+            _task: &OrchestrationTask,
+            _context: &TaskExecutionContext,
+        ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>> {
+            Box::pin(async { bail!("not implemented") })
+        }
+        fn resume_worker(
+            &self,
+            _session_id: &acp::SessionId,
+            _task: &OrchestrationTask,
+            _context: &TaskExecutionContext,
+        ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>> {
+            Box::pin(async { bail!("not implemented") })
+        }
+    }
+
+    struct DummyHostWithoutCancelOverride;
+    impl WorkerHost for DummyHostWithoutCancelOverride {
+        fn target(&self) -> WorkerTarget {
+            WorkerTarget::acp("no-override")
+        }
+        fn capabilities(&self) -> CapabilitySnapshot {
+            CapabilitySnapshot {
+                can_cancel: true,
+                ..CapabilitySnapshot::omp_default()
+            }
+        }
+        fn create_worker(
+            &self,
+            _task: &OrchestrationTask,
+            _context: &TaskExecutionContext,
+        ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>> {
+            Box::pin(async { bail!("not implemented") })
+        }
+        fn resume_worker(
+            &self,
+            _session_id: &acp::SessionId,
+            _task: &OrchestrationTask,
+            _context: &TaskExecutionContext,
+        ) -> LocalBoxFuture<'static, Result<Box<dyn WorkerHandle>>> {
+            Box::pin(async { bail!("not implemented") })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_default_worker_host_cancel_returns_unsupported_error() {
+        let host = DummyHostWithoutCancelOverride;
+        let result = host.cancel(acp::SessionId::new("test-session")).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cancellation is not supported"));
+    }
+
+    #[gpui::test]
+    async fn test_broker_cancel_rejects_uncapable_host() {
+        let mut registry = WorkerHostRegistry::new();
+        registry.register(
+            WorkerTarget::acp("unimplemented"),
+            Rc::new(UnimplementedHost),
+        );
+        let broker = WorkerBroker::new(true).with_host_registry(registry);
+
+        let mut task = OrchestrationTask::new("t1", "T1", "desc");
+        task.target = WorkerTarget::acp("unimplemented");
+        let result = broker.cancel(&task, Some(acp::SessionId::new("s1"))).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cancellation is not supported"));
+    }
+
+    #[gpui::test]
+    async fn test_broker_cancel_rejects_unregistered_host() {
+        let broker = WorkerBroker::new(true);
+        let mut task = OrchestrationTask::new("t1", "T1", "desc");
+        task.target = WorkerTarget::acp("missing");
+        let result = broker.cancel(&task, Some(acp::SessionId::new("s1"))).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("cancellation is not supported"));
     }
 }
