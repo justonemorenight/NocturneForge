@@ -5675,6 +5675,21 @@ mod internal_tests {
             (session.thread.clone(), session.project_id)
         });
         assert_eq!(parent_project_id, project_id);
+        let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
+        parent_thread.update(cx, |thread, cx| {
+            thread.push_acp_user_block(
+                ClientUserMessageId::new(),
+                [acp::ContentBlock::Text(acp::TextContent::new(
+                    "parent transcript sentinel",
+                ))],
+                path_style,
+                cx,
+            );
+        });
+        assert_eq!(
+            parent_thread.read_with(cx, |thread, _| thread.message_count()),
+            1
+        );
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.

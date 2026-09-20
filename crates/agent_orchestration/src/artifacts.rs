@@ -128,24 +128,7 @@ pub fn truncate_text(mut text: String, max_bytes: usize) -> String {
 /// - Preserves substantive findings, file references, and test outcomes
 pub fn sanitize_dependency_output(output: &str) -> String {
     let stripped = crate::verification::output_without_verification_claim(output);
-
-    // Strip ANSI escape codes
-    let mut cleaned = String::with_capacity(stripped.len());
-    let mut chars = stripped.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            if let Some(&'[') = chars.peek() {
-                chars.next();
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        cleaned.push(ch);
-    }
+    let cleaned = strip_terminal_control_sequences(stripped);
 
     // Collapse more than 2 consecutive newlines into 2
     let mut result = String::with_capacity(cleaned.len());
@@ -162,6 +145,68 @@ pub fn sanitize_dependency_output(output: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+fn strip_terminal_control_sequences(input: &str) -> String {
+    let mut cleaned = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\x1b' => consume_escape_sequence(&mut chars),
+            '\u{009b}' => consume_control_sequence(&mut chars),
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                consume_string_sequence(&mut chars)
+            }
+            '\r' => {
+                if !cleaned.ends_with('\n') {
+                    cleaned.push('\n');
+                }
+            }
+            '\n' | '\t' => cleaned.push(character),
+            character if character.is_control() => {}
+            character => cleaned.push(character),
+        }
+    }
+    cleaned
+}
+
+fn consume_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        Some('[') => consume_control_sequence(chars),
+        Some(']' | 'P' | 'X' | '^' | '_') => consume_string_sequence(chars),
+        Some(character) if (' '..='/').contains(&character) => consume_escape_final(chars),
+        Some(_) | None => {}
+    }
+}
+
+fn consume_escape_final(chars: &mut impl Iterator<Item = char>) {
+    for character in chars {
+        if character.is_ascii() && ('0'..='~').contains(&character) {
+            break;
+        }
+    }
+}
+
+fn consume_control_sequence(chars: &mut impl Iterator<Item = char>) {
+    for character in chars {
+        if character.is_ascii() && ('@'..='~').contains(&character) {
+            break;
+        }
+    }
+}
+
+fn consume_string_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = chars.next() {
+        if character == '\x07' {
+            break;
+        }
+        if character == '\u{009c}' {
+            break;
+        }
+        if character == '\x1b' && chars.next_if_eq(&'\\').is_some() {
+            break;
+        }
+    }
 }
 
 impl ArtifactStore {
@@ -254,5 +299,20 @@ mod tests {
         );
         let sanitized = sanitize_dependency_output(&raw_output);
         assert_eq!(sanitized, "PASS tests passed\n\nFinished in 0.1s");
+    }
+
+    #[test]
+    fn sanitize_dependency_output_strips_terminal_control_sequences() {
+        let raw_output = concat!(
+            "before\x1b]8;;https://example.com\x07linked\x1b]8;;\x1b\\ after\n",
+            "progress 10%\rprogress 100%\n",
+            "hidden\x08 text\x1b7\x1b(Bdone\n",
+            "\u{009b}31mgreen\u{009b}0m \u{009d}title\u{009c}plain",
+        );
+
+        assert_eq!(
+            sanitize_dependency_output(raw_output),
+            "beforelinked after\nprogress 10%\nprogress 100%\nhidden textdone\ngreen plain"
+        );
     }
 }

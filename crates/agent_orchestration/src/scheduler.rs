@@ -15,9 +15,7 @@ use crate::residency::AgentResidencyManager;
 use crate::state::{RunState, TaskState};
 use crate::task_mutation::TaskMutationGateway;
 use crate::task_registry::TaskRegistry;
-use crate::verification::{
-    VerificationPolicy, VerificationResult, output_without_verification_claim,
-};
+use crate::verification::{VerificationPolicy, VerificationResult};
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use collections::HashSet;
@@ -432,17 +430,19 @@ impl Scheduler {
             if remaining_bytes == 0 {
                 break;
             }
-            let output = self
+            let sanitized_output = self
                 .task_registry
                 .status(dependency_id)
                 .and_then(|status| status.latest_output)
-                .map(|output| {
-                    let output = sanitize_dependency_output(&output);
-                    let output =
-                        truncate_text(output, MAX_DEPENDENCY_OUTPUT_BYTES.min(remaining_bytes));
-                    remaining_bytes = remaining_bytes.saturating_sub(output.len());
-                    output
-                });
+                .map(|output| sanitize_dependency_output(&output));
+            let output = sanitized_output.as_ref().map(|output| {
+                let output = truncate_text(
+                    output.clone(),
+                    MAX_DEPENDENCY_OUTPUT_BYTES.min(remaining_bytes),
+                );
+                remaining_bytes = remaining_bytes.saturating_sub(output.len());
+                output
+            });
 
             let mut artifacts = Vec::new();
             for mut artifact in self
@@ -455,7 +455,10 @@ impl Scheduler {
                     break;
                 }
                 if artifact.kind == ArtifactKind::Text {
-                    artifact.data = output_without_verification_claim(&artifact.data).to_string();
+                    artifact.data = sanitize_dependency_output(&artifact.data);
+                    if sanitized_output.as_deref() == Some(artifact.data.as_str()) {
+                        continue;
+                    }
                 }
                 artifact.data = truncate_text(artifact.data, remaining_bytes);
                 remaining_bytes = remaining_bytes.saturating_sub(artifact.data.len());

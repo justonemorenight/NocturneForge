@@ -1316,21 +1316,26 @@ mod tests {
                     let verification = format!(
                         "\n{VERIFICATION_START}{{\"criteria\":[],\"expected_output_satisfied\":true,\"citations\":[]}}{VERIFICATION_END}"
                     );
-                    return Ok(TaskExecutionOutput::new(format!(
-                        "{}{verification}",
+                    let raw_output = format!(
+                        "\x1b]8;;https://example.com\x07{}\x1b]8;;\x1b\\{verification}",
                         "o".repeat(64 * 1024)
-                    ))
-                    .with_artifacts(
-                        (0..20)
-                            .map(|index| {
-                                Artifact::new(
-                                    context.task.id.clone(),
-                                    format!("artifact-{index}"),
-                                    ArtifactKind::Text,
-                                    format!("{}{verification}", "a".repeat(32 * 1024)),
-                                )
-                            })
-                            .collect(),
+                    );
+                    return Ok(TaskExecutionOutput::new(raw_output.clone()).with_artifacts(
+                        std::iter::once(Artifact::new(
+                            context.task.id.clone(),
+                            "duplicate-output",
+                            ArtifactKind::Text,
+                            raw_output,
+                        ))
+                        .chain((0..20).map(|index| {
+                            Artifact::new(
+                                context.task.id.clone(),
+                                format!("artifact-{index}"),
+                                ArtifactKind::Text,
+                                format!("{}{verification}", "a".repeat(32 * 1024)),
+                            )
+                        }))
+                        .collect(),
                     ));
                 }
                 captured.lock().replace(context.dependency_inputs);
@@ -1375,8 +1380,11 @@ mod tests {
             inputs[0]
                 .artifacts
                 .iter()
-                .all(|artifact| !artifact.data.contains(VERIFICATION_START))
+                .all(|artifact| artifact.name != "duplicate-output")
         );
+        assert!(inputs[0].artifacts.iter().all(|artifact| {
+            !artifact.data.contains(VERIFICATION_START) && !artifact.data.contains('\x1b')
+        }));
         let total_bytes = inputs
             .iter()
             .map(|input| {

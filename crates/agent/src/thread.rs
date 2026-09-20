@@ -2511,7 +2511,8 @@ impl Thread {
         self.messages.is_empty() && self.title.is_none()
     }
 
-    pub fn message_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn message_count(&self) -> usize {
         self.messages.len()
     }
 
