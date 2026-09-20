@@ -4,7 +4,7 @@ NocturneForge is an independent, AI-native code editor built on the open-source
 [Zed](https://github.com/zed-industries/zed) foundation. It is developed by
 `justonemorenight` and is not an official product of Zed Industries.
 
-The project keeps Zed's full Git ancestry and tracks the upstream repository so
+NocturneForge keeps Zed's full Git ancestry and tracks the upstream repository so
 that fixes and improvements can be reviewed, fetched, and cherry-picked without
 losing provenance.
 
@@ -26,6 +26,8 @@ sandbox, and diff-review workflows.
   collaboration, and project context are retained.
 
 ## Project status
+
+> Note: NocturneForge is actively evolving. Status reflects current preview builds.
 
 | Area | Status |
 | --- | --- |

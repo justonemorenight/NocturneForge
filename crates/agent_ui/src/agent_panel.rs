@@ -12200,6 +12200,7 @@ mod tests {
             discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
+            pending_edits: Vec::new(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));

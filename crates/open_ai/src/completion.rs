@@ -17,12 +17,12 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::responses::provider_compaction_state_from_items;
 use crate::responses::{
-    ContextManagement, Request as ResponseRequest, ResponseCustomToolCallItem,
-    ResponseCustomToolCallOutputItem, ResponseError, ResponseFunctionCallItem,
-    ResponseFunctionCallOutputContent, ResponseFunctionCallOutputItem, ResponseIncludable,
-    ResponseInputContent, ResponseInputItem, ResponseMessageItem, ResponseOutputItem,
-    ResponseOutputMessage, ResponseReasoningInputItem, ResponseReasoningItem,
-    ResponseReasoningSummaryPart, ResponseSummary as ResponsesSummary,
+    ContextManagement, Request as ResponseRequest, ResponseConfigurationReasoning,
+    ResponseConfigurationUpdateItem, ResponseCustomToolCallItem, ResponseCustomToolCallOutputItem,
+    ResponseError, ResponseFunctionCallItem, ResponseFunctionCallOutputContent,
+    ResponseFunctionCallOutputItem, ResponseIncludable, ResponseInputContent, ResponseInputItem,
+    ResponseMessageItem, ResponseOutputItem, ResponseOutputMessage, ResponseReasoningInputItem,
+    ResponseReasoningItem, ResponseReasoningSummaryPart, ResponseSummary as ResponsesSummary,
     ResponseUsage as ResponsesUsage, StreamEvent as ResponsesStreamEvent,
     provider_compaction_items_with_scope, provider_compaction_state_from_items_with_scope,
 };
@@ -306,12 +306,36 @@ pub fn into_open_ai_response_with_account_scope(
 
     let service_tier = service_tier_for(speed);
 
+    let supports_configuration_update = crate::model_supports_configuration_update(model_id);
+
+    let default_reasoning_effort =
+        default_reasoning_effort.filter(|effort| *effort != ReasoningEffort::None);
+    let desired_reasoning_effort = if thinking_allowed {
+        thinking_effort
+            .as_deref()
+            .and_then(|effort| effort.parse::<ReasoningEffort>().ok())
+            .filter(|effort| *effort != ReasoningEffort::None)
+            .or(default_reasoning_effort)
+    } else if supports_none_reasoning_effort {
+        Some(ReasoningEffort::None)
+    } else {
+        None
+    };
+
+    let baseline_reasoning_effort = if supports_configuration_update {
+        default_reasoning_effort.or(desired_reasoning_effort)
+    } else {
+        desired_reasoning_effort
+    };
+
     let mut provider_items = Vec::new();
     let mut input_items = Vec::new();
     let mut replayed_reasoning_item_indexes = HashMap::default();
     let mut tool_use_kinds_by_id = HashMap::default();
     let mut system_instructions = Vec::new();
-    for (index, message) in messages.into_iter().enumerate() {
+    let mut conversation_messages = Vec::new();
+
+    for message in messages {
         // System messages go to the top-level `instructions` field rather
         // than the input item list. `instructions` is applied per request
         // (the Responses API documents it as a system message inserted into
@@ -327,7 +351,52 @@ pub fn into_open_ai_response_with_account_scope(
                     system_instructions.push(text);
                 }
             }
-            continue;
+        } else {
+            conversation_messages.push(message);
+        }
+    }
+
+    let mut turn_configuration_updates: HashMap<usize, ReasoningEffort> = HashMap::default();
+    if supports_configuration_update {
+        let genuine_user_indices: Vec<usize> = conversation_messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| is_genuine_user_turn(msg).then_some(idx))
+            .collect();
+
+        let mut current_active = baseline_reasoning_effort;
+        for (turn_pos, &msg_idx) in genuine_user_indices.iter().enumerate() {
+            let is_last_turn = turn_pos + 1 == genuine_user_indices.len();
+            let target_effort = if is_last_turn {
+                desired_reasoning_effort
+            } else {
+                let next_idx = genuine_user_indices[turn_pos + 1];
+                conversation_messages[msg_idx + 1..next_idx]
+                    .iter()
+                    .find_map(|msg| {
+                        if msg.role == Role::Assistant {
+                            response_message_effective_effort_from_details(
+                                msg.reasoning_details.as_deref(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .or(baseline_reasoning_effort)
+            };
+
+            if let Some(target) = target_effort {
+                if Some(target) != current_active {
+                    turn_configuration_updates.insert(msg_idx, target);
+                    current_active = Some(target);
+                }
+            }
+        }
+    }
+
+    for (index, message) in conversation_messages.into_iter().enumerate() {
+        if let Some(&effort) = turn_configuration_updates.get(&index) {
+            push_configuration_update(&mut input_items, effort);
         }
         append_message_to_response_items(
             message,
@@ -366,21 +435,7 @@ pub fn into_open_ai_response_with_account_scope(
         })
         .collect();
 
-    let default_reasoning_effort =
-        default_reasoning_effort.filter(|effort| *effort != ReasoningEffort::None);
-    let reasoning_effort = if thinking_allowed {
-        thinking_effort
-            .as_deref()
-            .and_then(|effort| effort.parse::<ReasoningEffort>().ok())
-            .filter(|effort| *effort != ReasoningEffort::None)
-            .or(default_reasoning_effort)
-    } else if supports_none_reasoning_effort {
-        Some(ReasoningEffort::None)
-    } else {
-        None
-    };
-
-    let reasoning = reasoning_effort.map(|effort| crate::responses::ReasoningConfig {
+    let reasoning = baseline_reasoning_effort.map(|effort| crate::responses::ReasoningConfig {
         effort,
         summary: if effort == ReasoningEffort::None {
             None
@@ -436,6 +491,28 @@ pub fn into_open_ai_response_with_account_scope(
         context_management: compact_at_tokens
             .map(|compact_threshold| vec![ContextManagement::Compaction { compact_threshold }]),
     })
+}
+
+fn is_genuine_user_turn(message: &LanguageModelRequestMessage) -> bool {
+    message.role == Role::User
+        && !message.content.iter().any(|content| {
+            matches!(
+                content,
+                MessageContent::ToolResult(_) | MessageContent::Compaction(_)
+            )
+        })
+}
+
+fn push_configuration_update(input_items: &mut Vec<ResponseInputItem>, effort: ReasoningEffort) {
+    let update_item = ResponseConfigurationUpdateItem {
+        id: None,
+        reasoning: Some(ResponseConfigurationReasoning { effort }),
+    };
+    if let Some(ResponseInputItem::ConfigurationUpdate(existing)) = input_items.last_mut() {
+        *existing = update_item;
+        return;
+    }
+    input_items.push(ResponseInputItem::ConfigurationUpdate(update_item));
 }
 
 fn append_message_to_response_items(
@@ -1035,6 +1112,7 @@ pub struct OpenAiResponseEventMapper {
     reasoning_items: Vec<ResponseReasoningInputItem>,
     current_reasoning_summary_part: Option<(String, usize)>,
     current_message_phase: Option<String>,
+    effective_reasoning_effort: Option<ReasoningEffort>,
     pending_stop_reason: Option<StopReason>,
     pending_compaction_items: usize,
 }
@@ -1069,9 +1147,15 @@ impl OpenAiResponseEventMapper {
             reasoning_items: Vec::new(),
             current_reasoning_summary_part: None,
             current_message_phase: None,
+            effective_reasoning_effort: None,
             pending_stop_reason: None,
             pending_compaction_items: 0,
         }
+    }
+
+    pub fn with_effective_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.effective_reasoning_effort = effort;
+        self
     }
 
     pub fn map_stream(
@@ -1606,6 +1690,7 @@ impl OpenAiResponseEventMapper {
         let details = serde_json::to_value(ResponseMessageMetadata {
             phase: self.current_message_phase.clone(),
             reasoning_items: self.reasoning_items.clone(),
+            effective_reasoning_effort: self.effective_reasoning_effort,
         });
 
         match details {
@@ -1621,6 +1706,15 @@ struct ResponseMessageMetadata {
     phase: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     reasoning_items: Vec<ResponseReasoningInputItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_reasoning_effort: Option<ReasoningEffort>,
+}
+
+fn response_message_effective_effort_from_details(
+    details: Option<&serde_json::Value>,
+) -> Option<ReasoningEffort> {
+    let metadata = response_message_metadata_from_details(details?)?;
+    metadata.effective_reasoning_effort
 }
 
 fn response_message_metadata_from_details(
@@ -3117,6 +3211,268 @@ mod tests {
                         { "type": "output_text", "text": "Second.", "annotations": [] }
                     ],
                     "phase": "final_answer"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn into_open_ai_response_preserves_baseline_and_injects_configuration_update_for_astra() {
+        let request = LanguageModelRequest {
+            thread_id: Some("thread_1".into()),
+            prompt_cache_key: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text("Analyze this code deeply.".into())],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: Some("high".into()),
+            speed: None,
+            compact_at_tokens: None,
+            max_output_tokens: None,
+        };
+
+        let response = into_open_ai_response(
+            request,
+            "gpt-6-astra",
+            true,
+            true,
+            None,
+            Some(ReasoningEffort::Low),
+            false,
+            &OPEN_AI_PROVIDER_ID,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.reasoning.as_ref().map(|r| r.effort),
+            Some(ReasoningEffort::Low)
+        );
+
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serialized["input"],
+            json!([
+                {
+                    "type": "configuration_update",
+                    "reasoning": {
+                        "effort": "high"
+                    }
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Analyze this code deeply." }
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn into_open_ai_response_multi_turn_effort_switch_and_replay() {
+        let assistant_turn1_details = json!({
+            "phase": "final_answer",
+            "reasoning_items": [],
+            "effective_reasoning_effort": "high"
+        });
+
+        let request = LanguageModelRequest {
+            thread_id: Some("thread_1".into()),
+            prompt_cache_key: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Turn 1 prompt".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::Text("Turn 1 answer".into())],
+                    cache: false,
+                    reasoning_details: Some(Arc::new(assistant_turn1_details)),
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Turn 2 prompt - switch to low".into())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: Some("low".into()),
+            speed: None,
+            compact_at_tokens: None,
+            max_output_tokens: None,
+        };
+
+        let response = into_open_ai_response(
+            request,
+            "gpt-6-astra",
+            true,
+            true,
+            None,
+            Some(ReasoningEffort::Low),
+            false,
+            &OPEN_AI_PROVIDER_ID,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.reasoning.as_ref().map(|r| r.effort),
+            Some(ReasoningEffort::Low)
+        );
+
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serialized["input"],
+            json!([
+                {
+                    "type": "configuration_update",
+                    "reasoning": {
+                        "effort": "high"
+                    }
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Turn 1 prompt" }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "Turn 1 answer", "annotations": [] }
+                    ],
+                    "phase": "final_answer"
+                },
+                {
+                    "type": "configuration_update",
+                    "reasoning": {
+                        "effort": "low"
+                    }
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Turn 2 prompt - switch to low" }
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn into_open_ai_response_turns_reasoning_off_with_configuration_update() {
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text("Answer briefly.".into())],
+                cache: false,
+                reasoning_details: None,
+            }],
+            thinking_allowed: false,
+            ..Default::default()
+        };
+
+        let response = into_open_ai_response(
+            request,
+            "gpt-6-astra",
+            true,
+            true,
+            None,
+            Some(ReasoningEffort::Low),
+            true,
+            &OPEN_AI_PROVIDER_ID,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response
+                .reasoning
+                .as_ref()
+                .map(|reasoning| reasoning.effort),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["input"][0],
+            json!({
+                "type": "configuration_update",
+                "reasoning": { "effort": "none" }
+            })
+        );
+    }
+
+    #[test]
+    fn into_open_ai_response_unsupported_model_does_not_inject_configuration_update() {
+        let request = LanguageModelRequest {
+            thread_id: Some("thread_1".into()),
+            prompt_cache_key: None,
+            prompt_id: None,
+            intent: None,
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text("Hello".into())],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            stop: Vec::new(),
+            temperature: None,
+            thinking_allowed: true,
+            thinking_effort: Some("high".into()),
+            speed: None,
+            compact_at_tokens: None,
+            max_output_tokens: None,
+        };
+
+        let response = into_open_ai_response(
+            request,
+            "gpt-5.6-terra",
+            true,
+            true,
+            None,
+            Some(ReasoningEffort::Low),
+            false,
+            &OPEN_AI_PROVIDER_ID,
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.reasoning.as_ref().map(|r| r.effort),
+            Some(ReasoningEffort::High)
+        );
+
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serialized["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Hello" }
+                    ]
                 }
             ])
         );

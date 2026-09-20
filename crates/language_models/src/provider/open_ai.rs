@@ -682,6 +682,22 @@ impl LanguageModel for OpenAiLanguageModel {
         });
         if self.model.uses_responses_api() {
             normalize_open_ai_response_thinking_effort(&mut request, &self.model);
+            let effective_effort = if request.thinking_allowed {
+                request
+                    .thinking_effort
+                    .as_deref()
+                    .and_then(|effort| effort.parse::<open_ai::ReasoningEffort>().ok())
+                    .filter(|effort| *effort != open_ai::ReasoningEffort::None)
+                    .or_else(|| default_thinking_reasoning_effort(&self.model))
+            } else if self
+                .model
+                .supported_reasoning_efforts()
+                .contains(&open_ai::ReasoningEffort::None)
+            {
+                Some(open_ai::ReasoningEffort::None)
+            } else {
+                None
+            };
             let request = match into_open_ai_response(
                 request,
                 self.model.id(),
@@ -700,7 +716,8 @@ impl LanguageModel for OpenAiLanguageModel {
             let completions = self.stream_response(request, extra_headers, cx);
             let executor = cx.background_executor().clone();
             async move {
-                let mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID);
+                let mapper = OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID)
+                    .with_effective_reasoning_effort(effective_effort);
                 Ok(stream_in_background(
                     mapper.map_stream(completions.await?).boxed(),
                     executor,

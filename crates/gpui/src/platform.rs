@@ -2514,6 +2514,32 @@ pub(crate) fn decode_static_image_from_decoder(
     Ok(SmallVec::from_elem(Frame::new(data), 1))
 }
 
+pub(crate) fn decode_gif(bytes: &[u8]) -> Result<SmallVec<[Frame; 1]>> {
+    let decoder = GifDecoder::new(Cursor::new(bytes))?;
+    let mut frames = SmallVec::new();
+
+    for frame in decoder.into_frames() {
+        match frame {
+            Ok(mut frame) => {
+                // Convert from RGBA to BGRA.
+                for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                frames.push(frame);
+            }
+            Err(err) => {
+                log::debug!("Skipping GIF frame due to decode error: {err}");
+            }
+        }
+    }
+
+    if frames.is_empty() {
+        anyhow::bail!("GIF could not be decoded: all frames failed");
+    }
+
+    Ok(frames)
+}
+
 impl Hash for Image {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.id);
@@ -2570,31 +2596,7 @@ impl Image {
     /// Convert the clipboard image to an `ImageData` object.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
         let frames = match self.format {
-            ImageFormat::Gif => {
-                let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
-                let mut frames = SmallVec::new();
-
-                for frame in decoder.into_frames() {
-                    match frame {
-                        Ok(mut frame) => {
-                            // Convert from RGBA to BGRA.
-                            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                pixel.swap(0, 2);
-                            }
-                            frames.push(frame);
-                        }
-                        Err(err) => {
-                            log::debug!("Skipping GIF frame due to decode error: {err}");
-                        }
-                    }
-                }
-
-                if frames.is_empty() {
-                    anyhow::bail!("GIF could not be decoded: all frames failed");
-                }
-
-                frames
-            }
+            ImageFormat::Gif => decode_gif(&self.bytes)?,
             ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
             ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
             ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
@@ -2723,6 +2725,11 @@ mod image_tests {
         for pixel in bytes.chunks_exact(4) {
             assert_eq!(pixel, &[0xF8, 0xBD, 0x38, 0xFF]);
         }
+    }
+
+    #[test]
+    fn test_decode_gif_empty_bytes() {
+        assert!(decode_gif(&[]).is_err());
     }
 }
 

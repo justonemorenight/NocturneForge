@@ -178,6 +178,7 @@ mod tests {
             discovered_tools: Vec::new(),
             orchestration_run: None,
             orchestration_goal: None,
+            pending_edits: Vec::new(),
         }
     }
 

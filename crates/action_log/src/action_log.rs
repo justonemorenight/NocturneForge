@@ -112,6 +112,30 @@ impl ActionLog {
         self.file_read_times.get(path).copied()
     }
 
+    pub fn pending_edits(&self, cx: &App) -> Vec<(PathBuf, String)> {
+        self.tracked_buffers
+            .values()
+            .filter(|tracked| tracked.has_edits(cx))
+            .filter_map(|tracked| {
+                let file = tracked.buffer.read(cx).file()?.as_local()?.abs_path(cx);
+                Some((file, tracked.diff_base.to_string()))
+            })
+            .collect()
+    }
+
+    pub fn restore_pending_edit(
+        &mut self,
+        buffer: Entity<Buffer>,
+        base_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let tracked = self.track_buffer_internal(buffer.clone(), false, cx);
+        tracked.diff_base = Rope::from(base_text);
+        tracked.status = TrackedBufferStatus::Modified;
+        tracked.version = buffer.read(cx).version();
+        tracked.schedule_diff_update(ChangeAuthor::Agent, cx);
+    }
+
     fn update_file_read_time(&mut self, buffer: &Entity<Buffer>, cx: &App) {
         let buffer = buffer.read(cx);
         if let Some(file) = buffer.file() {
@@ -5034,6 +5058,45 @@ mod tests {
             expected_hunks,
             "parent should also track the agent edit via linked log forwarding"
         );
+    }
+
+    #[gpui::test]
+    async fn test_pending_edit_snapshot_restores_review_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "before"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(path, cx))
+            .await
+            .unwrap();
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| buffer.set_text("after", cx));
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        let pending = action_log.read_with(cx, |log, cx| log.pending_edits(cx));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "before");
+
+        let restored = cx.new(|_| ActionLog::new(project));
+        cx.update(|cx| {
+            restored.update(cx, |log, cx| {
+                log.restore_pending_edit(buffer, pending[0].1.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |log, cx| {
+            assert_eq!(log.changed_buffers(cx).count(), 1);
+        });
     }
 
     #[gpui::test]

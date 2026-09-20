@@ -881,6 +881,10 @@ impl NativeAgent {
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.schedule_thread_save(thread, cx)
             }),
+            cx.observe(&action_log, {
+                let thread_handle = thread_handle.clone();
+                move |this, _action_log, cx| this.schedule_thread_save(thread_handle.clone(), cx)
+            }),
             cx.observe_release(&acp_thread, {
                 let session_id = session_id.clone();
                 let acp_thread_id = acp_thread.entity_id();
