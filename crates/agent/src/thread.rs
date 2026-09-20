@@ -5537,7 +5537,9 @@ impl Thread {
                     Some(self.id.to_string())
                 }
             } else {
-                Some(self.prompt_cache_affinity())
+                // Restored sessions created before provider affinity was persisted
+                // cannot prove that sharing the root cache is safe.
+                Some(self.id.to_string())
             }
         } else {
             Some(self.prompt_cache_affinity())
@@ -12327,6 +12329,29 @@ mod tests {
         assert_eq!(
             subagent_request.prompt_cache_key.as_deref(),
             Some(root_id.0.as_ref())
+        );
+
+        cx.update(|cx| {
+            subagent_thread.update(cx, |thread, _| {
+                thread.set_subagent_context(SubagentContext {
+                    parent_thread_id: root_id.clone(),
+                    depth: 1,
+                    role: Some(SubagentRole::CodingWorker),
+                    root_session_id: Some(root_id.clone()),
+                    parent_provider_id: None,
+                });
+            });
+        });
+        let legacy_subagent_request = subagent_thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .unwrap();
+        let subagent_id = subagent_thread.read_with(cx, |thread, _| thread.id().clone());
+        assert_eq!(
+            legacy_subagent_request.prompt_cache_key.as_deref(),
+            Some(subagent_id.0.as_ref()),
+            "legacy subagent without provider metadata must use a session-local cache key"
         );
 
         let foreign_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
