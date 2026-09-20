@@ -384,7 +384,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
     }
 
     fn supports_split_token_display(&self) -> bool {
-        true
+        self.max_output_tokens().is_some()
     }
 
     fn telemetry_id(&self) -> String {
