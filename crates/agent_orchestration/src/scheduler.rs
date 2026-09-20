@@ -1,6 +1,7 @@
 use crate::artifacts::{
     ArtifactKind, ArtifactStore, MAX_DEPENDENCY_ARTIFACTS, MAX_DEPENDENCY_CONTEXT_BYTES,
-    MAX_DEPENDENCY_OUTPUT_BYTES, MAX_INLINE_OUTPUT_BYTES, truncate_text,
+    MAX_DEPENDENCY_OUTPUT_BYTES, MAX_INLINE_OUTPUT_BYTES, sanitize_dependency_output,
+    truncate_text,
 };
 use crate::budget::TaskExecutionReporter;
 use crate::cancellation::CancellationTree;
@@ -436,7 +437,7 @@ impl Scheduler {
                 .status(dependency_id)
                 .and_then(|status| status.latest_output)
                 .map(|output| {
-                    let output = output_without_verification_claim(&output).to_string();
+                    let output = sanitize_dependency_output(&output);
                     let output =
                         truncate_text(output, MAX_DEPENDENCY_OUTPUT_BYTES.min(remaining_bytes));
                     remaining_bytes = remaining_bytes.saturating_sub(output.len());

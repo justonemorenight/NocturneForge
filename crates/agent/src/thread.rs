@@ -2511,6 +2511,10 @@ impl Thread {
         self.messages.is_empty() && self.title.is_none()
     }
 
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
+
     pub fn draft_prompt(&self) -> Option<&[acp::ContentBlock]> {
         self.draft_prompt.as_deref()
     }

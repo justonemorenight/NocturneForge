@@ -418,7 +418,7 @@ impl LanguageModel for VercelAiGatewayLanguageModel {
     }
 
     fn supports_split_token_display(&self) -> bool {
-        self.max_output_tokens().is_some()
+        true
     }
 
     fn telemetry_id(&self) -> String {

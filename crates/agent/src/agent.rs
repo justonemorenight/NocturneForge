@@ -5691,6 +5691,11 @@ mod internal_tests {
         // without `register_session`, it would not.
         subagent_thread.read_with(cx, |thread, _cx| {
             assert!(thread.is_subagent());
+            assert_eq!(
+                thread.message_count(),
+                0,
+                "subagent must start with a clean context, not inheriting parent transcript"
+            );
             assert!(
                 thread.has_registered_tool(SkillTool::NAME),
                 "subagent should have SkillTool registered after register_session"

@@ -7494,13 +7494,8 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn supports_split_token_display(&self, cx: &App) -> bool {
-        self.as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).model())
-            .is_some_and(|model| {
-                model.supports_split_token_display()
-                    && model.max_output_tokens().is_some_and(|max| max > 0)
-            })
+    fn supports_split_token_display(&self, _cx: &App) -> bool {
+        false
     }
 
     fn native_model_reports_prompt_cache_usage(&self, cx: &App) -> bool {

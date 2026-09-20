@@ -534,7 +534,7 @@ impl LanguageModel for SuperGrokLanguageModel {
     }
 
     fn supports_split_token_display(&self) -> bool {
-        self.max_output_tokens().is_some()
+        true
     }
 
     fn stream_completion(

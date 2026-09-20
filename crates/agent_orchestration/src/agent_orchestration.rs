@@ -27,7 +27,7 @@ pub mod worktree_isolation;
 pub use acp_adapter::{AcpEventAdapter, AcpTaskBridge};
 pub use artifacts::{
     Artifact, ArtifactKind, ArtifactStore, ContextSnapshot, MAX_DEPENDENCY_CONTEXT_BYTES,
-    MAX_INLINE_OUTPUT_BYTES, truncate_text,
+    MAX_INLINE_OUTPUT_BYTES, sanitize_dependency_output, truncate_text,
 };
 pub use auto_policy::{
     AgentToolProfile, AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,

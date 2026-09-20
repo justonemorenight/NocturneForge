@@ -121,6 +121,49 @@ pub fn truncate_text(mut text: String, max_bytes: usize) -> String {
     text
 }
 
+/// Sanitizes a dependency task output before serializing it into downstream context:
+/// - Strips verification envelope if present
+/// - Strips ANSI terminal escape sequences
+/// - Compacts excessive consecutive blank lines
+/// - Preserves substantive findings, file references, and test outcomes
+pub fn sanitize_dependency_output(output: &str) -> String {
+    let stripped = crate::verification::output_without_verification_claim(output);
+
+    // Strip ANSI escape codes
+    let mut cleaned = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if let Some(&'[') = chars.peek() {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        cleaned.push(ch);
+    }
+
+    // Collapse more than 2 consecutive newlines into 2
+    let mut result = String::with_capacity(cleaned.len());
+    let mut newline_count = 0;
+    for ch in cleaned.chars() {
+        if ch == '\n' {
+            newline_count += 1;
+            if newline_count <= 2 {
+                result.push(ch);
+            }
+        } else {
+            newline_count = 0;
+            result.push(ch);
+        }
+    }
+    result.trim().to_string()
+}
+
 impl ArtifactStore {
     pub fn new() -> Self {
         Self {
@@ -200,5 +243,16 @@ mod tests {
             assert!(truncated.len() <= limit);
             assert!(truncated.is_char_boundary(truncated.len()));
         }
+    }
+
+    #[test]
+    fn sanitize_dependency_output_strips_ansi_escapes_and_verification() {
+        let raw_output = format!(
+            "\x1b[32mPASS\x1b[0m tests passed\n\n\n\nFinished in 0.1s\n\n{}\n{{\"criteria\":[]}}\n{}",
+            crate::verification::VERIFICATION_START,
+            crate::verification::VERIFICATION_END,
+        );
+        let sanitized = sanitize_dependency_output(&raw_output);
+        assert_eq!(sanitized, "PASS tests passed\n\nFinished in 0.1s");
     }
 }

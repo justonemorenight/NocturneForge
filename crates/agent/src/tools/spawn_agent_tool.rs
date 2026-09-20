@@ -16,7 +16,7 @@ use crate::{
 };
 use agent_orchestration::{
     MAX_DEPENDENCY_CONTEXT_BYTES, VERIFICATION_END, VERIFICATION_START,
-    output_without_verification_claim, truncate_text,
+    output_without_verification_claim, sanitize_dependency_output, truncate_text,
 };
 use settings::Settings;
 
@@ -131,9 +131,10 @@ pub(crate) fn task_execution_prompt_with_dependencies(
     let dependency_json = dependencies
         .iter()
         .map(|dependency| {
+            let sanitized_output = dependency.output.as_deref().map(sanitize_dependency_output);
             serde_json::json!({
                 "task_id": dependency.task_id,
-                "output": dependency.output,
+                "output": sanitized_output,
                 "artifacts": dependency.artifacts.iter().map(|artifact| serde_json::json!({
                     "name": artifact.name,
                     "kind": artifact.kind,
@@ -2255,6 +2256,28 @@ mod tests {
             .strip_prefix(header)
             .expect("dependency prompt should include its context header");
         assert!(header.len() + context.len() <= MAX_DEPENDENCY_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn dependency_prompt_sanitizes_raw_ansi_and_verification_envelopes() {
+        let task = agent_orchestration::OrchestrationTask::new(
+            "subsequent-task",
+            "Build UI",
+            "Implement UI according to spec.",
+        );
+        let dependencies = vec![agent_orchestration::DependencyInput {
+            task_id: "backend-task".into(),
+            output: Some(format!(
+                "\x1b[32mPASS\x1b[0m 10 tests passed\n\n\n\n{}\n{{\"criteria\":[]}}\n{}",
+                VERIFICATION_START, VERIFICATION_END
+            )),
+            artifacts: Vec::new(),
+        }];
+
+        let prompt = task_execution_prompt_with_dependencies(&task, &dependencies);
+        assert!(!prompt.contains("\x1b[32m"));
+        assert!(!prompt.contains(VERIFICATION_START));
+        assert!(prompt.contains("PASS 10 tests passed"));
     }
 
     #[test]
