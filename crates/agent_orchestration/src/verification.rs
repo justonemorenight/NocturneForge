@@ -182,6 +182,9 @@ pub struct VerificationPolicy {
     /// Maximum number of automatic retries per task.
     #[serde(default = "default_max_retries")]
     pub max_retries: u8,
+    /// Maximum number of repair cycles (code fix attempts) permitted before marking a semantic failure terminal.
+    #[serde(default = "default_max_repair_cycles")]
+    pub max_repair_cycles: u8,
     /// Initial backoff duration in milliseconds before first retry.
     #[serde(default = "default_backoff_initial_ms")]
     pub backoff_initial_ms: u64,
@@ -201,6 +204,12 @@ pub struct VerificationPolicy {
 
 fn default_max_retries() -> u8 {
     2
+}
+
+pub const DEFAULT_MAX_REPAIR_CYCLES: u8 = 1;
+
+pub fn default_max_repair_cycles() -> u8 {
+    DEFAULT_MAX_REPAIR_CYCLES
 }
 
 fn default_backoff_initial_ms() -> u64 {
@@ -223,6 +232,7 @@ impl Default for VerificationPolicy {
     fn default() -> Self {
         Self {
             max_retries: default_max_retries(),
+            max_repair_cycles: default_max_repair_cycles(),
             backoff_initial_ms: default_backoff_initial_ms(),
             backoff_factor: default_backoff_factor(),
             max_backoff_ms: default_max_backoff_ms(),
@@ -279,6 +289,16 @@ impl VerificationPolicy {
         // `attempt` is one-based in the scheduler, while max_retries is the
         // number of retries allowed after the initial attempt.
         attempt <= max_allowed && error_class.is_retryable()
+    }
+
+    /// Returns true when an error class represents a transient infrastructural issue
+    /// (e.g. rate limit, network timeout, provider downtime) that warrants retrying
+    /// a fresh attempt rather than code repair.
+    pub fn is_transient_retryable(&self, error_class: &ErrorClass) -> bool {
+        matches!(
+            error_class,
+            ErrorClass::TransientNetwork | ErrorClass::RateLimit | ErrorClass::ProviderUnavailable
+        )
     }
 
     /// Calculates exponential backoff duration for a given attempt index.

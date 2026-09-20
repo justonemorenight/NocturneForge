@@ -1221,6 +1221,7 @@ mod tests {
             depth: 1,
             role: None,
             root_session_id: None,
+            parent_provider_id: None,
         });
 
         let mut grandchild_thread = make_thread(
@@ -1232,6 +1233,7 @@ mod tests {
             depth: 2,
             role: None,
             root_session_id: None,
+            parent_provider_id: None,
         });
 
         let unrelated_thread = make_thread(
@@ -1274,6 +1276,7 @@ mod tests {
             depth: 2,
             role: Some(crate::SubagentRole::FlowReader),
             root_session_id: None,
+            parent_provider_id: None,
         });
 
         database

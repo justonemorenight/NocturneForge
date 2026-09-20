@@ -326,6 +326,7 @@ mod tests {
     fn test_exponential_backoff_calculation() {
         let policy = VerificationPolicy {
             max_retries: 3,
+            max_repair_cycles: 1,
             backoff_initial_ms: 100,
             backoff_factor: 2.0,
             max_backoff_ms: 1000,

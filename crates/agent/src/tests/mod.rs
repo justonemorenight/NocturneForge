@@ -6635,6 +6635,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
             depth: MAX_SUBAGENT_DEPTH - 1,
             role: None,
             root_session_id: None,
+            parent_provider_id: None,
         });
         thread
     });

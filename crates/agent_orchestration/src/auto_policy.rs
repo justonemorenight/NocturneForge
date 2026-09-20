@@ -213,6 +213,7 @@ impl AutoPolicyEngine {
             if terse_follow_up { 1.0 } else { 0.0 },
         );
         select_decision(
+            prompt,
             signals,
             scores,
             context,
@@ -358,6 +359,7 @@ fn work_item_bonus(work_item_count: usize, config: &AutoPolicyConfig) -> f32 {
 }
 
 fn select_decision(
+    prompt: &str,
     signals: PromptSignals,
     scores: PolicyScores,
     context: AutoPolicyContext,
@@ -392,7 +394,7 @@ fn select_decision(
             heuristics,
         );
     }
-    if let Some(reason) = continuation_reason(context, terse_follow_up) {
+    if let Some(reason) = continuation_reason(context, signals, prompt, terse_follow_up) {
         return continuation_decision(context, config, reason, heuristics);
     }
     if context.can_orchestrate
@@ -425,16 +427,43 @@ fn select_decision(
     )
 }
 
-fn continuation_reason(context: AutoPolicyContext, terse_follow_up: bool) -> Option<&'static str> {
+fn continuation_reason(
+    context: AutoPolicyContext,
+    signals: PromptSignals,
+    prompt: &str,
+    terse_follow_up: bool,
+) -> Option<&'static str> {
     if !terse_follow_up {
         None
     } else if context.has_active_orchestration {
         Some("The request continues an active orchestration run")
     } else if context.has_incomplete_plan {
-        Some("The request continues execution of an incomplete plan")
+        if is_question_or_clarification(prompt) && !signals.executes_after_plan {
+            None
+        } else {
+            Some("The request continues execution of an incomplete plan")
+        }
+    } else if context.previous_strategy == Some(AgentExecutionStrategy::Direct)
+        && !signals.orchestrate
+    {
+        Some("The request continues a direct conversation turn")
     } else {
         None
     }
+}
+
+fn is_question_or_clarification(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.ends_with('?') {
+        return true;
+    }
+    let lower = prompt.to_lowercase();
+    const QUESTION_WORDS: &[&str] = &[
+        "why", "what", "how", "when", "where", "who", "which", "explain", "clarify",
+    ];
+    QUESTION_WORDS
+        .iter()
+        .any(|&word| lower.starts_with(word) || contains_keyword(&lower, word))
 }
 
 fn continuation_decision(
@@ -443,6 +472,15 @@ fn continuation_decision(
     reason: &str,
     heuristics: HashMap<String, f32>,
 ) -> AutoPolicyDecision {
+    if reason == "The request continues a direct conversation turn" {
+        return decision(
+            AgentExecutionStrategy::Direct,
+            config.continuation_confidence,
+            reason,
+            heuristics,
+        );
+    }
+
     if context.can_orchestrate {
         decision(
             AgentExecutionStrategy::Orchestrate,
@@ -860,6 +898,55 @@ mod tests {
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
         assert_eq!(decision.heuristics["terse_follow_up"], 1.0);
+    }
+
+    #[test]
+    fn terse_follow_up_after_direct_turn_preserves_direct_strategy() {
+        let decision = AutoPolicyEngine::evaluate(
+            "tiếp đi",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Direct),
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
+        assert!(
+            decision
+                .reason
+                .contains("continues a direct conversation turn")
+        );
+    }
+
+    #[test]
+    fn terse_follow_up_in_vietnamese_continues_active_orchestration() {
+        let decision = AutoPolicyEngine::evaluate(
+            "làm tiếp đi",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Orchestrate),
+                has_active_orchestration: true,
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Orchestrate);
+        assert!(
+            decision
+                .reason
+                .contains("continues an active orchestration run")
+        );
+    }
+
+    #[test]
+    fn question_during_incomplete_plan_stays_direct_without_execution_intent() {
+        let decision = AutoPolicyEngine::evaluate(
+            "Tại sao lại cần bước 2?",
+            AutoPolicyContext {
+                previous_strategy: Some(AgentExecutionStrategy::Plan),
+                has_incomplete_plan: true,
+                ..capable_context()
+            },
+        );
+        assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
+        assert_ne!(decision.strategy, AgentExecutionStrategy::Orchestrate);
     }
 
     #[test]

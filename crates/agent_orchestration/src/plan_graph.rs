@@ -41,6 +41,9 @@ pub struct OrchestrationTask {
     /// Override for maximum retries on failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u8>,
+    /// Dedicated limit on repair cycles (code fix attempts) separate from transient network retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_repair_cycles: Option<u8>,
     /// Whether to attempt repair on verification failure.
     #[serde(default = "default_true")]
     pub repair_on_failure: bool,
@@ -105,6 +108,7 @@ impl OrchestrationTask {
             depends_on: Vec::new(),
             acceptance_criteria: Vec::new(),
             max_retries: None,
+            max_repair_cycles: None,
             repair_on_failure: true,
             context_paths: Vec::new(),
             expected_output: None,

@@ -586,6 +586,10 @@ impl Scheduler {
             }
         }
         let mut fallback_applied = task.active_fallback_from_model.is_some();
+        let max_repair_cycles = task
+            .max_repair_cycles
+            .unwrap_or(self.config.verification_policy.max_repair_cycles);
+        let mut repair_cycles_used: u8 = 0;
 
         loop {
             let context_checkpoint = self.context_checkpoints.latest(&agent_identity.path);
@@ -1002,8 +1006,10 @@ impl Scheduler {
                             && !verification.passed
                             && verification.repairable
                             && task.repair_on_failure
-                            && self.config.verification_policy.allow_repair_tasks;
+                            && self.config.verification_policy.allow_repair_tasks
+                            && repair_cycles_used < max_repair_cycles;
                         if should_repair {
+                            repair_cycles_used += 1;
                             self.task_mutations.transition_in_context(
                                 &task_id,
                                 TaskState::Repairing,
@@ -1267,7 +1273,9 @@ impl Scheduler {
                         let error_class = verification.error_class.unwrap_or(
                             crate::verification::ErrorClass::VerificationAssertionFailure,
                         );
+                        let is_semantic_failure = error_class.is_repairable();
                         let should_retry = verification.retryable
+                            && (!is_semantic_failure || repair_cycles_used < max_repair_cycles)
                             && self.config.verification_policy.should_retry(
                                 attempt,
                                 &error_class,

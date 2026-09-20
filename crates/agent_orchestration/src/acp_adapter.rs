@@ -49,6 +49,7 @@ impl From<AcpTaskBridge> for OrchestrationTask {
             depends_on: bridge.depends_on.into_iter().map(TaskId::new).collect(),
             acceptance_criteria: Vec::new(),
             max_retries: None,
+            max_repair_cycles: None,
             repair_on_failure: true,
             context_paths: Vec::new(),
             expected_output: None,

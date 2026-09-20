@@ -323,6 +323,10 @@ pub struct SubagentContext {
     /// Root thread ID used for cache affinity
     #[serde(default)]
     pub root_session_id: Option<acp::SessionId>,
+
+    /// Provider ID of the parent thread, used to prevent cross-provider physical prompt cache key sharing.
+    #[serde(default)]
+    pub parent_provider_id: Option<String>,
 }
 
 impl SubagentContext {
@@ -1694,11 +1698,13 @@ impl Thread {
         );
         let parent = parent_thread.read(cx);
         let root_session_id = parent.root_session_id();
+        let parent_provider_id = parent.model().map(|m| m.provider_id().0.to_string());
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent.id().clone(),
             depth: parent.depth() + 1,
             role,
             root_session_id: Some(root_session_id),
+            parent_provider_id,
         });
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(role) = role {
@@ -5522,9 +5528,24 @@ impl Thread {
         let messages = self.build_request_messages(available_tools, cx);
         log::debug!("Request will include {} messages", messages.len());
 
+        let prompt_cache_key = if let Some(subagent_context) = &self.subagent_context {
+            if let Some(parent_provider) = &subagent_context.parent_provider_id {
+                let current_provider = model.provider_id().0.to_string();
+                if parent_provider == &current_provider {
+                    Some(self.prompt_cache_affinity())
+                } else {
+                    Some(self.id.to_string())
+                }
+            } else {
+                Some(self.prompt_cache_affinity())
+            }
+        } else {
+            Some(self.prompt_cache_affinity())
+        };
+
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
-            prompt_cache_key: Some(self.prompt_cache_affinity()),
+            prompt_cache_key,
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(completion_intent),
             messages,
@@ -12306,6 +12327,34 @@ mod tests {
         assert_eq!(
             subagent_request.prompt_cache_key.as_deref(),
             Some(root_id.0.as_ref())
+        );
+
+        let foreign_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+            "foreign-provider",
+            "foreign-model",
+            "Foreign Model",
+            false,
+        ));
+        cx.update(|cx| {
+            subagent_thread.update(cx, |thread, cx| {
+                thread.set_model(foreign_model, cx);
+            });
+        });
+        let foreign_subagent_request = subagent_thread
+            .read_with(cx, |thread, cx| {
+                thread.build_completion_request(CompletionIntent::UserPrompt, cx)
+            })
+            .unwrap();
+        let subagent_id = subagent_thread.read_with(cx, |thread, _| thread.id().clone());
+        assert_eq!(
+            foreign_subagent_request.prompt_cache_key.as_deref(),
+            Some(subagent_id.0.as_ref()),
+            "cross-provider subagent must isolate prompt_cache_key to its own session ID"
+        );
+        assert_eq!(
+            subagent_thread.read_with(cx, |thread, _| thread.prompt_cache_affinity()),
+            root_id.to_string(),
+            "internal prompt_cache_affinity must still track the root session ID"
         );
     }
 }
