@@ -31,7 +31,7 @@ pub use artifacts::{
 };
 pub use auto_policy::{
     AgentToolProfile, AutoPolicyConfig, AutoPolicyContext, AutoPolicyDecision, AutoPolicyEngine,
-    ResolvedTurnPolicy, TurnPolicySource,
+    CacheAffinityRequirement, EscalationPolicy, ModelIntent, ResolvedTurnPolicy, TurnPolicySource,
 };
 pub use budget::{BudgetExceeded, BudgetUsage, TaskBudgetState, TaskExecutionReporter};
 pub use cancellation::{CancellationReason, CancellationToken, CancellationTree};

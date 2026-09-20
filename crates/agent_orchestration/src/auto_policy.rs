@@ -38,6 +38,45 @@ impl AgentToolProfile {
     }
 }
 
+/// Intent specifying the capability and performance profile required for a model turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelIntent {
+    /// Low-latency, cost-efficient model for discovery, formatting, and routine test/repair loops.
+    Fast,
+    /// Well-rounded coding model for bounded implementation tasks.
+    Balanced,
+    /// High-capacity frontier model for planning, architecture, acceptance review, and hard repairs.
+    Strong,
+    /// Retain the exact model selection of the parent thread when continuity or prompt caching is prioritized.
+    #[default]
+    SameAsParent,
+}
+
+/// Requirement governing cache key derivation and affinity sharing for a turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAffinityRequirement {
+    /// Cache affinity is preferred and enabled when same-provider criteria are met.
+    #[default]
+    Preferred,
+    /// Cache affinity is optional or unneeded (e.g. isolated tasks).
+    Optional,
+    /// Physical prompt cache key must be isolated to the current session ID.
+    Isolated,
+}
+
+/// Policy governing escalation to higher-capability models on failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationPolicy {
+    /// Allow escalating to a stronger model if failures occur.
+    #[default]
+    EscalateOnFailure,
+    /// Do not escalate; strictly retain the resolved intent.
+    Strict,
+}
+
 /// Immutable execution contract resolved before a model turn starts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedTurnPolicy {
@@ -46,6 +85,14 @@ pub struct ResolvedTurnPolicy {
     pub source: TurnPolicySource,
     pub tool_profile: AgentToolProfile,
     pub auto_decision: Option<AutoPolicyDecision>,
+    #[serde(default)]
+    pub model_intent: ModelIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub escalation_policy: EscalationPolicy,
+    #[serde(default)]
+    pub cache_affinity: CacheAffinityRequirement,
 }
 
 impl ResolvedTurnPolicy {
@@ -59,12 +106,25 @@ impl ResolvedTurnPolicy {
             (configured_strategy, TurnPolicySource::Configured)
         };
 
+        let model_intent = match strategy {
+            AgentExecutionStrategy::Plan | AgentExecutionStrategy::Orchestrate => {
+                ModelIntent::Strong
+            }
+            AgentExecutionStrategy::Direct | AgentExecutionStrategy::Auto => {
+                ModelIntent::SameAsParent
+            }
+        };
+
         Self {
             configured_strategy,
             strategy,
             source,
             tool_profile: AgentToolProfile::for_strategy(strategy),
             auto_decision: None,
+            model_intent,
+            reasoning_effort: None,
+            escalation_policy: EscalationPolicy::default(),
+            cache_affinity: CacheAffinityRequirement::default(),
         }
     }
 
@@ -74,13 +134,41 @@ impl ResolvedTurnPolicy {
             strategy => strategy,
         };
 
+        let model_intent = match strategy {
+            AgentExecutionStrategy::Plan | AgentExecutionStrategy::Orchestrate => {
+                ModelIntent::Strong
+            }
+            AgentExecutionStrategy::Direct | AgentExecutionStrategy::Auto => {
+                ModelIntent::SameAsParent
+            }
+        };
+
         Self {
             configured_strategy: AgentExecutionStrategy::Auto,
             strategy,
             source: TurnPolicySource::Automatic,
             tool_profile: AgentToolProfile::for_strategy(strategy),
             auto_decision: Some(decision),
+            model_intent,
+            reasoning_effort: None,
+            escalation_policy: EscalationPolicy::default(),
+            cache_affinity: CacheAffinityRequirement::default(),
         }
+    }
+
+    pub fn with_model_intent(mut self, intent: ModelIntent) -> Self {
+        self.model_intent = intent;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    pub fn with_cache_affinity(mut self, requirement: CacheAffinityRequirement) -> Self {
+        self.cache_affinity = requirement;
+        self
     }
 }
 
@@ -1053,5 +1141,30 @@ mod tests {
         assert_eq!(policy.strategy, AgentExecutionStrategy::Direct);
         assert_eq!(policy.source, TurnPolicySource::AutomaticFallback);
         assert_eq!(policy.tool_profile, AgentToolProfile::Direct);
+        assert_eq!(policy.model_intent, ModelIntent::SameAsParent);
+    }
+
+    #[test]
+    fn policy_defaults_model_intent_based_on_strategy() {
+        let plan_policy = ResolvedTurnPolicy::configured(AgentExecutionStrategy::Plan);
+        assert_eq!(plan_policy.model_intent, ModelIntent::Strong);
+
+        let orchestrate_policy =
+            ResolvedTurnPolicy::configured(AgentExecutionStrategy::Orchestrate);
+        assert_eq!(orchestrate_policy.model_intent, ModelIntent::Strong);
+
+        let direct_policy = ResolvedTurnPolicy::configured(AgentExecutionStrategy::Direct);
+        assert_eq!(direct_policy.model_intent, ModelIntent::SameAsParent);
+
+        let custom_policy = plan_policy
+            .with_model_intent(ModelIntent::Fast)
+            .with_reasoning_effort(Some("low".into()))
+            .with_cache_affinity(CacheAffinityRequirement::Isolated);
+        assert_eq!(custom_policy.model_intent, ModelIntent::Fast);
+        assert_eq!(custom_policy.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            custom_policy.cache_affinity,
+            CacheAffinityRequirement::Isolated
+        );
     }
 }
