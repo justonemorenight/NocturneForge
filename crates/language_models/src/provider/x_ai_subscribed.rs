@@ -6,7 +6,7 @@ use http_client::HttpClient;
 use language_model::{
     AuthenticateError, IconOrSvg, InlineDescription, LanguageModel, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    ProviderSettingsView,
+    ProviderAccountSummary, ProviderSettingsView,
 };
 use std::sync::Arc;
 use ui::{ConfiguredApiCard, prelude::*};
@@ -79,6 +79,43 @@ impl LanguageModelProvider for XAiSubscribedProvider {
 
     fn is_authenticated(&self, cx: &App) -> bool {
         self.state.read(cx).is_authenticated()
+    }
+
+    fn account_summaries(&self, cx: &App) -> Vec<ProviderAccountSummary> {
+        self.state
+            .read(cx)
+            .account_summaries()
+            .into_iter()
+            .map(|account| ProviderAccountSummary {
+                id: account.session_id,
+                label: account.email.unwrap_or_else(|| "SuperGrok account".into()),
+                detail: None,
+                quota: None,
+                is_active: account.is_active,
+                is_busy: account.is_busy,
+                reauthentication_required: account.reauthentication_required,
+            })
+            .collect()
+    }
+
+    fn switch_account(&self, account_id: SharedString, cx: &mut App) -> Task<Result<()>> {
+        self.state
+            .update(cx, |state, cx| state.switch_account(account_id, cx))
+    }
+
+    fn add_account(&self, cx: &mut App) -> Task<Result<()>> {
+        self.state.update(cx, |state, cx| {
+            state.sign_in(cx);
+            Task::ready(Ok(()))
+        })
+    }
+
+    fn can_cancel_account_sign_in(&self, cx: &App) -> bool {
+        self.state.read(cx).can_cancel_sign_in()
+    }
+
+    fn cancel_account_sign_in(&self, cx: &mut App) {
+        self.state.update(cx, |state, cx| state.cancel_sign_in(cx));
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
@@ -160,32 +197,93 @@ struct ConfigurationView {
 impl Render for ConfigurationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
+        let accounts = state.account_summaries();
+        let is_busy = state.is_busy();
+        let is_signing_in = state.is_signing_in();
+        let can_cancel_sign_in = state.can_cancel_sign_in();
 
-        if state.is_authenticated() {
-            let label = state
-                .email()
-                .map(|email| format!("Signed in as {email}"))
-                .unwrap_or_else(|| "Signed in".to_string());
+        if !accounts.is_empty() {
             let state_entity = self.state.clone();
-
+            let add_account_label = if can_cancel_sign_in {
+                "Cancel Sign In"
+            } else {
+                "Add Account"
+            };
             return v_flex()
                 .gap_2()
-                .child(
-                    ConfiguredApiCard::new("x-ai-subscribed-sign-out", SharedString::from(label))
-                        .button_label("Sign Out")
-                        .on_click(cx.listener(move |_this, _, _window, cx| {
+                .children(accounts.into_iter().map(|account| {
+                    let state_entity = state_entity.clone();
+                    let account_id = account.session_id.clone();
+                    let mut label = account.email.unwrap_or_else(|| "SuperGrok account".into());
+                    if account.reauthentication_required {
+                        label = format!("{label} · sign in required").into();
+                    }
+                    let (button_label, is_active) = if account.is_active {
+                        ("Sign Out", true)
+                    } else {
+                        ("Switch", false)
+                    };
+                    ConfiguredApiCard::new(
+                        format!("x-ai-subscribed-account-{}", account.session_id),
+                        label,
+                    )
+                    .button_label(button_label)
+                    .disabled(is_busy)
+                    .on_click(move |_, _window, cx| {
+                        if is_active {
                             state_entity
                                 .update(cx, |state, cx| state.sign_out(cx))
                                 .detach_and_log_err(cx);
-                        })),
+                        } else {
+                            state_entity
+                                .update(cx, |state, cx| {
+                                    state.switch_account(account_id.clone(), cx)
+                                })
+                                .detach_and_log_err(cx);
+                        }
+                    })
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .when(!state.is_authenticated(), |this| {
+                            let sign_in_state = state_entity.clone();
+                            this.child(
+                                Button::new("x-ai-subscribed-sign-in", "Sign In")
+                                    .style(ButtonStyle::Outlined)
+                                    .size(ButtonSize::Medium)
+                                    .disabled(is_busy)
+                                    .on_click(move |_, _window, cx| {
+                                        sign_in_state.update(cx, |state, cx| state.sign_in(cx));
+                                    }),
+                            )
+                        })
+                        .child(
+                            Button::new("x-ai-subscribed-add-account", add_account_label)
+                                .style(ButtonStyle::Outlined)
+                                .size(ButtonSize::Medium)
+                                .disabled(is_busy && !can_cancel_sign_in)
+                                .on_click(cx.listener(move |_this, _, _window, cx| {
+                                    if can_cancel_sign_in {
+                                        state_entity.update(cx, |state, cx| {
+                                            state.cancel_sign_in(cx);
+                                        });
+                                    } else {
+                                        state_entity.update(cx, |state, cx| {
+                                            state.sign_in(cx);
+                                        });
+                                    }
+                                })),
+                        ),
                 )
                 .into_any_element();
         }
 
         let last_auth_error = state.last_auth_error();
         let provider_state = self.state.clone();
-        let is_signing_in = state.is_signing_in();
-        let button_label = if is_signing_in {
+        let button_label = if can_cancel_sign_in {
+            "Cancel Sign In"
+        } else if is_signing_in {
             "Signing in…"
         } else {
             "Sign In"
@@ -201,10 +299,14 @@ impl Render for ConfigurationView {
                     .when(!self.compact, |this| this.full_width())
                     .style(ButtonStyle::Outlined)
                     .size(ButtonSize::Medium)
-                    .loading(is_signing_in)
-                    .disabled(is_signing_in)
+                    .loading(is_signing_in && !can_cancel_sign_in)
+                    .disabled((is_signing_in || is_busy) && !can_cancel_sign_in)
                     .on_click(move |_, _window, cx| {
-                        provider_state.update(cx, |state, cx| state.sign_in(cx));
+                        if can_cancel_sign_in {
+                            provider_state.update(cx, |state, cx| state.cancel_sign_in(cx));
+                        } else {
+                            provider_state.update(cx, |state, cx| state.sign_in(cx));
+                        }
                     }),
             )
             .when_some(last_auth_error, |this, error| {

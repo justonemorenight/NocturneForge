@@ -3,6 +3,7 @@ pub mod cache_keepalive;
 mod conversation_fork;
 mod db;
 mod legacy_thread;
+mod model_intent;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
@@ -59,8 +60,9 @@ use gpui::{
     TaskExt, WeakEntity,
 };
 use language_model::{
-    ConfiguredModel, IconOrSvg, LanguageModel, LanguageModelId, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelRegistry, SelectedModel,
+    ConfiguredModel, IconOrSvg, LanguageModel, LanguageModelCompletionError, LanguageModelId,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, ProviderErrorCategory,
+    SelectedModel,
 };
 use project::{
     AgentId, Project, ProjectItem, ProjectPath, Worktree, WorktreeId,
@@ -3306,6 +3308,7 @@ struct ResolvedNativeSubagentConfiguration {
 
 fn resolve_native_subagent_configuration(
     request: &NativeSubagentRequest,
+    parent_provider_id: Option<&str>,
     cx: &mut App,
 ) -> Result<ResolvedNativeSubagentConfiguration> {
     let role = resolve_subagent_role_policy(
@@ -3317,13 +3320,24 @@ fn resolve_native_subagent_configuration(
     let (model_override, thinking_effort) = match (&request.model_override, role) {
         (Some(model), _) => (Some(model.clone()), request.thinking_effort.clone()),
         (None, Some(role)) => {
-            let selection = role.model_selection(
-                &agent_settings::AgentSettings::get_global(cx).native_subagent_roles,
-            );
-            (
-                Some(format!("{}/{}", selection.provider.0, selection.model)),
-                selection.effort,
-            )
+            let settings = agent_settings::AgentSettings::get_global(cx)
+                .native_subagent_roles
+                .clone();
+            let candidates = crate::model_intent::intent_model_candidates(cx);
+            match crate::model_intent::resolve_role_model_selection(
+                role,
+                &settings,
+                &candidates,
+                parent_provider_id,
+            ) {
+                Some(selection) => (
+                    Some(format!("{}/{}", selection.provider.0, selection.model)),
+                    selection.effort,
+                ),
+                // Nothing in the catalog satisfies the role, so the subagent
+                // inherits the parent model rather than failing to start.
+                None => (None, request.thinking_effort.clone()),
+            }
         }
         (None, None) => (None, request.thinking_effort.clone()),
     };
@@ -3432,7 +3446,12 @@ impl NativeThreadEnvironment {
             ));
         }
 
-        let configuration = resolve_native_subagent_configuration(&request, cx)?;
+        let parent_provider_id = parent_thread_entity
+            .read(cx)
+            .model()
+            .map(|model| model.provider_id().0.to_string());
+        let configuration =
+            resolve_native_subagent_configuration(&request, parent_provider_id.as_deref(), cx)?;
         let tool_filter = validate_subagent_tool_filter(request.tool_filter, &available_tools)?;
         let subagent_thread = build_native_subagent_thread(
             &parent_thread_entity,
@@ -3723,11 +3742,87 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum SubagentPromptResult {
     Completed,
     Cancelled,
-    Error(String),
+    Error(anyhow::Error),
+}
+
+fn provider_failure_route(
+    category: &ProviderErrorCategory,
+) -> Option<(
+    agent_orchestration::ErrorClass,
+    agent_orchestration::FailureScope,
+)> {
+    use agent_orchestration::{ErrorClass, FailureScope};
+
+    match category {
+        ProviderErrorCategory::PromptTooLarge { .. } => {
+            Some((ErrorClass::ContextOverflow, FailureScope::Model))
+        }
+        ProviderErrorCategory::RateLimit => Some((ErrorClass::RateLimit, FailureScope::Account)),
+        ProviderErrorCategory::Authentication
+        | ProviderErrorCategory::Permission
+        | ProviderErrorCategory::PaymentRequired => {
+            Some((ErrorClass::ProviderUnavailable, FailureScope::Account))
+        }
+        ProviderErrorCategory::Overloaded
+        | ProviderErrorCategory::EndpointNotFound
+        | ProviderErrorCategory::InternalServer => {
+            Some((ErrorClass::ProviderUnavailable, FailureScope::Provider))
+        }
+        ProviderErrorCategory::Timeout => {
+            Some((ErrorClass::TransientNetwork, FailureScope::Request))
+        }
+        _ => None,
+    }
+}
+
+fn classify_subagent_failure(
+    error: &anyhow::Error,
+) -> Option<(
+    agent_orchestration::ErrorClass,
+    agent_orchestration::FailureScope,
+    Option<std::time::Duration>,
+)> {
+    let completion_error = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<LanguageModelCompletionError>())?;
+    let route = match completion_error {
+        LanguageModelCompletionError::ProviderRejection {
+            category,
+            retry_after,
+            ..
+        } => provider_failure_route(category).map(|(class, scope)| (class, scope, *retry_after))?,
+        LanguageModelCompletionError::ApiReadResponseError { .. } => (
+            agent_orchestration::ErrorClass::TransientNetwork,
+            agent_orchestration::FailureScope::Request,
+            None,
+        ),
+        LanguageModelCompletionError::NoApiKey { .. } => (
+            agent_orchestration::ErrorClass::ProviderUnavailable,
+            agent_orchestration::FailureScope::Account,
+            None,
+        ),
+        _ => return None,
+    };
+    Some(route)
+}
+
+fn structured_subagent_failure(
+    error: anyhow::Error,
+) -> Result<agent_orchestration::TaskExecutionFailure, anyhow::Error> {
+    let Some((class, scope, retry_after)) = classify_subagent_failure(&error) else {
+        return Err(error);
+    };
+    let message = error.to_string();
+
+    Ok(
+        agent_orchestration::TaskExecutionFailure::new(class, scope, message)
+            .with_retry_after(retry_after)
+            .with_source(error),
+    )
 }
 
 pub struct NativeSubagentHandle {
@@ -3801,14 +3896,19 @@ impl SubagentHandle for NativeSubagentHandle {
                         Ok(Some(response)) => {
                             match response.stop_reason {
                                 acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
-                                acp::StopReason::MaxTokens => SubagentPromptResult::Error("The agent reached the maximum number of tokens.".into()),
-                                acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error("The agent reached the maximum number of allowed requests between user turns. Try prompting again.".into()),
-                                acp::StopReason::Refusal => SubagentPromptResult::Error("The agent refused to process that prompt. Try again.".into()),
+                                acp::StopReason::MaxTokens => SubagentPromptResult::Error(anyhow!("The agent reached the maximum number of tokens.")),
+                                acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
+                                acp::StopReason::Refusal => SubagentPromptResult::Error(anyhow!("The agent refused to process that prompt. Try again.")),
                                 acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
                             }
                         }
-                        Ok(None) => SubagentPromptResult::Error("No response from the agent. You can try messaging again.".into()),
-                        Err(error) => SubagentPromptResult::Error(error.to_string()),
+                        Ok(None) => SubagentPromptResult::Error(anyhow!("No response from the agent. You can try messaging again.")),
+                        Err(error) => {
+                            match structured_subagent_failure(error) {
+                                Ok(failure) => SubagentPromptResult::Error(failure.into()),
+                                Err(error) => SubagentPromptResult::Error(error),
+                            }
+                        }
                     }
                 })
             });
@@ -3835,7 +3935,7 @@ impl SubagentHandle for NativeSubagentHandle {
                         .context("No response from subagent")
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
-                SubagentPromptResult::Error(message) => Err(anyhow!("{message}")),
+                SubagentPromptResult::Error(error) => Err(error),
             };
 
             if let Ok(output) = &result {

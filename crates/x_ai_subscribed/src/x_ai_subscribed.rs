@@ -17,6 +17,7 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 use util::ResultExt as _;
@@ -32,6 +33,9 @@ const OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access a
 
 /// Keychain slot. Must not collide with the xAI API-key provider (`https://api.x.ai/v1`).
 const CREDENTIALS_KEY: &str = "https://auth.x.ai/zed-supergrok";
+const ACCOUNT_MANIFEST_KEY: &str = "https://auth.x.ai/zed-supergrok/accounts";
+const ACCOUNT_CREDENTIALS_PREFIX: &str = "https://auth.x.ai/zed-supergrok/account/";
+const MAX_ACCOUNT_SESSIONS: usize = 5;
 const TOKEN_REFRESH_BUFFER_MS: u64 = Duration::from_secs(120).as_millis() as u64;
 
 const CALLBACK_HOST: &str = "127.0.0.1";
@@ -48,6 +52,34 @@ struct SuperGrokCredentials {
     refresh_token: String,
     expires_at_ms: u64,
     email: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct AccountManifest {
+    #[serde(default)]
+    active_session_id: Option<String>,
+    #[serde(default)]
+    sessions: Vec<AccountSessionMetadata>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct AccountSessionMetadata {
+    session_id: String,
+    email: Option<String>,
+    last_used_at_ms: u64,
+    #[serde(default)]
+    reauthentication_required: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountSummary {
+    pub session_id: SharedString,
+    pub email: Option<SharedString>,
+    pub reauthentication_required: bool,
+    pub is_active: bool,
+    pub is_busy: bool,
 }
 
 impl SuperGrokCredentials {
@@ -57,7 +89,9 @@ impl SuperGrokCredentials {
 }
 
 pub struct State {
+    manifest: AccountManifest,
     credentials: Option<SuperGrokCredentials>,
+    active_session_id: Option<String>,
     sign_in_task: Option<Task<Result<()>>>,
     refresh_task: Option<Shared<Task<Result<SuperGrokCredentials, Arc<anyhow::Error>>>>>,
     load_task: Option<Shared<Task<Result<(), Arc<anyhow::Error>>>>>,
@@ -65,6 +99,9 @@ pub struct State {
     http_client: Arc<dyn HttpClient>,
     auth_generation: u64,
     last_auth_error: Option<SharedString>,
+    active_operations: Arc<AtomicUsize>,
+    account_mutation_in_progress: bool,
+    account_mutation_seq: u64,
 }
 
 #[derive(Debug)]
@@ -92,40 +129,187 @@ impl State {
             .spawn({
                 let credentials_provider = credentials_provider.clone();
                 async move |this, cx| {
-                    let result = credentials_provider
+                    let manifest = credentials_provider
+                        .read_credentials(ACCOUNT_MANIFEST_KEY, cx)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, bytes)| {
+                            serde_json::from_slice::<AccountManifest>(&bytes).ok()
+                        });
+                    let legacy = credentials_provider
                         .read_credentials(CREDENTIALS_KEY, cx)
-                        .await;
-                    this.update(cx, |state, cx| {
-                        match result {
-                            Ok(Some((_, bytes))) => {
-                                match serde_json::from_slice::<SuperGrokCredentials>(&bytes) {
-                                    Ok(credentials) => {
-                                        state.auth_generation =
-                                            state.auth_generation.wrapping_add(1);
-                                        state.credentials = Some(credentials);
-                                    }
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Failed to deserialize SuperGrok credentials: {error}"
-                                        );
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, bytes)| {
+                            serde_json::from_slice::<SuperGrokCredentials>(&bytes).ok()
+                        });
+                    let mut manifest = manifest.unwrap_or_default();
+                    let mut active_credentials = None;
+                    let mut active_session_id = None;
+                    let mut needs_persist = false;
+                    if manifest.sessions.is_empty() {
+                        if let Some(mut credentials) = legacy {
+                            let session_id = credentials
+                                .account_id
+                                .clone()
+                                .unwrap_or_else(|| account_session_id(&credentials));
+                            credentials.account_id = Some(session_id.clone());
+                            manifest.sessions.push(AccountSessionMetadata {
+                                session_id: session_id.clone(),
+                                email: credentials.email.clone(),
+                                last_used_at_ms: now_ms(),
+                                reauthentication_required: false,
+                            });
+                            manifest.active_session_id = Some(session_id.clone());
+                            active_session_id = Some(session_id);
+                            active_credentials = Some(credentials);
+                            needs_persist = true;
+                        }
+                    } else {
+                        let manifest_active_session_id = manifest.active_session_id.clone();
+                        let mut session_ids = Vec::with_capacity(manifest.sessions.len());
+                        if let Some(session_id) = manifest_active_session_id.as_ref() {
+                            session_ids.push(session_id.clone());
+                        }
+                        let mut other_sessions = manifest
+                            .sessions
+                            .iter()
+                            .filter(|session| {
+                                Some(session.session_id.as_str())
+                                    != manifest_active_session_id.as_deref()
+                            })
+                            .collect::<Vec<_>>();
+                        other_sessions.sort_by(|left, right| {
+                            right.last_used_at_ms.cmp(&left.last_used_at_ms)
+                        });
+                        session_ids.extend(
+                            other_sessions
+                                .into_iter()
+                                .map(|session| session.session_id.clone()),
+                        );
+
+                        for session_id in session_ids {
+                            let key = account_credentials_key(&session_id);
+                            let stored_credentials = match credentials_provider
+                                .read_credentials(&key, cx)
+                                .await
+                            {
+                                Ok(stored_credentials) => stored_credentials,
+                                Err(error) => {
+                                    log::warn!(
+                                        "Failed to read SuperGrok credentials for session {session_id}: {error:#}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let Some((_, bytes)) = stored_credentials else {
+                                if let Some(account) = manifest
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|account| account.session_id == session_id)
+                                {
+                                    if !account.reauthentication_required {
+                                        account.reauthentication_required = true;
+                                        needs_persist = true;
                                     }
                                 }
+                                continue;
+                            };
+                            let mut credentials = match serde_json::from_slice::<
+                                SuperGrokCredentials,
+                            >(&bytes)
+                            {
+                                Ok(credentials) => credentials,
+                                Err(error) => {
+                                    log::warn!(
+                                        "Invalid SuperGrok credentials for session {session_id}: {error:#}"
+                                    );
+                                    if let Some(account) = manifest
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|account| account.session_id == session_id)
+                                    {
+                                        if !account.reauthentication_required {
+                                            account.reauthentication_required = true;
+                                            needs_persist = true;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            };
+                            credentials.account_id = Some(session_id.clone());
+                            if manifest.active_session_id.as_deref() != Some(session_id.as_str()) {
+                                manifest.active_session_id = Some(session_id.clone());
+                                needs_persist = true;
                             }
-                            Ok(None) => {}
-                            Err(error) => {
-                                log::error!("Failed to load SuperGrok credentials: {error:#}");
+                            if let Some(account) = manifest
+                                .sessions
+                                .iter_mut()
+                                .find(|account| account.session_id == session_id)
+                            {
+                                if account.reauthentication_required {
+                                    account.reauthentication_required = false;
+                                    needs_persist = true;
+                                }
                             }
+                            active_session_id = Some(session_id);
+                            active_credentials = Some(credentials);
+                            break;
                         }
+
+                        if active_credentials.is_none() && manifest.active_session_id.take().is_some()
+                        {
+                            needs_persist = true;
+                        }
+                    }
+                    let credentials_to_persist = active_credentials.clone();
+                    let session_to_persist = active_session_id.clone();
+                    let manifest_for_state = manifest.clone();
+                    this.update(cx, |state, cx| {
+                        state.credentials = active_credentials;
+                        state.active_session_id = active_session_id;
+                        if state.credentials.is_some() {
+                            state.auth_generation = state.auth_generation.wrapping_add(1);
+                        }
+                        state.manifest = manifest_for_state;
                         state.load_task = None;
                         cx.notify();
                     })?;
+                    if needs_persist {
+                        if let (Some(credentials), Some(session_id)) =
+                            (credentials_to_persist, session_to_persist)
+                        {
+                            credentials_provider
+                                .write_credentials(
+                                    &account_credentials_key(&session_id),
+                                    "Bearer",
+                                    &serde_json::to_vec(&credentials)
+                                        .map_err(|error| Arc::new(anyhow!(error)))?,
+                                    cx,
+                                )
+                                .await?;
+                        }
+                        credentials_provider
+                            .write_credentials(
+                                ACCOUNT_MANIFEST_KEY,
+                                "manifest",
+                                &serde_json::to_vec(&manifest)
+                                    .map_err(|error| Arc::new(anyhow!(error)))?,
+                                cx,
+                            )
+                            .await?;
+                    }
                     Ok::<(), Arc<anyhow::Error>>(())
                 }
             })
             .shared();
 
         Self {
+            manifest: AccountManifest::default(),
             credentials: None,
+            active_session_id: None,
             sign_in_task: None,
             refresh_task: None,
             load_task: Some(load_task),
@@ -133,6 +317,9 @@ impl State {
             http_client,
             auth_generation: 0,
             last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
         }
     }
 
@@ -156,12 +343,104 @@ impl State {
         self.load_task.clone()
     }
 
+    pub fn account_summaries(&self) -> Vec<AccountSummary> {
+        self.manifest
+            .sessions
+            .iter()
+            .map(|account| AccountSummary {
+                session_id: account.session_id.clone().into(),
+                email: account.email.clone().map(Into::into),
+                reauthentication_required: account.reauthentication_required,
+                is_active: self.active_session_id.as_deref() == Some(account.session_id.as_str()),
+                is_busy: self.is_busy(),
+            })
+            .collect()
+    }
+
+    pub fn can_cancel_sign_in(&self) -> bool {
+        self.sign_in_task.is_some()
+    }
+
+    pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        self.sign_in_task = None;
+        cx.notify();
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_operations.load(Ordering::Acquire) > 0 || self.account_mutation_in_progress
+    }
+
+    pub fn switch_account(
+        &mut self,
+        session_id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.is_busy() || self.is_signing_in() {
+            return Task::ready(Err(anyhow!(
+                "Cannot change SuperGrok accounts while another account operation or request is active"
+            )));
+        }
+        let session_id = session_id.to_string();
+        if self.active_session_id.as_deref() == Some(session_id.as_str()) {
+            return Task::ready(Ok(()));
+        }
+        self.account_mutation_in_progress = true;
+        self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        let mutation_seq = self.account_mutation_seq;
+        cx.notify();
+        let credentials_provider = self.credentials_provider.clone();
+        let manifest = self.manifest.clone();
+        let generation = self.auth_generation.wrapping_add(1);
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let key = account_credentials_key(&session_id);
+                let (_, bytes) = credentials_provider
+                    .read_credentials(&key, cx)
+                    .await?
+                    .ok_or_else(|| anyhow!("SuperGrok account credentials not found"))?;
+                let mut credentials: SuperGrokCredentials = serde_json::from_slice(&bytes)?;
+                credentials.account_id = Some(session_id.clone());
+                let mut manifest = manifest;
+                manifest.active_session_id = Some(session_id.clone());
+                if let Some(account) = manifest
+                    .sessions
+                    .iter_mut()
+                    .find(|account| account.session_id == session_id)
+                {
+                    account.last_used_at_ms = now_ms();
+                    account.reauthentication_required = false;
+                }
+                let manifest_bytes = serde_json::to_vec(&manifest)?;
+                credentials_provider
+                    .write_credentials(ACCOUNT_MANIFEST_KEY, "manifest", &manifest_bytes, cx)
+                    .await?;
+                anyhow::Ok((credentials, manifest))
+            }
+            .await;
+
+            this.update(cx, |state, cx| {
+                if state.account_mutation_seq == mutation_seq {
+                    state.account_mutation_in_progress = false;
+                    if let Ok((credentials, manifest)) = &result {
+                        state.manifest = manifest.clone();
+                        state.credentials = Some(credentials.clone());
+                        state.active_session_id = Some(session_id.clone());
+                        state.auth_generation = generation;
+                        state.refresh_task = None;
+                    }
+                    cx.notify();
+                }
+                result.map(|_| ())
+            })?
+        })
+    }
+
     pub fn http_client(&self) -> Arc<dyn HttpClient> {
         self.http_client.clone()
     }
 
     pub fn sign_in(&mut self, cx: &mut Context<Self>) {
-        if self.is_signing_in() {
+        if self.is_signing_in() || self.is_busy() {
             return;
         }
 
@@ -172,18 +451,68 @@ impl State {
                     let persist_result = async {
                         let credentials_provider =
                             this.read_with(cx, |state, _| state.credentials_provider.clone())?;
+                        let mut creds = creds;
+                        let session_id = creds
+                            .account_id
+                            .clone()
+                            .unwrap_or_else(|| account_session_id(&creds));
+                        creds.account_id = Some(session_id.clone());
+                        let mut manifest = this.read_with(cx, |state, _| state.manifest.clone())?;
+                        if !manifest
+                            .sessions
+                            .iter()
+                            .any(|account| account.session_id == session_id)
+                            && manifest.sessions.len() >= MAX_ACCOUNT_SESSIONS
+                        {
+                            return Err(anyhow!(
+                                "Maximum of {MAX_ACCOUNT_SESSIONS} SuperGrok accounts reached"
+                            ));
+                        }
                         let json = serde_json::to_vec(&creds)?;
                         credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, cx)
+                            .write_credentials(
+                                &account_credentials_key(&session_id),
+                                "Bearer",
+                                &json,
+                                cx,
+                            )
                             .await?;
-                        anyhow::Ok(())
+                        if let Some(account) = manifest
+                            .sessions
+                            .iter_mut()
+                            .find(|account| account.session_id == session_id)
+                        {
+                            account.email = creds.email.clone();
+                            account.last_used_at_ms = now_ms();
+                            account.reauthentication_required = false;
+                        } else {
+                            manifest.sessions.push(AccountSessionMetadata {
+                                session_id: session_id.clone(),
+                                email: creds.email.clone(),
+                                last_used_at_ms: now_ms(),
+                                reauthentication_required: false,
+                            });
+                        }
+                        manifest.active_session_id = Some(session_id.clone());
+                        credentials_provider
+                            .write_credentials(
+                                ACCOUNT_MANIFEST_KEY,
+                                "manifest",
+                                &serde_json::to_vec(&manifest)?,
+                                cx,
+                            )
+                            .await?;
+                        anyhow::Ok((creds, manifest))
                     }
                     .await;
 
                     match persist_result {
-                        Ok(()) => {
+                        Ok((creds, manifest)) => {
                             this.update(cx, |state, cx| {
                                 state.auth_generation = state.auth_generation.wrapping_add(1);
+                                let session_id = creds.account_id.clone().unwrap_or_default();
+                                state.active_session_id = Some(session_id);
+                                state.manifest = manifest;
                                 state.credentials = Some(creds);
                                 state.last_auth_error = None;
                                 state.sign_in_task = None;
@@ -221,20 +550,108 @@ impl State {
     }
 
     pub fn sign_out(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        self.auth_generation += 1;
-        self.credentials = None;
-        self.sign_in_task = None;
-        self.refresh_task = None;
-        self.last_auth_error = None;
+        let Some(active_session_id) = self.active_session_id.clone() else {
+            return Task::ready(Ok(()));
+        };
+        self.sign_out_account(active_session_id.into(), cx)
+    }
+
+    pub fn sign_out_account(
+        &mut self,
+        session_id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.is_busy() || self.is_signing_in() {
+            return Task::ready(Err(anyhow!(
+                "Cannot sign out while another account operation or request is active"
+            )));
+        }
+        self.account_mutation_in_progress = true;
+        self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        let mutation_seq = self.account_mutation_seq;
+        let removed_session_id = session_id.to_string();
+        let was_active = self.active_session_id.as_deref() == Some(removed_session_id.as_str());
+
+        let mut manifest = self.manifest.clone();
+        manifest
+            .sessions
+            .retain(|account| account.session_id != removed_session_id);
+
+        let next_session_id = if was_active {
+            manifest
+                .sessions
+                .iter()
+                .max_by_key(|account| account.last_used_at_ms)
+                .map(|account| account.session_id.clone())
+        } else {
+            manifest.active_session_id.clone()
+        };
+        manifest.active_session_id = next_session_id.clone();
+
+        if was_active {
+            self.auth_generation = self.auth_generation.wrapping_add(1);
+            self.credentials = None;
+            self.active_session_id = None;
+            self.sign_in_task = None;
+            self.refresh_task = None;
+            self.last_auth_error = None;
+        }
+        self.manifest = manifest.clone();
         cx.notify();
 
         let credentials_provider = self.credentials_provider.clone();
-        cx.spawn(async move |_this, cx| {
-            credentials_provider
-                .delete_credentials(CREDENTIALS_KEY, cx)
-                .await
-                .context("Failed to delete SuperGrok credentials from keychain")?;
-            anyhow::Ok(())
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                credentials_provider
+                    .delete_credentials(&account_credentials_key(&removed_session_id), cx)
+                    .await?;
+                if was_active {
+                    credentials_provider
+                        .delete_credentials(CREDENTIALS_KEY, cx)
+                        .await?;
+                }
+                if let Some(session_id) = next_session_id.clone() {
+                    let credentials = if was_active {
+                        let (_, bytes) = credentials_provider
+                            .read_credentials(&account_credentials_key(&session_id), cx)
+                            .await?
+                            .ok_or_else(|| anyhow!("SuperGrok account credentials not found"))?;
+                        Some(serde_json::from_slice::<SuperGrokCredentials>(&bytes)?)
+                    } else {
+                        None
+                    };
+                    credentials_provider
+                        .write_credentials(
+                            ACCOUNT_MANIFEST_KEY,
+                            "manifest",
+                            &serde_json::to_vec(&manifest)?,
+                            cx,
+                        )
+                        .await?;
+                    if was_active {
+                        this.update(cx, |state, cx| {
+                            state.credentials = credentials;
+                            state.active_session_id = Some(session_id);
+                            state.auth_generation = state.auth_generation.wrapping_add(1);
+                            cx.notify();
+                        })?;
+                    }
+                } else {
+                    credentials_provider
+                        .delete_credentials(ACCOUNT_MANIFEST_KEY, cx)
+                        .await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+
+            this.update(cx, |state, cx| {
+                if state.account_mutation_seq == mutation_seq {
+                    state.account_mutation_in_progress = false;
+                    cx.notify();
+                }
+                result
+            })?
         })
     }
 }
@@ -326,6 +743,7 @@ pub fn create_language_model(
         api_url: XAI_API_URL.into(),
         extra_headers: CustomHeaders::default(),
         request_limiter: RateLimiter::new(4),
+        active_operations: state.read(cx).active_operations.clone(),
     })
 }
 
@@ -337,6 +755,7 @@ struct SuperGrokLanguageModel {
     api_url: SharedString,
     extra_headers: CustomHeaders,
     request_limiter: RateLimiter,
+    active_operations: Arc<AtomicUsize>,
 }
 
 fn advertised_reasoning_efforts(model: &SuperGrokModel) -> &'static [ReasoningEffort] {
@@ -433,6 +852,14 @@ fn map_completion_error(error: LanguageModelCompletionError) -> LanguageModelCom
     }
 }
 
+struct ActiveOperationGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveOperationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl SuperGrokLanguageModel {
     fn stream_open_ai_completion(
         &self,
@@ -450,11 +877,14 @@ impl SuperGrokLanguageModel {
         let extra_headers = self.extra_headers.clone();
         let state = self.state.downgrade();
         let request_limiter = self.request_limiter.clone();
+        let active_operations = self.active_operations.clone();
+        active_operations.fetch_add(1, Ordering::AcqRel);
+        let guard = ActiveOperationGuard(active_operations);
 
         let future = cx.spawn(async move |cx| {
             let credentials = get_fresh_credentials(&state, &http_client, cx).await?;
             let access_token = credentials.access_token.clone();
-            request_limiter
+            let stream = request_limiter
                 .stream(async move {
                     open_ai::stream_completion(
                         http_client.as_ref(),
@@ -469,14 +899,34 @@ impl SuperGrokLanguageModel {
                         map_completion_error(LanguageModelCompletionError::from(error))
                     })
                 })
-                .await
+                .await?;
+            Ok::<_, LanguageModelCompletionError>((stream, guard))
         });
 
-        async move { Ok(future.await?.boxed()) }.boxed()
+        async move {
+            let (stream, guard) = future.await?;
+            let stream =
+                futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+                    let event = stream.next().await?;
+                    Some((event, (stream, guard)))
+                });
+            Ok(stream.boxed())
+        }
+        .boxed()
     }
 }
 
 impl LanguageModel for SuperGrokLanguageModel {
+    fn cache_warming_scope(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        Some(format!(
+            "{}:{}:{}",
+            state.active_session_id.as_deref()?,
+            state.auth_generation,
+            self.model.id()
+        ))
+    }
+
     fn id(&self) -> LanguageModelId {
         self.id.clone()
     }
@@ -583,8 +1033,14 @@ async fn get_fresh_credentials(
     http_client: &Arc<dyn HttpClient>,
     cx: &mut AsyncApp,
 ) -> Result<SuperGrokCredentials, LanguageModelCompletionError> {
-    let (creds, existing_task) = state
-        .read_with(&*cx, |s, _| (s.credentials.clone(), s.refresh_task.clone()))
+    let (creds, existing_task, session_id) = state
+        .read_with(&*cx, |s, _| {
+            (
+                s.credentials.clone(),
+                s.refresh_task.clone(),
+                s.active_session_id.clone(),
+            )
+        })
         .map_err(LanguageModelCompletionError::Other)?;
 
     let creds = creds.ok_or(LanguageModelCompletionError::NoApiKey {
@@ -605,6 +1061,9 @@ async fn get_fresh_credentials(
     let state_clone = state.clone();
     let previous_refresh_token = creds.refresh_token.clone();
     let previous_email = creds.email.clone();
+    let session_id = session_id.ok_or_else(|| {
+        LanguageModelCompletionError::Other(anyhow!("SuperGrok account is not selected"))
+    })?;
 
     let generation = state
         .read_with(&*cx, |s, _| s.auth_generation)
@@ -638,6 +1097,7 @@ async fn get_fresh_credentials(
                                 .unwrap_or(previous_refresh_token.clone()),
                             expires_at_ms: now_ms() + tokens.expires_in * 1000,
                             email: claims.or(tokens.email).or(previous_email.clone()),
+                            account_id: Some(session_id.clone()),
                         };
 
                         let credentials_provider = state_clone
@@ -648,7 +1108,12 @@ async fn get_fresh_credentials(
                             serde_json::to_vec(&refreshed).map_err(|e| Arc::new(e.into()))?;
 
                         credentials_provider
-                            .write_credentials(CREDENTIALS_KEY, "Bearer", &json, &*cx)
+                            .write_credentials(
+                                &account_credentials_key(&session_id),
+                                "Bearer",
+                                &json,
+                                &*cx,
+                            )
                             .await
                             .map_err(|e| Arc::new(e))?;
 
@@ -679,23 +1144,45 @@ async fn get_fresh_credentials(
                         .read_with(&*cx, |s, _| s.auth_generation == generation)
                         .unwrap_or(false);
                     if still_current_generation {
-                        state_clone
+                        let manifest_to_persist = state_clone
                             .update(cx, |s, cx| {
                                 s.refresh_task = None;
                                 s.credentials = None;
+                                if let Some(account) = s
+                                    .manifest
+                                    .sessions
+                                    .iter_mut()
+                                    .find(|account| account.session_id == session_id)
+                                {
+                                    account.reauthentication_required = true;
+                                }
                                 s.last_auth_error = Some(
                                     "Your SuperGrok session has expired. Sign in again.".into(),
                                 );
                                 cx.notify();
+                                s.manifest.clone()
                             })
                             .ok();
                         if let Ok(credentials_provider) =
                             state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
                         {
                             credentials_provider
-                                .delete_credentials(CREDENTIALS_KEY, &*cx)
+                                .delete_credentials(&account_credentials_key(&session_id), &*cx)
                                 .await
                                 .log_err();
+                            if let Some(manifest) = manifest_to_persist {
+                                if let Ok(json) = serde_json::to_vec(&manifest) {
+                                    credentials_provider
+                                        .write_credentials(
+                                            ACCOUNT_MANIFEST_KEY,
+                                            "manifest",
+                                            &json,
+                                            &*cx,
+                                        )
+                                        .await
+                                        .log_err();
+                                }
+                            }
                         }
                     } else {
                         state_clone
@@ -740,6 +1227,8 @@ struct TokenResponse {
     expires_in: u64,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
 }
 
 struct PkceAuthorizeRequest {
@@ -838,12 +1327,18 @@ async fn do_oauth_flow(
         .as_deref()
         .and_then(extract_email_claim)
         .or(tokens.email);
+    let account_id = tokens
+        .id_token
+        .as_deref()
+        .and_then(|token| extract_claim(token, "sub"))
+        .or(tokens.sub);
 
     Ok(SuperGrokCredentials {
         access_token: tokens.access_token,
         refresh_token,
         expires_at_ms: now_ms() + tokens.expires_in * 1000,
         email,
+        account_id,
     })
 }
 
@@ -935,6 +1430,28 @@ fn extract_email_claim(jwt: &str) -> Option<String> {
         .get("email")
         .and_then(|value| value.as_str())
         .map(str::to_owned)
+}
+
+fn extract_claim(jwt: &str, name: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
+    claims
+        .get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn account_credentials_key(session_id: &str) -> String {
+    format!("{ACCOUNT_CREDENTIALS_PREFIX}{session_id}")
+}
+
+fn account_session_id(credentials: &SuperGrokCredentials) -> String {
+    credentials.email.clone().unwrap_or_else(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(credentials.refresh_token.as_bytes());
+        format!("grok-{:x}", hasher.finalize())
+    })
 }
 
 fn redact_token_body(body: &str) -> String {
@@ -1196,6 +1713,95 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_fatal_refresh_persists_reauth_in_manifest(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |_request| async move {
+            Ok(http_client::Response::builder()
+                .status(401)
+                .body(http_client::AsyncBody::from(r#"{"error":"invalid_grant"}"#))?)
+        });
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let mut expired = make_expired_credentials();
+        expired.account_id = Some("test-session".to_string());
+
+        credentials_provider
+            .write_credentials(
+                &account_credentials_key("test-session"),
+                "Bearer",
+                &serde_json::to_vec(&expired).unwrap(),
+                &cx.to_async(),
+            )
+            .await
+            .unwrap();
+
+        let manifest = AccountManifest {
+            active_session_id: Some("test-session".to_string()),
+            sessions: vec![AccountSessionMetadata {
+                session_id: "test-session".to_string(),
+                email: Some("test@example.com".to_string()),
+                last_used_at_ms: now_ms(),
+                reauthentication_required: false,
+            }],
+        };
+        credentials_provider
+            .write_credentials(
+                ACCOUNT_MANIFEST_KEY,
+                "manifest",
+                &serde_json::to_vec(&manifest).unwrap(),
+                &cx.to_async(),
+            )
+            .await
+            .unwrap();
+
+        let state = cx.new(|_cx| State {
+            manifest: manifest.clone(),
+            credentials: Some(expired),
+            active_session_id: Some("test-session".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            load_task: None,
+            credentials_provider: credentials_provider.clone(),
+            http_client: http.clone(),
+            auth_generation: 1,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let result = cx
+            .spawn(async move |mut cx| get_fresh_credentials(&weak_state, &http, &mut cx).await)
+            .await;
+
+        cx.run_until_parked();
+        assert!(result.is_err());
+
+        // Manifest in state must have reauthentication_required = true
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(state.credentials.is_none());
+            assert!(state.manifest.sessions[0].reauthentication_required);
+        });
+
+        // Manifest in persistent storage must also have reauthentication_required = true
+        let stored_manifest_bytes = credentials_provider
+            .read_credentials(ACCOUNT_MANIFEST_KEY, &cx.to_async())
+            .await
+            .unwrap()
+            .expect("manifest must be persisted");
+        let stored_manifest: AccountManifest =
+            serde_json::from_slice(&stored_manifest_bytes.1).unwrap();
+        assert!(stored_manifest.sessions[0].reauthentication_required);
+
+        // Account credentials must be deleted from storage
+        let stored_creds = credentials_provider
+            .read_credentials(&account_credentials_key("test-session"), &cx.to_async())
+            .await
+            .unwrap();
+        assert!(stored_creds.is_none());
+    }
+
+    #[gpui::test]
     async fn test_transient_refresh_keeps_credentials(cx: &mut TestAppContext) {
         let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |_request| async move {
             Ok(http_client::Response::builder()
@@ -1315,10 +1921,10 @@ mod tests {
 
         let new_creds = make_fresh_credentials();
         let new_creds_json = serde_json::to_vec(&new_creds).unwrap();
-        creds_provider
-            .storage
-            .lock()
-            .replace(("Bearer".to_string(), new_creds_json));
+        creds_provider.storage.lock().insert(
+            CREDENTIALS_KEY.to_string(),
+            ("Bearer".to_string(), new_creds_json),
+        );
         state.update(cx, |state, cx| {
             state.auth_generation = state.auth_generation.wrapping_add(1);
             state.credentials = Some(new_creds);
@@ -1338,16 +1944,16 @@ mod tests {
             );
             assert!(state.last_auth_error.is_none());
         });
-        assert!(creds_provider.storage.lock().is_some());
+        assert!(creds_provider.storage.lock().contains_key(CREDENTIALS_KEY));
     }
 
     #[gpui::test]
     async fn test_sign_out_completes_fully(cx: &mut TestAppContext) {
         let creds_provider = Arc::new(FakeCredentialsProvider::new());
-        creds_provider
-            .storage
-            .lock()
-            .replace(("Bearer".to_string(), b"some-creds".to_vec()));
+        creds_provider.storage.lock().insert(
+            CREDENTIALS_KEY.to_string(),
+            ("Bearer".to_string(), b"some-creds".to_vec()),
+        );
 
         let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
             Ok(http_client::Response::builder()
@@ -1365,7 +1971,7 @@ mod tests {
         cx.run_until_parked();
         sign_out_task.await.expect("sign-out should succeed");
 
-        assert!(creds_provider.storage.lock().is_none());
+        assert!(!creds_provider.storage.lock().contains_key(CREDENTIALS_KEY));
         cx.read(|cx| {
             assert!(!state.read(cx).is_authenticated());
         });
@@ -1376,10 +1982,10 @@ mod tests {
         let creds = make_fresh_credentials();
         let creds_json = serde_json::to_vec(&creds).unwrap();
         let creds_provider = Arc::new(FakeCredentialsProvider::new());
-        creds_provider
-            .storage
-            .lock()
-            .replace(("Bearer".to_string(), creds_json));
+        creds_provider.storage.lock().insert(
+            CREDENTIALS_KEY.to_string(),
+            ("Bearer".to_string(), creds_json),
+        );
 
         let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
             Ok(http_client::Response::builder()
@@ -1401,14 +2007,87 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn test_initial_load_falls_back_to_valid_account(cx: &mut TestAppContext) {
+        let fallback_credentials = SuperGrokCredentials {
+            access_token: "fallback_access".to_string(),
+            refresh_token: "fallback_refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            email: Some("fallback@example.com".to_string()),
+            account_id: Some("session-fallback".to_string()),
+        };
+        let manifest = AccountManifest {
+            active_session_id: Some("session-missing".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-missing".to_string(),
+                    email: Some("missing@example.com".to_string()),
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                },
+                AccountSessionMetadata {
+                    session_id: "session-fallback".to_string(),
+                    email: fallback_credentials.email.clone(),
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                },
+            ],
+        };
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-fallback"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&fallback_credentials).unwrap(),
+            ),
+        );
+        credentials_provider.storage.lock().insert(
+            ACCOUNT_MANIFEST_KEY.to_string(),
+            (
+                "manifest".to_string(),
+                serde_json::to_vec(&manifest).unwrap(),
+            ),
+        );
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = cx.new(|cx| State::new(http, credentials_provider.clone(), cx));
+        let load_task = cx
+            .read(|cx| state.read(cx).load_task())
+            .expect("constructor should start the credentials load");
+
+        cx.run_until_parked();
+        load_task.await.expect("load should succeed");
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-fallback"));
+            assert_eq!(
+                state
+                    .credentials
+                    .as_ref()
+                    .map(|credentials| credentials.access_token.as_str()),
+                Some("fallback_access")
+            );
+            assert_eq!(
+                state.manifest.active_session_id.as_deref(),
+                Some("session-fallback")
+            );
+            assert!(state.manifest.sessions[0].reauthentication_required);
+        });
+    }
+
     struct FakeCredentialsProvider {
-        storage: Mutex<Option<(String, Vec<u8>)>>,
+        storage: Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
     }
 
     impl FakeCredentialsProvider {
         fn new() -> Self {
             Self {
-                storage: Mutex::new(None),
+                storage: Mutex::new(std::collections::HashMap::new()),
             }
         }
     }
@@ -1416,31 +2095,32 @@ mod tests {
     impl CredentialsProvider for FakeCredentialsProvider {
         fn read_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-            Box::pin(async { Ok(self.storage.lock().clone()) })
+            let result = self.storage.lock().get(url).cloned();
+            Box::pin(async move { Ok(result) })
         }
 
         fn write_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             username: &'a str,
             password: &'a [u8],
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
             self.storage
                 .lock()
-                .replace((username.to_string(), password.to_vec()));
+                .insert(url.to_string(), (username.to_string(), password.to_vec()));
             Box::pin(async { Ok(()) })
         }
 
         fn delete_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            *self.storage.lock() = None;
+            self.storage.lock().remove(url);
             Box::pin(async { Ok(()) })
         }
     }
@@ -1464,15 +2144,28 @@ mod tests {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut TestAppContext,
     ) -> Entity<State> {
-        cx.new(|_cx| State {
-            credentials,
-            sign_in_task: None,
-            refresh_task: None,
-            load_task: None,
-            credentials_provider,
-            http_client,
-            auth_generation: 0,
-            last_auth_error: None,
+        cx.new(|_cx| {
+            let active_session_id = credentials.as_ref().map(|credentials| {
+                credentials
+                    .account_id
+                    .clone()
+                    .unwrap_or_else(|| account_session_id(credentials))
+            });
+            State {
+                manifest: AccountManifest::default(),
+                credentials,
+                active_session_id,
+                sign_in_task: None,
+                refresh_task: None,
+                load_task: None,
+                credentials_provider,
+                http_client,
+                auth_generation: 0,
+                last_auth_error: None,
+                active_operations: Arc::new(AtomicUsize::new(0)),
+                account_mutation_in_progress: false,
+                account_mutation_seq: 0,
+            }
         })
     }
 
@@ -1482,6 +2175,7 @@ mod tests {
             refresh_token: "old_refresh".to_string(),
             expires_at_ms: 0,
             email: None,
+            account_id: None,
         }
     }
 
@@ -1491,6 +2185,7 @@ mod tests {
             refresh_token: "fresh_refresh".to_string(),
             expires_at_ms: now_ms() + 3_600_000,
             email: None,
+            account_id: None,
         }
     }
 
@@ -1503,5 +2198,236 @@ mod tests {
             value["refresh_token"] = serde_json::json!("fresh_refresh");
         }
         value.to_string()
+    }
+
+    #[test]
+    fn test_active_operation_guard_tracks_busy_count() {
+        let active_operations = Arc::new(AtomicUsize::new(0));
+        assert_eq!(active_operations.load(Ordering::Acquire), 0);
+
+        active_operations.fetch_add(1, Ordering::AcqRel);
+        let guard1 = ActiveOperationGuard(active_operations.clone());
+        assert_eq!(active_operations.load(Ordering::Acquire), 1);
+
+        active_operations.fetch_add(1, Ordering::AcqRel);
+        let guard2 = ActiveOperationGuard(active_operations.clone());
+        assert_eq!(active_operations.load(Ordering::Acquire), 2);
+
+        drop(guard1);
+        assert_eq!(active_operations.load(Ordering::Acquire), 1);
+
+        drop(guard2);
+        assert_eq!(active_operations.load(Ordering::Acquire), 0);
+    }
+
+    #[gpui::test]
+    async fn test_cancel_sign_in(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let state = make_state(http, None, cx);
+
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.sign_in_task = Some(cx.spawn(async move |_, _| Ok::<(), anyhow::Error>(())));
+                assert!(state.can_cancel_sign_in());
+                state.cancel_sign_in(cx);
+                assert!(!state.can_cancel_sign_in());
+                assert!(!state.is_signing_in());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_account_removes_inactive_account(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let active_creds = SuperGrokCredentials {
+            access_token: "active_token".to_string(),
+            refresh_token: "active_refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            email: Some("active@example.com".to_string()),
+            account_id: Some("session-active".to_string()),
+        };
+        let inactive_creds = SuperGrokCredentials {
+            access_token: "inactive_token".to_string(),
+            refresh_token: "inactive_refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            email: Some("inactive@example.com".to_string()),
+            account_id: Some("session-inactive".to_string()),
+        };
+
+        credentials_provider
+            .write_credentials(
+                &account_credentials_key("session-active"),
+                "Bearer",
+                &serde_json::to_vec(&active_creds).unwrap(),
+                &cx.to_async(),
+            )
+            .await
+            .unwrap();
+        credentials_provider
+            .write_credentials(
+                &account_credentials_key("session-inactive"),
+                "Bearer",
+                &serde_json::to_vec(&inactive_creds).unwrap(),
+                &cx.to_async(),
+            )
+            .await
+            .unwrap();
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-active".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-active".to_string(),
+                    email: Some("active@example.com".to_string()),
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                },
+                AccountSessionMetadata {
+                    session_id: "session-inactive".to_string(),
+                    email: Some("inactive@example.com".to_string()),
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                },
+            ],
+        };
+        credentials_provider
+            .write_credentials(
+                ACCOUNT_MANIFEST_KEY,
+                "manifest",
+                &serde_json::to_vec(&manifest).unwrap(),
+                &cx.to_async(),
+            )
+            .await
+            .unwrap();
+
+        let state = cx.new(|_cx| State {
+            manifest: manifest.clone(),
+            credentials: Some(active_creds),
+            active_session_id: Some("session-active".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            load_task: None,
+            credentials_provider: credentials_provider.clone(),
+            http_client: http,
+            auth_generation: 1,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+        });
+
+        let task = cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.sign_out_account("session-inactive".into(), cx)
+            })
+        });
+        cx.run_until_parked();
+        task.await.unwrap();
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-active"));
+            assert_eq!(state.account_summaries().len(), 1);
+            assert_eq!(
+                state.account_summaries()[0].session_id.as_ref(),
+                "session-active"
+            );
+        });
+
+        // Inactive account credentials must be deleted from storage
+        let inactive_in_store = credentials_provider
+            .read_credentials(&account_credentials_key("session-inactive"), &cx.to_async())
+            .await
+            .unwrap();
+        assert!(inactive_in_store.is_none());
+    }
+
+    #[gpui::test]
+    async fn test_account_switch_is_serialized(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "a_access".to_string(),
+            refresh_token: "a_refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        let account_b = SuperGrokCredentials {
+            access_token: "b_access".to_string(),
+            refresh_token: "b_refresh".to_string(),
+            expires_at_ms: now_ms() + 3_600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    email: account_a.email.clone(),
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    email: account_b.email.clone(),
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                },
+            ],
+        };
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            load_task: None,
+            credentials_provider,
+            http_client: http,
+            auth_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+        });
+
+        let first_switch =
+            state.update(cx, |state, cx| state.switch_account("session-b".into(), cx));
+        assert!(cx.read(|cx| state.read(cx).is_busy()));
+        let second_switch =
+            state.update(cx, |state, cx| state.switch_account("session-a".into(), cx));
+        assert!(second_switch.await.is_err());
+
+        cx.run_until_parked();
+        first_switch
+            .await
+            .expect("first account switch should succeed");
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-b"));
+            assert!(!state.is_busy());
+        });
     }
 }

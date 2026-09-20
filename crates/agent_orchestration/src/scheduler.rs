@@ -15,7 +15,9 @@ use crate::residency::AgentResidencyManager;
 use crate::state::{RunState, TaskState};
 use crate::task_mutation::TaskMutationGateway;
 use crate::task_registry::TaskRegistry;
-use crate::verification::{VerificationPolicy, VerificationResult};
+use crate::verification::{
+    FailureScope, TaskExecutionFailure, VerificationPolicy, VerificationResult,
+};
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use collections::HashSet;
@@ -1389,13 +1391,12 @@ impl Scheduler {
                 }
                 Err(error) => {
                     let error_str = error.to_string();
-                    let error_class = VerificationPolicy::classify_error(&error_str);
-                    let fallback_model = task.fallback_model_override.clone().filter(|fallback| {
-                        !fallback_applied
-                            && task.model_override.as_deref() != Some(fallback.as_str())
-                            && error_class.is_model_fallback_eligible()
-                            && task.target.is_native()
-                    });
+                    let structured_failure = error
+                        .chain()
+                        .find_map(|source| source.downcast_ref::<TaskExecutionFailure>());
+                    let error_class = structured_failure
+                        .map(|failure| failure.class)
+                        .unwrap_or_else(|| VerificationPolicy::classify_error(&error_str));
                     let reporter_usage = reporter.usage();
                     let external_disconnect = task.target.is_acp()
                         && error_class == crate::verification::ErrorClass::TransientNetwork;
@@ -1409,9 +1410,14 @@ impl Scheduler {
                     let disconnected_session = live_status
                         .as_ref()
                         .and_then(|status| status.active_session_id.clone());
-                    let should_retry = if fallback_model.is_some() {
-                        true
-                    } else if external_disconnect {
+                    let fallback_candidate =
+                        task.fallback_model_override.clone().filter(|fallback| {
+                            !fallback_applied
+                                && task.model_override.as_deref() != Some(fallback.as_str())
+                                && error_class.is_model_fallback_eligible()
+                                && task.target.is_native()
+                        });
+                    let retry_allowed = if external_disconnect {
                         (disconnected_session.is_none() || reconnectable)
                             && attempt
                                 <= task
@@ -1425,6 +1431,12 @@ impl Scheduler {
                             task.max_retries,
                         )
                     };
+                    let retry_same_route = match structured_failure {
+                        Some(failure) if failure.scope == FailureScope::Request => retry_allowed,
+                        Some(_) | None => fallback_candidate.is_none() && retry_allowed,
+                    };
+                    let fallback_model = fallback_candidate.filter(|_| !retry_same_route);
+                    let should_retry = fallback_model.is_some() || retry_same_route;
 
                     self.task_mutations.fail_attempt_with_usage_in_context(
                         &task_id,
@@ -1450,6 +1462,12 @@ impl Scheduler {
                             .model_override
                             .clone()
                             .unwrap_or_else(|| "inherited parent model".to_string());
+                        task.description = format!(
+                            "{}\n\n<zed_fallback_recovery>\nA previous attempt using {} ended with {}. The shared workspace may contain partial changes from that attempt. Inspect and reconcile the current workspace before continuing, and do not repeat completed side effects.\n</zed_fallback_recovery>",
+                            task.description,
+                            previous_model,
+                            error_class.label(),
+                        );
                         task.model_override = Some(fallback_model.clone());
                         task.thinking_effort = task.fallback_thinking_effort.clone();
                         task.active_fallback_from_model = Some(previous_model.clone());
@@ -1528,6 +1546,10 @@ impl Scheduler {
                         }
                         let delay = if external_disconnect {
                             self.config.acp_workers.reconnect_delay(attempt)
+                        } else if let Some(retry_after) =
+                            structured_failure.and_then(TaskExecutionFailure::retry_after)
+                        {
+                            retry_after
                         } else {
                             self.config.verification_policy.backoff_duration(attempt)
                         };

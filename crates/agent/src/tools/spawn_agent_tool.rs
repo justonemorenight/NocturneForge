@@ -44,24 +44,48 @@ fn apply_native_role_model_policies(
             effort: parent_thread.thinking_effort().cloned(),
             speed: parent_thread.speed(),
         });
+    let parent_provider_id = parent_selection
+        .as_ref()
+        .map(|selection| selection.provider.0.clone());
+    let parent_model_selection_id = parent_selection.as_ref().map(model_selection_id);
+    let candidates = crate::model_intent::intent_model_candidates(cx);
 
     for task in &mut plan.tasks {
         let Some(role) = roles.get(&task.id).copied().flatten() else {
             continue;
         };
         if task.model_override.is_none() {
-            let primary = role.model_selection(&settings.native_subagent_roles);
-            task.model_override = Some(model_selection_id(&primary));
-            task.thinking_effort = primary.effort;
+            // A role that resolves to nothing inherits the parent model, so a
+            // stale pin or an empty catalog degrades instead of failing.
+            if let Some(selection) = crate::model_intent::resolve_role_model_selection(
+                role,
+                &settings.native_subagent_roles,
+                &candidates,
+                parent_provider_id.as_deref(),
+            ) {
+                task.model_override = Some(model_selection_id(&selection));
+                task.thinking_effort = selection.effort;
+            }
         }
         if task.fallback_model_override.is_none()
-            && let Some(fallback) = role.fallback_model_selection(
-                &settings.native_subagent_roles,
-                parent_selection.as_ref(),
-            )
+            && let Some(fallback) = role
+                .fallback_model_selection(
+                    &settings.native_subagent_roles,
+                    parent_selection.as_ref(),
+                )
+                .and_then(|selection| {
+                    crate::model_intent::normalize_model_selection(selection, &candidates)
+                })
         {
-            task.fallback_model_override = Some(model_selection_id(&fallback));
-            task.fallback_thinking_effort = fallback.effort;
+            let fallback_id = model_selection_id(&fallback);
+            let effective_primary_model = task
+                .model_override
+                .as_deref()
+                .or(parent_model_selection_id.as_deref());
+            if effective_primary_model != Some(fallback_id.as_str()) {
+                task.fallback_model_override = Some(fallback_id);
+                task.fallback_thinking_effort = fallback.effort;
+            }
         }
     }
 }

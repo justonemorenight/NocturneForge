@@ -4643,6 +4643,24 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
     });
 }
 
+#[test]
+fn structured_subagent_failure_preserves_provider_semantics() {
+    let error = anyhow::Error::new(LanguageModelCompletionError::from_http_status(
+        language_model::LanguageModelProviderName::new("test"),
+        gpui::http_client::StatusCode::TOO_MANY_REQUESTS,
+        "opaque rejection".to_string(),
+        Some(std::time::Duration::from_secs(3)),
+    ));
+
+    let failure = structured_subagent_failure(error).expect("rate limit is structured");
+    assert_eq!(failure.class, agent_orchestration::ErrorClass::RateLimit);
+    assert_eq!(failure.scope, agent_orchestration::FailureScope::Account);
+    assert_eq!(
+        failure.retry_after(),
+        Some(std::time::Duration::from_secs(3))
+    );
+}
+
 #[gpui::test]
 async fn test_streaming_tool_json_parse_error_is_forwarded_to_running_tool(
     cx: &mut TestAppContext,

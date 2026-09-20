@@ -724,13 +724,63 @@ impl MentionSet {
                     tracked_buffers: Vec::new(),
                 })
             } else {
+                let content = truncate_diff_for_mention(diff_text);
                 Ok(Mention::Text {
-                    content: diff_text,
+                    content,
                     tracked_buffers: Vec::new(),
                 })
             }
         })
     }
+}
+
+const MENTION_DIFF_MAX_BYTES: usize = 200 * 1024;
+const MENTION_DIFF_MAX_LINES: usize = 5_000;
+
+fn truncate_diff_for_mention(diff_text: String) -> String {
+    let byte_over = diff_text.len() > MENTION_DIFF_MAX_BYTES;
+    if !byte_over {
+        let line_count = diff_text.as_bytes().iter().filter(|&&b| b == b'\n').count();
+        if line_count <= MENTION_DIFF_MAX_LINES {
+            return diff_text;
+        }
+    }
+
+    let mut end = 0;
+    let mut lines_seen = 0;
+    for (ix, byte) in diff_text.as_bytes().iter().enumerate() {
+        if ix >= MENTION_DIFF_MAX_BYTES {
+            end = ix;
+            break;
+        }
+        if *byte == b'\n' {
+            lines_seen += 1;
+            if lines_seen >= MENTION_DIFF_MAX_LINES {
+                end = ix + 1;
+                break;
+            }
+        }
+    }
+    if end == 0 {
+        end = diff_text.len().min(MENTION_DIFF_MAX_BYTES);
+    }
+
+    let truncated = match std::str::from_utf8(&diff_text.as_bytes()[..end]) {
+        Ok(s) => s,
+        Err(err) => {
+            let valid_end = err.valid_up_to();
+            &diff_text[..valid_end]
+        }
+    };
+
+    let shown_lines = truncated.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    let total_lines = diff_text.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    format!(
+        "{truncated}\n\n[Diff truncated: showing ~{shown_lines} of ~{total_lines} lines ({} of {} bytes). \
+         Use `git diff` in the terminal for the full diff.]",
+        end,
+        diff_text.len()
+    )
 }
 
 /// Computes disambiguated labels for a set of mentions, so that mentions sharing
@@ -898,6 +948,53 @@ mod tests {
         assert_eq!(labels[2].as_ref(), "b/foo.rs");
         // The duplicate keeps the same label rather than escalating to full path.
         assert_eq!(labels[1].as_ref(), "a/foo.rs");
+    }
+
+    #[test]
+    fn test_truncate_diff_for_mention_small_diff_unchanged() {
+        let small = "diff --git a/foo.rs b/foo.rs\n+hello\n".to_string();
+        let result = truncate_diff_for_mention(small.clone());
+        assert_eq!(result, small);
+    }
+
+    #[test]
+    fn test_truncate_diff_for_mention_oversized_bytes() {
+        let oversized = "x".repeat(MENTION_DIFF_MAX_BYTES + 10_000);
+        let result = truncate_diff_for_mention(oversized.clone());
+        assert!(
+            result.len() < oversized.len(),
+            "result should be shorter than original"
+        );
+        assert!(
+            result.contains("[Diff truncated:"),
+            "should contain truncation marker"
+        );
+        assert!(
+            result.contains("Use `git diff` in the terminal"),
+            "should suggest terminal fallback"
+        );
+    }
+
+    #[test]
+    fn test_truncate_diff_for_mention_oversized_lines() {
+        let line = "+added line content\n";
+        let oversized: String = std::iter::repeat(line)
+            .take(MENTION_DIFF_MAX_LINES + 500)
+            .collect();
+        let result = truncate_diff_for_mention(oversized.clone());
+        assert!(
+            result.len() < oversized.len(),
+            "result should be shorter than original"
+        );
+        assert!(
+            result.contains("[Diff truncated:"),
+            "should contain truncation marker"
+        );
+        let result_lines = result.lines().count();
+        assert!(
+            result_lines <= MENTION_DIFF_MAX_LINES + 5,
+            "result should have roughly {MENTION_DIFF_MAX_LINES} lines, got {result_lines}"
+        );
     }
 }
 

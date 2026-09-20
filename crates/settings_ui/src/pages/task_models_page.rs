@@ -5,9 +5,9 @@ use agent_settings::{
 use gpui::{ReadGlobal as _, ScrollHandle, prelude::*};
 use language_model::LanguageModelRegistry;
 use settings::{
-    LanguageModelProviderSetting, LanguageModelSelection, NativeSubagentRoleContent,
-    NativeSubagentRolesContent, Settings as _, SettingsStore, SubagentFallbackModelContent,
-    SubagentFallbackStrategy,
+    LanguageModelProviderSetting, LanguageModelSelection, NativeSubagentModelIntent,
+    NativeSubagentRoleContent, NativeSubagentRolesContent, Settings as _, SettingsStore,
+    SubagentFallbackModelContent, SubagentFallbackStrategy,
 };
 use ui::{ContextMenu, PopoverMenu, SwitchField, ToggleState, prelude::*};
 
@@ -193,27 +193,33 @@ fn render_role_card(
     cx: &mut App,
 ) -> AnyElement {
     let role_settings = role.settings(settings);
-    let primary_label = models
-        .iter()
-        .find(|model| {
-            model.provider_id == role_settings.provider.0 && model.id == role_settings.model
-        })
-        .map(available_model_label)
-        .unwrap_or_else(|| {
-            format!("{} · {}", role_settings.provider.0, role_settings.model).into()
-        });
-    let selected_model = models.iter().find(|model| {
-        model.provider_id == role_settings.provider.0 && model.id == role_settings.model
+    let pinned = role_settings.pinned_selection();
+    let selected_model = pinned.as_ref().and_then(|selection| {
+        models
+            .iter()
+            .find(|model| model.provider_id == selection.provider.0 && model.id == selection.model)
     });
+    let primary_label =
+        selected_model
+            .map(available_model_label)
+            .unwrap_or_else(|| match &pinned {
+                Some(selection) => format!("{} · {}", selection.provider.0, selection.model).into(),
+                None => intent_label(role_settings.intent),
+            });
     let effort_label = selected_model
         .and_then(|model| {
             if model.efforts.is_empty() {
                 return Some(SharedString::from("Not supported"));
             }
-            model
-                .efforts
-                .iter()
-                .find(|(value, _)| value.as_ref() == role_settings.effort)
+            role_settings
+                .effort
+                .as_ref()
+                .and_then(|effort| {
+                    model
+                        .efforts
+                        .iter()
+                        .find(|(value, _)| value.as_ref() == effort.as_str())
+                })
                 .or_else(|| {
                     model.default_effort.as_deref().and_then(|default| {
                         model
@@ -224,7 +230,10 @@ fn render_role_card(
                 })
                 .map(|(_, name)| name.clone())
         })
-        .unwrap_or_else(|| role_settings.effort.clone().into());
+        .unwrap_or_else(|| match &role_settings.effort {
+            Some(effort) => SharedString::from(effort.clone()),
+            None => SharedString::from("Auto"),
+        });
     let fallback_label: SharedString = match &role_settings.fallback {
         SubagentFallbackModelSettings::None => "None".into(),
         SubagentFallbackModelSettings::InheritFromParent => "Inherit from parent".into(),
@@ -269,7 +278,10 @@ fn render_role_card(
                 role,
                 fallback_label,
                 models.to_vec(),
-                role_settings.provider.0.clone(),
+                role_settings
+                    .provider
+                    .as_ref()
+                    .map(|provider| provider.0.clone()),
                 role_settings.model.clone(),
                 disabled,
             ),
@@ -279,6 +291,16 @@ fn render_role_card(
 
 fn available_model_label(model: &AvailableModel) -> SharedString {
     format!("{} · {}", model.provider_name, model.name).into()
+}
+
+/// Label for a role that is not pinned to a model and resolves by intent.
+fn intent_label(intent: NativeSubagentModelIntent) -> SharedString {
+    match intent {
+        NativeSubagentModelIntent::Fast => "Auto · fast intent".into(),
+        NativeSubagentModelIntent::Balanced => "Auto · balanced intent".into(),
+        NativeSubagentModelIntent::Strong => "Auto · strong intent".into(),
+        NativeSubagentModelIntent::SameAsParent => "Auto · inherit parent".into(),
+    }
 }
 
 fn render_setting_row(label: &'static str, control: impl IntoElement) -> impl IntoElement {
@@ -310,11 +332,27 @@ fn model_menu(
         .trigger(menu_button(
             format!("{}-{kind}-model-trigger", role.id()),
             label,
-            disabled || models.is_empty(),
+            disabled,
         ))
         .menu(move |window, cx| {
             let models = models.clone();
             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                // Allow picking any capability intent when running in Auto mode,
+                // or choosing an explicit model to pin.
+                menu = menu
+                    .entry("Auto · Fast intent", None, move |_, cx| {
+                        set_role_intent(role, NativeSubagentModelIntent::Fast, cx);
+                    })
+                    .entry("Auto · Balanced intent", None, move |_, cx| {
+                        set_role_intent(role, NativeSubagentModelIntent::Balanced, cx);
+                    })
+                    .entry("Auto · Strong intent", None, move |_, cx| {
+                        set_role_intent(role, NativeSubagentModelIntent::Strong, cx);
+                    })
+                    .entry("Auto · Inherit parent", None, move |_, cx| {
+                        set_role_intent(role, NativeSubagentModelIntent::SameAsParent, cx);
+                    })
+                    .separator();
                 for model in models.clone() {
                     let provider_id = model.provider_id.clone();
                     let model_id = model.id.clone();
@@ -365,8 +403,8 @@ fn fallback_menu(
     role: TaskRole,
     label: SharedString,
     models: Vec<AvailableModel>,
-    primary_provider: String,
-    primary_model: String,
+    primary_provider: Option<String>,
+    primary_model: Option<String>,
     disabled: bool,
 ) -> impl IntoElement {
     PopoverMenu::new(format!("{}-fallback", role.id()))
@@ -399,7 +437,12 @@ fn fallback_menu(
                     })
                     .separator();
                 for model in models.clone().into_iter().filter(|model| {
-                    model.provider_id != primary_provider || model.id != primary_model
+                    match (primary_provider.as_ref(), primary_model.as_ref()) {
+                        (Some(provider), Some(model_id)) => {
+                            provider != &model.provider_id || model_id != &model.id
+                        }
+                        _ => true,
+                    }
                 }) {
                     let provider_id = model.provider_id.clone();
                     let model_id = model.id.clone();
@@ -458,11 +501,29 @@ fn set_primary_model(
     cx: &mut App,
 ) {
     update_role(role, cx, move |settings| {
+        let fallback_matches_primary = matches!(
+            settings.fallback.as_ref(),
+            Some(SubagentFallbackModelContent::Model(selection))
+                if selection.provider.0 == provider && selection.model == model
+        );
+        if fallback_matches_primary {
+            settings.fallback = Some(SubagentFallbackModelContent::Strategy(
+                SubagentFallbackStrategy::InheritFromParent,
+            ));
+        }
         settings.provider = Some(LanguageModelProviderSetting(provider));
         settings.model = Some(model);
-        if let Some(default_effort) = default_effort {
-            settings.effort = Some(default_effort);
-        }
+        settings.effort = default_effort;
+    });
+}
+
+/// Drops an explicit pin and sets the role's model intent.
+fn set_role_intent(role: TaskRole, intent: NativeSubagentModelIntent, cx: &mut App) {
+    update_role(role, cx, move |settings| {
+        settings.provider = None;
+        settings.model = None;
+        settings.effort = None;
+        settings.intent = Some(intent);
     });
 }
 

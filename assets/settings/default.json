@@ -1139,24 +1139,22 @@
     // Native role routing for subagents, independent of the parent provider.
     // Set enabled to false to restore Zed's standard subagent_model/parent
     // inheritance behavior. While enabled, tool permissions remain fixed by role.
+    //
+    // Roles resolve their model from `intent` unless they pin a `provider` and
+    // `model`. Intent is a capability request, so a role keeps working when the
+    // provider of the day is unavailable or renamed.
     "native_subagent_roles": {
       "enabled": true,
       "explorer": {
-        "provider": "openai-subscribed",
-        "model": "gpt-5.6-luna",
-        "effort": "low",
+        "intent": "fast",
         "fallback": "inherit_from_parent",
       },
       "flow_reader": {
-        "provider": "openai-subscribed",
-        "model": "gpt-5.6-luna",
-        "effort": "medium",
+        "intent": "fast",
         "fallback": "inherit_from_parent",
       },
       "coding_worker": {
-        "provider": "openai-subscribed",
-        "model": "gpt-5.6-luna",
-        "effort": "xhigh",
+        "intent": "balanced",
         "fallback": "inherit_from_parent",
       },
     },

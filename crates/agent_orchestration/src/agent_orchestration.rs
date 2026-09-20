@@ -10,6 +10,7 @@ pub mod execution_limiter;
 pub mod executor;
 pub mod goal_controller;
 pub mod ids;
+pub mod model_intent;
 pub mod persistence;
 pub mod plan_graph;
 pub mod planner;
@@ -56,6 +57,10 @@ pub use goal_controller::{
     GoalBlocker, GoalController, GoalControllerConfig, GoalSnapshot, GoalStatus,
 };
 pub use ids::{CorrelationId, EventId, PlanId, RunId, TaskId};
+pub use model_intent::{
+    IntentModelCandidate, ModelTier, ResolvedIntentModel, classify_model_tier, preferred_efforts,
+    preferred_tiers, resolve_model_intent,
+};
 pub use persistence::{PERSISTENCE_SCHEMA_VERSION, PersistedRun};
 pub use plan_graph::{GraphValidationError, OrchestrationPlan, OrchestrationTask, PlanGraph};
 pub use planner::{OrchestrationPlanner, PlanProposal};
@@ -70,10 +75,10 @@ pub use state::{RunState, TaskAttempt, TaskState, TaskStatus};
 pub use task_mutation::TaskMutationGateway;
 pub use task_registry::TaskRegistry;
 pub use verification::{
-    CriterionClaim, ErrorClass, RetryReason, VERIFICATION_END, VERIFICATION_START,
-    VerificationPolicy, VerificationResult, VerificationRunner, VerificationVerdict,
-    is_file_line_citation, output_without_verification_claim, verification_claim_envelope,
-    web_citation_url,
+    CriterionClaim, ErrorClass, FailureScope, RetryReason, TaskExecutionFailure, VERIFICATION_END,
+    VERIFICATION_START, VerificationPolicy, VerificationResult, VerificationRunner,
+    VerificationVerdict, is_file_line_citation, output_without_verification_claim,
+    verification_claim_envelope, web_citation_url,
 };
 pub use worker::{
     AcpWorkerRuntimeConfig, CapabilitySnapshot, StructuredWaitReason, WorkerBroker, WorkerHandle,
@@ -699,7 +704,7 @@ mod tests {
         let mut task = OrchestrationTask::new("task-1", "Task 1", "desc");
         task.model_override = Some("provider/primary".to_string());
         task.fallback_model_override = Some("provider/fallback".to_string());
-        task.max_retries = Some(0);
+        task.max_retries = Some(1);
         let plan = OrchestrationPlan::new("Fallback", vec![task]);
         let policy = AgentExecutionPolicy {
             strategy: AgentExecutionStrategy::Orchestrate,
@@ -735,6 +740,135 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.fallback_from_model.as_deref()),
             Some("provider/primary")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_native_model_fallback_prefers_structured_failure_class(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let observed_descriptions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let attempt_count = attempt_count.clone();
+            let observed_descriptions = observed_descriptions.clone();
+            move |context| {
+                observed_descriptions
+                    .lock()
+                    .expect("description observations lock")
+                    .push(context.task.description);
+                if attempt_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(TaskExecutionFailure::new(
+                        ErrorClass::ContextOverflow,
+                        FailureScope::Model,
+                        "opaque provider rejection",
+                    )
+                    .into());
+                }
+                Ok(TaskExecutionOutput::new("completed with fallback"))
+            }
+        }));
+
+        let mut task = OrchestrationTask::new("task-1", "Task 1", "desc");
+        task.model_override = Some("provider/primary".to_string());
+        task.fallback_model_override = Some("provider/fallback".to_string());
+        task.max_retries = Some(0);
+        let plan = OrchestrationPlan::new("Fallback", vec![task]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(attempt_count.load(Ordering::SeqCst), 2);
+        let descriptions = observed_descriptions
+            .lock()
+            .expect("description observations lock");
+        let [primary_description, fallback_description] = descriptions.as_slice() else {
+            panic!("expected primary and fallback descriptions");
+        };
+        assert!(!primary_description.contains("zed_fallback_recovery"));
+        assert!(fallback_description.contains("zed_fallback_recovery"));
+        assert!(fallback_description.contains("Inspect and reconcile the current workspace"));
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("task-1"))
+                .and_then(|status| status.worker_metadata)
+                .and_then(|metadata| metadata.fallback_reason),
+            Some("context overflow".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_request_failures_retry_primary_before_model_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let observed_models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let attempt_count = attempt_count.clone();
+            let observed_models = observed_models.clone();
+            move |context| {
+                observed_models
+                    .lock()
+                    .expect("model observations lock")
+                    .push(context.task.model_override);
+                if attempt_count.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err(TaskExecutionFailure::new(
+                        ErrorClass::TransientNetwork,
+                        FailureScope::Request,
+                        "temporary transport failure",
+                    )
+                    .into());
+                }
+                Ok(TaskExecutionOutput::new("completed after fallback"))
+            }
+        }));
+
+        let mut task = OrchestrationTask::new("task-1", "Task 1", "desc");
+        task.model_override = Some("provider/primary".to_string());
+        task.fallback_model_override = Some("provider/fallback".to_string());
+        task.max_retries = Some(1);
+        let plan = OrchestrationPlan::new("Retry before fallback", vec![task]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start runtime");
+        assert_eq!(
+            completion.await.expect("receive").expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(
+            observed_models
+                .lock()
+                .expect("model observations lock")
+                .as_slice(),
+            [
+                Some("provider/primary".to_string()),
+                Some("provider/primary".to_string()),
+                Some("provider/fallback".to_string())
+            ]
+        );
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("task-1"))
+                .expect("status")
+                .total_attempts,
+            3
         );
     }
 
@@ -1959,7 +2093,7 @@ mod tests {
         assert!(
             broker_enabled
                 .validate_task_parameters(&native_task)
-                .is_ok()
+                .is_err()
         );
         native_task.fallback_model_override = Some("provider/fallback-model".to_string());
         assert!(

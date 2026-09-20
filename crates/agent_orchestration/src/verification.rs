@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use globset::GlobSetBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Duration;
 
 use crate::plan_graph::OrchestrationTask;
@@ -31,6 +32,73 @@ pub enum ErrorClass {
     FatalError,
     /// Operation was explicitly cancelled.
     Cancelled,
+}
+
+/// The boundary at which a failed task attempt can be retried safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureScope {
+    /// Retry the same request without changing its model or credentials.
+    Request,
+    /// Retry with another account from the same provider pool.
+    Account,
+    /// Retry outside the current provider's failure domain.
+    Provider,
+    /// Retry with a different model, normally one with different capabilities.
+    Model,
+}
+
+/// Structured failure information preserved across the task-executor boundary.
+///
+/// Executors use this error when an upstream service already classified a
+/// failure. The scheduler can then make routing decisions without parsing a
+/// provider's user-facing error text.
+#[derive(Debug)]
+pub struct TaskExecutionFailure {
+    pub class: ErrorClass,
+    pub scope: FailureScope,
+    pub retry_after_ms: Option<u64>,
+    pub message: String,
+    source: Option<anyhow::Error>,
+}
+
+impl TaskExecutionFailure {
+    pub fn new(class: ErrorClass, scope: FailureScope, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            scope,
+            retry_after_ms: None,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after_ms =
+            retry_after.map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        self
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after_ms.map(Duration::from_millis)
+    }
+
+    pub fn with_source(mut self, source: anyhow::Error) -> Self {
+        self.source = Some(source);
+        self
+    }
+}
+
+impl fmt::Display for TaskExecutionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TaskExecutionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
 }
 
 impl ErrorClass {
@@ -1029,5 +1097,20 @@ mod tests {
                 .as_deref()
                 .is_some_and(|feedback| feedback.contains("scope"))
         );
+    }
+
+    #[test]
+    fn structured_failure_preserves_scope_and_retry_after() {
+        let failure = TaskExecutionFailure::new(
+            ErrorClass::RateLimit,
+            FailureScope::Account,
+            "account is temporarily rate limited",
+        )
+        .with_retry_after(Some(Duration::from_millis(2_500)));
+
+        assert_eq!(failure.class, ErrorClass::RateLimit);
+        assert_eq!(failure.scope, FailureScope::Account);
+        assert_eq!(failure.retry_after(), Some(Duration::from_millis(2_500)));
+        assert_eq!(failure.to_string(), "account is temporarily rate limited");
     }
 }

@@ -806,7 +806,13 @@ fn validate_native_task_parameters(task: &OrchestrationTask) -> Result<()> {
         bail!("mode override is not supported for native agent; use native_role for a Native role");
     }
     validate_native_model(task.model_override.as_deref(), "model")?;
-    validate_native_model(task.fallback_model_override.as_deref(), "fallback model")
+    validate_native_model(task.fallback_model_override.as_deref(), "fallback model")?;
+    if task.model_override.is_some()
+        && task.model_override.as_deref() == task.fallback_model_override.as_deref()
+    {
+        bail!("native fallback model must differ from the primary model");
+    }
+    Ok(())
 }
 
 fn validate_native_model(model: Option<&str>, field_name: &str) -> Result<()> {

@@ -212,18 +212,50 @@ pub struct AutoCompactSettingsContent {
     pub threshold: Option<AutoCompactThreshold>,
 }
 
+/// Capability-based model intent for a native subagent role.
+///
+/// Intent is a capability request rather than a provider or model identifier, so
+/// a role keeps resolving to a usable model as providers are added, removed, or
+/// renamed. It is only consulted when the role does not pin a provider and model.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSubagentModelIntent {
+    /// Retain the parent thread's model.
+    #[default]
+    SameAsParent,
+    /// Lowest-latency available model, for discovery, scanning, and routine loops.
+    Fast,
+    /// Well-rounded model, for bounded implementation work.
+    Balanced,
+    /// Highest-capability available model, for planning and acceptance review.
+    Strong,
+}
+
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct NativeSubagentRoleContent {
     /// Native provider used for this role.
+    ///
+    /// Leave unset to resolve the model from the model intent instead.
     pub provider: Option<LanguageModelProviderSetting>,
     /// Model ID used for this role.
+    ///
+    /// Leave unset to resolve the model from the model intent instead.
     pub model: Option<String>,
     /// Reasoning effort used for this role.
+    ///
+    /// Leave unset to let the model intent pick the effort.
     pub effort: Option<String>,
+    /// Capability request used when this role does not pin a provider and model.
+    pub intent: Option<NativeSubagentModelIntent>,
     /// Optional fallback used only for provider availability, rate-limit, network,
     /// or context-window failures. Defaults to the parent model.
     pub fallback: Option<SubagentFallbackModelContent>,
+    /// Optional list of allowed models (e.g. `["anthropic/claude-3-5-haiku", "openai/gpt-4o-mini"]`)
+    /// that Auto intent is restricted to choose from for this role.
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(
@@ -254,6 +286,9 @@ impl Default for SubagentFallbackModelContent {
 pub struct NativeSubagentRolesContent {
     /// Whether native role routing is enabled.
     pub enabled: Option<bool>,
+    /// Optional global list of allowed models for Auto intent across all subagent roles.
+    /// Can be overridden per role.
+    pub allowed_models: Option<Vec<String>>,
     pub explorer: Option<NativeSubagentRoleContent>,
     pub flow_reader: Option<NativeSubagentRoleContent>,
     pub coding_worker: Option<NativeSubagentRoleContent>,

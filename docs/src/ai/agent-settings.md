@@ -48,37 +48,39 @@ Some Zed AI features have their own model or prompt settings in `settings.json`,
 
 `agent.native_subagent_roles` controls role routing for Native Agent workers.
 The parent conversation and each child role may use different configured
-providers. Disable it to restore the standard `agent.subagent_model` or
-parent-model inheritance flow. The legacy key `chatgpt_subagent_roles` remains
-accepted for existing settings:
+providers or resolve models dynamically by capability intent (`fast`, `balanced`,
+`strong`, `same_as_parent`). When `provider` and `model` are omitted, the role
+resolves its model from the authenticated catalog using the requested intent,
+preferring models on the parent provider to preserve prompt-cache affinity.
+You can constrain Auto intent to choose only from a specified list of candidate
+models by setting `allowed_models` globally or per role.
+Disable it to restore the standard `agent.subagent_model` or parent-model
+inheritance flow. The legacy key `chatgpt_subagent_roles` remains accepted for
+existing settings:
 
 ```json [settings]
 {
   "agent": {
     "native_subagent_roles": {
       "enabled": true,
+      "allowed_models": [
+        "openai-subscribed/gpt-5.6-luna",
+        "9router/gemini-3.8-flash-high",
+        "9router/opus-4.6",
+        "9router/deepseek-v4.1-flash",
+        "x_ai_subscribed/grok-4.6"
+      ],
       "explorer": {
-        "provider": "openai-subscribed",
-        "model": "gpt-5.6-luna",
-        "effort": "low",
-        "fallback": "none"
+        "intent": "fast",
+        "fallback": "inherit_from_parent"
       },
       "flow_reader": {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-5",
-        "effort": "medium",
+        "intent": "balanced",
         "fallback": "inherit_from_parent"
       },
       "coding_worker": {
-        "provider": "openai-subscribed",
-        "model": "gpt-5.6-luna",
-        "effort": "xhigh",
-        "fallback": {
-          "provider": "openai-subscribed",
-          "model": "gpt-5.6-sol",
-          "enable_thinking": true,
-          "effort": "high"
-        }
+        "intent": "strong",
+        "fallback": "inherit_from_parent"
       }
     }
   }

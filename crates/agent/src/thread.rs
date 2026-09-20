@@ -23,8 +23,9 @@ use crate::sandboxing::{
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
     AgentAutonomy, AgentExecutionStrategy, AgentProfileId, AgentProfileSettings, AgentSettings,
-    AutoCompactThreshold, COMPACTION_PROMPT, NativeSubagentRolesSettings,
-    SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
+    AutoCompactThreshold, COMPACTION_PROMPT, NativeSubagentRoleSettings,
+    NativeSubagentRolesSettings, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT,
+    builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -111,23 +112,22 @@ impl SubagentRole {
         }
     }
 
-    pub(crate) fn model_selection(
+    pub(crate) fn role_settings<'a>(
         self,
-        roles: &NativeSubagentRolesSettings,
-    ) -> LanguageModelSelection {
-        let configured = match self {
+        roles: &'a NativeSubagentRolesSettings,
+    ) -> &'a NativeSubagentRoleSettings {
+        match self {
             Self::Explorer => &roles.explorer,
             Self::FlowReader => &roles.flow_reader,
             Self::CodingWorker => &roles.coding_worker,
-        };
-
-        LanguageModelSelection {
-            provider: configured.provider.clone(),
-            model: configured.model.clone(),
-            enable_thinking: true,
-            effort: Some(configured.effort.clone()),
-            speed: None,
         }
+    }
+
+    pub(crate) fn pinned_selection(
+        self,
+        roles: &NativeSubagentRolesSettings,
+    ) -> Option<LanguageModelSelection> {
+        self.role_settings(roles).pinned_selection()
     }
 
     pub(crate) fn fallback_model_selection(
@@ -135,11 +135,7 @@ impl SubagentRole {
         roles: &NativeSubagentRolesSettings,
         parent: Option<&LanguageModelSelection>,
     ) -> Option<LanguageModelSelection> {
-        let configured = match self {
-            Self::Explorer => &roles.explorer,
-            Self::FlowReader => &roles.flow_reader,
-            Self::CodingWorker => &roles.coding_worker,
-        };
+        let configured = self.role_settings(roles);
         match &configured.fallback {
             agent_settings::SubagentFallbackModelSettings::None => None,
             agent_settings::SubagentFallbackModelSettings::InheritFromParent => parent.cloned(),
@@ -293,6 +289,8 @@ const TOOL_OUTPUT_FIT_SAFETY_BYTES: usize = 16 * 1024;
 const REQUEST_IMAGE_TOKEN_ESTIMATE: usize = 4_000;
 const COMPACTION_TARGET_THRESHOLD_PERCENT: u64 = 90;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
+const COMPACTION_USER_TEXT_PER_MESSAGE_BYTE_LIMIT: usize = 128 * 1024;
+const COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET: usize = 384 * 1024;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -1704,17 +1702,26 @@ impl Thread {
             depth: parent.depth() + 1,
             role,
             root_session_id: Some(root_session_id),
-            parent_provider_id,
+            parent_provider_id: parent_provider_id.clone(),
         });
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(role) = role {
             thread.profile_id = role.profile_id();
             thread.profile_downgraded_for_restricted_workspace = false;
-            thread.inherits_parent_model_settings = false;
-            thread.apply_model_selection(
-                &role.model_selection(&AgentSettings::get_global(cx).native_subagent_roles),
-                cx,
-            );
+            // A role either pins its own model or resolves one from its model
+            // intent. When neither yields a model the subagent inherits the
+            // parent model, so catalog drift can never break a role.
+            let role_settings = AgentSettings::get_global(cx).native_subagent_roles.clone();
+            let candidates = crate::model_intent::intent_model_candidates(cx);
+            if let Some(selection) = crate::model_intent::resolve_role_model_selection(
+                role,
+                &role_settings,
+                &candidates,
+                parent_provider_id.as_deref(),
+            ) {
+                thread.inherits_parent_model_settings = false;
+                thread.apply_model_selection(&selection, cx);
+            }
         } else if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
@@ -5985,9 +5992,43 @@ impl Thread {
             None => user_agents_md,
         };
 
-        let tool_guidance = crate::tool_guidance::ToolGuidanceStore::global(cx)
+        let mut tool_guidance = crate::tool_guidance::ToolGuidanceStore::global(cx)
             .map(|store| store.render_sections(&available_tools, &rules_context))
             .unwrap_or_default();
+
+        // Inject the role→model manifest into the spawn_agent guidance so the
+        // orchestrator knows which worker models the user has configured.
+        if available_tools
+            .iter()
+            .any(|tool| tool.as_ref() == "spawn_agent")
+        {
+            let settings = agent_settings::AgentSettings::get_global(cx);
+            let candidates = crate::model_intent::intent_model_candidates(cx);
+            let parent_model = self.model();
+            let parent_provider_id = parent_model
+                .as_ref()
+                .map(|model| model.provider_id().0.to_string());
+            let parent_model_id = parent_model.as_ref().map(|model| model.id().0.to_string());
+            if let Some(manifest) = crate::model_intent::role_model_manifest(
+                &settings.native_subagent_roles,
+                &candidates,
+                parent_provider_id.as_deref(),
+                parent_model_id.as_deref(),
+            ) {
+                if let Some(section) = tool_guidance
+                    .iter_mut()
+                    .find(|section| section.tool_name.as_ref() == "spawn_agent")
+                {
+                    section.guidance =
+                        SharedString::from(format!("{}{manifest}", section.guidance));
+                } else {
+                    tool_guidance.push(crate::templates::ToolGuidanceSection {
+                        tool_name: "spawn_agent".into(),
+                        guidance: SharedString::from(manifest),
+                    });
+                }
+            }
+        }
 
         let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
@@ -6376,6 +6417,7 @@ impl Thread {
             reasoning_details: None,
         });
         budget_tool_outputs(&mut request, false);
+        budget_user_message_text(&mut request);
 
         request
     }
@@ -7059,6 +7101,32 @@ fn budget_tool_outputs(request: &mut LanguageModelRequest, preserve_latest_tool_
             ACTIVE_TOOL_OUTPUT_TOTAL_BYTE_BUDGET,
             NORMAL_TOOL_OUTPUT_BYTE_LIMIT,
         );
+    }
+}
+
+fn budget_user_message_text(request: &mut LanguageModelRequest) {
+    let mut remaining_total = COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET;
+    for message in request.messages.iter_mut() {
+        if message.role != Role::User {
+            continue;
+        }
+        for content in message.content.iter_mut() {
+            let MessageContent::Text(text) = content else {
+                continue;
+            };
+            let per_item_limit = COMPACTION_USER_TEXT_PER_MESSAGE_BYTE_LIMIT.min(remaining_total);
+            if text.len() <= per_item_limit {
+                remaining_total = remaining_total.saturating_sub(text.len());
+                continue;
+            }
+            let truncate_at = text.floor_char_boundary(per_item_limit);
+            let original_len = text.len();
+            text.truncate(truncate_at);
+            text.push_str(&format!(
+                "\n\n[Content truncated for compaction: {truncate_at} of {original_len} bytes retained]"
+            ));
+            remaining_total = remaining_total.saturating_sub(text.len());
+        }
     }
 }
 
@@ -9270,23 +9338,34 @@ mod tests {
 
         let roles = NativeSubagentRolesSettings {
             enabled: true,
+            allowed_models: Vec::new(),
             explorer: agent_settings::NativeSubagentRoleSettings {
-                provider: settings::LanguageModelProviderSetting("anthropic".to_string()),
-                model: "explorer-model".to_string(),
-                effort: "low".to_string(),
+                provider: Some(settings::LanguageModelProviderSetting(
+                    "anthropic".to_string(),
+                )),
+                model: Some("explorer-model".to_string()),
+                effort: Some("low".to_string()),
+                intent: settings::NativeSubagentModelIntent::Fast,
                 fallback: agent_settings::SubagentFallbackModelSettings::InheritFromParent,
+                allowed_models: None,
             },
             flow_reader: agent_settings::NativeSubagentRoleSettings {
-                provider: settings::LanguageModelProviderSetting("google".to_string()),
-                model: "flow-model".to_string(),
-                effort: "medium".to_string(),
+                provider: Some(settings::LanguageModelProviderSetting("google".to_string())),
+                model: Some("flow-model".to_string()),
+                effort: Some("medium".to_string()),
+                intent: settings::NativeSubagentModelIntent::Fast,
                 fallback: agent_settings::SubagentFallbackModelSettings::None,
+                allowed_models: None,
             },
             coding_worker: agent_settings::NativeSubagentRoleSettings {
-                provider: settings::LanguageModelProviderSetting("openai-subscribed".to_string()),
-                model: "worker-model".to_string(),
-                effort: "xhigh".to_string(),
+                provider: Some(settings::LanguageModelProviderSetting(
+                    "openai-subscribed".to_string(),
+                )),
+                model: Some("worker-model".to_string()),
+                effort: Some("xhigh".to_string()),
+                intent: settings::NativeSubagentModelIntent::Balanced,
                 fallback: agent_settings::SubagentFallbackModelSettings::None,
+                allowed_models: None,
             },
         };
         let cases = [
@@ -9314,7 +9393,9 @@ mod tests {
         ];
 
         for (role, provider, model, effort, profile) in cases {
-            let selection = role.model_selection(&roles);
+            let selection = role
+                .pinned_selection(&roles)
+                .expect("role pins an explicit model");
             assert_eq!(selection.provider.0, provider);
             assert_eq!(selection.model, model);
             assert_eq!(selection.effort.as_deref(), Some(effort));
@@ -9776,6 +9857,118 @@ mod tests {
                 })]
             )
         }));
+    }
+
+    #[test]
+    fn test_budget_user_message_text_truncates_oversized_content() {
+        let oversized = "x".repeat(COMPACTION_USER_TEXT_PER_MESSAGE_BYTE_LIMIT + 50_000);
+        let small = "small text".to_string();
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(oversized.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(small.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        budget_user_message_text(&mut request);
+
+        let first_text = request.messages[0].string_contents();
+        assert!(
+            first_text.len() < oversized.len(),
+            "oversized message should have been truncated"
+        );
+        assert!(
+            first_text.contains("[Content truncated for compaction:"),
+            "truncation marker missing"
+        );
+        let second_text = request.messages[1].string_contents();
+        assert_eq!(second_text, small, "small message should not be truncated");
+    }
+
+    #[test]
+    fn test_budget_user_message_text_respects_total_budget() {
+        let chunk_size = COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET / 2 + 1;
+        let chunk = "a".repeat(chunk_size);
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(chunk.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text(chunk.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        budget_user_message_text(&mut request);
+
+        let total_text_bytes: usize = request
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .map(|c| match c {
+                MessageContent::Text(t) => t.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            total_text_bytes <= COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET + 200,
+            "total text bytes {total_text_bytes} should be near the total budget {}",
+            COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET
+        );
+    }
+
+    #[test]
+    fn test_budget_user_message_text_skips_non_user_roles() {
+        let big = "y".repeat(COMPACTION_USER_TEXT_PER_MESSAGE_BYTE_LIMIT + 10_000);
+        let mut request = LanguageModelRequest {
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::System,
+                    content: vec![MessageContent::Text(big.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::Assistant,
+                    content: vec![MessageContent::Text(big.clone())],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        budget_user_message_text(&mut request);
+
+        assert_eq!(
+            request.messages[0].string_contents().len(),
+            big.len(),
+            "system message should not be truncated"
+        );
+        assert_eq!(
+            request.messages[1].string_contents().len(),
+            big.len(),
+            "assistant message should not be truncated"
+        );
     }
 
     #[test]

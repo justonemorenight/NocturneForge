@@ -21,10 +21,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
     AgentNotificationStyle, DockPosition, DockSide, LanguageModelParameters,
-    LanguageModelSelection, NativeSubagentRoleContent, NativeSubagentRolesContent,
-    NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, ReviewControlLocation,
-    Settings, SettingsContent, SettingsStore, SidebarDockPosition, SidebarSide,
-    SubagentFallbackModelContent, SubagentFallbackStrategy, ThinkingBlockDisplay,
+    LanguageModelSelection, NativeSubagentModelIntent, NativeSubagentRoleContent,
+    NativeSubagentRolesContent, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting,
+    ReviewControlLocation, Settings, SettingsContent, SettingsStore, SidebarDockPosition,
+    SidebarSide, SubagentFallbackModelContent, SubagentFallbackStrategy, ThinkingBlockDisplay,
     ToolPermissionMode, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
@@ -51,10 +51,17 @@ pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt"
 
 #[derive(Clone, Debug)]
 pub struct NativeSubagentRoleSettings {
-    pub provider: settings::LanguageModelProviderSetting,
-    pub model: String,
-    pub effort: String,
+    /// Explicit provider pin. Unset means the role resolves its model by intent.
+    pub provider: Option<settings::LanguageModelProviderSetting>,
+    /// Explicit model pin. Unset means the role resolves its model by intent.
+    pub model: Option<String>,
+    /// Explicit reasoning-effort override. Unset means the intent picks the effort.
+    pub effort: Option<String>,
+    /// Capability request used when this role is not pinned to a provider and model.
+    pub intent: NativeSubagentModelIntent,
     pub fallback: SubagentFallbackModelSettings,
+    /// Optional role-specific list of allowed models for Auto intent.
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,18 +85,67 @@ impl From<SubagentFallbackModelContent> for SubagentFallbackModelSettings {
 }
 
 impl NativeSubagentRoleSettings {
+    /// The selection a user pinned explicitly.
+    ///
+    /// A role is only pinned when it names both a provider and a model; a
+    /// partial pin would be ambiguous against the model intent, so it resolves
+    /// by intent and the stale half stays inert.
+    pub fn pinned_selection(&self) -> Option<LanguageModelSelection> {
+        Some(LanguageModelSelection {
+            provider: self.provider.clone()?,
+            model: self.model.clone()?,
+            enable_thinking: true,
+            effort: self.effort.clone(),
+            speed: None,
+        })
+    }
+
+    /// The effective list of allowed models for this role, falling back to the
+    /// global list if no role-specific list is configured.
+    pub fn allowed_models<'a>(
+        &'a self,
+        roles: &'a NativeSubagentRolesSettings,
+    ) -> Option<&'a [String]> {
+        if let Some(ref models) = self.allowed_models {
+            Some(models.as_slice())
+        } else if !roles.allowed_models.is_empty() {
+            Some(roles.allowed_models.as_slice())
+        } else {
+            None
+        }
+    }
+
     fn merge_content(mut self, content: NativeSubagentRoleContent) -> Self {
         if let Some(provider) = content.provider {
-            self.provider = provider;
+            self.provider = Some(provider);
         }
         if let Some(model) = content.model {
-            self.model = model;
+            self.model = Some(model);
         }
         if let Some(effort) = content.effort {
-            self.effort = effort;
+            self.effort = Some(effort);
+        }
+        if let Some(intent) = content.intent {
+            self.intent = intent;
         }
         if let Some(fallback) = content.fallback {
             self.fallback = fallback.into();
+        }
+        if let Some(allowed_models) = content.allowed_models {
+            self.allowed_models = Some(allowed_models);
+        }
+        self
+    }
+
+    fn normalize_fallback(mut self) -> Self {
+        let fallback_matches_primary = match (self.pinned_selection(), &self.fallback) {
+            (Some(primary), SubagentFallbackModelSettings::Model(fallback)) => {
+                primary.provider == fallback.provider && primary.model == fallback.model
+            }
+            _ => false,
+        };
+        if fallback_matches_primary {
+            self.fallback = SubagentFallbackModelSettings::InheritFromParent;
         }
         self
     }
@@ -98,6 +154,8 @@ impl NativeSubagentRoleSettings {
 #[derive(Clone, Debug)]
 pub struct NativeSubagentRolesSettings {
     pub enabled: bool,
+    /// Global list of allowed models for Auto intent across all roles.
+    pub allowed_models: Vec<String>,
     pub explorer: NativeSubagentRoleSettings,
     pub flow_reader: NativeSubagentRoleSettings,
     pub coding_worker: NativeSubagentRoleSettings,
@@ -105,17 +163,23 @@ pub struct NativeSubagentRolesSettings {
 
 impl Default for NativeSubagentRolesSettings {
     fn default() -> Self {
-        let role = |effort: &str| NativeSubagentRoleSettings {
-            provider: settings::LanguageModelProviderSetting("openai-subscribed".to_string()),
-            model: "gpt-5.6-luna".to_string(),
-            effort: effort.to_string(),
+        // Roles intentionally declare no provider or model. Resolution goes
+        // through the model intent so a role still works when the hardcoded
+        // provider of the day is unavailable or renamed.
+        let role = |intent: NativeSubagentModelIntent| NativeSubagentRoleSettings {
+            provider: None,
+            model: None,
+            effort: None,
+            intent,
             fallback: SubagentFallbackModelSettings::InheritFromParent,
+            allowed_models: None,
         };
         Self {
             enabled: true,
-            explorer: role("low"),
-            flow_reader: role("medium"),
-            coding_worker: role("xhigh"),
+            allowed_models: Vec::new(),
+            explorer: role(NativeSubagentModelIntent::Fast),
+            flow_reader: role(NativeSubagentModelIntent::Fast),
+            coding_worker: role(NativeSubagentModelIntent::Balanced),
         }
     }
 }
@@ -126,14 +190,26 @@ impl From<NativeSubagentRolesContent> for NativeSubagentRolesSettings {
         if let Some(enabled) = content.enabled {
             settings.enabled = enabled;
         }
+        if let Some(allowed_models) = content.allowed_models {
+            settings.allowed_models = allowed_models;
+        }
         if let Some(explorer) = content.explorer {
-            settings.explorer = settings.explorer.merge_content(explorer);
+            settings.explorer = settings
+                .explorer
+                .merge_content(explorer)
+                .normalize_fallback();
         }
         if let Some(flow_reader) = content.flow_reader {
-            settings.flow_reader = settings.flow_reader.merge_content(flow_reader);
+            settings.flow_reader = settings
+                .flow_reader
+                .merge_content(flow_reader)
+                .normalize_fallback();
         }
         if let Some(coding_worker) = content.coding_worker {
-            settings.coding_worker = settings.coding_worker.merge_content(coding_worker);
+            settings.coding_worker = settings
+                .coding_worker
+                .merge_content(coding_worker)
+                .normalize_fallback();
         }
         settings
     }
@@ -1109,14 +1185,46 @@ mod tests {
     use settings::ToolPermissionsContent;
 
     #[test]
-    fn native_subagent_roles_default_to_parent_fallback() {
+    fn native_subagent_roles_default_to_intent_resolution() {
         let roles = NativeSubagentRolesSettings::default();
+        assert_eq!(roles.explorer.intent, NativeSubagentModelIntent::Fast);
+        assert_eq!(roles.flow_reader.intent, NativeSubagentModelIntent::Fast);
+        assert_eq!(
+            roles.coding_worker.intent,
+            NativeSubagentModelIntent::Balanced
+        );
         for role in [&roles.explorer, &roles.flow_reader, &roles.coding_worker] {
+            assert!(role.pinned_selection().is_none());
             assert_eq!(
                 role.fallback,
                 SubagentFallbackModelSettings::InheritFromParent
             );
         }
+    }
+
+    #[test]
+    fn native_subagent_role_normalizes_duplicate_fallback() {
+        let primary = LanguageModelSelection {
+            provider: settings::LanguageModelProviderSetting("provider".to_string()),
+            model: "model".to_string(),
+            enable_thinking: true,
+            effort: Some("high".to_string()),
+            speed: None,
+        };
+        let roles = NativeSubagentRolesSettings::from(NativeSubagentRolesContent {
+            coding_worker: Some(NativeSubagentRoleContent {
+                provider: Some(primary.provider.clone()),
+                model: Some(primary.model.clone()),
+                fallback: Some(SubagentFallbackModelContent::Model(primary)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            roles.coding_worker.fallback,
+            SubagentFallbackModelSettings::InheritFromParent
+        );
     }
 
     #[test]
@@ -1129,10 +1237,46 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(roles.explorer.model, "custom-model");
-        assert_eq!(roles.explorer.provider.0, "openai-subscribed");
-        assert_eq!(roles.flow_reader.effort, "medium");
-        assert_eq!(roles.coding_worker.effort, "xhigh");
+        assert_eq!(roles.explorer.model.as_deref(), Some("custom-model"));
+        // A model without a provider is not a usable pin, so the role keeps
+        // resolving by intent rather than guessing a provider.
+        assert!(roles.explorer.provider.is_none());
+        assert!(roles.explorer.pinned_selection().is_none());
+        assert_eq!(roles.flow_reader.effort, None);
+        assert_eq!(roles.coding_worker.effort, None);
+    }
+
+    #[test]
+    fn test_native_subagent_roles_allowed_models() {
+        let roles = NativeSubagentRolesSettings::from(NativeSubagentRolesContent {
+            allowed_models: Some(vec![
+                "anthropic/claude-3-5-haiku".to_string(),
+                "openai/gpt-4o-mini".to_string(),
+            ]),
+            coding_worker: Some(NativeSubagentRoleContent {
+                allowed_models: Some(vec!["google/gemini-2.0-flash".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // Explorer inherits the global allowed_models list
+        assert_eq!(
+            roles.explorer.allowed_models(&roles),
+            Some(
+                [
+                    "anthropic/claude-3-5-haiku".to_string(),
+                    "openai/gpt-4o-mini".to_string()
+                ]
+                .as_slice()
+            )
+        );
+
+        // Coding worker uses its role-specific allowed_models override
+        assert_eq!(
+            roles.coding_worker.allowed_models(&roles),
+            Some(["google/gemini-2.0-flash".to_string()].as_slice())
+        );
     }
 
     #[gpui::test]
@@ -1347,17 +1491,27 @@ mod tests {
 
         let roles = &AgentSettings::get_global(cx).native_subagent_roles;
         assert!(!roles.enabled);
-        assert_eq!(roles.explorer.provider.0, "openai-subscribed");
-        assert_eq!(roles.explorer.model, "custom-luna");
-        assert_eq!(roles.explorer.effort, "high");
+        assert!(roles.explorer.provider.is_none());
+        assert_eq!(roles.explorer.model.as_deref(), Some("custom-luna"));
+        assert_eq!(roles.explorer.effort.as_deref(), Some("high"));
         assert_eq!(
             roles.explorer.fallback,
             SubagentFallbackModelSettings::InheritFromParent
         );
-        assert_eq!(roles.flow_reader.provider.0, "anthropic");
-        assert_eq!(roles.flow_reader.model, "claude-sonnet-4-5");
-        assert_eq!(roles.flow_reader.effort, "medium");
-        assert_eq!(roles.coding_worker.effort, "xhigh");
+        assert_eq!(
+            roles
+                .flow_reader
+                .provider
+                .as_ref()
+                .map(|provider| provider.0.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            roles.flow_reader.model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(roles.flow_reader.effort, None);
+        assert_eq!(roles.coding_worker.effort, None);
         let SubagentFallbackModelSettings::Model(fallback) = &roles.coding_worker.fallback else {
             panic!("expected an explicit fallback model");
         };
