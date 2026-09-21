@@ -6,7 +6,7 @@ use http_client::HttpClient;
 use language_model::{
     AuthenticateError, IconOrSvg, InlineDescription, LanguageModel, LanguageModelProvider,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    ProviderAccountSummary, ProviderSettingsView,
+    ProviderAccountSummary, ProviderSettingsView, QuotaPoolAccountSummary, QuotaPoolSummary,
 };
 use std::sync::Arc;
 use ui::{ConfiguredApiCard, prelude::*};
@@ -14,6 +14,10 @@ use x_ai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, SuperGrokModel, create_
 
 const SUBSCRIPTION_DESCRIPTION: &str =
     "Sign in with your SuperGrok subscription to use Grok models in Zed's agent.";
+
+fn remaining_percent(used_percent: f64) -> f64 {
+    100.0 - used_percent.clamp(0.0, 100.0)
+}
 
 pub struct XAiSubscribedProvider {
     state: Entity<State>,
@@ -86,16 +90,118 @@ impl LanguageModelProvider for XAiSubscribedProvider {
             .read(cx)
             .account_summaries()
             .into_iter()
-            .map(|account| ProviderAccountSummary {
-                id: account.session_id,
-                label: account.email.unwrap_or_else(|| "SuperGrok account".into()),
-                detail: None,
-                quota: None,
-                is_active: account.is_active,
-                is_busy: account.is_busy,
-                reauthentication_required: account.reauthentication_required,
+            .map(|account| {
+                let quota = account.quota.as_ref().map(|quota| {
+                    let stale = if account.quota_stale { " · stale" } else { "" };
+                    format!(
+                        "{:.0}% remaining{stale}",
+                        remaining_percent(quota.used_percent),
+                    )
+                    .into()
+                });
+                ProviderAccountSummary {
+                    id: account.session_id,
+                    label: account.email.unwrap_or_else(|| "SuperGrok account".into()),
+                    detail: account.plan_type,
+                    quota,
+                    is_active: account.is_active,
+                    is_busy: account.is_busy,
+                    reauthentication_required: account.reauthentication_required,
+                }
             })
             .collect()
+    }
+
+    fn quota_pool(&self, model_id: Option<&str>, cx: &App) -> Option<QuotaPoolSummary> {
+        let state = self.state.read(cx);
+        let summaries = state.account_summaries();
+        if summaries.is_empty() {
+            return None;
+        }
+
+        let now = x_ai_subscribed::now_ms();
+        let target_model = model_id.unwrap_or("grok-4.6");
+        let eligible_session_ids: std::collections::HashSet<_> = state
+            .eligible_accounts(target_model)
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        let eligible_count = eligible_session_ids.len();
+
+        let mut total_known_remaining = 0.0;
+        let mut has_unknown_eligible = false;
+        let mut pool_has_stale = false;
+        let mut accounts = Vec::new();
+
+        for account in &summaries {
+            let is_eligible = eligible_session_ids.contains(account.session_id.as_ref());
+            let is_reauth = account.reauthentication_required;
+            let is_stale = account.quota_stale;
+            let is_rate_limited = account.exclusions.iter().any(|ex| match ex {
+                x_ai_subscribed::AccountExclusion::RateLimited { retry_at_ms, scope } => {
+                    let applies = match scope {
+                        x_ai_subscribed::AccountExclusionScope::Account => true,
+                        x_ai_subscribed::AccountExclusionScope::Model(m) => m == target_model,
+                    };
+                    applies && *retry_at_ms > now
+                }
+                _ => false,
+            });
+            let is_forbidden = account.exclusions.iter().any(|ex| match ex {
+                x_ai_subscribed::AccountExclusion::Forbidden { scope } => match scope {
+                    x_ai_subscribed::AccountExclusionScope::Account => true,
+                    x_ai_subscribed::AccountExclusionScope::Model(m) => m == target_model,
+                },
+                _ => false,
+            });
+
+            let rem = if !is_eligible {
+                Some(0.0)
+            } else if let Some(quota) = &account.quota {
+                if is_stale {
+                    pool_has_stale = true;
+                }
+                Some(remaining_percent(quota.used_percent))
+            } else {
+                has_unknown_eligible = true;
+                None
+            };
+
+            if let Some(r) = rem {
+                total_known_remaining += r;
+            }
+
+            accounts.push(QuotaPoolAccountSummary {
+                id: account.session_id.clone(),
+                label: account
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| "SuperGrok account".into()),
+                remaining_percent: rem,
+                is_stale,
+                is_active: account.is_active,
+                is_eligible,
+                is_rate_limited,
+                is_reauth_required: is_reauth,
+                is_forbidden,
+            });
+        }
+
+        let avg_remaining = if eligible_count == 0 {
+            Some(0.0)
+        } else if has_unknown_eligible {
+            None
+        } else {
+            Some((total_known_remaining / summaries.len() as f64).clamp(0.0, 100.0))
+        };
+
+        Some(QuotaPoolSummary {
+            remaining_percent: avg_remaining,
+            total_accounts: summaries.len(),
+            eligible_accounts: eligible_count,
+            is_stale: pool_has_stale,
+            accounts,
+        })
     }
 
     fn switch_account(&self, account_id: SharedString, cx: &mut App) -> Task<Result<()>> {
@@ -215,6 +321,16 @@ impl Render for ConfigurationView {
                     let state_entity = state_entity.clone();
                     let account_id = account.session_id.clone();
                     let mut label = account.email.unwrap_or_else(|| "SuperGrok account".into());
+                    if let Some(plan) = account.plan_type.as_ref() {
+                        label = format!("{label} · {plan}").into();
+                    }
+                    if let Some(quota) = account.quota.as_ref() {
+                        label = format!(
+                            "{label} · {:.0}% remaining",
+                            remaining_percent(quota.used_percent)
+                        )
+                        .into();
+                    }
                     if account.reauthentication_required {
                         label = format!("{label} · sign in required").into();
                     }

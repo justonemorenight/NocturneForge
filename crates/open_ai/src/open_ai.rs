@@ -677,9 +677,13 @@ mod tests {
     #[test]
     fn test_supports_configuration_update_capability() {
         assert!(super::model_supports_configuration_update("gpt-6-astra"));
-        assert!(super::model_supports_configuration_update("openai/gpt-6-astra"));
+        assert!(super::model_supports_configuration_update(
+            "openai/gpt-6-astra"
+        ));
         assert!(super::model_supports_configuration_update("gpt-6"));
-        assert!(super::model_supports_configuration_update("claude-fable-5.1"));
+        assert!(super::model_supports_configuration_update(
+            "claude-fable-5.1"
+        ));
 
         assert!(!super::model_supports_configuration_update("gpt-5.6-sol"));
         assert!(!super::model_supports_configuration_update("gpt-5.6-terra"));
@@ -688,7 +692,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
 }
@@ -701,7 +705,7 @@ impl Default for StreamOptions {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
     pub model: String,
     pub messages: Vec<RequestMessage>,
@@ -746,7 +750,7 @@ pub enum ServiceTier {
     Priority,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
     Auto,

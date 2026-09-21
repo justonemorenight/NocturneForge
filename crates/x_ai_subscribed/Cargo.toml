@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+chrono.workspace = true
 credentials_provider.workspace = true
 futures.workspace = true
 gpui.workspace = true

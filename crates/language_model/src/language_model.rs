@@ -76,6 +76,28 @@ pub struct ProviderAccountSummary {
     pub reauthentication_required: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaPoolAccountSummary {
+    pub id: SharedString,
+    pub label: SharedString,
+    pub remaining_percent: Option<f64>,
+    pub is_stale: bool,
+    pub is_active: bool,
+    pub is_eligible: bool,
+    pub is_rate_limited: bool,
+    pub is_reauth_required: bool,
+    pub is_forbidden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaPoolSummary {
+    pub remaining_percent: Option<f64>,
+    pub total_accounts: usize,
+    pub eligible_accounts: usize,
+    pub is_stale: bool,
+    pub accounts: Vec<QuotaPoolAccountSummary>,
+}
+
 /// The outcome of an explicit [`LanguageModel::compact`] request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionResult {
@@ -442,6 +464,10 @@ pub trait LanguageModelProvider: 'static {
 
     fn account_summaries(&self, _cx: &App) -> Vec<ProviderAccountSummary> {
         Vec::new()
+    }
+
+    fn quota_pool(&self, _model_id: Option<&str>, _cx: &App) -> Option<QuotaPoolSummary> {
+        None
     }
 
     fn switch_account(&self, _account_id: SharedString, _cx: &mut App) -> Task<Result<()>> {

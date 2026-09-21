@@ -16,8 +16,9 @@ use open_ai::{ReasoningEffort, ResponseStreamEvent};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 use util::ResultExt as _;
@@ -37,6 +38,12 @@ const ACCOUNT_MANIFEST_KEY: &str = "https://auth.x.ai/zed-supergrok/accounts";
 const ACCOUNT_CREDENTIALS_PREFIX: &str = "https://auth.x.ai/zed-supergrok/account/";
 const MAX_ACCOUNT_SESSIONS: usize = 5;
 const TOKEN_REFRESH_BUFFER_MS: u64 = Duration::from_secs(120).as_millis() as u64;
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+pub const QUOTA_EXHAUSTION_THRESHOLD_PERCENT: f64 = 100.0;
+const GROK_CLI_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const GROK_CREDITS_GRPC_URL: &str =
+    "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 
 const CALLBACK_HOST: &str = "127.0.0.1";
 const CALLBACK_PORT: u16 = 56121;
@@ -64,22 +71,310 @@ struct AccountManifest {
     sessions: Vec<AccountSessionMetadata>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct AccountSessionMetadata {
-    session_id: String,
-    email: Option<String>,
-    last_used_at_ms: u64,
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum AccountExclusionScope {
+    Account,
+    Model(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum AccountExclusion {
+    ReauthenticationRequired,
+    Forbidden {
+        scope: AccountExclusionScope,
+    },
+    RateLimited {
+        retry_at_ms: u64,
+        scope: AccountExclusionScope,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AccountSessionMetadata {
+    pub session_id: String,
+    pub email: Option<String>,
     #[serde(default)]
-    reauthentication_required: bool,
+    pub login_order: u32,
+    pub last_used_at_ms: u64,
+    #[serde(default)]
+    pub reauthentication_required: bool,
+    #[serde(default)]
+    pub quota: Option<QuotaSnapshot>,
+    #[serde(default)]
+    pub quota_fetched_at_ms: Option<u64>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub exclusion: Option<AccountExclusion>,
+    #[serde(default)]
+    pub exclusions: Vec<AccountExclusion>,
+}
+
+impl AccountSessionMetadata {
+    pub fn is_excluded_for(&self, model_id: &str, now_ms: u64) -> bool {
+        if self.reauthentication_required {
+            return true;
+        }
+        if let Some(quota) = &self.quota {
+            if quota.used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT {
+                if let Some(reset_ms) = quota
+                    .resets_at
+                    .map(|seconds| (seconds as u64).saturating_mul(1000))
+                {
+                    if now_ms < reset_ms {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.all_exclusions().into_iter().any(|ex| match ex {
+            AccountExclusion::ReauthenticationRequired => self.reauthentication_required,
+            AccountExclusion::Forbidden { scope } => match scope {
+                AccountExclusionScope::Account => true,
+                AccountExclusionScope::Model(m) => m == model_id,
+            },
+            AccountExclusion::RateLimited { retry_at_ms, scope } => {
+                if now_ms >= retry_at_ms {
+                    false
+                } else {
+                    match scope {
+                        AccountExclusionScope::Account => true,
+                        AccountExclusionScope::Model(m) => m == model_id,
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn is_eligible_for(&self, model_id: &str, now_ms: u64) -> bool {
+        !self.is_excluded_for(model_id, now_ms)
+    }
+
+    pub fn clean_expired_exclusions(&mut self, now_ms: u64) {
+        if let Some(ex) = self.exclusion.take() {
+            if !self.exclusions.contains(&ex) {
+                self.exclusions.push(ex);
+            }
+        }
+        self.exclusions.retain(|ex| match ex {
+            AccountExclusion::RateLimited { retry_at_ms, .. } => *retry_at_ms > now_ms,
+            _ => true,
+        });
+        self.exclusion = self.exclusions.last().cloned();
+    }
+
+    pub fn add_exclusion(&mut self, exclusion: AccountExclusion) {
+        if let Some(ex) = self.exclusion.take() {
+            if !self.exclusions.contains(&ex) {
+                self.exclusions.push(ex);
+            }
+        }
+        match &exclusion {
+            AccountExclusion::Forbidden {
+                scope: AccountExclusionScope::Account,
+            } => {
+                self.exclusions
+                    .retain(|ex| !matches!(ex, AccountExclusion::Forbidden { .. }));
+            }
+            AccountExclusion::Forbidden {
+                scope: AccountExclusionScope::Model(m),
+            } => {
+                self.exclusions.retain(|ex| match ex {
+                    AccountExclusion::Forbidden {
+                        scope: AccountExclusionScope::Model(existing),
+                    } if existing == m => false,
+                    _ => true,
+                });
+            }
+            AccountExclusion::RateLimited {
+                scope: AccountExclusionScope::Account,
+                ..
+            } => {
+                self.exclusions
+                    .retain(|ex| !matches!(ex, AccountExclusion::RateLimited { .. }));
+            }
+            AccountExclusion::RateLimited {
+                scope: AccountExclusionScope::Model(m),
+                ..
+            } => {
+                self.exclusions.retain(|ex| match ex {
+                    AccountExclusion::RateLimited {
+                        scope: AccountExclusionScope::Model(existing),
+                        ..
+                    } if existing == m => false,
+                    _ => true,
+                });
+            }
+            AccountExclusion::ReauthenticationRequired => {
+                self.reauthentication_required = true;
+            }
+        }
+        self.exclusions.push(exclusion.clone());
+        self.exclusion = Some(exclusion);
+    }
+
+    pub fn clear_rate_limits(&mut self) {
+        if let Some(ex) = self.exclusion.take() {
+            if !self.exclusions.contains(&ex) {
+                self.exclusions.push(ex);
+            }
+        }
+        self.exclusions
+            .retain(|ex| !matches!(ex, AccountExclusion::RateLimited { .. }));
+        self.exclusion = self.exclusions.last().cloned();
+    }
+
+    pub fn clear_account_rate_limits(&mut self) {
+        if let Some(ex) = self.exclusion.take() {
+            if !self.exclusions.contains(&ex) {
+                self.exclusions.push(ex);
+            }
+        }
+        self.exclusions.retain(|ex| {
+            !matches!(
+                ex,
+                AccountExclusion::RateLimited {
+                    scope: AccountExclusionScope::Account,
+                    ..
+                }
+            )
+        });
+        self.exclusion = self.exclusions.last().cloned();
+    }
+
+    pub fn clear_reauthentication_required(&mut self) {
+        self.reauthentication_required = false;
+        if let Some(ex) = self.exclusion.take() {
+            if !self.exclusions.contains(&ex) {
+                self.exclusions.push(ex);
+            }
+        }
+        self.exclusions
+            .retain(|ex| !matches!(ex, AccountExclusion::ReauthenticationRequired));
+        self.exclusion = self.exclusions.last().cloned();
+    }
+
+    pub fn clear_all_exclusions(&mut self) {
+        self.exclusion = None;
+        self.exclusions.clear();
+        self.reauthentication_required = false;
+    }
+
+    fn all_exclusions(&self) -> Vec<AccountExclusion> {
+        let mut list = self.exclusions.clone();
+        if let Some(ex) = &self.exclusion {
+            if !list.contains(ex) {
+                list.push(ex.clone());
+            }
+        }
+        list
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuotaSnapshot {
+    pub used_percent: f64,
+    pub resets_at: Option<i64>,
+    pub plan_type: Option<String>,
+    pub captured_at_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct AccountSummary {
     pub session_id: SharedString,
     pub email: Option<SharedString>,
+    pub plan_type: Option<SharedString>,
+    pub quota: Option<QuotaSnapshot>,
+    pub quota_stale: bool,
     pub reauthentication_required: bool,
     pub is_active: bool,
     pub is_busy: bool,
+    pub exclusion: Option<AccountExclusion>,
+    pub exclusions: Vec<AccountExclusion>,
+}
+
+impl AccountSummary {
+    pub fn is_excluded_for(&self, model_id: &str, now_ms: u64) -> bool {
+        if self.reauthentication_required {
+            return true;
+        }
+        if let Some(quota) = &self.quota {
+            if quota.used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT {
+                if let Some(reset_ms) = quota
+                    .resets_at
+                    .map(|seconds| (seconds as u64).saturating_mul(1000))
+                {
+                    if now_ms < reset_ms {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.exclusions.iter().any(|ex| match ex {
+            AccountExclusion::ReauthenticationRequired => self.reauthentication_required,
+            AccountExclusion::Forbidden { scope } => match scope {
+                AccountExclusionScope::Account => true,
+                AccountExclusionScope::Model(m) => m == model_id,
+            },
+            AccountExclusion::RateLimited { retry_at_ms, scope } => {
+                if now_ms >= *retry_at_ms {
+                    false
+                } else {
+                    match scope {
+                        AccountExclusionScope::Account => true,
+                        AccountExclusionScope::Model(m) => m == model_id,
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn is_eligible_for(&self, model_id: &str, now_ms: u64) -> bool {
+        !self.is_excluded_for(model_id, now_ms)
+    }
+}
+
+#[derive(Clone, Default)]
+struct SessionInFlightTracker {
+    counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl SessionInFlightTracker {
+    fn acquire(&self, session_id: &str) -> SessionLease {
+        if let Ok(mut counts) = self.counts.lock() {
+            *counts.entry(session_id.to_string()).or_insert(0) += 1;
+        }
+        SessionLease {
+            session_id: session_id.to_string(),
+            tracker: self.clone(),
+        }
+    }
+
+    fn release(&self, session_id: &str) {
+        if let Ok(mut counts) = self.counts.lock() {
+            if let Some(count) = counts.get_mut(session_id) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+
+    fn count(&self, session_id: &str) -> usize {
+        self.counts
+            .lock()
+            .map(|counts| counts.get(session_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
+struct SessionLease {
+    session_id: String,
+    tracker: SessionInFlightTracker,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.tracker.release(&self.session_id);
+    }
 }
 
 impl SuperGrokCredentials {
@@ -91,17 +386,23 @@ impl SuperGrokCredentials {
 pub struct State {
     manifest: AccountManifest,
     credentials: Option<SuperGrokCredentials>,
+    cached_credentials: HashMap<String, SuperGrokCredentials>,
     active_session_id: Option<String>,
     sign_in_task: Option<Task<Result<()>>>,
     refresh_task: Option<Shared<Task<Result<SuperGrokCredentials, Arc<anyhow::Error>>>>>,
+    refresh_tasks: HashMap<String, Shared<Task<Result<SuperGrokCredentials, Arc<anyhow::Error>>>>>,
     load_task: Option<Shared<Task<Result<(), Arc<anyhow::Error>>>>>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
     auth_generation: u64,
+    routing_generation: u64,
     last_auth_error: Option<SharedString>,
     active_operations: Arc<AtomicUsize>,
+    in_flight_tracker: SessionInFlightTracker,
+    consecutive_rate_limits: HashMap<String, u32>,
     account_mutation_in_progress: bool,
     account_mutation_seq: u64,
+    quota_refresh_task: Option<Task<()>>,
 }
 
 #[derive(Debug)]
@@ -145,6 +446,7 @@ impl State {
                         .and_then(|(_, bytes)| {
                             serde_json::from_slice::<SuperGrokCredentials>(&bytes).ok()
                         });
+                    let mut cached_credentials = HashMap::new();
                     let mut manifest = manifest.unwrap_or_default();
                     let mut active_credentials = None;
                     let mut active_session_id = None;
@@ -159,15 +461,32 @@ impl State {
                             manifest.sessions.push(AccountSessionMetadata {
                                 session_id: session_id.clone(),
                                 email: credentials.email.clone(),
+                                login_order: 1,
                                 last_used_at_ms: now_ms(),
                                 reauthentication_required: false,
+                                ..Default::default()
                             });
                             manifest.active_session_id = Some(session_id.clone());
-                            active_session_id = Some(session_id);
+                            active_session_id = Some(session_id.clone());
+                            cached_credentials.insert(session_id, credentials.clone());
                             active_credentials = Some(credentials);
                             needs_persist = true;
                         }
                     } else {
+                        let mut max_order = manifest
+                            .sessions
+                            .iter()
+                            .map(|s| s.login_order)
+                            .max()
+                            .unwrap_or(0);
+                        for session in &mut manifest.sessions {
+                            if session.login_order == 0 {
+                                max_order += 1;
+                                session.login_order = max_order;
+                                needs_persist = true;
+                            }
+                        }
+
                         let manifest_active_session_id = manifest.active_session_id.clone();
                         let mut session_ids = Vec::with_capacity(manifest.sessions.len());
                         if let Some(session_id) = manifest_active_session_id.as_ref() {
@@ -240,23 +559,16 @@ impl State {
                                 }
                             };
                             credentials.account_id = Some(session_id.clone());
-                            if manifest.active_session_id.as_deref() != Some(session_id.as_str()) {
-                                manifest.active_session_id = Some(session_id.clone());
-                                needs_persist = true;
-                            }
-                            if let Some(account) = manifest
-                                .sessions
-                                .iter_mut()
-                                .find(|account| account.session_id == session_id)
-                            {
-                                if account.reauthentication_required {
-                                    account.reauthentication_required = false;
+                            cached_credentials.insert(session_id.clone(), credentials.clone());
+
+                            if active_credentials.is_none() {
+                                if manifest.active_session_id.as_deref() != Some(session_id.as_str()) {
+                                    manifest.active_session_id = Some(session_id.clone());
                                     needs_persist = true;
                                 }
+                                active_session_id = Some(session_id);
+                                active_credentials = Some(credentials);
                             }
-                            active_session_id = Some(session_id);
-                            active_credentials = Some(credentials);
-                            break;
                         }
 
                         if active_credentials.is_none() && manifest.active_session_id.take().is_some()
@@ -267,14 +579,17 @@ impl State {
                     let credentials_to_persist = active_credentials.clone();
                     let session_to_persist = active_session_id.clone();
                     let manifest_for_state = manifest.clone();
+                    let cached_credentials_for_state = cached_credentials.clone();
                     this.update(cx, |state, cx| {
                         state.credentials = active_credentials;
+                        state.cached_credentials = cached_credentials_for_state;
                         state.active_session_id = active_session_id;
                         if state.credentials.is_some() {
                             state.auth_generation = state.auth_generation.wrapping_add(1);
                         }
                         state.manifest = manifest_for_state;
                         state.load_task = None;
+                        state.start_quota_monitor(cx);
                         cx.notify();
                     })?;
                     if needs_persist {
@@ -309,17 +624,23 @@ impl State {
         Self {
             manifest: AccountManifest::default(),
             credentials: None,
+            cached_credentials: HashMap::new(),
             active_session_id: None,
             sign_in_task: None,
             refresh_task: None,
+            refresh_tasks: HashMap::new(),
             load_task: Some(load_task),
             credentials_provider,
             http_client,
             auth_generation: 0,
+            routing_generation: 0,
             last_auth_error: None,
             active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
             account_mutation_in_progress: false,
             account_mutation_seq: 0,
+            quota_refresh_task: None,
         }
     }
 
@@ -344,17 +665,164 @@ impl State {
     }
 
     pub fn account_summaries(&self) -> Vec<AccountSummary> {
+        let now = now_ms();
+        let stale_after_ms = QUOTA_STALE_AFTER.as_millis() as u64;
         self.manifest
             .sessions
             .iter()
             .map(|account| AccountSummary {
                 session_id: account.session_id.clone().into(),
                 email: account.email.clone().map(Into::into),
+                plan_type: account.plan_type.clone().map(Into::into),
+                quota: account.quota.clone(),
+                quota_stale: account
+                    .quota_fetched_at_ms
+                    .is_none_or(|fetched_at| now.saturating_sub(fetched_at) > stale_after_ms),
                 reauthentication_required: account.reauthentication_required,
                 is_active: self.active_session_id.as_deref() == Some(account.session_id.as_str()),
-                is_busy: self.is_busy(),
+                is_busy: self.in_flight_tracker.count(&account.session_id) > 0
+                    || self.account_mutation_in_progress,
+                exclusion: account.exclusion.clone(),
+                exclusions: account.all_exclusions(),
             })
             .collect()
+    }
+
+    pub fn eligible_accounts(&self, model_id: &str) -> Vec<AccountSessionMetadata> {
+        let now = now_ms();
+        let mut accounts = Vec::new();
+
+        if let Some(active_id) = self.active_session_id.as_deref() {
+            if let Some(active_session) = self
+                .manifest
+                .sessions
+                .iter()
+                .find(|s| s.session_id == active_id)
+            {
+                if active_session.is_eligible_for(model_id, now) {
+                    accounts.push(active_session.clone());
+                }
+            }
+        }
+
+        let mut others: Vec<_> = self
+            .manifest
+            .sessions
+            .iter()
+            .filter(|s| {
+                Some(s.session_id.as_str()) != self.active_session_id.as_deref()
+                    && s.is_eligible_for(model_id, now)
+            })
+            .cloned()
+            .collect();
+
+        others.sort_by(|a, b| {
+            a.login_order
+                .cmp(&b.login_order)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+
+        accounts.extend(others);
+        accounts
+    }
+
+    pub fn record_session_success(&mut self, session_id: &str) {
+        if let Some(session) = self
+            .manifest
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        {
+            session.last_used_at_ms = now_ms();
+        }
+        self.consecutive_rate_limits.remove(session_id);
+    }
+
+    pub fn mark_reauthentication_required(&mut self, session_id: &str) {
+        if let Some(session) = self
+            .manifest
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        {
+            session.reauthentication_required = true;
+            session.add_exclusion(AccountExclusion::ReauthenticationRequired);
+        }
+        if self.active_session_id.as_deref() == Some(session_id) {
+            self.credentials = None;
+            self.last_auth_error =
+                Some("Your SuperGrok session has expired. Sign in again.".into());
+        }
+        self.cached_credentials.remove(session_id);
+        self.routing_generation = self.routing_generation.wrapping_add(1);
+    }
+
+    pub fn exclude_session(&mut self, session_id: &str, exclusion: AccountExclusion) {
+        if let Some(session) = self
+            .manifest
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        {
+            session.add_exclusion(exclusion);
+        }
+        self.routing_generation = self.routing_generation.wrapping_add(1);
+    }
+
+    pub fn calculate_rate_limit_retry(
+        &mut self,
+        session_id: &str,
+        model_id: &str,
+        error: &LanguageModelCompletionError,
+    ) -> (u64, AccountExclusionScope) {
+        let now = now_ms();
+        let consecutive = self
+            .consecutive_rate_limits
+            .get(session_id)
+            .copied()
+            .unwrap_or(0);
+        self.consecutive_rate_limits
+            .insert(session_id.to_string(), consecutive + 1);
+
+        if let LanguageModelCompletionError::ProviderRejection {
+            retry_after: Some(retry_after),
+            ..
+        } = error
+        {
+            let retry_at_ms = now + retry_after.as_millis() as u64;
+            return (
+                retry_at_ms,
+                AccountExclusionScope::Model(model_id.to_string()),
+            );
+        }
+
+        if let Some(session) = self
+            .manifest
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+        {
+            if let Some(quota) = &session.quota {
+                if quota.used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT {
+                    if let Some(resets_at) = quota.resets_at {
+                        let reset_ms = (resets_at as u64).saturating_mul(1000);
+                        if reset_ms > now {
+                            return (reset_ms, AccountExclusionScope::Account);
+                        }
+                    }
+                }
+            }
+        }
+
+        let cooldown_ms = match consecutive {
+            0 => 30_000,
+            1 => 60_000,
+            _ => 300_000,
+        };
+        (
+            now + cooldown_ms,
+            AccountExclusionScope::Model(model_id.to_string()),
+        )
     }
 
     pub fn can_cancel_sign_in(&self) -> bool {
@@ -364,6 +832,20 @@ impl State {
     pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
         self.sign_in_task = None;
         cx.notify();
+    }
+
+    fn start_quota_monitor(&mut self, cx: &mut Context<Self>) {
+        if self.quota_refresh_task.is_some() || self.manifest.sessions.is_empty() {
+            return;
+        }
+        self.quota_refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                if let Err(error) = refresh_all_account_quotas(&this, cx).await {
+                    log::warn!("SuperGrok all-account quota cycle failed: {error:#}");
+                }
+                cx.background_executor().timer(QUOTA_REFRESH_INTERVAL).await;
+            }
+        }));
     }
 
     pub fn is_busy(&self) -> bool {
@@ -386,21 +868,57 @@ impl State {
         }
         self.account_mutation_in_progress = true;
         self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        self.auth_generation = self.auth_generation.wrapping_add(1);
         let mutation_seq = self.account_mutation_seq;
+        let generation = self.auth_generation;
         cx.notify();
         let credentials_provider = self.credentials_provider.clone();
-        let manifest = self.manifest.clone();
-        let generation = self.auth_generation.wrapping_add(1);
         cx.spawn(async move |this, cx| {
-            let result = async {
-                let key = account_credentials_key(&session_id);
-                let (_, bytes) = credentials_provider
-                    .read_credentials(&key, cx)
-                    .await?
-                    .ok_or_else(|| anyhow!("SuperGrok account credentials not found"))?;
-                let mut credentials: SuperGrokCredentials = serde_json::from_slice(&bytes)?;
-                credentials.account_id = Some(session_id.clone());
-                let mut manifest = manifest;
+            let key = account_credentials_key(&session_id);
+            let stored = credentials_provider.read_credentials(&key, cx).await;
+            let credentials = match stored {
+                Ok(Some((_, bytes))) => {
+                    match serde_json::from_slice::<SuperGrokCredentials>(&bytes) {
+                        Ok(mut credentials) => {
+                            credentials.account_id = Some(session_id.clone());
+                            credentials
+                        }
+                        Err(e) => {
+                            this.update(cx, |state, cx| {
+                                if state.account_mutation_seq == mutation_seq {
+                                    state.account_mutation_in_progress = false;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                            return Err(anyhow!("Invalid SuperGrok credentials: {e:#}"));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    this.update(cx, |state, cx| {
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return Err(anyhow!("SuperGrok account credentials not found"));
+                }
+                Err(e) => {
+                    this.update(cx, |state, cx| {
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return Err(e);
+                }
+            };
+
+            let manifest_bytes = match this.read_with(cx, |state, _| {
+                let mut manifest = state.manifest.clone();
                 manifest.active_session_id = Some(session_id.clone());
                 if let Some(account) = manifest
                     .sessions
@@ -408,29 +926,70 @@ impl State {
                     .find(|account| account.session_id == session_id)
                 {
                     account.last_used_at_ms = now_ms();
-                    account.reauthentication_required = false;
                 }
-                let manifest_bytes = serde_json::to_vec(&manifest)?;
-                credentials_provider
-                    .write_credentials(ACCOUNT_MANIFEST_KEY, "manifest", &manifest_bytes, cx)
-                    .await?;
-                anyhow::Ok((credentials, manifest))
+                serde_json::to_vec(&manifest)
+            }) {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    this.update(cx, |state, cx| {
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    this.update(cx, |state, cx| {
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    return Err(e);
+                }
+            };
+
+            if let Err(write_err) = credentials_provider
+                .write_credentials(ACCOUNT_MANIFEST_KEY, "manifest", &manifest_bytes, cx)
+                .await
+            {
+                this.update(cx, |state, cx| {
+                    if state.account_mutation_seq == mutation_seq {
+                        state.account_mutation_in_progress = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+                return Err(write_err);
             }
-            .await;
 
             this.update(cx, |state, cx| {
                 if state.account_mutation_seq == mutation_seq {
                     state.account_mutation_in_progress = false;
-                    if let Ok((credentials, manifest)) = &result {
-                        state.manifest = manifest.clone();
-                        state.credentials = Some(credentials.clone());
-                        state.active_session_id = Some(session_id.clone());
-                        state.auth_generation = generation;
-                        state.refresh_task = None;
+                    state.manifest.active_session_id = Some(session_id.clone());
+                    if let Some(account) = state
+                        .manifest
+                        .sessions
+                        .iter_mut()
+                        .find(|account| account.session_id == session_id)
+                    {
+                        account.last_used_at_ms = now_ms();
                     }
+                    state.credentials = Some(credentials.clone());
+                    state
+                        .cached_credentials
+                        .insert(session_id.clone(), credentials);
+                    state.active_session_id = Some(session_id);
+                    state.auth_generation = generation;
+                    state.routing_generation = state.routing_generation.wrapping_add(1);
+                    state.refresh_task = None;
+                    state.start_quota_monitor(cx);
                     cx.notify();
                 }
-                result.map(|_| ())
+                Ok(())
             })?
         })
     }
@@ -444,39 +1003,38 @@ impl State {
             return;
         }
 
+        self.account_mutation_in_progress = true;
+        self.account_mutation_seq = self.account_mutation_seq.wrapping_add(1);
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        let mutation_seq = self.account_mutation_seq;
+        let generation = self.auth_generation;
         let http_client = self.http_client.clone();
         let task = cx.spawn(async move |this, cx| {
-            match do_oauth_flow(http_client, cx).await {
+            let oauth_result = do_oauth_flow(http_client, cx).await;
+
+            match oauth_result {
                 Ok(creds) => {
-                    let persist_result = async {
-                        let credentials_provider =
-                            this.read_with(cx, |state, _| state.credentials_provider.clone())?;
-                        let mut creds = creds;
-                        let session_id = creds
-                            .account_id
-                            .clone()
-                            .unwrap_or_else(|| account_session_id(&creds));
-                        creds.account_id = Some(session_id.clone());
-                        let mut manifest = this.read_with(cx, |state, _| state.manifest.clone())?;
-                        if !manifest
+                    let credentials_provider =
+                        this.read_with(cx, |state, _| state.credentials_provider.clone())?;
+                    let mut creds = creds;
+                    let session_id = creds
+                        .account_id
+                        .clone()
+                        .unwrap_or_else(|| account_session_id(&creds));
+                    creds.account_id = Some(session_id.clone());
+
+                    let (creds_json, manifest_bytes) = match this.read_with(cx, |state, _| {
+                        let has = state
+                            .manifest
                             .sessions
                             .iter()
-                            .any(|account| account.session_id == session_id)
-                            && manifest.sessions.len() >= MAX_ACCOUNT_SESSIONS
-                        {
+                            .any(|account| account.session_id == session_id);
+                        if !has && state.manifest.sessions.len() >= MAX_ACCOUNT_SESSIONS {
                             return Err(anyhow!(
                                 "Maximum of {MAX_ACCOUNT_SESSIONS} SuperGrok accounts reached"
                             ));
                         }
-                        let json = serde_json::to_vec(&creds)?;
-                        credentials_provider
-                            .write_credentials(
-                                &account_credentials_key(&session_id),
-                                "Bearer",
-                                &json,
-                                cx,
-                            )
-                            .await?;
+                        let mut manifest = state.manifest.clone();
                         if let Some(account) = manifest
                             .sessions
                             .iter_mut()
@@ -484,64 +1042,157 @@ impl State {
                         {
                             account.email = creds.email.clone();
                             account.last_used_at_ms = now_ms();
-                            account.reauthentication_required = false;
+                            account.clear_all_exclusions();
                         } else {
+                            let next_order = manifest
+                                .sessions
+                                .iter()
+                                .map(|s| s.login_order)
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
                             manifest.sessions.push(AccountSessionMetadata {
                                 session_id: session_id.clone(),
                                 email: creds.email.clone(),
+                                login_order: next_order,
                                 last_used_at_ms: now_ms(),
                                 reauthentication_required: false,
+                                ..Default::default()
                             });
                         }
                         manifest.active_session_id = Some(session_id.clone());
-                        credentials_provider
-                            .write_credentials(
-                                ACCOUNT_MANIFEST_KEY,
-                                "manifest",
-                                &serde_json::to_vec(&manifest)?,
-                                cx,
-                            )
-                            .await?;
-                        anyhow::Ok((creds, manifest))
-                    }
-                    .await;
-
-                    match persist_result {
-                        Ok((creds, manifest)) => {
+                        let creds_bytes = serde_json::to_vec(&creds)?;
+                        let manifest_bytes = serde_json::to_vec(&manifest)?;
+                        anyhow::Ok((creds_bytes, manifest_bytes))
+                    }) {
+                        Ok(Ok(pair)) => pair,
+                        Ok(Err(e)) => {
                             this.update(cx, |state, cx| {
-                                state.auth_generation = state.auth_generation.wrapping_add(1);
-                                let session_id = creds.account_id.clone().unwrap_or_default();
-                                state.active_session_id = Some(session_id);
-                                state.manifest = manifest;
-                                state.credentials = Some(creds);
-                                state.last_auth_error = None;
-                                state.sign_in_task = None;
-                                cx.notify();
-                            })?;
+                                if state.account_mutation_seq == mutation_seq {
+                                    state.account_mutation_in_progress = false;
+                                    state.sign_in_task = None;
+                                    state.last_auth_error = Some(SharedString::from(e.to_string()));
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                            return Err(e);
                         }
-                        Err(err) => {
-                            log::error!("SuperGrok sign-in failed to persist credentials: {err:?}");
+                        Err(e) => {
                             this.update(cx, |state, cx| {
+                                if state.account_mutation_seq == mutation_seq {
+                                    state.account_mutation_in_progress = false;
+                                    state.sign_in_task = None;
+                                    state.last_auth_error =
+                                        Some("Failed to sign in. Please try again.".into());
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                            return Err(e);
+                        }
+                    };
+
+                    let account_key = account_credentials_key(&session_id);
+                    if let Err(write_err) = credentials_provider
+                        .write_credentials(&account_key, "Bearer", &creds_json, cx)
+                        .await
+                    {
+                        this.update(cx, |state, cx| {
+                            if state.account_mutation_seq == mutation_seq {
+                                state.account_mutation_in_progress = false;
                                 state.sign_in_task = None;
                                 state.last_auth_error =
                                     Some("Failed to save credentials. Please try again.".into());
                                 cx.notify();
-                            })
-                            .log_err();
-                        }
+                            }
+                        })
+                        .ok();
+                        return Err(write_err);
                     }
+
+                    if let Err(write_err) = credentials_provider
+                        .write_credentials(ACCOUNT_MANIFEST_KEY, "manifest", &manifest_bytes, cx)
+                        .await
+                    {
+                        credentials_provider
+                            .delete_credentials(&account_key, cx)
+                            .await
+                            .log_err();
+                        this.update(cx, |state, cx| {
+                            if state.account_mutation_seq == mutation_seq {
+                                state.account_mutation_in_progress = false;
+                                state.sign_in_task = None;
+                                state.last_auth_error = Some(
+                                    "Failed to save account manifest. Please try again.".into(),
+                                );
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                        return Err(write_err);
+                    }
+
+                    this.update(cx, |state, cx| {
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            state.auth_generation = state.auth_generation.max(generation);
+                            if let Some(account) = state
+                                .manifest
+                                .sessions
+                                .iter_mut()
+                                .find(|account| account.session_id == session_id)
+                            {
+                                account.email = creds.email.clone();
+                                account.last_used_at_ms = now_ms();
+                                account.clear_all_exclusions();
+                            } else {
+                                let next_order = state
+                                    .manifest
+                                    .sessions
+                                    .iter()
+                                    .map(|s| s.login_order)
+                                    .max()
+                                    .unwrap_or(0)
+                                    + 1;
+                                state.manifest.sessions.push(AccountSessionMetadata {
+                                    session_id: session_id.clone(),
+                                    email: creds.email.clone(),
+                                    login_order: next_order,
+                                    last_used_at_ms: now_ms(),
+                                    reauthentication_required: false,
+                                    ..Default::default()
+                                });
+                            }
+                            state.manifest.active_session_id = Some(session_id.clone());
+                            state.active_session_id = Some(session_id.clone());
+                            state.credentials = Some(creds.clone());
+                            state.cached_credentials.insert(session_id.clone(), creds);
+                            state.consecutive_rate_limits.remove(&session_id);
+                            state.routing_generation = state.routing_generation.wrapping_add(1);
+                            state.last_auth_error = None;
+                            state.sign_in_task = None;
+                            state.start_quota_monitor(cx);
+                            cx.notify();
+                        }
+                    })?;
+                    Ok(())
                 }
                 Err(err) => {
                     log::error!("SuperGrok sign-in failed: {err:?}");
                     this.update(cx, |state, cx| {
-                        state.sign_in_task = None;
-                        state.last_auth_error = Some("Sign-in failed. Please try again.".into());
-                        cx.notify();
+                        if state.account_mutation_seq == mutation_seq {
+                            state.account_mutation_in_progress = false;
+                            state.sign_in_task = None;
+                            state.last_auth_error =
+                                Some("Failed to sign in. Please try again.".into());
+                            cx.notify();
+                        }
                     })
                     .log_err();
+                    Err(err)
                 }
             }
-            anyhow::Ok(())
         });
 
         self.last_auth_error = None;
@@ -588,8 +1239,12 @@ impl State {
         };
         manifest.active_session_id = next_session_id.clone();
 
+        self.cached_credentials.remove(&removed_session_id);
+        self.consecutive_rate_limits.remove(&removed_session_id);
+        self.refresh_tasks.remove(&removed_session_id);
+        self.routing_generation = self.routing_generation.wrapping_add(1);
+        self.auth_generation = self.auth_generation.wrapping_add(1);
         if was_active {
-            self.auth_generation = self.auth_generation.wrapping_add(1);
             self.credentials = None;
             self.active_session_id = None;
             self.sign_in_task = None;
@@ -597,6 +1252,9 @@ impl State {
             self.last_auth_error = None;
         }
         self.manifest = manifest.clone();
+        if self.manifest.sessions.is_empty() {
+            self.quota_refresh_task = None;
+        }
         cx.notify();
 
         let credentials_provider = self.credentials_provider.clone();
@@ -735,15 +1393,20 @@ pub fn create_language_model(
     state: &Entity<State>,
     cx: &App,
 ) -> Arc<dyn LanguageModel> {
+    let state_read = state.read(cx);
+    let http_client = state_read.http_client();
+    let in_flight_tracker = state_read.in_flight_tracker.clone();
+    let active_operations = state_read.active_operations.clone();
     Arc::new(SuperGrokLanguageModel {
         id: LanguageModelId::from(model.id().to_string()),
-        http_client: state.read(cx).http_client(),
+        http_client,
         model,
         state: state.clone(),
         api_url: XAI_API_URL.into(),
         extra_headers: CustomHeaders::default(),
         request_limiter: RateLimiter::new(4),
-        active_operations: state.read(cx).active_operations.clone(),
+        active_operations,
+        in_flight_tracker,
     })
 }
 
@@ -756,6 +1419,7 @@ struct SuperGrokLanguageModel {
     extra_headers: CustomHeaders,
     request_limiter: RateLimiter,
     active_operations: Arc<AtomicUsize>,
+    in_flight_tracker: SessionInFlightTracker,
 }
 
 fn advertised_reasoning_efforts(model: &SuperGrokModel) -> &'static [ReasoningEffort] {
@@ -860,6 +1524,76 @@ impl Drop for ActiveOperationGuard {
     }
 }
 
+fn classify_forbidden_scope(
+    error: &LanguageModelCompletionError,
+    model_id: &str,
+) -> AccountExclusionScope {
+    let message = match error {
+        LanguageModelCompletionError::ProviderRejection { message, .. } => message.as_str(),
+        _ => "",
+    };
+    let lower = message.to_ascii_lowercase();
+    let model_lower = model_id.to_ascii_lowercase();
+    if lower.contains(&model_lower) || lower.contains("model") {
+        AccountExclusionScope::Model(model_id.to_string())
+    } else {
+        AccountExclusionScope::Account
+    }
+}
+
+fn is_authentication_error(error: &LanguageModelCompletionError) -> bool {
+    matches!(
+        error,
+        LanguageModelCompletionError::ProviderRejection {
+            status: Some(http_client::StatusCode::UNAUTHORIZED),
+            ..
+        } | LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Authentication,
+            ..
+        }
+    )
+}
+
+fn is_forbidden_error(error: &LanguageModelCompletionError) -> bool {
+    matches!(
+        error,
+        LanguageModelCompletionError::ProviderRejection {
+            status: Some(http_client::StatusCode::FORBIDDEN),
+            ..
+        } | LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::Permission,
+            ..
+        }
+    )
+}
+
+fn is_rate_limit_error(error: &LanguageModelCompletionError) -> bool {
+    matches!(
+        error,
+        LanguageModelCompletionError::ProviderRejection {
+            status: Some(http_client::StatusCode::TOO_MANY_REQUESTS),
+            ..
+        } | LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::RateLimit,
+            ..
+        }
+    )
+}
+
+fn persist_manifest_in_background(state: &WeakEntity<State>, cx: &AsyncApp) {
+    let state = state.clone();
+    cx.spawn(async move |cx| {
+        let Some(provider) = state
+            .read_with(cx, |s, _| s.credentials_provider.clone())
+            .ok()
+        else {
+            return;
+        };
+        persist_manifest(&provider, &state, cx).await.log_err();
+    })
+    .detach();
+}
+
 impl SuperGrokLanguageModel {
     fn stream_open_ai_completion(
         &self,
@@ -878,38 +1612,346 @@ impl SuperGrokLanguageModel {
         let state = self.state.downgrade();
         let request_limiter = self.request_limiter.clone();
         let active_operations = self.active_operations.clone();
+        let in_flight_tracker = self.in_flight_tracker.clone();
+        let model_id = self.model.id().to_string();
         active_operations.fetch_add(1, Ordering::AcqRel);
         let guard = ActiveOperationGuard(active_operations);
 
         let future = cx.spawn(async move |cx| {
-            let credentials = get_fresh_credentials(&state, &http_client, cx).await?;
-            let access_token = credentials.access_token.clone();
-            let stream = request_limiter
-                .stream(async move {
-                    open_ai::stream_completion(
-                        http_client.as_ref(),
-                        PROVIDER_NAME.0.as_str(),
-                        api_url.as_ref(),
-                        &access_token,
-                        request,
-                        &extra_headers,
-                    )
-                    .await
-                    .map_err(|error| {
-                        map_completion_error(LanguageModelCompletionError::from(error))
+            let mut attempted_sessions = HashSet::new();
+
+            loop {
+                let eligible = state
+                    .read_with(cx, |s, _| s.eligible_accounts(&model_id))
+                    .map_err(LanguageModelCompletionError::Other)?;
+
+                let candidate = eligible
+                    .into_iter()
+                    .find(|s| !attempted_sessions.contains(&s.session_id));
+
+                let Some(candidate) = candidate else {
+                    let no_accounts = state
+                        .read_with(cx, |s, _| s.manifest.sessions.is_empty())
+                        .unwrap_or(true);
+                    if no_accounts {
+                        return Err(LanguageModelCompletionError::NoApiKey {
+                            provider: PROVIDER_NAME,
+                        });
+                    }
+
+                    let fallback_err = state
+                        .read_with(cx, |s, _| {
+                            let now = now_ms();
+                            let mut earliest_rate_limit: Option<u64> = None;
+                            let mut all_reauth = true;
+                            let mut all_forbidden = true;
+
+                            for session in &s.manifest.sessions {
+                                if !session.reauthentication_required {
+                                    all_reauth = false;
+                                }
+                                let is_forbidden =
+                                    session.all_exclusions().iter().any(|ex| match ex {
+                                        AccountExclusion::Forbidden { scope } => match scope {
+                                            AccountExclusionScope::Account => true,
+                                            AccountExclusionScope::Model(m) => m == &model_id,
+                                        },
+                                        _ => false,
+                                    });
+                                if !is_forbidden {
+                                    all_forbidden = false;
+                                }
+                                for ex in session.all_exclusions() {
+                                    if let AccountExclusion::RateLimited {
+                                        retry_at_ms,
+                                        scope,
+                                    } = ex
+                                    {
+                                        let applies = match scope {
+                                            AccountExclusionScope::Account => true,
+                                            AccountExclusionScope::Model(m) => m == model_id,
+                                        };
+                                        if applies && retry_at_ms > now {
+                                            earliest_rate_limit = Some(
+                                                earliest_rate_limit
+                                                    .map(|current| current.min(retry_at_ms))
+                                                    .unwrap_or(retry_at_ms),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(retry_at) = earliest_rate_limit {
+                                let retry_after =
+                                    Duration::from_millis(retry_at.saturating_sub(now));
+                                LanguageModelCompletionError::ProviderRejection {
+                                    provider: PROVIDER_NAME,
+                                    status: Some(http_client::StatusCode::TOO_MANY_REQUESTS),
+                                    code: Some("rate_limit_exceeded".to_string()),
+                                    message:
+                                        "All SuperGrok accounts are currently rate-limited. Please try again shortly."
+                                            .to_string(),
+                                    retry_after: Some(retry_after),
+                                    category: ProviderErrorCategory::RateLimit,
+                                }
+                            } else if all_reauth {
+                                LanguageModelCompletionError::ProviderRejection {
+                                    provider: PROVIDER_NAME,
+                                    status: Some(http_client::StatusCode::UNAUTHORIZED),
+                                    code: Some("reauthentication_required".to_string()),
+                                    message:
+                                        "All SuperGrok accounts require signing in again."
+                                            .to_string(),
+                                    retry_after: None,
+                                    category: ProviderErrorCategory::Authentication,
+                                }
+                            } else if all_forbidden {
+                                LanguageModelCompletionError::ProviderRejection {
+                                    provider: PROVIDER_NAME,
+                                    status: Some(http_client::StatusCode::FORBIDDEN),
+                                    code: Some("forbidden".to_string()),
+                                    message: INFERENCE_FORBIDDEN_MESSAGE.to_string(),
+                                    retry_after: None,
+                                    category: ProviderErrorCategory::Permission,
+                                }
+                            } else {
+                                LanguageModelCompletionError::ProviderRejection {
+                                    provider: PROVIDER_NAME,
+                                    status: Some(http_client::StatusCode::SERVICE_UNAVAILABLE),
+                                    code: Some("no_eligible_accounts".to_string()),
+                                    message:
+                                        "No eligible SuperGrok accounts available for this request."
+                                            .to_string(),
+                                    retry_after: None,
+                                    category: ProviderErrorCategory::Other,
+                                }
+                            }
+                        })
+                        .map_err(LanguageModelCompletionError::Other)?;
+
+                    return Err(fallback_err);
+                };
+
+                let session_id = candidate.session_id.clone();
+                attempted_sessions.insert(session_id.clone());
+                let lease = in_flight_tracker.acquire(&session_id);
+
+                let credentials = match get_fresh_credentials_for_session(
+                    &state,
+                    &http_client,
+                    &session_id,
+                    cx,
+                )
+                .await
+                {
+                    Ok(creds) => creds,
+                    Err(err) => {
+                        drop(lease);
+                        if matches!(err, LanguageModelCompletionError::NoApiKey { .. }) {
+                            state
+                                .update(cx, |s, cx| {
+                                    s.mark_reauthentication_required(&session_id);
+                                    cx.notify();
+                                })
+                                .ok();
+                            persist_manifest_in_background(&state, cx);
+                        }
+                        continue;
+                    }
+                };
+
+                let request_clone = request.clone();
+                let access_token = credentials.access_token.clone();
+                let client = http_client.clone();
+                let url = api_url.clone();
+                let headers = extra_headers.clone();
+
+                let stream_result = request_limiter
+                    .stream(async move {
+                        open_ai::stream_completion(
+                            client.as_ref(),
+                            PROVIDER_NAME.0.as_str(),
+                            url.as_ref(),
+                            &access_token,
+                            request_clone,
+                            &headers,
+                        )
+                        .await
+                        .map_err(LanguageModelCompletionError::from)
                     })
-                })
-                .await?;
-            Ok::<_, LanguageModelCompletionError>((stream, guard))
+                    .await;
+
+                match stream_result {
+                    Ok(stream) => {
+                        state
+                            .update(cx, |s, _| {
+                                s.record_session_success(&session_id);
+                            })
+                            .ok();
+                        return Ok((stream.boxed(), guard, lease));
+                    }
+                    Err(completion_error) => {
+                        drop(lease);
+
+                        if is_authentication_error(&completion_error) {
+                            match force_refresh_session_credentials(
+                                &state,
+                                &http_client,
+                                &session_id,
+                                cx,
+                            )
+                            .await
+                            {
+                                Ok(refreshed_creds) => {
+                                    let retry_lease = in_flight_tracker.acquire(&session_id);
+                                    let request_clone = request.clone();
+                                    let access_token = refreshed_creds.access_token.clone();
+                                    let client = http_client.clone();
+                                    let url = api_url.clone();
+                                    let headers = extra_headers.clone();
+
+                                    let retry_result = request_limiter
+                                        .stream(async move {
+                                            open_ai::stream_completion(
+                                                client.as_ref(),
+                                                PROVIDER_NAME.0.as_str(),
+                                                url.as_ref(),
+                                                &access_token,
+                                                request_clone,
+                                                &headers,
+                                            )
+                                            .await
+                                            .map_err(LanguageModelCompletionError::from)
+                                        })
+                                        .await;
+
+                                    match retry_result {
+                                        Ok(stream) => {
+                                            state
+                                                .update(cx, |s, _| {
+                                                    s.record_session_success(&session_id);
+                                                })
+                                                .ok();
+                                            return Ok((stream.boxed(), guard, retry_lease));
+                                        }
+                                        Err(retry_comp_err) => {
+                                            drop(retry_lease);
+                                            if is_authentication_error(&retry_comp_err) {
+                                                state
+                                                    .update(cx, |s, cx| {
+                                                        s.mark_reauthentication_required(
+                                                            &session_id,
+                                                        );
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                                persist_manifest_in_background(&state, cx);
+                                                continue;
+                                            } else if is_forbidden_error(&retry_comp_err) {
+                                                let scope = classify_forbidden_scope(
+                                                    &retry_comp_err,
+                                                    &model_id,
+                                                );
+                                                state
+                                                    .update(cx, |s, cx| {
+                                                        s.exclude_session(
+                                                            &session_id,
+                                                            AccountExclusion::Forbidden { scope },
+                                                        );
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                                persist_manifest_in_background(&state, cx);
+                                                continue;
+                                            } else if is_rate_limit_error(&retry_comp_err) {
+                                                state
+                                                    .update(cx, |s, cx| {
+                                                        let (retry_at_ms, scope) = s
+                                                            .calculate_rate_limit_retry(
+                                                                &session_id,
+                                                                &model_id,
+                                                                &retry_comp_err,
+                                                            );
+                                                        s.exclude_session(
+                                                            &session_id,
+                                                            AccountExclusion::RateLimited {
+                                                                retry_at_ms,
+                                                                scope,
+                                                            },
+                                                        );
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                                persist_manifest_in_background(&state, cx);
+                                                continue;
+                                            } else {
+                                                return Err(map_completion_error(retry_comp_err));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(RefreshError::Fatal(_)) => {
+                                    state
+                                        .update(cx, |s, cx| {
+                                            s.mark_reauthentication_required(&session_id);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    persist_manifest_in_background(&state, cx);
+                                    continue;
+                                }
+                                Err(RefreshError::Transient(_)) => {
+                                    continue;
+                                }
+                            }
+                        } else if is_forbidden_error(&completion_error) {
+                            let scope = classify_forbidden_scope(&completion_error, &model_id);
+                            state
+                                .update(cx, |s, cx| {
+                                    s.exclude_session(
+                                        &session_id,
+                                        AccountExclusion::Forbidden { scope },
+                                    );
+                                    cx.notify();
+                                })
+                                .ok();
+                            persist_manifest_in_background(&state, cx);
+                            continue;
+                        } else if is_rate_limit_error(&completion_error) {
+                            state
+                                .update(cx, |s, cx| {
+                                    let (retry_at_ms, scope) = s.calculate_rate_limit_retry(
+                                        &session_id,
+                                        &model_id,
+                                        &completion_error,
+                                    );
+                                    s.exclude_session(
+                                        &session_id,
+                                        AccountExclusion::RateLimited { retry_at_ms, scope },
+                                    );
+                                    cx.notify();
+                                })
+                                .ok();
+                            persist_manifest_in_background(&state, cx);
+                            continue;
+                        } else {
+                            return Err(map_completion_error(completion_error));
+                        }
+                    }
+                }
+            }
         });
 
         async move {
-            let (stream, guard) = future.await?;
-            let stream =
-                futures::stream::unfold((stream, guard), |(mut stream, guard)| async move {
+            let (stream, guard, lease) = future.await?;
+            let stream = futures::stream::unfold(
+                (stream, guard, lease),
+                |(mut stream, guard, lease)| async move {
                     let event = stream.next().await?;
-                    Some((event, (stream, guard)))
-                });
+                    Some((event, (stream, guard, lease)))
+                },
+            );
             Ok(stream.boxed())
         }
         .boxed()
@@ -1028,24 +2070,89 @@ impl LanguageModel for SuperGrokLanguageModel {
     }
 }
 
+#[allow(dead_code)]
 async fn get_fresh_credentials(
     state: &WeakEntity<State>,
     http_client: &Arc<dyn HttpClient>,
     cx: &mut AsyncApp,
 ) -> Result<SuperGrokCredentials, LanguageModelCompletionError> {
-    let (creds, existing_task, session_id) = state
+    let session_id = state
+        .read_with(&*cx, |s, _| s.active_session_id.clone())
+        .map_err(LanguageModelCompletionError::Other)?
+        .ok_or(LanguageModelCompletionError::NoApiKey {
+            provider: PROVIDER_NAME,
+        })?;
+    get_fresh_credentials_for_session(state, http_client, &session_id, cx).await
+}
+
+async fn get_fresh_credentials_for_session(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    session_id: &str,
+    cx: &mut AsyncApp,
+) -> Result<SuperGrokCredentials, LanguageModelCompletionError> {
+    let (creds, existing_task, generation) = state
         .read_with(&*cx, |s, _| {
             (
-                s.credentials.clone(),
-                s.refresh_task.clone(),
-                s.active_session_id.clone(),
+                s.cached_credentials.get(session_id).cloned().or_else(|| {
+                    if s.active_session_id.as_deref() == Some(session_id) {
+                        s.credentials.clone()
+                    } else {
+                        None
+                    }
+                }),
+                s.refresh_tasks.get(session_id).cloned().or_else(|| {
+                    if s.active_session_id.as_deref() == Some(session_id) {
+                        s.refresh_task.clone()
+                    } else {
+                        None
+                    }
+                }),
+                s.auth_generation,
             )
         })
         .map_err(LanguageModelCompletionError::Other)?;
 
-    let creds = creds.ok_or(LanguageModelCompletionError::NoApiKey {
-        provider: PROVIDER_NAME,
-    })?;
+    let creds = match creds {
+        Some(c) => c,
+        None => {
+            let provider = state
+                .read_with(&*cx, |s, _| s.credentials_provider.clone())
+                .map_err(LanguageModelCompletionError::Other)?;
+            let key = account_credentials_key(session_id);
+            let stored = provider
+                .read_credentials(&key, cx)
+                .await
+                .map_err(LanguageModelCompletionError::Other)?;
+            let Some((_, bytes)) = stored else {
+                return Err(LanguageModelCompletionError::NoApiKey {
+                    provider: PROVIDER_NAME,
+                });
+            };
+            let session_is_in_manifest = state
+                .read_with(&*cx, |s, _| {
+                    s.manifest
+                        .sessions
+                        .iter()
+                        .any(|sess| sess.session_id == session_id)
+                })
+                .map_err(LanguageModelCompletionError::Other)?;
+            if !session_is_in_manifest {
+                return Err(LanguageModelCompletionError::NoApiKey {
+                    provider: PROVIDER_NAME,
+                });
+            }
+            let loaded: SuperGrokCredentials = serde_json::from_slice(&bytes)
+                .map_err(|e| LanguageModelCompletionError::Other(e.into()))?;
+            state
+                .update(cx, |s, _| {
+                    s.cached_credentials
+                        .insert(session_id.to_string(), loaded.clone());
+                })
+                .ok();
+            loaded
+        }
+    };
 
     if !creds.is_expired() {
         return Ok(creds);
@@ -1057,17 +2164,22 @@ async fn get_fresh_credentials(
             .map_err(|e| LanguageModelCompletionError::Other(anyhow!("{e}")));
     }
 
+    perform_token_refresh(state, http_client, session_id, &creds, generation, cx).await
+}
+
+async fn perform_token_refresh(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    session_id: &str,
+    creds: &SuperGrokCredentials,
+    generation: u64,
+    cx: &mut AsyncApp,
+) -> Result<SuperGrokCredentials, LanguageModelCompletionError> {
     let http_client_clone = http_client.clone();
     let state_clone = state.clone();
     let previous_refresh_token = creds.refresh_token.clone();
     let previous_email = creds.email.clone();
-    let session_id = session_id.ok_or_else(|| {
-        LanguageModelCompletionError::Other(anyhow!("SuperGrok account is not selected"))
-    })?;
-
-    let generation = state
-        .read_with(&*cx, |s, _| s.auth_generation)
-        .map_err(LanguageModelCompletionError::Other)?;
+    let session_id_str = session_id.to_string();
 
     let shared_task = cx
         .spawn(async move |cx| {
@@ -1076,10 +2188,18 @@ async fn get_fresh_credentials(
             match result {
                 Ok(tokens) => {
                     let persist_result: Result<SuperGrokCredentials, Arc<anyhow::Error>> = async {
-                        let current_generation = state_clone
-                            .read_with(&*cx, |s, _| s.auth_generation)
+                        let (current_generation, session_still_present) = state_clone
+                            .read_with(&*cx, |s, _| {
+                                (
+                                    s.auth_generation,
+                                    s.manifest
+                                        .sessions
+                                        .iter()
+                                        .any(|sess| sess.session_id == session_id_str),
+                                )
+                            })
                             .map_err(|e| Arc::new(e))?;
-                        if current_generation != generation {
+                        if current_generation != generation || !session_still_present {
                             return Err(Arc::new(anyhow!(
                                 "Sign-out occurred during token refresh"
                             )));
@@ -1097,7 +2217,7 @@ async fn get_fresh_credentials(
                                 .unwrap_or(previous_refresh_token.clone()),
                             expires_at_ms: now_ms() + tokens.expires_in * 1000,
                             email: claims.or(tokens.email).or(previous_email.clone()),
-                            account_id: Some(session_id.clone()),
+                            account_id: Some(session_id_str.clone()),
                         };
 
                         let credentials_provider = state_clone
@@ -1109,7 +2229,7 @@ async fn get_fresh_credentials(
 
                         credentials_provider
                             .write_credentials(
-                                &account_credentials_key(&session_id),
+                                &account_credentials_key(&session_id_str),
                                 "Bearer",
                                 &json,
                                 &*cx,
@@ -1117,10 +2237,63 @@ async fn get_fresh_credentials(
                             .await
                             .map_err(|e| Arc::new(e))?;
 
+                        let (still_current, still_in_manifest) = state_clone
+                            .read_with(&*cx, |s, _| {
+                                (
+                                    s.auth_generation == generation,
+                                    s.manifest
+                                        .sessions
+                                        .iter()
+                                        .any(|sess| sess.session_id == session_id_str),
+                                )
+                            })
+                            .map_err(|e| Arc::new(e))?;
+
+                        if !still_in_manifest {
+                            credentials_provider
+                                .delete_credentials(&account_credentials_key(&session_id_str), &*cx)
+                                .await
+                                .log_err();
+                            state_clone
+                                .update(cx, |s, _| {
+                                    s.cached_credentials.remove(&session_id_str);
+                                    if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                        s.refresh_task = None;
+                                    }
+                                    s.refresh_tasks.remove(&session_id_str);
+                                })
+                                .ok();
+                            return Err(Arc::new(anyhow!(
+                                "Session was signed out during token refresh persistence"
+                            )));
+                        }
+
+                        if !still_current {
+                            state_clone
+                                .update(cx, |s, _| {
+                                    s.cached_credentials
+                                        .insert(session_id_str.clone(), refreshed.clone());
+                                    if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                        s.credentials = Some(refreshed.clone());
+                                        s.refresh_task = None;
+                                    }
+                                    s.refresh_tasks.remove(&session_id_str);
+                                })
+                                .map_err(|e| Arc::new(e))?;
+                            return Err(Arc::new(anyhow!(
+                                "Account context changed during token refresh persistence"
+                            )));
+                        }
+
                         state_clone
                             .update(cx, |s, _| {
-                                s.credentials = Some(refreshed.clone());
-                                s.refresh_task = None;
+                                s.cached_credentials
+                                    .insert(session_id_str.clone(), refreshed.clone());
+                                if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                    s.credentials = Some(refreshed.clone());
+                                    s.refresh_task = None;
+                                }
+                                s.refresh_tasks.remove(&session_id_str);
                             })
                             .map_err(|e| Arc::new(e))?;
 
@@ -1131,7 +2304,10 @@ async fn get_fresh_credentials(
                     if persist_result.is_err() {
                         state_clone
                             .update(cx, |s, _| {
-                                s.refresh_task = None;
+                                if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                    s.refresh_task = None;
+                                }
+                                s.refresh_tasks.remove(&session_id_str);
                             })
                             .ok();
                     }
@@ -1146,19 +2322,26 @@ async fn get_fresh_credentials(
                     if still_current_generation {
                         let manifest_to_persist = state_clone
                             .update(cx, |s, cx| {
-                                s.refresh_task = None;
-                                s.credentials = None;
+                                if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                    s.refresh_task = None;
+                                    s.credentials = None;
+                                    s.last_auth_error = Some(
+                                        "Your SuperGrok session has expired. Sign in again.".into(),
+                                    );
+                                }
+                                s.refresh_tasks.remove(&session_id_str);
+                                s.cached_credentials.remove(&session_id_str);
                                 if let Some(account) = s
                                     .manifest
                                     .sessions
                                     .iter_mut()
-                                    .find(|account| account.session_id == session_id)
+                                    .find(|account| account.session_id == session_id_str)
                                 {
                                     account.reauthentication_required = true;
+                                    account
+                                        .add_exclusion(AccountExclusion::ReauthenticationRequired);
                                 }
-                                s.last_auth_error = Some(
-                                    "Your SuperGrok session has expired. Sign in again.".into(),
-                                );
+                                s.routing_generation = s.routing_generation.wrapping_add(1);
                                 cx.notify();
                                 s.manifest.clone()
                             })
@@ -1167,7 +2350,7 @@ async fn get_fresh_credentials(
                             state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
                         {
                             credentials_provider
-                                .delete_credentials(&account_credentials_key(&session_id), &*cx)
+                                .delete_credentials(&account_credentials_key(&session_id_str), &*cx)
                                 .await
                                 .log_err();
                             if let Some(manifest) = manifest_to_persist {
@@ -1187,7 +2370,10 @@ async fn get_fresh_credentials(
                     } else {
                         state_clone
                             .update(cx, |s, _| {
-                                s.refresh_task = None;
+                                if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                    s.refresh_task = None;
+                                }
+                                s.refresh_tasks.remove(&session_id_str);
                             })
                             .ok();
                     }
@@ -1197,7 +2383,10 @@ async fn get_fresh_credentials(
                     log::warn!("SuperGrok token refresh failed transiently: {e:?}");
                     state_clone
                         .update(cx, |s, _| {
-                            s.refresh_task = None;
+                            if s.active_session_id.as_deref() == Some(&session_id_str) {
+                                s.refresh_task = None;
+                            }
+                            s.refresh_tasks.remove(&session_id_str);
                         })
                         .ok();
                     Err(Arc::new(e))
@@ -1206,15 +2395,204 @@ async fn get_fresh_credentials(
         })
         .shared();
 
+    let session_key = session_id.to_string();
+    let is_active = state
+        .read_with(&*cx, |s, _| {
+            s.active_session_id.as_deref() == Some(&session_key)
+        })
+        .unwrap_or(false);
+
     state
         .update(cx, |s, _| {
-            s.refresh_task = Some(shared_task.clone());
+            if is_active {
+                s.refresh_task = Some(shared_task.clone());
+            }
+            s.refresh_tasks.insert(session_key, shared_task.clone());
         })
         .map_err(LanguageModelCompletionError::Other)?;
 
     shared_task
         .await
         .map_err(|e| LanguageModelCompletionError::Other(anyhow!("{e}")))
+}
+
+async fn force_refresh_session_credentials(
+    state: &WeakEntity<State>,
+    http_client: &Arc<dyn HttpClient>,
+    session_id: &str,
+    cx: &mut AsyncApp,
+) -> Result<SuperGrokCredentials, RefreshError> {
+    let (creds, generation) = state
+        .read_with(&*cx, |s, _| {
+            (
+                s.cached_credentials.get(session_id).cloned().or_else(|| {
+                    if s.active_session_id.as_deref() == Some(session_id) {
+                        s.credentials.clone()
+                    } else {
+                        None
+                    }
+                }),
+                s.auth_generation,
+            )
+        })
+        .map_err(RefreshError::Transient)?;
+
+    let creds = match creds {
+        Some(c) => c,
+        None => {
+            let provider = state
+                .read_with(&*cx, |s, _| s.credentials_provider.clone())
+                .map_err(RefreshError::Transient)?;
+            let key = account_credentials_key(session_id);
+            let stored = provider
+                .read_credentials(&key, cx)
+                .await
+                .map_err(RefreshError::Transient)?;
+            let Some((_, bytes)) = stored else {
+                return Err(RefreshError::Fatal(anyhow!("Account credentials missing")));
+            };
+            serde_json::from_slice(&bytes).map_err(|e| RefreshError::Fatal(e.into()))?
+        }
+    };
+
+    let session_id_str = session_id.to_string();
+    let state_clone = state.clone();
+    let http_client = http_client.clone();
+    let previous_refresh = creds.refresh_token.clone();
+    let previous_email = creds.email.clone();
+
+    let tokens = match refresh_token(&http_client, &previous_refresh).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            if matches!(e, RefreshError::Fatal(_)) {
+                let still_present = state_clone
+                    .read_with(&*cx, |s, _| {
+                        s.auth_generation == generation
+                            && s.manifest
+                                .sessions
+                                .iter()
+                                .any(|sess| sess.session_id == session_id_str)
+                    })
+                    .unwrap_or(false);
+                if still_present {
+                    state_clone
+                        .update(cx, |s, cx| {
+                            s.mark_reauthentication_required(&session_id_str);
+                            cx.notify();
+                        })
+                        .ok();
+                    if let Ok(provider) =
+                        state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
+                    {
+                        provider
+                            .delete_credentials(&account_credentials_key(&session_id_str), &*cx)
+                            .await
+                            .log_err();
+                    }
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    let claims = tokens
+        .id_token
+        .as_deref()
+        .map(extract_email_claim)
+        .unwrap_or(None);
+    let refreshed = SuperGrokCredentials {
+        access_token: tokens.access_token,
+        refresh_token: tokens
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .unwrap_or(previous_refresh),
+        expires_at_ms: now_ms() + tokens.expires_in * 1000,
+        email: claims.or(tokens.email).or(previous_email),
+        account_id: Some(session_id_str.clone()),
+    };
+
+    let credentials_provider = state_clone
+        .read_with(&*cx, |s, _| s.credentials_provider.clone())
+        .map_err(RefreshError::Transient)?;
+    let json = serde_json::to_vec(&refreshed).map_err(|e| RefreshError::Transient(e.into()))?;
+
+    let (current_gen, session_still_present) = state_clone
+        .read_with(&*cx, |s, _| {
+            (
+                s.auth_generation,
+                s.manifest
+                    .sessions
+                    .iter()
+                    .any(|sess| sess.session_id == session_id_str),
+            )
+        })
+        .map_err(RefreshError::Transient)?;
+    if current_gen != generation || !session_still_present {
+        return Err(RefreshError::Transient(anyhow!(
+            "Sign-out occurred during token refresh"
+        )));
+    }
+
+    credentials_provider
+        .write_credentials(
+            &account_credentials_key(&session_id_str),
+            "Bearer",
+            &json,
+            &*cx,
+        )
+        .await
+        .map_err(RefreshError::Transient)?;
+
+    let (still_current, still_in_manifest) = state_clone
+        .read_with(&*cx, |s, _| {
+            (
+                s.auth_generation == generation,
+                s.manifest
+                    .sessions
+                    .iter()
+                    .any(|sess| sess.session_id == session_id_str),
+            )
+        })
+        .map_err(RefreshError::Transient)?;
+
+    if !still_in_manifest {
+        credentials_provider
+            .delete_credentials(&account_credentials_key(&session_id_str), &*cx)
+            .await
+            .log_err();
+        state_clone
+            .update(cx, |s, _| {
+                s.cached_credentials.remove(&session_id_str);
+            })
+            .ok();
+        return Err(RefreshError::Transient(anyhow!(
+            "Session was signed out during token refresh persistence"
+        )));
+    }
+
+    if !still_current {
+        state_clone
+            .update(cx, |s, _| {
+                s.cached_credentials
+                    .insert(session_id_str.clone(), refreshed.clone());
+            })
+            .map_err(RefreshError::Transient)?;
+        return Err(RefreshError::Transient(anyhow!(
+            "Account context changed during token refresh persistence"
+        )));
+    }
+
+    state_clone
+        .update(cx, |s, _| {
+            s.cached_credentials
+                .insert(session_id_str.clone(), refreshed.clone());
+            if s.active_session_id.as_deref() == Some(&session_id_str) {
+                s.credentials = Some(refreshed.clone());
+            }
+        })
+        .map_err(RefreshError::Transient)?;
+
+    Ok(refreshed)
 }
 
 #[derive(Deserialize)]
@@ -1463,7 +2841,7 @@ fn redact_token_body(body: &str) -> String {
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1471,6 +2849,711 @@ fn now_ms() -> u64 {
             log::error!("System clock is before UNIX epoch: {err}");
             0
         })
+}
+
+#[derive(Debug)]
+enum QuotaFetchError {
+    Unauthorized(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for QuotaFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(error) | Self::Other(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+async fn refresh_all_account_quotas(state: &WeakEntity<State>, cx: &mut AsyncApp) -> Result<()> {
+    let Some((provider, http_client, session_ids, generation)) = state
+        .read_with(cx, |state, _| {
+            if state.manifest.sessions.is_empty()
+                || state.account_mutation_in_progress
+                || state.is_signing_in()
+            {
+                return None;
+            }
+            Some((
+                state.credentials_provider.clone(),
+                state.http_client.clone(),
+                state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect::<Vec<_>>(),
+                state.auth_generation,
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+
+    let mut updates = Vec::new();
+    let mut credential_updates = Vec::new();
+    let mut reauthentication_required = Vec::new();
+    for session_id in session_ids {
+        let mut credentials = match provider
+            .read_credentials(&account_credentials_key(&session_id), cx)
+            .await
+        {
+            Ok(Some((_, bytes))) => match serde_json::from_slice::<SuperGrokCredentials>(&bytes) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    log::warn!(
+                        "SuperGrok quota check skipped account {session_id}: invalid credentials: {error}"
+                    );
+                    continue;
+                }
+            },
+            Ok(None) => {
+                log::warn!(
+                    "SuperGrok quota check skipped account {session_id}: credentials missing"
+                );
+                continue;
+            }
+            Err(error) => {
+                log::warn!(
+                    "SuperGrok quota check skipped account {session_id}: keychain read failed: {error:#}"
+                );
+                continue;
+            }
+        };
+
+        if credentials.is_expired() {
+            match refresh_quota_credentials(
+                state,
+                generation,
+                &provider,
+                &http_client,
+                &session_id,
+                &credentials,
+                cx,
+            )
+            .await
+            {
+                Ok(refreshed) => {
+                    credential_updates.push((
+                        session_id.clone(),
+                        credentials.refresh_token.clone(),
+                        refreshed.clone(),
+                    ));
+                    credentials = refreshed;
+                }
+                Err(RefreshError::Fatal(error)) => {
+                    log::warn!(
+                        "SuperGrok quota check requires sign-in again for account {session_id}: {error:#}"
+                    );
+                    reauthentication_required.push(session_id);
+                    continue;
+                }
+                Err(RefreshError::Transient(error)) => {
+                    log::debug!(
+                        "SuperGrok quota token refresh failed transiently for account {session_id}: {error:#}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let mut result = fetch_quota(http_client.as_ref(), &credentials).await;
+        if matches!(result, Err(QuotaFetchError::Unauthorized(_))) {
+            match refresh_quota_credentials(
+                state,
+                generation,
+                &provider,
+                &http_client,
+                &session_id,
+                &credentials,
+                cx,
+            )
+            .await
+            {
+                Ok(refreshed) => {
+                    credential_updates.push((
+                        session_id.clone(),
+                        credentials.refresh_token.clone(),
+                        refreshed.clone(),
+                    ));
+                    credentials = refreshed;
+                    result = fetch_quota(http_client.as_ref(), &credentials).await;
+                }
+                Err(RefreshError::Fatal(error)) => {
+                    log::warn!(
+                        "SuperGrok quota check requires sign-in again for account {session_id}: {error:#}"
+                    );
+                    reauthentication_required.push(session_id);
+                    continue;
+                }
+                Err(RefreshError::Transient(error)) => {
+                    log::debug!(
+                        "SuperGrok quota token recovery failed transiently for account {session_id}: {error:#}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        match result {
+            Ok(quota) => updates.push((session_id, quota)),
+            Err(error) => {
+                log::debug!("SuperGrok quota check failed for account {session_id}: {error}")
+            }
+        }
+    }
+
+    if updates.is_empty() && credential_updates.is_empty() && reauthentication_required.is_empty() {
+        return Ok(());
+    }
+    let updated = state.update(cx, |state, cx| {
+        if state.auth_generation != generation || state.account_mutation_in_progress {
+            return false;
+        }
+        let fetched_at = now_ms();
+        for (session_id, quota) in updates {
+            if let Some(session) = state
+                .manifest
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                if let Some(plan_type) = quota.plan_type.clone() {
+                    session.plan_type = Some(plan_type);
+                }
+                session.clean_expired_exclusions(fetched_at);
+                if quota.used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT {
+                    let retry_at_ms = quota
+                        .resets_at
+                        .map(|s| (s as u64).saturating_mul(1000))
+                        .filter(|ms| *ms > fetched_at)
+                        .unwrap_or(fetched_at + 300_000);
+                    session.add_exclusion(AccountExclusion::RateLimited {
+                        retry_at_ms,
+                        scope: AccountExclusionScope::Account,
+                    });
+                } else {
+                    session.clear_account_rate_limits();
+                }
+                session.quota = Some(quota);
+                session.quota_fetched_at_ms = Some(fetched_at);
+            }
+        }
+        for (session_id, old_refresh_token, credentials) in credential_updates {
+            if state.active_session_id.as_deref() == Some(session_id.as_str())
+                && state
+                    .credentials
+                    .as_ref()
+                    .is_some_and(|current| current.refresh_token == old_refresh_token)
+            {
+                state.credentials = Some(credentials);
+            }
+        }
+        for session_id in reauthentication_required {
+            if let Some(session) = state
+                .manifest
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == session_id)
+            {
+                session.reauthentication_required = true;
+                session.add_exclusion(AccountExclusion::ReauthenticationRequired);
+            }
+        }
+        state.routing_generation = state.routing_generation.wrapping_add(1);
+        cx.notify();
+        true
+    })?;
+    if updated {
+        persist_manifest(&provider, state, cx).await?;
+    } else {
+        log::debug!("Discarded stale SuperGrok quota cycle after account mutation");
+    }
+    Ok(())
+}
+
+async fn refresh_quota_credentials(
+    state: &WeakEntity<State>,
+    generation: u64,
+    provider: &Arc<dyn CredentialsProvider>,
+    http_client: &Arc<dyn HttpClient>,
+    session_id: &str,
+    credentials: &SuperGrokCredentials,
+    cx: &AsyncApp,
+) -> Result<SuperGrokCredentials, RefreshError> {
+    let tokens = refresh_token(http_client, &credentials.refresh_token).await?;
+    let claims = tokens
+        .id_token
+        .as_deref()
+        .map(extract_email_claim)
+        .unwrap_or(None);
+    let refreshed = SuperGrokCredentials {
+        access_token: tokens.access_token,
+        refresh_token: tokens
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .unwrap_or_else(|| credentials.refresh_token.clone()),
+        expires_at_ms: now_ms() + tokens.expires_in * 1000,
+        email: claims.or(tokens.email).or(credentials.email.clone()),
+        account_id: Some(session_id.to_string()),
+    };
+
+    let key = account_credentials_key(session_id);
+    let session_is_current = state
+        .read_with(cx, |state, _| {
+            state.auth_generation == generation
+                && state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+        })
+        .unwrap_or(false);
+    if !session_is_current {
+        return Err(RefreshError::Transient(anyhow!(
+            "SuperGrok account changed during quota token refresh"
+        )));
+    }
+
+    if let Some((_, bytes)) = provider
+        .read_credentials(&key, cx)
+        .await
+        .map_err(RefreshError::Transient)?
+    {
+        let current = serde_json::from_slice::<SuperGrokCredentials>(&bytes)
+            .map_err(|error| RefreshError::Transient(error.into()))?;
+        if current.refresh_token != credentials.refresh_token
+            || current.access_token != credentials.access_token
+        {
+            return Ok(current);
+        }
+    }
+
+    let json =
+        serde_json::to_vec(&refreshed).map_err(|error| RefreshError::Transient(error.into()))?;
+    provider
+        .write_credentials(&key, "Bearer", &json, cx)
+        .await
+        .map_err(RefreshError::Transient)?;
+
+    let session_still_current = state
+        .read_with(cx, |state, _| {
+            state.auth_generation == generation
+                && state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+        })
+        .unwrap_or(false);
+    if !session_still_current {
+        let account_was_removed = state
+            .read_with(cx, |state, _| {
+                !state
+                    .manifest
+                    .sessions
+                    .iter()
+                    .any(|session| session.session_id == session_id)
+            })
+            .unwrap_or(true);
+        if account_was_removed {
+            provider.delete_credentials(&key, cx).await.log_err();
+        }
+        return Err(RefreshError::Transient(anyhow!(
+            "SuperGrok account changed during quota credential persistence"
+        )));
+    }
+    Ok(refreshed)
+}
+
+async fn persist_manifest(
+    credentials_provider: &Arc<dyn CredentialsProvider>,
+    state: &WeakEntity<State>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    for _ in 0..4 {
+        let Some((manifest, generation)) = state
+            .read_with(cx, |state, _| {
+                (state.manifest.clone(), state.auth_generation)
+            })
+            .ok()
+        else {
+            return Ok(());
+        };
+        if manifest.sessions.is_empty() {
+            credentials_provider
+                .delete_credentials(ACCOUNT_MANIFEST_KEY, cx)
+                .await?;
+            let still_current = state
+                .read_with(cx, |state, _| state.auth_generation == generation)
+                .unwrap_or(false);
+            if still_current {
+                return Ok(());
+            }
+            continue;
+        }
+        credentials_provider
+            .write_credentials(
+                ACCOUNT_MANIFEST_KEY,
+                "manifest",
+                &serde_json::to_vec(&manifest)?,
+                cx,
+            )
+            .await?;
+        let still_current = state
+            .read_with(cx, |state, _| state.auth_generation == generation)
+            .unwrap_or(false);
+        if still_current {
+            return Ok(());
+        }
+    }
+    Err(anyhow!(
+        "SuperGrok subscription manifest writes kept racing account mutations"
+    ))
+}
+
+async fn fetch_quota(
+    http_client: &dyn HttpClient,
+    credentials: &SuperGrokCredentials,
+) -> Result<QuotaSnapshot, QuotaFetchError> {
+    match fetch_quota_from_cli_billing(http_client, credentials).await {
+        Ok(quota) => return Ok(quota),
+        Err(QuotaFetchError::Unauthorized(error)) => {
+            return Err(QuotaFetchError::Unauthorized(error));
+        }
+        Err(error) => {
+            log::debug!("SuperGrok CLI billing quota failed, trying grok.com credits: {error}");
+        }
+    }
+    fetch_quota_from_grok_credits(http_client, credentials).await
+}
+
+async fn fetch_quota_from_cli_billing(
+    http_client: &dyn HttpClient,
+    credentials: &SuperGrokCredentials,
+) -> Result<QuotaSnapshot, QuotaFetchError> {
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(GROK_CLI_BILLING_URL)
+        .header(
+            "Authorization",
+            format!("Bearer {}", credentials.access_token.trim()),
+        )
+        .header("Accept", "application/json")
+        .header("x-xai-token-auth", "xai-grok-cli")
+        .body(AsyncBody::empty())
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
+    let mut response = http_client
+        .send(request)
+        .await
+        .map_err(QuotaFetchError::Other)?;
+    let status = response.status();
+    let mut body = String::new();
+    smol::io::AsyncReadExt::read_to_string(response.body_mut(), &mut body)
+        .await
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
+    if !status.is_success() {
+        let error = anyhow!("SuperGrok billing request failed (HTTP {status}): {body}");
+        if status == http_client::StatusCode::UNAUTHORIZED {
+            return Err(QuotaFetchError::Unauthorized(error));
+        }
+        return Err(QuotaFetchError::Other(error));
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .context("Failed to parse SuperGrok billing response")
+        .map_err(QuotaFetchError::Other)?;
+    quota_snapshot_from_billing_value(&value).map_err(QuotaFetchError::Other)
+}
+
+async fn fetch_quota_from_grok_credits(
+    http_client: &dyn HttpClient,
+    credentials: &SuperGrokCredentials,
+) -> Result<QuotaSnapshot, QuotaFetchError> {
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(GROK_CREDITS_GRPC_URL)
+        .header(
+            "Authorization",
+            format!("Bearer {}", credentials.access_token.trim()),
+        )
+        .header("Content-Type", "application/grpc-web+proto")
+        .header("Accept", "application/grpc-web+proto")
+        .header("X-Grpc-Web", "1")
+        .header("Origin", "https://grok.com")
+        .header("Referer", "https://grok.com/")
+        .body(AsyncBody::from(vec![0u8, 0, 0, 0, 0]))
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
+    let mut response = http_client
+        .send(request)
+        .await
+        .map_err(QuotaFetchError::Other)?;
+    let status = response.status();
+    let mut body = Vec::new();
+    smol::io::AsyncReadExt::read_to_end(response.body_mut(), &mut body)
+        .await
+        .map_err(|error| QuotaFetchError::Other(error.into()))?;
+    if !status.is_success() {
+        let preview = String::from_utf8_lossy(&body);
+        let error = anyhow!("SuperGrok credits request failed (HTTP {status}): {preview}");
+        if status == http_client::StatusCode::UNAUTHORIZED {
+            return Err(QuotaFetchError::Unauthorized(error));
+        }
+        return Err(QuotaFetchError::Other(error));
+    }
+    quota_snapshot_from_grok_credits(&body).map_err(QuotaFetchError::Other)
+}
+
+fn quota_snapshot_from_billing_value(value: &serde_json::Value) -> Result<QuotaSnapshot> {
+    let config = value.get("config").unwrap_or(value);
+    let used_percent = json_f64(config, "creditUsagePercent")
+        .or_else(|| json_f64(config, "credit_usage_percent"))
+        .or_else(|| json_f64(value, "creditUsagePercent"))
+        .or_else(|| json_f64(value, "credit_usage_percent"))
+        .or_else(|| {
+            let used = json_f64(config, "onDemandUsed")
+                .or_else(|| nested_json_f64(config, &["onDemandUsed", "val"]))
+                .or_else(|| json_f64(value, "used"));
+            let cap = json_f64(config, "onDemandCap")
+                .or_else(|| nested_json_f64(config, &["onDemandCap", "val"]))
+                .or_else(|| json_f64(value, "monthlyLimit"));
+            match (used, cap) {
+                (Some(used), Some(cap)) if cap > 0.0 => Some((used / cap) * 100.0),
+                (Some(_), Some(0.0)) => Some(0.0),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| anyhow!("SuperGrok billing response did not contain usage percent"))?;
+    if !used_percent.is_finite() {
+        return Err(anyhow!("SuperGrok billing usage percent was not finite"));
+    }
+    let resets_at = json_timestamp_seconds(
+        config
+            .get("currentPeriod")
+            .and_then(|period| period.get("end").or_else(|| period.get("billingPeriodEnd"))),
+    )
+    .or_else(|| json_timestamp_seconds(config.get("billingPeriodEnd")))
+    .or_else(|| json_timestamp_seconds(value.get("billingPeriodEnd")));
+    let plan_type = config
+        .get("subscription_tier_display")
+        .or_else(|| config.get("plan"))
+        .or_else(|| value.get("subscription_tier_display"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok(QuotaSnapshot {
+        used_percent: used_percent.clamp(0.0, 100.0),
+        resets_at,
+        plan_type,
+        captured_at_ms: now_ms(),
+    })
+}
+
+fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
+    json_number(value.get(key))
+}
+
+fn nested_json_f64(value: &serde_json::Value, path: &[&str]) -> Option<f64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    json_number(Some(current))
+}
+
+fn json_number(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        return number.is_finite().then_some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number as f64);
+    }
+    if let Some(number) = value.as_u64() {
+        return Some(number as f64);
+    }
+    value
+        .as_str()?
+        .parse()
+        .ok()
+        .filter(|number: &f64| number.is_finite())
+}
+
+fn json_timestamp_seconds(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds);
+    }
+    if let Some(seconds) = value.as_u64() {
+        return Some(seconds as i64);
+    }
+    if let Some(seconds) = value.as_f64() {
+        return seconds.is_finite().then_some(seconds as i64);
+    }
+    if let Some(text) = value.as_str() {
+        if let Ok(seconds) = text.parse::<i64>() {
+            return Some(seconds);
+        }
+        return chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|datetime| datetime.timestamp());
+    }
+    None
+}
+
+fn quota_snapshot_from_grok_credits(body: &[u8]) -> Result<QuotaSnapshot> {
+    let message = decode_grpc_web_message(body)?;
+    let config = protobuf_first_bytes(&message, 1)
+        .ok_or_else(|| anyhow!("GetGrokCreditsConfigResponse missing config field"))?;
+    let mut used_percent = 0.0;
+    let mut resets_at = None;
+    let mut saw_percent = false;
+    for (number, wire, value) in protobuf_fields(config)? {
+        match (number, wire) {
+            (1, 5) => {
+                if let Ok(bytes) = <[u8; 4]>::try_from(value) {
+                    used_percent = f32::from_le_bytes(bytes) as f64;
+                    saw_percent = true;
+                }
+            }
+            (5, 2) => {
+                resets_at = protobuf_timestamp_seconds(value);
+            }
+            _ => {}
+        }
+    }
+    if !saw_percent && resets_at.is_none() && config.is_empty() {
+        return Err(anyhow!(
+            "SuperGrok credits response did not contain usage data"
+        ));
+    }
+    if !used_percent.is_finite() {
+        return Err(anyhow!("SuperGrok credits usage percent was not finite"));
+    }
+    Ok(QuotaSnapshot {
+        used_percent: used_percent.clamp(0.0, 100.0),
+        resets_at,
+        plan_type: None,
+        captured_at_ms: now_ms(),
+    })
+}
+
+fn decode_grpc_web_message(body: &[u8]) -> Result<&[u8]> {
+    if body.is_empty() {
+        return Err(anyhow!(
+            "Empty gRPC-web response from grok.com credits endpoint"
+        ));
+    }
+    let mut offset = 0;
+    let mut messages = Vec::new();
+    while offset < body.len() {
+        if offset + 5 > body.len() {
+            return Err(anyhow!("Malformed gRPC-web frame: truncated header"));
+        }
+        let flags = body[offset];
+        let length = u32::from_be_bytes(
+            body[offset + 1..offset + 5]
+                .try_into()
+                .map_err(|_| anyhow!("Malformed gRPC-web frame: invalid length"))?,
+        ) as usize;
+        offset += 5;
+        if offset + length > body.len() {
+            return Err(anyhow!("Malformed gRPC-web frame: truncated payload"));
+        }
+        let payload = &body[offset..offset + length];
+        offset += length;
+        if flags & 0x80 != 0 {
+            continue;
+        }
+        messages.push(payload);
+    }
+    messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("gRPC-web response contained no message frames"))
+}
+
+fn protobuf_fields(data: &[u8]) -> Result<Vec<(u32, u32, &[u8])>> {
+    let mut fields = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (key, next) = protobuf_varint(data, offset)?;
+        offset = next;
+        let number = (key >> 3) as u32;
+        let wire = (key & 0x07) as u32;
+        match wire {
+            0 => {
+                let start = offset;
+                let (_, next) = protobuf_varint(data, offset)?;
+                fields.push((number, wire, &data[start..next]));
+                offset = next;
+            }
+            1 => {
+                if offset + 8 > data.len() {
+                    return Err(anyhow!("Malformed protobuf: truncated fixed64"));
+                }
+                fields.push((number, wire, &data[offset..offset + 8]));
+                offset += 8;
+            }
+            2 => {
+                let (length, next) = protobuf_varint(data, offset)?;
+                offset = next;
+                let length = length as usize;
+                if offset + length > data.len() {
+                    return Err(anyhow!("Malformed protobuf: truncated bytes"));
+                }
+                fields.push((number, wire, &data[offset..offset + length]));
+                offset += length;
+            }
+            5 => {
+                if offset + 4 > data.len() {
+                    return Err(anyhow!("Malformed protobuf: truncated fixed32"));
+                }
+                fields.push((number, wire, &data[offset..offset + 4]));
+                offset += 4;
+            }
+            other => return Err(anyhow!("Unsupported protobuf wire type {other}")),
+        }
+    }
+    Ok(fields)
+}
+
+fn protobuf_first_bytes(data: &[u8], field: u32) -> Option<&[u8]> {
+    protobuf_fields(data)
+        .ok()?
+        .into_iter()
+        .find(|(number, wire, _)| *number == field && *wire == 2)
+        .map(|(_, _, value)| value)
+}
+
+fn protobuf_timestamp_seconds(data: &[u8]) -> Option<i64> {
+    let mut seconds = None;
+    for (number, wire, value) in protobuf_fields(data).ok()? {
+        if number == 1 && wire == 0 {
+            let (parsed, _) = protobuf_varint(value, 0).ok()?;
+            seconds = Some(parsed as i64);
+        }
+    }
+    seconds
+}
+
+fn protobuf_varint(data: &[u8], mut offset: usize) -> Result<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = *data
+            .get(offset)
+            .ok_or_else(|| anyhow!("Malformed protobuf: truncated varint"))?;
+        offset += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((value, offset));
+        }
+        shift += 7;
+        if shift > 70 {
+            return Err(anyhow!("Malformed protobuf: varint too long"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1740,6 +3823,7 @@ mod tests {
                 email: Some("test@example.com".to_string()),
                 last_used_at_ms: now_ms(),
                 reauthentication_required: false,
+                ..Default::default()
             }],
         };
         credentials_provider
@@ -1755,17 +3839,23 @@ mod tests {
         let state = cx.new(|_cx| State {
             manifest: manifest.clone(),
             credentials: Some(expired),
+            cached_credentials: HashMap::new(),
             active_session_id: Some("test-session".to_string()),
             sign_in_task: None,
             refresh_task: None,
+            refresh_tasks: HashMap::new(),
             load_task: None,
             credentials_provider: credentials_provider.clone(),
             http_client: http.clone(),
             auth_generation: 1,
+            routing_generation: 0,
             last_auth_error: None,
             active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
             account_mutation_in_progress: false,
             account_mutation_seq: 0,
+            quota_refresh_task: None,
         });
 
         let weak_state = cx.read(|_cx| state.downgrade());
@@ -2024,12 +4114,14 @@ mod tests {
                     email: Some("missing@example.com".to_string()),
                     last_used_at_ms: now_ms(),
                     reauthentication_required: false,
+                    ..Default::default()
                 },
                 AccountSessionMetadata {
                     session_id: "session-fallback".to_string(),
                     email: fallback_credentials.email.clone(),
                     last_used_at_ms: now_ms() - 1000,
                     reauthentication_required: false,
+                    ..Default::default()
                 },
             ],
         };
@@ -2082,12 +4174,14 @@ mod tests {
 
     struct FakeCredentialsProvider {
         storage: Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>,
+        fail_write: std::sync::atomic::AtomicBool,
     }
 
     impl FakeCredentialsProvider {
         fn new() -> Self {
             Self {
                 storage: Mutex::new(std::collections::HashMap::new()),
+                fail_write: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2109,6 +4203,9 @@ mod tests {
             password: &'a [u8],
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Box::pin(async { Err(anyhow!("Keychain write failed")) });
+            }
             self.storage
                 .lock()
                 .insert(url.to_string(), (username.to_string(), password.to_vec()));
@@ -2151,20 +4248,38 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| account_session_id(credentials))
             });
+            let mut manifest = AccountManifest::default();
+            if let Some(session_id) = &active_session_id {
+                manifest.active_session_id = Some(session_id.clone());
+                manifest.sessions.push(AccountSessionMetadata {
+                    session_id: session_id.clone(),
+                    email: credentials.as_ref().and_then(|c| c.email.clone()),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                });
+            }
             State {
-                manifest: AccountManifest::default(),
+                manifest,
                 credentials,
+                cached_credentials: HashMap::new(),
                 active_session_id,
                 sign_in_task: None,
                 refresh_task: None,
+                refresh_tasks: HashMap::new(),
                 load_task: None,
                 credentials_provider,
                 http_client,
                 auth_generation: 0,
+                routing_generation: 0,
                 last_auth_error: None,
                 active_operations: Arc::new(AtomicUsize::new(0)),
+                in_flight_tracker: SessionInFlightTracker::default(),
+                consecutive_rate_limits: HashMap::new(),
                 account_mutation_in_progress: false,
                 account_mutation_seq: 0,
+                quota_refresh_task: None,
             }
         })
     }
@@ -2290,12 +4405,14 @@ mod tests {
                     email: Some("active@example.com".to_string()),
                     last_used_at_ms: now_ms(),
                     reauthentication_required: false,
+                    ..Default::default()
                 },
                 AccountSessionMetadata {
                     session_id: "session-inactive".to_string(),
                     email: Some("inactive@example.com".to_string()),
                     last_used_at_ms: now_ms() - 1000,
                     reauthentication_required: false,
+                    ..Default::default()
                 },
             ],
         };
@@ -2312,17 +4429,23 @@ mod tests {
         let state = cx.new(|_cx| State {
             manifest: manifest.clone(),
             credentials: Some(active_creds),
+            cached_credentials: HashMap::new(),
             active_session_id: Some("session-active".to_string()),
             sign_in_task: None,
             refresh_task: None,
+            refresh_tasks: HashMap::new(),
             load_task: None,
             credentials_provider: credentials_provider.clone(),
             http_client: http,
             auth_generation: 1,
+            routing_generation: 0,
             last_auth_error: None,
             active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
             account_mutation_in_progress: false,
             account_mutation_seq: 0,
+            quota_refresh_task: None,
         });
 
         let task = cx.update(|cx| {
@@ -2388,29 +4511,37 @@ mod tests {
                     email: account_a.email.clone(),
                     last_used_at_ms: now_ms(),
                     reauthentication_required: false,
+                    ..Default::default()
                 },
                 AccountSessionMetadata {
                     session_id: "session-b".to_string(),
                     email: account_b.email.clone(),
                     last_used_at_ms: now_ms() - 1000,
                     reauthentication_required: false,
+                    ..Default::default()
                 },
             ],
         };
         let state = cx.new(|_cx| State {
             manifest,
             credentials: Some(account_a),
+            cached_credentials: HashMap::new(),
             active_session_id: Some("session-a".to_string()),
             sign_in_task: None,
             refresh_task: None,
+            refresh_tasks: HashMap::new(),
             load_task: None,
             credentials_provider,
             http_client: http,
             auth_generation: 0,
+            routing_generation: 0,
             last_auth_error: None,
             active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
             account_mutation_in_progress: false,
             account_mutation_seq: 0,
+            quota_refresh_task: None,
         });
 
         let first_switch =
@@ -2429,5 +4560,1439 @@ mod tests {
             assert_eq!(state.active_session_id.as_deref(), Some("session-b"));
             assert!(!state.is_busy());
         });
+    }
+
+    #[test]
+    fn quota_snapshot_from_billing_percent() {
+        let value = serde_json::json!({
+            "config": {
+                "creditUsagePercent": 35.4,
+                "currentPeriod": { "end": "2026-05-31T19:00:00-05:00" },
+                "subscription_tier_display": "SuperGrok"
+            }
+        });
+        let quota = quota_snapshot_from_billing_value(&value).unwrap();
+        assert!((quota.used_percent - 35.4).abs() < f64::EPSILON);
+        assert_eq!(quota.plan_type.as_deref(), Some("SuperGrok"));
+        assert_eq!(
+            quota.resets_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-05-31T19:00:00-05:00")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_from_billing_on_demand_ratio() {
+        let value = serde_json::json!({
+            "config": {
+                "onDemandUsed": { "val": 25 },
+                "onDemandCap": { "val": 100 }
+            }
+        });
+        let quota = quota_snapshot_from_billing_value(&value).unwrap();
+        assert!((quota.used_percent - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quota_snapshot_from_grok_credits_protobuf() {
+        let payload = grok_credits_payload(42.5, Some(1_780_272_000));
+        let quota = quota_snapshot_from_grok_credits(&payload).unwrap();
+        assert!((quota.used_percent - 42.5).abs() < 0.01);
+        assert_eq!(quota.resets_at, Some(1_780_272_000));
+    }
+
+    #[gpui::test]
+    async fn test_fetch_quota_uses_cli_billing_json(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> =
+            FakeHttpClient::create(|request| async move {
+                assert_eq!(request.uri().host(), Some("cli-chat-proxy.grok.com"));
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-xai-token-auth")
+                        .map(|value| value.as_bytes()),
+                    Some(&b"xai-grok-cli"[..])
+                );
+                Ok(http_client::Response::builder().status(200).body(
+                    http_client::AsyncBody::from(r#"{"config":{"creditUsagePercent":12.0}}"#),
+                )?)
+            });
+        let credentials = make_fresh_credentials();
+        let quota = cx
+            .spawn(async move |_cx| fetch_quota(http.as_ref(), &credentials).await)
+            .await
+            .unwrap();
+        assert!((quota.used_percent - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_sticky_priority_failover_account_order() {
+        let now = now_ms();
+        let session_1 = AccountSessionMetadata {
+            session_id: "session-1".to_string(),
+            login_order: 1,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            ..Default::default()
+        };
+        let session_2 = AccountSessionMetadata {
+            session_id: "session-2".to_string(),
+            login_order: 2,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            ..Default::default()
+        };
+        let session_3 = AccountSessionMetadata {
+            session_id: "session-3".to_string(),
+            login_order: 3,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            ..Default::default()
+        };
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-2".to_string()),
+            sessions: vec![session_1, session_2, session_3],
+        };
+
+        let mut state = State {
+            manifest,
+            credentials: None,
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-2".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider: Arc::new(FakeCredentialsProvider::new()),
+            http_client: FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(Default::default())?)
+            }),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        };
+
+        // 1. Preferred active account ("session-2") must come first
+        let eligible = state.eligible_accounts("grok-4.6");
+        assert_eq!(eligible.len(), 3);
+        assert_eq!(eligible[0].session_id, "session-2");
+        assert_eq!(eligible[1].session_id, "session-1");
+        assert_eq!(eligible[2].session_id, "session-3");
+
+        // 2. Exclude session-2 -> failover chooses session-1 (lowest login_order)
+        state.exclude_session(
+            "session-2",
+            AccountExclusion::RateLimited {
+                retry_at_ms: now + 60_000,
+                scope: AccountExclusionScope::Account,
+            },
+        );
+        let eligible = state.eligible_accounts("grok-4.6");
+        assert_eq!(eligible.len(), 2);
+        assert_eq!(eligible[0].session_id, "session-1");
+        assert_eq!(eligible[1].session_id, "session-3");
+
+        // 3. Exclude session-1 -> failover chooses session-3
+        state.exclude_session(
+            "session-1",
+            AccountExclusion::Forbidden {
+                scope: AccountExclusionScope::Account,
+            },
+        );
+        let eligible = state.eligible_accounts("grok-4.6");
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].session_id, "session-3");
+
+        // 4. Rate limit on session-2 expires -> session-2 becomes preferred active again
+        state.manifest.sessions[1].clean_expired_exclusions(now + 70_000);
+        let eligible = state.eligible_accounts("grok-4.6");
+        assert_eq!(eligible.len(), 2);
+        assert_eq!(eligible[0].session_id, "session-2");
+        assert_eq!(eligible[1].session_id, "session-3");
+    }
+
+    #[test]
+    fn test_exclusion_scope_model_vs_account() {
+        let error_model = LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::FORBIDDEN),
+            code: Some("forbidden".to_string()),
+            message: "The model grok-4.6 is restricted on your plan".to_string(),
+            retry_after: None,
+            category: ProviderErrorCategory::Permission,
+        };
+        assert_eq!(
+            classify_forbidden_scope(&error_model, "grok-4.6"),
+            AccountExclusionScope::Model("grok-4.6".to_string())
+        );
+
+        let error_account = LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::FORBIDDEN),
+            code: Some("forbidden".to_string()),
+            message: "Inference access not enabled for this account".to_string(),
+            retry_after: None,
+            category: ProviderErrorCategory::Permission,
+        };
+        assert_eq!(
+            classify_forbidden_scope(&error_account, "grok-4.6"),
+            AccountExclusionScope::Account
+        );
+
+        let mut session = AccountSessionMetadata {
+            session_id: "test-session".to_string(),
+            login_order: 1,
+            last_used_at_ms: now_ms(),
+            reauthentication_required: false,
+            ..Default::default()
+        };
+
+        // Model-specific exclusion
+        session.add_exclusion(AccountExclusion::Forbidden {
+            scope: AccountExclusionScope::Model("grok-4.6".to_string()),
+        });
+        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(!session.is_excluded_for("grok-build-0.1", now_ms()));
+
+        // Account-wide exclusion
+        session.add_exclusion(AccountExclusion::Forbidden {
+            scope: AccountExclusionScope::Account,
+        });
+        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(session.is_excluded_for("grok-build-0.1", now_ms()));
+    }
+
+    #[test]
+    fn test_failover_rate_limit_calculation() {
+        let mut state = state_placeholder();
+        let now = now_ms();
+
+        // 1. Retry-After header
+        let err_retry_after = LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::TOO_MANY_REQUESTS),
+            code: Some("rate_limit_exceeded".to_string()),
+            message: "Rate limit exceeded".to_string(),
+            retry_after: Some(Duration::from_secs(15)),
+            category: ProviderErrorCategory::RateLimit,
+        };
+        let (retry_at, scope) =
+            state.calculate_rate_limit_retry("session-1", "grok-4.6", &err_retry_after);
+        assert!((retry_at as i64 - (now + 15_000) as i64).abs() < 500);
+        assert_eq!(scope, AccountExclusionScope::Model("grok-4.6".to_string()));
+
+        // 2. Quota exhausted (used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT)
+        let reset_timestamp = (now / 1000 + 3600) as i64;
+        state.manifest.sessions.push(AccountSessionMetadata {
+            session_id: "session-exhausted".to_string(),
+            login_order: 1,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            quota: Some(QuotaSnapshot {
+                used_percent: 100.0,
+                resets_at: Some(reset_timestamp),
+                plan_type: Some("SuperGrok".to_string()),
+                captured_at_ms: now,
+            }),
+            ..Default::default()
+        });
+
+        let err_no_header = LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::TOO_MANY_REQUESTS),
+            code: Some("rate_limit_exceeded".to_string()),
+            message: "Rate limit exceeded".to_string(),
+            retry_after: None,
+            category: ProviderErrorCategory::RateLimit,
+        };
+        let (retry_at, scope) =
+            state.calculate_rate_limit_retry("session-exhausted", "grok-4.6", &err_no_header);
+        assert_eq!(retry_at, (reset_timestamp as u64) * 1000);
+        assert_eq!(scope, AccountExclusionScope::Account);
+
+        // 3. Fallback exponential backoff ladder: 30s -> 60s -> 300s
+        let (retry_1, _) =
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+        assert!((retry_1 as i64 - (now + 30_000) as i64).abs() < 500);
+
+        let (retry_2, _) =
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+        assert!((retry_2 as i64 - (now + 60_000) as i64).abs() < 500);
+
+        let (retry_3, _) =
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+        assert!((retry_3 as i64 - (now + 300_000) as i64).abs() < 500);
+    }
+
+    #[gpui::test]
+    async fn test_401_inference_refreshes_and_retries_same_account(cx: &mut TestAppContext) {
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+
+        let auth_calls_clone = auth_calls.clone();
+        let completion_calls_clone = completion_calls.clone();
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |request| {
+            let auth_calls = auth_calls_clone.clone();
+            let completion_calls = completion_calls_clone.clone();
+            async move {
+                let uri = request.uri().to_string();
+                if uri.contains("/oauth2/token") || uri.contains("/oauth/token") {
+                    auth_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = serde_json::json!({
+                        "access_token": "refreshed_access_token",
+                        "refresh_token": "same_refresh_token",
+                        "expires_in": 3600
+                    });
+                    Ok(http_client::Response::builder().status(200).body(
+                        http_client::AsyncBody::from(serde_json::to_vec(&body).unwrap()),
+                    )?)
+                } else if uri.contains("/chat/completions") {
+                    let count = completion_calls.fetch_add(1, Ordering::SeqCst);
+                    if count == 0 {
+                        // First inference call returns 401 Unauthorized
+                        Ok(http_client::Response::builder().status(401).body(
+                            http_client::AsyncBody::from(r#"{"error":{"message":"Unauthorized"}}"#),
+                        )?)
+                    } else {
+                        // Retry with refreshed token succeeds!
+                        let auth_header = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok());
+                        assert_eq!(auth_header, Some("Bearer refreshed_access_token"));
+                        Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(http_client::AsyncBody::from(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from refreshed account\"}}]}\n\ndata: [DONE]\n\n"
+                            ))?)
+                    }
+                } else {
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(Default::default())?)
+                }
+            }
+        });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "old_access_token".to_string(),
+            refresh_token: "refresh_a".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        let account_b = SuperGrokCredentials {
+            access_token: "access_b".to_string(),
+            refresh_token: "refresh_b".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let mut cached_creds = HashMap::new();
+        cached_creds.insert("session-a".to_string(), account_a.clone());
+        cached_creds.insert("session-b".to_string(), account_b.clone());
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a),
+            cached_credentials: cached_creds,
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http.clone(),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let request = LanguageModelRequest {
+            messages: vec![language_model::LanguageModelRequestMessage {
+                role: language_model::Role::User,
+                content: vec!["Hello".into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+
+        let stream = cx
+            .spawn({
+                let model = model.clone();
+                async move |cx| model.stream_completion(request, &cx).await
+            })
+            .await
+            .unwrap();
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert!(!events.is_empty());
+
+        // Account A remains active and not excluded
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-a"));
+            assert!(!state.manifest.sessions[0].reauthentication_required);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_401_fatal_refresh_marks_reauth_and_fails_over(cx: &mut TestAppContext) {
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+
+        let auth_calls_clone = auth_calls.clone();
+        let completion_calls_clone = completion_calls.clone();
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |request| {
+            let auth_calls = auth_calls_clone.clone();
+            let completion_calls = completion_calls_clone.clone();
+            async move {
+                let uri = request.uri().to_string();
+                if uri.contains("/oauth2/token") || uri.contains("/oauth/token") {
+                    auth_calls.fetch_add(1, Ordering::SeqCst);
+                    // Fatal invalid_grant
+                    Ok(http_client::Response::builder()
+                        .status(400)
+                        .body(http_client::AsyncBody::from(r#"{"error":"invalid_grant"}"#))?)
+                } else if uri.contains("/chat/completions") {
+                    let count = completion_calls.fetch_add(1, Ordering::SeqCst);
+                    let auth_header = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok());
+                    if count == 0 {
+                        // First call on Account A returns 401
+                        assert_eq!(auth_header, Some("Bearer access_a"));
+                        Ok(http_client::Response::builder().status(401).body(
+                            http_client::AsyncBody::from(r#"{"error":{"message":"Unauthorized"}}"#),
+                        )?)
+                    } else {
+                        // Failover call on Account B succeeds!
+                        assert_eq!(auth_header, Some("Bearer access_b"));
+                        Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(http_client::AsyncBody::from(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from Account B\"}}]}\n\ndata: [DONE]\n\n"
+                            ))?)
+                    }
+                } else {
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(Default::default())?)
+                }
+            }
+        });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "access_a".to_string(),
+            refresh_token: "refresh_a".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        let account_b = SuperGrokCredentials {
+            access_token: "access_b".to_string(),
+            refresh_token: "refresh_b".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let mut cached_creds = HashMap::new();
+        cached_creds.insert("session-a".to_string(), account_a.clone());
+        cached_creds.insert("session-b".to_string(), account_b.clone());
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a),
+            cached_credentials: cached_creds,
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http.clone(),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let request = LanguageModelRequest {
+            messages: vec![language_model::LanguageModelRequestMessage {
+                role: language_model::Role::User,
+                content: vec!["Hello".into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+
+        let stream = cx
+            .spawn({
+                let model = model.clone();
+                async move |cx| model.stream_completion(request, &cx).await
+            })
+            .await
+            .unwrap();
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+        assert!(!events.is_empty());
+
+        // Account A was marked reauthentication_required
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-a"));
+            assert!(state.manifest.sessions[0].reauthentication_required);
+            assert!(!state.manifest.sessions[1].reauthentication_required);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_403_and_429_failover_to_backup_account(cx: &mut TestAppContext) {
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls_clone = completion_calls.clone();
+
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(move |request| {
+            let completion_calls = completion_calls_clone.clone();
+            async move {
+                let uri = request.uri().to_string();
+                if uri.contains("/chat/completions") {
+                    let count = completion_calls.fetch_add(1, Ordering::SeqCst);
+                    let auth_header = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok());
+                    if count == 0 {
+                        assert_eq!(auth_header, Some("Bearer access_a"));
+                        // 429 Too Many Requests
+                        Ok(http_client::Response::builder()
+                            .status(429)
+                            .header("Retry-After", "30")
+                            .body(http_client::AsyncBody::from(
+                                r#"{"error":{"message":"Rate limited"}}"#,
+                            ))?)
+                    } else {
+                        // Failover to Account B succeeds
+                        assert_eq!(auth_header, Some("Bearer access_b"));
+                        Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(http_client::AsyncBody::from(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from B\"}}]}\n\ndata: [DONE]\n\n"
+                            ))?)
+                    }
+                } else {
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(Default::default())?)
+                }
+            }
+        });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "access_a".to_string(),
+            refresh_token: "refresh_a".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        let account_b = SuperGrokCredentials {
+            access_token: "access_b".to_string(),
+            refresh_token: "refresh_b".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let mut cached_creds = HashMap::new();
+        cached_creds.insert("session-a".to_string(), account_a.clone());
+        cached_creds.insert("session-b".to_string(), account_b.clone());
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a),
+            cached_credentials: cached_creds,
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http.clone(),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let request = LanguageModelRequest {
+            messages: vec![language_model::LanguageModelRequestMessage {
+                role: language_model::Role::User,
+                content: vec!["Hello".into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+
+        let stream = cx
+            .spawn({
+                let model = model.clone();
+                async move |cx| model.stream_completion(request, &cx).await
+            })
+            .await
+            .unwrap();
+
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 2);
+        assert!(!events.is_empty());
+
+        // Account A is rate limited, Account B served request, active UI session remains session-a
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-a"));
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            assert!(!state.manifest.sessions[1].is_excluded_for("grok-4.6", now_ms()));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_quota_monitor_readmits_rate_limited_account(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> =
+            FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder().status(200).body(
+                    http_client::AsyncBody::from(r#"{"config":{"creditUsagePercent":35.0}}"#),
+                )?)
+            });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "access_a".to_string(),
+            refresh_token: "refresh_a".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+
+        let mut session_a = AccountSessionMetadata {
+            session_id: "session-a".to_string(),
+            login_order: 1,
+            last_used_at_ms: now_ms(),
+            reauthentication_required: false,
+            ..Default::default()
+        };
+        session_a.add_exclusion(AccountExclusion::RateLimited {
+            retry_at_ms: now_ms() + 300_000,
+            scope: AccountExclusionScope::Account,
+        });
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![session_a],
+        };
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a.clone()),
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http,
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        cx.spawn(async move |mut cx| {
+            refresh_all_account_quotas(&weak_state, &mut cx)
+                .await
+                .unwrap();
+        })
+        .await;
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(!state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            assert_eq!(
+                state.manifest.sessions[0]
+                    .quota
+                    .as_ref()
+                    .map(|q| q.used_percent),
+                Some(35.0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_clear_reauth_restores_eligibility() {
+        let mut session = AccountSessionMetadata {
+            session_id: "test-session".to_string(),
+            login_order: 1,
+            last_used_at_ms: now_ms(),
+            reauthentication_required: true,
+            ..Default::default()
+        };
+        session.add_exclusion(AccountExclusion::ReauthenticationRequired);
+        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+
+        session.clear_reauthentication_required();
+        assert!(!session.reauthentication_required);
+        assert!(!session.is_excluded_for("grok-4.6", now_ms()));
+    }
+
+    #[gpui::test]
+    async fn test_switch_account_does_not_clear_reauth(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(Default::default())?)
+        });
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_b = SuperGrokCredentials {
+            access_token: "access_b".to_string(),
+            refresh_token: "refresh_b".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: true,
+                    exclusion: Some(AccountExclusion::ReauthenticationRequired),
+                    exclusions: vec![AccountExclusion::ReauthenticationRequired],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: None,
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http,
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        // Switch to session-b
+        state
+            .update(cx, |state, cx| state.switch_account("session-b".into(), cx))
+            .await
+            .unwrap();
+
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-b"));
+            // Reauth requirement must NOT be cleared by switch_account!
+            assert!(state.manifest.sessions[1].reauthentication_required);
+            assert!(state.manifest.sessions[1].is_excluded_for("grok-4.6", now_ms()));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_switch_account_propagates_keychain_write_failure(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(Default::default())?)
+        });
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_b = SuperGrokCredentials {
+            access_token: "access_b".to_string(),
+            refresh_token: "refresh_b".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("b@example.com".to_string()),
+            account_id: Some("session-b".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-b"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_b).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms() - 1000,
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: None,
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider: credentials_provider.clone(),
+            http_client: http,
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        // Force keychain write failure
+        credentials_provider
+            .fail_write
+            .store(true, Ordering::SeqCst);
+
+        // Switch to session-b should fail and propagate error
+        let switch_result = state
+            .update(cx, |state, cx| state.switch_account("session-b".into(), cx))
+            .await;
+        assert!(switch_result.is_err());
+
+        // In-memory state must NOT be changed!
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.active_session_id.as_deref(), Some("session-a"));
+            assert!(!state.account_mutation_in_progress);
+        });
+    }
+
+    #[test]
+    fn test_quota_exhaustion_immediately_excludes_account() {
+        let now = now_ms();
+        let session = AccountSessionMetadata {
+            session_id: "session-exhausted".to_string(),
+            login_order: 1,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            quota: Some(QuotaSnapshot {
+                used_percent: 100.0,
+                resets_at: Some((now / 1000 + 3600) as i64),
+                plan_type: Some("SuperGrok".to_string()),
+                captured_at_ms: now,
+            }),
+            ..Default::default()
+        };
+
+        assert!(session.is_excluded_for("grok-4.6", now));
+        assert!(!session.is_eligible_for("grok-4.6", now));
+    }
+
+    #[test]
+    fn test_quota_exhaustion_threshold_100_percent() {
+        let now = now_ms();
+        let session_99_5 = AccountSessionMetadata {
+            session_id: "session-almost-full".to_string(),
+            login_order: 1,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            quota: Some(QuotaSnapshot {
+                used_percent: 99.5,
+                resets_at: Some((now / 1000 + 3600) as i64),
+                plan_type: Some("SuperGrok".to_string()),
+                captured_at_ms: now,
+            }),
+            ..Default::default()
+        };
+        // Under 100.0% threshold, 99.5% used is still eligible to consume the last 0.5%!
+        assert!(session_99_5.is_eligible_for("grok-4.6", now));
+
+        let session_100 = AccountSessionMetadata {
+            session_id: "session-fully-exhausted".to_string(),
+            login_order: 2,
+            last_used_at_ms: now,
+            reauthentication_required: false,
+            quota: Some(QuotaSnapshot {
+                used_percent: 100.0,
+                resets_at: Some((now / 1000 + 3600) as i64),
+                plan_type: Some("SuperGrok".to_string()),
+                captured_at_ms: now,
+            }),
+            ..Default::default()
+        };
+        // At 100.0%, it is immediately excluded!
+        assert!(session_100.is_excluded_for("grok-4.6", now));
+        assert!(!session_100.is_eligible_for("grok-4.6", now));
+    }
+
+    #[test]
+    fn test_quota_without_reset_uses_explicit_cooldown() {
+        let now = now_ms();
+        let mut session = AccountSessionMetadata {
+            session_id: "session-without-reset".to_string(),
+            login_order: 1,
+            last_used_at_ms: now,
+            quota: Some(QuotaSnapshot {
+                used_percent: 100.0,
+                resets_at: None,
+                plan_type: None,
+                captured_at_ms: now,
+            }),
+            ..Default::default()
+        };
+
+        assert!(session.is_eligible_for("grok-4.6", now));
+        session.add_exclusion(AccountExclusion::RateLimited {
+            retry_at_ms: now + 300_000,
+            scope: AccountExclusionScope::Account,
+        });
+        assert!(!session.is_eligible_for("grok-4.6", now));
+        assert!(session.is_eligible_for("grok-4.6", now + 300_001));
+    }
+
+    #[gpui::test]
+    async fn test_token_refresh_during_sign_out_does_not_resurrect(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|request| async move {
+            let uri = request.uri().to_string();
+            if uri.contains("/oauth2/token") || uri.contains("/oauth/token") {
+                let body = serde_json::json!({
+                    "access_token": "resurrected_access_token",
+                    "refresh_token": "resurrected_refresh_token",
+                    "expires_in": 3600
+                });
+                Ok(http_client::Response::builder().status(200).body(
+                    http_client::AsyncBody::from(serde_json::to_vec(&body).unwrap()),
+                )?)
+            } else {
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(Default::default())?)
+            }
+        });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "old_token".to_string(),
+            refresh_token: "old_refresh".to_string(),
+            expires_at_ms: now_ms() - 1000, // Expired!
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![AccountSessionMetadata {
+                session_id: "session-a".to_string(),
+                login_order: 1,
+                last_used_at_ms: now_ms(),
+                reauthentication_required: false,
+                ..Default::default()
+            }],
+        };
+
+        let mut cached_creds = HashMap::new();
+        cached_creds.insert("session-a".to_string(), account_a.clone());
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a),
+            cached_credentials: cached_creds,
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider: credentials_provider.clone(),
+            http_client: http.clone(),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        // Simulate user signing out session-a!
+        state
+            .update(cx, |state, cx| {
+                state.sign_out_account("session-a".into(), cx)
+            })
+            .await
+            .unwrap();
+
+        // Now if a background refresh task tries to force refresh session-a:
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let refresh_result = cx
+            .spawn(async move |mut cx| {
+                force_refresh_session_credentials(&weak_state, &http, "session-a", &mut cx).await
+            })
+            .await;
+
+        // Refresh must fail because session-a was signed out!
+        assert!(refresh_result.is_err());
+
+        // Credential must NOT be resurrected into cache!
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(!state.cached_credentials.contains_key("session-a"));
+            assert!(state.credentials.is_none());
+        });
+
+        // Credential must NOT be in credentials_provider storage!
+        assert!(
+            !credentials_provider
+                .storage
+                .lock()
+                .contains_key(&account_credentials_key("session-a"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_inactive_account_bumps_auth_generation(cx: &mut TestAppContext) {
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: "session-a".to_string(),
+                    login_order: 1,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+                AccountSessionMetadata {
+                    session_id: "session-b".to_string(),
+                    login_order: 2,
+                    last_used_at_ms: now_ms(),
+                    reauthentication_required: false,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: None,
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider: Arc::new(FakeCredentialsProvider::new()),
+            http_client: FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(Default::default())?)
+            }),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        let initial_auth_generation = cx.read(|cx| state.read(cx).auth_generation);
+        state
+            .update(cx, |state, cx| {
+                state.sign_out_account("session-b".into(), cx)
+            })
+            .await
+            .unwrap();
+
+        // Auth generation must be bumped even for inactive account sign-out!
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.auth_generation, initial_auth_generation + 1);
+            assert_eq!(state.manifest.sessions.len(), 1);
+            assert_eq!(state.manifest.sessions[0].session_id, "session-a");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_quota_monitor_preserves_model_level_retry_after(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> =
+            FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder().status(200).body(
+                    http_client::AsyncBody::from(r#"{"config":{"creditUsagePercent":35.0}}"#),
+                )?)
+            });
+
+        let credentials_provider = Arc::new(FakeCredentialsProvider::new());
+        let account_a = SuperGrokCredentials {
+            access_token: "access_a".to_string(),
+            refresh_token: "refresh_a".to_string(),
+            expires_at_ms: now_ms() + 3600_000,
+            email: Some("a@example.com".to_string()),
+            account_id: Some("session-a".to_string()),
+        };
+        credentials_provider.storage.lock().insert(
+            account_credentials_key("session-a"),
+            (
+                "Bearer".to_string(),
+                serde_json::to_vec(&account_a).unwrap(),
+            ),
+        );
+
+        let mut session_a = AccountSessionMetadata {
+            session_id: "session-a".to_string(),
+            login_order: 1,
+            last_used_at_ms: now_ms(),
+            reauthentication_required: false,
+            ..Default::default()
+        };
+        // Model-scoped 429 Retry-After cooldown (5 minutes)
+        session_a.add_exclusion(AccountExclusion::RateLimited {
+            retry_at_ms: now_ms() + 300_000,
+            scope: AccountExclusionScope::Model("grok-4.6".to_string()),
+        });
+
+        let manifest = AccountManifest {
+            active_session_id: Some("session-a".to_string()),
+            sessions: vec![session_a],
+        };
+
+        let state = cx.new(|_cx| State {
+            manifest,
+            credentials: Some(account_a.clone()),
+            cached_credentials: HashMap::new(),
+            active_session_id: Some("session-a".to_string()),
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider,
+            http_client: http,
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        cx.spawn(async move |mut cx| {
+            refresh_all_account_quotas(&weak_state, &mut cx)
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // Model-level rate limit must still be preserved after quota refresh!
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            // But it is not excluded for other models!
+            assert!(!state.manifest.sessions[0].is_excluded_for("grok-build-0.1", now_ms()));
+        });
+    }
+
+    #[test]
+    fn test_concurrency_lease_tracks_active_sessions() {
+        let tracker = SessionInFlightTracker::default();
+        assert_eq!(tracker.count("session-1"), 0);
+
+        let lease_1 = tracker.acquire("session-1");
+        assert_eq!(tracker.count("session-1"), 1);
+
+        let lease_2 = tracker.acquire("session-1");
+        assert_eq!(tracker.count("session-1"), 2);
+
+        drop(lease_1);
+        assert_eq!(tracker.count("session-1"), 1);
+
+        drop(lease_2);
+        assert_eq!(tracker.count("session-1"), 0);
+    }
+
+    fn state_placeholder() -> State {
+        State {
+            manifest: AccountManifest::default(),
+            credentials: None,
+            cached_credentials: HashMap::new(),
+            active_session_id: None,
+            sign_in_task: None,
+            refresh_task: None,
+            refresh_tasks: HashMap::new(),
+            load_task: None,
+            credentials_provider: Arc::new(FakeCredentialsProvider::new()),
+            http_client: FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder()
+                    .status(200)
+                    .body(Default::default())?)
+            }),
+            auth_generation: 0,
+            routing_generation: 0,
+            last_auth_error: None,
+            active_operations: Arc::new(AtomicUsize::new(0)),
+            in_flight_tracker: SessionInFlightTracker::default(),
+            consecutive_rate_limits: HashMap::new(),
+            account_mutation_in_progress: false,
+            account_mutation_seq: 0,
+            quota_refresh_task: None,
+        }
+    }
+
+    fn grok_credits_payload(used_percent: f32, resets_at: Option<i64>) -> Vec<u8> {
+        let mut config = Vec::new();
+        config.push((1 << 3) | 5);
+        config.extend_from_slice(&used_percent.to_le_bytes());
+        if let Some(seconds) = resets_at {
+            let mut timestamp = Vec::new();
+            timestamp.push(1 << 3);
+            encode_varint(seconds as u64, &mut timestamp);
+            config.push((5 << 3) | 2);
+            encode_varint(timestamp.len() as u64, &mut config);
+            config.extend_from_slice(&timestamp);
+        }
+        let mut message = Vec::new();
+        message.push((1 << 3) | 2);
+        encode_varint(config.len() as u64, &mut message);
+        message.extend_from_slice(&config);
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&message);
+        frame
+    }
+
+    fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
     }
 }

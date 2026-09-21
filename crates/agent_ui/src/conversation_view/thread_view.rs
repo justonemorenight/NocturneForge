@@ -35,9 +35,7 @@ use crate::ui::{
 use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
-use gpui::List;
-use gpui::Stateful;
-use gpui::TaskExt;
+use gpui::{Bounds, FontWeight, List, PathBuilder, Stateful, TaskExt, canvas, point, size};
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
@@ -7252,7 +7250,8 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_thinking_control(cx))
+                                    .children(self.render_quota_pool_control(window, cx)),
                             )
                             .child(
                                 h_flex()
@@ -7991,13 +7990,30 @@ impl ThreadView {
 
     fn render_chatgpt_account_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let native_thread = self.as_native_thread(cx)?;
-        if native_thread.read(cx).model().is_none_or(|model| {
-            model.provider_id() != LanguageModelProviderId::new("openai-subscribed")
-        }) {
-            return None;
-        }
-        let provider = LanguageModelRegistry::read_global(cx)
-            .provider(&LanguageModelProviderId::new("openai-subscribed"))?;
+        let provider_id = native_thread.read(cx).model()?.provider_id();
+        let (icon, header, tooltip, add_label, cancel_label, picker_id) =
+            if provider_id == LanguageModelProviderId::new("openai-subscribed") {
+                (
+                    IconName::AiOpenAiGptSub,
+                    "ChatGPT accounts",
+                    "Switch ChatGPT account",
+                    "Add ChatGPT account",
+                    "Cancel ChatGPT sign-in",
+                    "chatgpt-account-picker",
+                )
+            } else if provider_id == LanguageModelProviderId::new("x_ai_subscribed") {
+                (
+                    IconName::AiXAi,
+                    "SuperGrok accounts",
+                    "Switch SuperGrok account",
+                    "Add SuperGrok account",
+                    "Cancel SuperGrok sign-in",
+                    "supergrok-account-picker",
+                )
+            } else {
+                return None;
+            };
+        let provider = LanguageModelRegistry::read_global(cx).provider(&provider_id)?;
         let accounts = provider.account_summaries(cx);
         if accounts.is_empty() {
             return None;
@@ -8012,18 +8028,18 @@ impl ThreadView {
         let can_cancel_sign_in = provider.can_cancel_account_sign_in(cx);
         let menu_accounts = accounts.clone();
         let menu_provider = provider.clone();
-        let trigger = ButtonLike::new("chatgpt-account-picker")
+        let trigger = ButtonLike::new(picker_id)
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(IconName::AiOpenAiGptSub).size(IconSize::XSmall))
+                    .child(Icon::new(icon).size(IconSize::XSmall))
                     .child(Label::new(active_label).size(LabelSize::Small))
                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
             )
             .disabled(busy && !can_cancel_sign_in)
-            .tooltip(Tooltip::text("Switch ChatGPT account"));
+            .tooltip(Tooltip::text(tooltip));
         Some(
-            PopoverMenu::new("chatgpt-account-picker")
+            PopoverMenu::new(picker_id)
                 .with_handle(self.chatgpt_account_menu_handle.clone())
                 .trigger(trigger)
                 .menu(move |window, cx| {
@@ -8033,7 +8049,7 @@ impl ThreadView {
                         window,
                         cx,
                         move |mut menu, _window, _cx| {
-                            menu = menu.header("ChatGPT accounts");
+                            menu = menu.header(header);
                             for account in accounts.iter().cloned() {
                                 let mut label = account.label.to_string();
                                 if account.reauthentication_required {
@@ -8061,9 +8077,9 @@ impl ThreadView {
                                 );
                             }
                             let account_action_label = if can_cancel_sign_in {
-                                "Cancel ChatGPT sign-in"
+                                cancel_label
                             } else {
-                                "Add ChatGPT account"
+                                add_label
                             };
                             menu.separator().item(
                                 ContextMenuEntry::new(account_action_label)
@@ -8082,6 +8098,272 @@ impl ThreadView {
                         },
                     ))
                 })
+                .into_any_element(),
+        )
+    }
+
+    fn render_quota_pool_control(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let native_thread = self.as_native_thread(cx)?;
+        let model = native_thread.read(cx).model()?;
+        let provider_id = model.provider_id();
+        let provider = LanguageModelRegistry::read_global(cx).provider(&provider_id)?;
+        let model_id = model.id();
+        let quota_pool = provider.quota_pool(Some(model_id.0.as_ref()), cx)?;
+
+        let remaining_pct = quota_pool.remaining_percent;
+        let is_empty = remaining_pct.is_some_and(|p| p <= 0.0);
+        let ratio = remaining_pct
+            .map(|p| (p / 100.0).clamp(0.0, 1.0) as f32)
+            .unwrap_or(0.0);
+        let is_narrow_window = window.viewport_size().width < px(800.0);
+
+        let tooltip_accounts = quota_pool.accounts.clone();
+        let tooltip_eligible = quota_pool.eligible_accounts;
+        let tooltip_total = quota_pool.total_accounts;
+        let is_pool_stale = quota_pool.is_stale;
+
+        let account_menu_handle = self.chatgpt_account_menu_handle.clone();
+
+        let title_text = if tooltip_eligible == 0 {
+            "Quota Pool: 0% remaining (Exhausted)".to_string()
+        } else if let Some(pct) = remaining_pct {
+            if pct <= 0.0 {
+                "Quota Pool: 0% remaining (Exhausted)".to_string()
+            } else if pct <= 1.0 {
+                "Quota Pool: 1% remaining (Critical)".to_string()
+            } else if is_pool_stale {
+                format!("Quota Pool: {:.0}% remaining (stale)", pct)
+            } else {
+                format!("Quota Pool: {:.0}% remaining", pct)
+            }
+        } else {
+            "Quota Pool: Checking quota...".to_string()
+        };
+
+        Some(
+            h_flex()
+                .id("quota-pool-bar")
+                .items_center()
+                .cursor_pointer()
+                .px_1()
+                .py_0p5()
+                .rounded_md()
+                .hover(|this| this.bg(cx.theme().colors().element_hover))
+                .on_click({
+                    let account_menu_handle = account_menu_handle.clone();
+                    cx.listener(move |_this, _, window, cx| {
+                        account_menu_handle.toggle(window, cx);
+                    })
+                })
+                .tooltip(Tooltip::element(move |_window, _cx| {
+                    v_flex()
+                        .gap_1()
+                        .p_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(Label::new(title_text.clone()).weight(FontWeight::SEMIBOLD))
+                                .child(
+                                    Label::new(format!(
+                                        "({}/{} accounts)",
+                                        tooltip_eligible, tooltip_total
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                ),
+                        )
+                        .when(!tooltip_accounts.is_empty(), |this| {
+                            this.child(v_flex().gap_0p5().children(tooltip_accounts.iter().map(
+                                |acc| {
+                                    let mut status_note = String::new();
+                                    if acc.is_active {
+                                        status_note.push_str(" · Active");
+                                    }
+                                    if !acc.is_eligible {
+                                        if acc.is_reauth_required {
+                                            status_note.push_str(" · Sign-in required");
+                                        } else if acc.is_rate_limited {
+                                            status_note.push_str(" · Rate-limited");
+                                        } else if acc.is_forbidden {
+                                            status_note.push_str(" · Restricted");
+                                        }
+                                    }
+
+                                    let quota_label = if let Some(rem) = acc.remaining_percent {
+                                        let stale_tag = if acc.is_stale { " · stale" } else { "" };
+                                        format!("{:.0}%{stale_tag}", rem)
+                                    } else {
+                                        "Unknown".to_string()
+                                    };
+
+                                    h_flex()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(
+                                            Label::new(format!("• {}{status_note}", acc.label))
+                                                .size(LabelSize::Small)
+                                                .color(if acc.is_active {
+                                                    Color::Default
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                        )
+                                        .child(
+                                            Label::new(quota_label)
+                                                .size(LabelSize::Small)
+                                                .weight(FontWeight::MEDIUM),
+                                        )
+                                },
+                            )))
+                        })
+                        .into_any_element()
+                }))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            // Algorithmic color distinguishing 0% vs 1%..100% vs Unknown:
+                            // - 0% Quota: Completely exhausted -> Desaturated muted gray (inactive/depleted).
+                            // - 1% Quota: Critical warning -> Pure vibrant Alert Red (Hue 0°).
+                            // - 1% to 100%: Mathematical smooth transition from Red (Hue 0°) to Green (Hue 120°).
+                            // - Unknown quota: Neutral muted color (does not masquerade as 100% full green).
+                            let (pool_color, is_zero) = if tooltip_eligible == 0 || is_empty {
+                                (cx.theme().colors().text_muted, true)
+                            } else if let Some(pct) = remaining_pct {
+                                let t = ((pct - 1.0) / 99.0).clamp(0.0, 1.0) as f32;
+                                let hue = t * (1.0 / 3.0);
+                                let saturation = if is_pool_stale { 0.50 } else { 0.90 };
+                                (gpui::hsla(hue, saturation, 0.48, 1.0), false)
+                            } else {
+                                (cx.theme().colors().text_muted, true)
+                            };
+                            let bg_color = cx.theme().colors().border_variant.opacity(0.5);
+
+                            // Responsive check: if narrow space (< 50px), render as circle
+                            if bounds.size.width < px(50.0) {
+                                let diameter =
+                                    bounds.size.height.min(bounds.size.width).min(px(14.0));
+                                let center_x = bounds.origin.x + bounds.size.width / 2.;
+                                let center_y = bounds.origin.y + bounds.size.height / 2.;
+                                let stroke_width = px(2.5);
+                                let radius = (diameter / 2.) - stroke_width / 2.;
+
+                                if radius > px(1.0) {
+                                    let mut bg_builder = PathBuilder::stroke(stroke_width);
+                                    bg_builder.move_to(point(center_x + radius, center_y));
+                                    bg_builder.arc_to(
+                                        point(radius, radius),
+                                        px(0.),
+                                        false,
+                                        true,
+                                        point(center_x - radius, center_y),
+                                    );
+                                    bg_builder.arc_to(
+                                        point(radius, radius),
+                                        px(0.),
+                                        false,
+                                        true,
+                                        point(center_x + radius, center_y),
+                                    );
+                                    bg_builder.close();
+                                    if let Ok(path) = bg_builder.build() {
+                                        window.paint_path(path, bg_color);
+                                    }
+
+                                    // Active progress arc: drawn if quota > 0%
+                                    if !is_zero {
+                                        // Ensure at least a visible arc pip for 1%
+                                        let arc_ratio = ratio.max(0.04);
+                                        let mut progress_builder =
+                                            PathBuilder::stroke(stroke_width);
+                                        if arc_ratio >= 0.999 {
+                                            progress_builder
+                                                .move_to(point(center_x + radius, center_y));
+                                            progress_builder.arc_to(
+                                                point(radius, radius),
+                                                px(0.),
+                                                false,
+                                                true,
+                                                point(center_x - radius, center_y),
+                                            );
+                                            progress_builder.arc_to(
+                                                point(radius, radius),
+                                                px(0.),
+                                                false,
+                                                true,
+                                                point(center_x + radius, center_y),
+                                            );
+                                            progress_builder.close();
+                                        } else {
+                                            let start_x = center_x;
+                                            let start_y = center_y - radius;
+                                            progress_builder.move_to(point(start_x, start_y));
+
+                                            let angle = -std::f32::consts::PI / 2.0
+                                                + (arc_ratio * 2.0 * std::f32::consts::PI);
+                                            let end_x = center_x + radius * angle.cos();
+                                            let end_y = center_y + radius * angle.sin();
+                                            let large_arc = arc_ratio > 0.5;
+
+                                            progress_builder.arc_to(
+                                                point(radius, radius),
+                                                px(0.),
+                                                large_arc,
+                                                true,
+                                                point(end_x, end_y),
+                                            );
+                                        }
+                                        if let Ok(path) = progress_builder.build() {
+                                            window.paint_path(path, pool_color);
+                                        }
+                                    }
+                                }
+                            } else {
+                                // 10-segmented bar ("Làm gì làm cứ chia thành 10 nấc")
+                                let num_segments = 10;
+                                let gap = px(2.0);
+                                let total_gap = gap * (num_segments - 1) as f32;
+                                let segment_w = ((bounds.size.width - total_gap)
+                                    / num_segments as f32)
+                                    .max(px(3.0));
+                                let segment_h = px(10.0).min(bounds.size.height);
+                                let top = bounds.origin.y + (bounds.size.height - segment_h) / 2.;
+
+                                // At 0%: 0 segments lit.
+                                // At 1%..10%: 1 segment lit (in vibrant Alert Red).
+                                // At 100%: 10 segments lit (in vibrant Green).
+                                let fill_threshold = if is_zero {
+                                    0
+                                } else {
+                                    ((ratio * num_segments as f32).round() as usize).max(1)
+                                };
+
+                                for i in 0..num_segments {
+                                    let left = bounds.origin.x + (segment_w + gap) * i as f32;
+                                    let segment_bounds =
+                                        Bounds::new(point(left, top), size(segment_w, segment_h));
+
+                                    let is_active = i < fill_threshold;
+                                    let color = if is_active { pool_color } else { bg_color };
+
+                                    window.paint_quad(
+                                        gpui::fill(segment_bounds, color).corner_radii(px(1.5)),
+                                    );
+                                }
+                            }
+                        },
+                    )
+                    .h(px(14.0))
+                    .when(is_narrow_window, |this| this.w(px(14.0)))
+                    .when(!is_narrow_window, |this| {
+                        this.w(px(72.0)).min_w(px(14.0)).flex_shrink_1()
+                    }),
+                )
                 .into_any_element(),
         )
     }
