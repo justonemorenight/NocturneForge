@@ -1,6 +1,7 @@
 use super::*;
 use acp_thread::{AcpThread, PermissionOptions, StubAgentConnection};
 use agent::ThreadStore;
+use agent_settings::AgentSettings;
 use agent_ui::{
     ThreadId,
     terminal_thread_metadata_store::{
@@ -14,15 +15,25 @@ use agent_ui::{
 };
 use chrono::DateTime;
 use fs::{FakeFs, Fs};
-use gpui::TestAppContext;
+use gpui::{App, TestAppContext};
 use pretty_assertions::assert_eq;
 use project::AgentId;
-use settings::SettingsStore;
+use settings::{Settings, SettingsStore};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 use util::{path_list::PathList, rel_path::rel_path};
+
+fn set_max_idle_retained_threads(max_idle_retained_threads: usize, cx: &mut App) {
+    AgentSettings::override_global(
+        AgentSettings {
+            max_idle_retained_threads,
+            ..AgentSettings::get_global(cx).clone()
+        },
+        cx,
+    );
+}
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -1667,7 +1678,7 @@ async fn init_test_project_with_agent_panel(
 ) -> Entity<project::Project> {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -1879,7 +1890,7 @@ async fn test_agent_panel_terminal_metadata_remains_visible_after_panel_is_remov
 async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAppContext) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -1960,7 +1971,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
 async fn test_agent_panel_terminal_shows_project_and_linked_worktree(cx: &mut TestAppContext) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -4846,7 +4857,7 @@ async fn test_confirm_on_historical_thread_in_new_project_group_opens_real_threa
 
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -7480,7 +7491,7 @@ async fn test_clicking_absorbed_worktree_thread_activates_worktree_workspace(
 async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut TestAppContext) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -10121,7 +10132,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
 ) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -10252,7 +10263,7 @@ async fn test_unarchive_after_removing_parent_project_group_restores_real_thread
 ) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -11347,7 +11358,7 @@ async fn init_multi_project_test(
 ) -> (Arc<FakeFs>, Entity<project::Project>) {
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -12149,7 +12160,7 @@ async fn test_worktree_add_only_regroups_threads_for_changed_workspace(cx: &mut 
     // linked worktree workspace should remain under the original group.
     agent_ui::test_support::init_test(cx);
     cx.update(|cx| {
-        cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+        set_max_idle_retained_threads(1, cx);
         ThreadStore::init_global(cx);
         ThreadMetadataStore::init_global(cx);
         language_model::LanguageModelRegistry::test(cx);
@@ -13274,7 +13285,7 @@ mod property_test {
         agent_ui::test_support::init_test(cx);
         cx.update(|cx| {
             cx.set_global(db::AppDatabase::test_new());
-            cx.set_global(agent_ui::MaxIdleRetainedThreads(1));
+            set_max_idle_retained_threads(1, cx);
             cx.set_global(agent_ui::thread_metadata_store::TestMetadataDbName(
                 format!("PROPTEST_THREAD_METADATA_{test_db_id}"),
             ));

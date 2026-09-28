@@ -617,6 +617,7 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),
+            max_idle_retained_threads: 5,
             thinking_display: Default::default(),
             terminal_output_limit: agent_settings::DEFAULT_TERMINAL_OUTPUT_LIMIT,
             enable_acp_delegation: false,

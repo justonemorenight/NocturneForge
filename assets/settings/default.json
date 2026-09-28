@@ -1114,6 +1114,10 @@
     //
     // Default: true
     "flexible": true,
+    // Maximum number of idle threads with loadable sessions to retain in the
+    // agent panel. Set to 0 to unload every eligible idle thread when it is
+    // no longer active.
+    "max_idle_retained_threads": 5,
     // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
     // Default width when the agent panel is docked to the left or right.
