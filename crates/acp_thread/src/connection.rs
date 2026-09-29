@@ -763,6 +763,8 @@ mod test_support {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
+        next_prompt_response: Arc<Mutex<Option<oneshot::Receiver<Result<acp::PromptResponse>>>>>,
+        next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
@@ -784,6 +786,8 @@ mod test_support {
         pub fn new() -> Self {
             Self {
                 next_prompt_updates: Default::default(),
+                next_prompt_response: Default::default(),
+                next_truncate: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
                 supports_load_session: false,
@@ -795,6 +799,20 @@ mod test_support {
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
             *self.next_prompt_updates.lock() = updates;
+        }
+
+        pub fn defer_next_prompt_response(
+            &self,
+        ) -> oneshot::Sender<Result<acp::PromptResponse>> {
+            let (sender, receiver) = oneshot::channel();
+            assert!(self.next_prompt_response.lock().replace(receiver).is_none());
+            sender
+        }
+
+        pub fn defer_next_truncate(&self) -> oneshot::Sender<()> {
+            let (sender, receiver) = oneshot::channel();
+            assert!(self.next_truncate.lock().replace(receiver).is_none());
+            sender
         }
 
         pub fn with_permission_requests(
@@ -974,7 +992,9 @@ mod test_support {
                 response_tx,
             } = sessions.get_mut(&params.session_id).unwrap();
             let mut tasks = vec![];
-            if self.next_prompt_updates.lock().is_empty() {
+            if let Some(receiver) = self.next_prompt_response.lock().take() {
+                cx.spawn(async move |_| receiver.await?)
+            } else if self.next_prompt_updates.lock().is_empty() {
                 let (tx, rx) = oneshot::channel();
                 response_tx.replace(tx);
                 cx.spawn(async move |_| {
