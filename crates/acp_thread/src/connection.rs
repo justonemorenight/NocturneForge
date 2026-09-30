@@ -767,6 +767,7 @@ mod test_support {
         next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
+        supports_set_title: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
     }
@@ -792,6 +793,7 @@ mod test_support {
                 sessions: Arc::default(),
                 supports_load_session: false,
                 supports_session_additional_directories: false,
+                supports_set_title: true,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
             }
@@ -833,6 +835,11 @@ mod test_support {
             supports_session_additional_directories: bool,
         ) -> Self {
             self.supports_session_additional_directories = supports_session_additional_directories;
+            self
+        }
+
+        pub fn with_supports_set_title(mut self, supports_set_title: bool) -> Self {
+            self.supports_set_title = supports_set_title;
             self
         }
 
@@ -1068,7 +1075,8 @@ mod test_support {
             _session_id: &acp::SessionId,
             _cx: &App,
         ) -> Option<Rc<dyn AgentSessionSetTitle>> {
-            Some(Rc::new(StubAgentSessionSetTitle))
+            self.supports_set_title
+                .then(|| Rc::new(StubAgentSessionSetTitle) as _)
         }
 
         fn truncate(
