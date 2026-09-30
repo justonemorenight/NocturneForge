@@ -819,70 +819,89 @@ pub(crate) fn render_buffer_header(
                         .gap_1()
                         .justify_between()
                         .overflow_hidden()
-                        .child(h_flex().min_w_0().flex_1().gap_0p5().overflow_hidden().map(
-                            |path_header| {
-                                let filename = filename
-                                    .map(SharedString::from)
-                                    .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into());
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .flex_1()
+                                .gap_0p5()
+                                .overflow_hidden()
+                                .when(is_diff_multibuffer, |this| {
+                                    this.flex_col().items_start().justify_center().gap_0()
+                                })
+                                .map(|path_header| {
+                                    let filename = filename
+                                        .map(SharedString::from)
+                                        .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into());
+                                    let full_path = match parent_path.as_deref() {
+                                        Some(parent) if !parent.is_empty() => {
+                                            format!("{}{}", parent, filename.as_str())
+                                        }
+                                        _ => filename.as_str().to_string(),
+                                    };
 
-                                let full_path = match parent_path.as_deref() {
-                                    Some(parent) if !parent.is_empty() => {
-                                        format!("{}{}", parent, filename.as_str())
-                                    }
-                                    _ => filename.as_str().to_string(),
-                                };
-
-                                path_header
-                                    .child(
-                                        ButtonLike::new("filename-button")
-                                            .when(
-                                                should_show_file_icon(
-                                                    is_diff_multibuffer,
-                                                    ItemSettings::get_global(cx).file_icons,
-                                                ),
-                                                |this| {
-                                                    let path =
-                                                        std::path::Path::new(filename.as_str());
-                                                    let icon = FileIcons::get_icon(path, cx)
-                                                        .unwrap_or_default();
-
-                                                    this.child(
-                                                        Icon::from_path(icon).color(Color::Muted),
-                                                    )
-                                                },
-                                            )
-                                            .child(
-                                                Label::new(filename)
-                                                    .single_line()
-                                                    .color(file_status_label_color(file_status))
-                                                    .buffer_font(cx)
-                                                    .when(
-                                                        file_status.is_some_and(|s| s.is_deleted()),
-                                                        |label| label.strikethrough(),
-                                                    ),
-                                            )
-                                            .tooltip(move |_, cx| {
-                                                Tooltip::with_meta(
-                                                    "Open File",
-                                                    None,
-                                                    full_path.clone(),
+                                    let filename_label = Label::new(filename.clone())
+                                        .single_line()
+                                        .color(file_status_label_color(file_status))
+                                        .buffer_font(cx)
+                                        .when(is_diff_multibuffer, |label| {
+                                            label
+                                                .flex_1()
+                                                .truncate_middle()
+                                                .weight(gpui::FontWeight::SEMIBOLD)
+                                                .line_height_style(LineHeightStyle::UiLabel)
+                                        })
+                                        .when(
+                                            file_status.is_some_and(|status| status.is_deleted()),
+                                            |label| label.strikethrough(),
+                                        );
+                                    let filename_content = h_flex()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .text_align(TextAlign::Left)
+                                        .when(is_diff_multibuffer, |this| this.w_full())
+                                        .when(
+                                            should_show_file_icon(
+                                                is_diff_multibuffer,
+                                                ItemSettings::get_global(cx).file_icons,
+                                            ),
+                                            |this| {
+                                                let icon = FileIcons::get_icon(
+                                                    Path::new(filename.as_str()),
                                                     cx,
                                                 )
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            })),
-                                    )
-                                    .when_some(parent_path, |then, path| {
-                                        then.child(
+                                                .unwrap_or_default();
+                                                this.child(
+                                                    Icon::from_path(icon).color(Color::Muted),
+                                                )
+                                            },
+                                        )
+                                        .child(filename_label);
+                                    let filename_button = ButtonLike::new("filename-button")
+                                        .when(is_diff_multibuffer, |this| {
+                                            this.full_width().size(ButtonSize::Compact)
+                                        })
+                                        .child(filename_content)
+                                        .tooltip(move |_, cx| {
+                                            Tooltip::with_meta(
+                                                "Open File",
+                                                None,
+                                                full_path.clone(),
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(window.listener_for(editor, {
+                                            let jump_data = jump_data.clone();
+                                            move |editor, event: &ClickEvent, window, cx| {
+                                                editor.open_excerpts_common(
+                                                    Some(jump_data.clone()),
+                                                    event.modifiers().secondary(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }));
+                                    let mut parent_label =
+                                        parent_path.filter(|path| !path.is_empty()).map(|path| {
                                             Label::new(path)
                                                 .buffer_font(cx)
                                                 .truncate_start()
@@ -894,31 +913,67 @@ pub(crate) fn render_buffer_header(
                                                     } else {
                                                         Color::Custom(colors.text_muted)
                                                     },
-                                                ),
+                                                )
+                                                .when(is_diff_multibuffer, |label| {
+                                                    label
+                                                        .size(LabelSize::Small)
+                                                        .line_height_style(LineHeightStyle::UiLabel)
+                                                })
+                                        });
+                                    let filename_row = h_flex()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .when(is_diff_multibuffer, |this| this.w_full())
+                                        .child(
+                                            div()
+                                                .when(is_diff_multibuffer, |this| {
+                                                    this.min_w_0().flex_1().overflow_hidden()
+                                                })
+                                                .child(filename_button),
                                         )
-                                    })
-                                    .when(!buffer.capability.editable(), |el| {
-                                        el.child(Icon::new(IconName::FileLock).color(Color::Muted))
-                                    })
-                                    .when_some(breadcrumbs, |then, breadcrumbs| {
-                                        let font = theme_settings::ThemeSettings::get_global(cx)
-                                            .buffer_font
-                                            .clone();
-                                        then.child(render_breadcrumb_text(
-                                            breadcrumbs,
-                                            Some(font),
-                                            None,
-                                            editor_handle,
-                                            true,
-                                            window,
-                                            cx,
-                                        ))
-                                    })
-                            },
-                        ))
+                                        .when(!is_diff_multibuffer, |this| {
+                                            this.children(parent_label.take())
+                                        })
+                                        .when(!buffer.capability.editable(), |this| {
+                                            this.child(
+                                                Icon::new(IconName::FileLock).color(Color::Muted),
+                                            )
+                                        })
+                                        .when_some(breadcrumbs, |this, breadcrumbs| {
+                                            let font =
+                                                theme_settings::ThemeSettings::get_global(cx)
+                                                    .buffer_font
+                                                    .clone();
+                                            this.child(render_breadcrumb_text(
+                                                breadcrumbs,
+                                                Some(font),
+                                                None,
+                                                editor_handle,
+                                                true,
+                                                window,
+                                                cx,
+                                            ))
+                                        });
+
+                                    path_header.child(filename_row).when(
+                                        is_diff_multibuffer,
+                                        |this| {
+                                            this.children(parent_label.map(|label| {
+                                                div().min_w_0().w_full().px_1().child(label)
+                                            }))
+                                        },
+                                    )
+                                }),
+                        )
                         .child(
                             h_flex()
                                 .gap_2()
+                                .when(is_diff_multibuffer, |this| {
+                                    this.flex_shrink_0()
+                                        .pl_2()
+                                        .border_l_1()
+                                        .border_color(colors.border)
+                                })
                                 .when_some(diff_stat, |this, (added, removed)| {
                                     let ui_font_size =
                                         theme_settings::ThemeSettings::get_global(cx)
@@ -929,33 +984,44 @@ pub(crate) fn render_buffer_header(
                                         removed as usize,
                                     )))
                                 })
-                                .when(show_open_file_button, |this| {
-                                    this.child(
-                                        Button::new("open-file-button", "Open File")
-                                            .style(ButtonStyle::OutlinedCustom(
-                                                cx.theme().colors().border.opacity(0.6),
-                                            ))
-                                            .layer(ui::ElevationIndex::ElevatedSurface)
-                                            .when(is_selected, |this| {
-                                                this.key_binding(KeyBinding::for_action_in(
-                                                    &OpenExcerpts,
-                                                    &focus_handle,
-                                                    cx,
+                                .when(
+                                    can_open_excerpts
+                                        && relative_path.is_some()
+                                        && (is_diff_multibuffer || show_open_file_button),
+                                    |this| {
+                                        let open_file_button =
+                                            Button::new("open-file-button", "Open File")
+                                                .style(ButtonStyle::OutlinedCustom(
+                                                    cx.theme().colors().border.opacity(0.6),
                                                 ))
-                                            })
-                                            .on_click(window.listener_for(editor, {
-                                                let jump_data = jump_data.clone();
-                                                move |editor, e: &ClickEvent, window, cx| {
-                                                    editor.open_excerpts_common(
-                                                        Some(jump_data.clone()),
-                                                        e.modifiers().secondary(),
-                                                        window,
+                                                .layer(ui::ElevationIndex::ElevatedSurface)
+                                                .when(is_selected || is_diff_multibuffer, |this| {
+                                                    this.key_binding(KeyBinding::for_action_in(
+                                                        &OpenExcerpts,
+                                                        &focus_handle,
                                                         cx,
-                                                    );
-                                                }
-                                            })),
-                                    )
-                                }),
+                                                    ))
+                                                })
+                                                .on_click(window.listener_for(editor, {
+                                                    let jump_data = jump_data.clone();
+                                                    move |editor, event: &ClickEvent, window, cx| {
+                                                        editor.open_excerpts_common(
+                                                            Some(jump_data.clone()),
+                                                            event.modifiers().secondary(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }));
+                                        this.child(
+                                            div()
+                                                .when(!show_open_file_button, |this| {
+                                                    this.invisible()
+                                                })
+                                                .child(open_file_button),
+                                        )
+                                    },
+                                ),
                         )
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(window.listener_for(editor, {
