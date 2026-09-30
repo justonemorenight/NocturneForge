@@ -54,7 +54,8 @@ use crate::{
     ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
     ToggleNewThreadMenu, ToggleOptionsMenu,
     conversation_view::{
-        AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
+        AcpThreadViewEvent, RootThreadUpdated, ThreadView, format_review_feedback_message,
+        reset_fast_mode_warnings,
     },
     ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
 };
@@ -67,7 +68,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{DiffReviewComment, Editor, MultiBuffer, ReviewFeedback, actions::SendReviewToAgent};
+use editor::{Editor, MultiBuffer, ReviewFeedback, actions::SendReviewToAgent};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -740,28 +741,7 @@ pub fn init(cx: &mut App) {
                         Ok(true) => editor.update(cx, |editor, cx| {
                             editor.mark_review_feedback_sent(cx);
                         }),
-                        Ok(false) => {
-                            let comments =
-                                editor.update(cx, |editor, cx| editor.take_review_comments(cx));
-                            let Some(initial_content) =
-                                build_diff_review_initial_content(&comments)
-                            else {
-                                return;
-                            };
-                            panel.update(cx, |panel, cx| {
-                                panel.external_thread(
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    Some(initial_content),
-                                    true,
-                                    AgentThreadSource::GitPanel,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }
+                        Ok(false) => {}
                         Err(error) => workspace
                             .show_error(format!("Failed to send review feedback: {error:#}"), cx),
                     }
@@ -944,48 +924,19 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-fn build_diff_review_comments_prompt(comments: &[DiffReviewComment]) -> String {
-    let mut prompt = format!(
-        "Address the following {} review comment{} from the current Git diff. Inspect the surrounding code, make the requested changes, and verify the result.\n",
-        comments.len(),
-        if comments.len() == 1 { "" } else { "s" }
-    );
-
-    for (index, comment) in comments.iter().enumerate() {
-        let location = if comment.start_line == comment.end_line {
-            format!("{}:{}", comment.file_path, comment.start_line)
-        } else {
-            format!(
-                "{}:{}-{}",
-                comment.file_path, comment.start_line, comment.end_line
-            )
-        };
-        prompt.push_str(&format!("\n{}. `{location}`\n", index + 1));
-        prompt.push_str(&format!("   Feedback: {}\n", comment.comment));
-        if !comment.selected_text.is_empty() {
-            prompt.push_str("   Selected code:\n");
-            for line in comment.selected_text.lines() {
-                prompt.push_str(&format!("       {line}\n"));
-            }
-        }
-    }
-
-    prompt
-}
-
 fn build_diff_review_initial_content(
-    comments: &[DiffReviewComment],
-) -> Option<AgentInitialContent> {
-    if comments.is_empty() {
-        return None;
+    feedback: &[ReviewFeedback],
+) -> Result<Option<AgentInitialContent>> {
+    if feedback.is_empty() {
+        return Ok(None);
     }
 
-    Some(AgentInitialContent::ContentBlock {
+    Ok(Some(AgentInitialContent::ContentBlock {
         blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-            build_diff_review_comments_prompt(comments),
+            format_review_feedback_message(feedback)?,
         ))],
         auto_submit: true,
-    })
+    }))
 }
 
 fn format_selection_for_terminal(
@@ -4442,12 +4393,29 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<bool> {
-        let Some(thread_view) = self.active_thread_view(cx) else {
-            return Ok(false);
-        };
-        thread_view.update(cx, |thread_view, cx| {
-            thread_view.send_review_feedback(feedback, window, cx)
-        })?;
+        if let Some(thread_view) = self.active_thread_view(cx) {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.send_review_feedback(feedback, window, cx)
+            })?;
+        } else {
+            let Some(initial_content) = build_diff_review_initial_content(&feedback)? else {
+                return Ok(false);
+            };
+            if !self.has_open_project(cx) {
+                return Err(anyhow!("Open a project before sending review feedback"));
+            }
+            self.external_thread(
+                None,
+                None,
+                None,
+                None,
+                Some(initial_content),
+                true,
+                AgentThreadSource::GitPanel,
+                window,
+                cx,
+            );
+        }
         Ok(true)
     }
 
@@ -7757,58 +7725,91 @@ mod tests {
     }
 
     #[test]
-    fn test_build_diff_review_comments_prompt() {
-        let prompt = build_diff_review_comments_prompt(&[
-            DiffReviewComment {
-                file_path: "src/main.rs".to_string(),
-                start_line: 4,
-                end_line: 4,
-                comment: "Handle this error".to_string(),
-                selected_text: "do_work()?;".to_string(),
-            },
-            DiffReviewComment {
-                file_path: "src/lib.rs".to_string(),
-                start_line: 8,
-                end_line: 10,
-                comment: "Add a regression test".to_string(),
-                selected_text: String::new(),
-            },
-        ]);
-
-        assert!(prompt.contains("2 review comments"));
-        assert!(prompt.contains("`src/main.rs:4`"));
-        assert!(prompt.contains("       do_work()?;"));
-        assert!(prompt.contains("`src/lib.rs:8-10`"));
-        assert!(prompt.contains("Feedback: Add a regression test"));
-    }
-
-    #[test]
-    fn test_diff_review_comments_become_auto_submitted_agent_content() {
-        let content = build_diff_review_initial_content(&[DiffReviewComment {
+    fn test_diff_review_comments_become_auto_submitted_agent_content() -> Result<()> {
+        let feedback = vec![ReviewFeedback {
+            worktree_name: Some("feature-worktree".to_string()),
             file_path: "src/main.rs".to_string(),
             start_line: 4,
-            end_line: 4,
+            end_line: 6,
             comment: "Handle this error".to_string(),
-            selected_text: "do_work()?;".to_string(),
-        }])
-        .expect("a review comment should produce agent content");
+            excerpt: "do_work()?;".to_string(),
+            status: editor::ReviewCommentStatus::Draft,
+        }];
+        let content = build_diff_review_initial_content(&feedback)?
+            .ok_or_else(|| anyhow!("a review comment should produce agent content"))?;
 
         let AgentInitialContent::ContentBlock {
             blocks,
             auto_submit,
         } = content
         else {
-            panic!("review comments should use structured content blocks");
+            return Err(anyhow!(
+                "review comments should use structured content blocks"
+            ));
         };
         assert!(auto_submit);
-        assert_eq!(blocks.len(), 1);
-        let acp::ContentBlock::Text(text) = &blocks[0] else {
-            panic!("review comments should be sent as text");
+        let [acp::ContentBlock::Text(text)] = blocks.as_slice() else {
+            return Err(anyhow!("review comments should be sent as one text block"));
         };
-        assert!(text.text.contains("`src/main.rs:4`"));
-        assert!(text.text.contains("Feedback: Handle this error"));
+        assert_eq!(text.text, format_review_feedback_message(&feedback)?);
+        assert!(
+            text.text
+                .contains("`src/main.rs` L4–6 (`feature-worktree`)")
+        );
+        assert!(text.text.contains("Handle this error"));
+        assert!(text.text.contains("do_work()?;"));
+        assert!(text.text.contains("Machine-readable review feedback"));
+        assert!(build_diff_review_initial_content(&[])?.is_none());
+        Ok(())
+    }
 
-        assert!(build_diff_review_initial_content(&[]).is_none());
+    #[gpui::test]
+    async fn test_review_feedback_creates_thread_when_none_is_active(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Review addressed".into()),
+        )]);
+        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+        assert!(panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).is_none()));
+
+        let feedback = vec![ReviewFeedback {
+            worktree_name: Some("project".to_string()),
+            file_path: "file.txt".to_string(),
+            start_line: 1,
+            end_line: 1,
+            excerpt: "original code".to_string(),
+            comment: "Handle this edge case".to_string(),
+            status: editor::ReviewCommentStatus::Draft,
+        }];
+        let expected_message =
+            format_review_feedback_message(&feedback).expect("review metadata should serialize");
+        assert!(
+            panel
+                .update_in(&mut cx, |panel, window, cx| {
+                    panel.send_review_feedback(feedback, window, cx)
+                })
+                .expect("review should create an agent thread")
+        );
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let thread = panel
+                .active_agent_thread(cx)
+                .expect("new thread should be active");
+            let message = thread
+                .read(cx)
+                .entries()
+                .iter()
+                .find_map(|entry| {
+                    let acp_thread::AgentThreadEntry::UserMessage(message) = entry else {
+                        return None;
+                    };
+                    message.content.text_content(cx)
+                })
+                .expect("review should be submitted as a user message");
+            assert_eq!(message, expected_message.trim_end());
+        });
     }
 
     #[test]

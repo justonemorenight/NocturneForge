@@ -674,7 +674,9 @@ fn markdown_fenced_block(text: &str, language: Option<&str>) -> String {
     block
 }
 
-fn format_review_feedback_message(feedback: &[ReviewFeedback]) -> anyhow::Result<String> {
+pub(crate) fn format_review_feedback_message(
+    feedback: &[ReviewFeedback],
+) -> anyhow::Result<String> {
     let mut message = String::from(
         "Address the following human-authored review feedback. Each card is anchored to a local diff; paths in backticks can be opened from the thread.\n",
     );
@@ -1100,6 +1102,26 @@ impl OrchestrationProposalPresentation {
     }
 }
 
+#[derive(IntoElement)]
+struct ToolOutputScroll {
+    id: SharedString,
+    scroll_handle: ScrollHandle,
+    content: AnyElement,
+}
+
+impl RenderOnce for ToolOutputScroll {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .id(self.id)
+            .w_full()
+            .max_h((window.viewport_size().height * 0.4).min(px(360.)))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .child(self.content)
+            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+    }
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp::SessionId,
@@ -1135,7 +1157,8 @@ pub struct ThreadView {
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp::ToolCallId>,
-    pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
+    pub subagent_scroll_handles: RefCell<HashMap<(acp::SessionId, acp::ToolCallId), ScrollHandle>>,
+    tool_output_scroll_handles: RefCell<HashMap<acp::ToolCallId, ScrollHandle>>,
     floating_tool_call_scroll_handles: RefCell<HashMap<acp::ToolCallId, ScrollHandle>>,
     pub edits_expanded: bool,
     large_diff_review_prompt: bool,
@@ -1647,6 +1670,7 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            tool_output_scroll_handles: RefCell::new(HashMap::default()),
             floating_tool_call_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             large_diff_review_prompt: false,
@@ -9842,6 +9866,12 @@ impl ThreadView {
                                             })
                                     })
                                     .text_xs()
+                                    .child(
+                                        Label::new(if is_subagent { "Task" } else { "You" })
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .mb_1(),
+                                    )
                                     .child(editor.clone().into_any_element())
                             )
                             .when(editor_focus, |this| {
@@ -9989,6 +10019,12 @@ impl ThreadView {
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
+                        .child(
+                            Label::new("Agent")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .mb_1(),
+                        )
                         .child(self.render_message_context_menu(entry_ix, message_body, cx))
                         .when_some(
                             self.entry_view_state
@@ -12720,7 +12756,18 @@ impl ThreadView {
                     )
                 }
             })
-            .children(tool_output_display);
+            .children(tool_output_display.map(|output| {
+                if is_edit || is_terminal_tool {
+                    return output;
+                }
+                let scroll_handle = self.tool_output_scroll_handles.borrow_mut()
+                    .entry(tool_call.id.clone()).or_default().clone();
+                ToolOutputScroll {
+                    id: format!("tool-output-scroll-{}", tool_call.id.0).into(),
+                    scroll_handle,
+                    content: output,
+                }.into_any_element()
+            }));
 
         v_flex()
             .map(|this| {
@@ -15030,11 +15077,14 @@ impl ThreadView {
         let scroll_handle = self
             .subagent_scroll_handles
             .borrow_mut()
-            .entry(subagent_view.session_id.clone())
+            .entry((subagent_view.session_id.clone(), tool_call.id.clone()))
             .or_default()
             .clone();
 
-        scroll_handle.scroll_to_bottom();
+        // Follow streaming output only while the user is already at the bottom.
+        if scroll_handle.offset().y <= -scroll_handle.max_offset().y + px(1.) {
+            scroll_handle.scroll_to_bottom();
+        }
 
         let rendered_entries: Vec<AnyElement> = entries
             .get(entry_range)
@@ -15047,27 +15097,21 @@ impl ThreadView {
             })
             .collect();
 
-        v_flex()
+        div()
+            .relative()
             .w_full()
             .border_t_1()
             .when(is_canceled_or_failed, |this| this.border_dashed())
             .border_color(self.tool_card_border_color(cx))
             .overflow_hidden()
-            .child(
-                div()
+            .child(ToolOutputScroll {
+                id: format!("subagent-entries-{}-{}", session_id, tool_call.id.0).into(),
+                scroll_handle,
+                content: v_flex()
                     .pb_1()
-                    .min_h_0()
-                    // Include the tool call id so the same subagent session
-                    // rendered in multiple parent cards gets distinct element
-                    // ids for its inlined entries (avoids duplicate a11y ids).
-                    .id(format!(
-                        "subagent-entries-{}-{}",
-                        session_id, tool_call.id.0
-                    ))
-                    .track_scroll(&scroll_handle)
-                    .children(rendered_entries),
-            )
-            .h_56()
+                    .children(rendered_entries)
+                    .into_any_element(),
+            })
             .child(overlay)
             .into_any_element()
     }
@@ -16801,6 +16845,56 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    fn test_tool_output_scroll_keeps_short_content_natural_and_long_content_accessible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct TestToolOutput {
+            content_height: Pixels,
+            scroll_handle: ScrollHandle,
+        }
+
+        impl Render for TestToolOutput {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().child(ToolOutputScroll {
+                    id: "test-tool-output-scroll".into(),
+                    scroll_handle: self.scroll_handle.clone(),
+                    content: div().h(self.content_height).w_full().into_any_element(),
+                })
+            }
+        }
+
+        crate::conversation_view::tests::init_test(cx);
+        let scroll_handle = ScrollHandle::new();
+        let (view, cx) = cx.add_window_view(|_, _| TestToolOutput {
+            content_height: px(80.),
+            scroll_handle: scroll_handle.clone(),
+        });
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+        let max_height = cx.update(|window, _| (window.viewport_size().height * 0.4).min(px(360.)));
+
+        for content_height in [px(80.), px(1200.)] {
+            view.update(cx, |view, cx| {
+                view.content_height = content_height;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                scroll_handle.bounds().size.height,
+                content_height.min(max_height)
+            );
+            assert_eq!(
+                scroll_handle.max_offset().y > px(0.),
+                content_height > max_height
+            );
+        }
+    }
 
     #[test]
     fn test_tool_call_icon_tooltip() {

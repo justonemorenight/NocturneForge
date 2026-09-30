@@ -288,17 +288,38 @@ pub(crate) struct Conversation {
 
 impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
-        let session_id = thread.read(cx).session_id().clone();
+        let thread_state = thread.read(cx);
+        let session_id = thread_state.session_id().clone();
+        for entry in thread_state.entries() {
+            match entry {
+                AgentThreadEntry::ToolCall(tool_call)
+                    if matches!(
+                        tool_call.status,
+                        ToolCallStatus::WaitingForConfirmation { .. }
+                    ) =>
+                {
+                    self.add_permission_request(&session_id, &tool_call.id);
+                }
+                AgentThreadEntry::Elicitation(id)
+                    if thread_state
+                        .elicitation(id)
+                        .is_some_and(|(_, elicitation)| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        }) =>
+                {
+                    self.add_elicitation_request(&session_id, id);
+                }
+                _ => {}
+            }
+        }
+
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
             move |this, _thread, event, _cx| {
                 this.updated_at = Some(Instant::now());
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
-                        this.permission_requests
-                            .entry(session_id.clone())
-                            .or_default()
-                            .push(id.clone());
+                        this.add_permission_request(&session_id, id);
                     }
                     AcpThreadEvent::ToolAuthorizationReceived(id) => {
                         if let Some(tool_calls) = this.permission_requests.get_mut(&session_id) {
@@ -309,10 +330,7 @@ impl Conversation {
                         }
                     }
                     AcpThreadEvent::ElicitationRequested(id) => {
-                        this.elicitation_requests
-                            .entry(session_id.clone())
-                            .or_default()
-                            .push(id.clone());
+                        this.add_elicitation_request(&session_id, id);
                     }
                     AcpThreadEvent::ElicitationResponded(id) => {
                         if let Some(elicitations) = this.elicitation_requests.get_mut(&session_id) {
@@ -345,6 +363,58 @@ impl Conversation {
         });
         self.subscriptions.insert(session_id.clone(), subscription);
         self.threads.insert(session_id, thread);
+    }
+
+    fn add_permission_request(
+        &mut self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+    ) {
+        let requests = self
+            .permission_requests
+            .entry(session_id.clone())
+            .or_default();
+        if !requests.contains(tool_call_id) {
+            requests.push(tool_call_id.clone());
+        }
+    }
+
+    fn add_elicitation_request(
+        &mut self,
+        session_id: &acp::SessionId,
+        elicitation_id: &ElicitationEntryId,
+    ) {
+        let requests = self
+            .elicitation_requests
+            .entry(session_id.clone())
+            .or_default();
+        if !requests.contains(elicitation_id) {
+            requests.push(elicitation_id.clone());
+        }
+    }
+
+    pub fn has_pending_elicitation(&self, session_id: &acp::SessionId, cx: &App) -> bool {
+        let Some(thread) = self.threads.get(session_id) else {
+            return false;
+        };
+        let is_subagent = thread.read(cx).parent_session_id().is_some();
+        self.elicitation_requests
+            .iter()
+            .any(|(request_session_id, ids)| {
+                if is_subagent && request_session_id != session_id {
+                    return false;
+                }
+                self.threads.get(request_session_id).is_some_and(|thread| {
+                    ids.iter().any(|id| {
+                        thread
+                            .read(cx)
+                            .elicitation(id)
+                            .is_some_and(|(_, elicitation)| {
+                                matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                            })
+                    })
+                })
+            })
     }
 
     fn register_orchestration_worker(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
@@ -753,17 +823,17 @@ impl ConversationView {
             .pending_tool_call(&session_id, cx)
     }
 
-    pub fn root_thread_has_pending_tool_call(&self, cx: &App) -> bool {
+    pub fn root_thread_is_waiting_on_user(&self, cx: &App) -> bool {
         let Some(root_thread) = self.root_thread_view() else {
             return false;
         };
         let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
         self.as_connected().is_some_and(|connected| {
-            connected
-                .conversation
-                .read(cx)
+            let conversation = connected.conversation.read(cx);
+            conversation
                 .pending_tool_call(&root_session_id, cx)
                 .is_some()
+                || conversation.has_pending_elicitation(&root_session_id, cx)
         })
     }
 
@@ -10423,6 +10493,119 @@ pub(crate) mod tests {
                     .unwrap()
             })
         })
+    }
+
+    #[gpui::test]
+    async fn test_conversation_discovers_elicitation_pending_before_thread_registration(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let session_id = acp::SessionId::new("pending-before-register");
+        let thread = cx.update(|cx| {
+            create_test_acp_thread(None, "pending-before-register", connection, project, cx)
+        });
+        let (elicitation_id, _response) = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id.clone()),
+                            acp::ElicitationSchema::new().string("answer", true),
+                        ),
+                        "Which option should I use?",
+                    ),
+                    cx,
+                )
+                .expect("valid session-scoped question should be accepted")
+        });
+        let conversation = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            })
+        });
+        cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            assert!(conversation.has_pending_elicitation(&session_id, cx));
+            assert_eq!(
+                conversation
+                    .elicitation_requests
+                    .get(&session_id)
+                    .map(Vec::len),
+                Some(1),
+                "queued request event must not duplicate seeded state"
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            assert!(!conversation.has_pending_elicitation(&session_id, cx))
+        });
+    }
+
+    #[gpui::test]
+    async fn test_conversation_discovers_permission_pending_before_thread_registration(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let session_id = acp::SessionId::new("pending-before-register");
+        let thread = cx.update(|cx| {
+            create_test_acp_thread(None, "pending-before-register", connection, project, cx)
+        });
+
+        let _response = request_test_tool_authorization(&thread, "pending-tool", "allow-tool", cx);
+        let conversation = cx.update(|cx| {
+            cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            })
+        });
+
+        cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            assert_eq!(
+                conversation.pending_tool_call_for_session(&session_id, cx),
+                Some(acp::ToolCallId::new("pending-tool")),
+                "registration should discover permissions that were already waiting"
+            );
+            assert_eq!(
+                conversation.pending_tool_call_count_for_session(&session_id),
+                1,
+                "a queued authorization event must not duplicate seeded state"
+            );
+        });
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.authorize_tool_call(
+                session_id.clone(),
+                acp::ToolCallId::new("pending-tool"),
+                SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new("allow-tool"),
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        conversation.read_with(cx, |conversation, _| {
+            assert_eq!(
+                conversation.pending_tool_call_count_for_session(&session_id),
+                0
+            );
+        });
     }
 
     #[gpui::test]
