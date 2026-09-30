@@ -112,10 +112,10 @@ impl SubagentRole {
         }
     }
 
-    pub(crate) fn role_settings<'a>(
+    pub(crate) fn role_settings(
         self,
-        roles: &'a NativeSubagentRolesSettings,
-    ) -> &'a NativeSubagentRoleSettings {
+        roles: &NativeSubagentRolesSettings,
+    ) -> &NativeSubagentRoleSettings {
         match self {
             Self::Explorer => &roles.explorer,
             Self::FlowReader => &roles.flow_reader,

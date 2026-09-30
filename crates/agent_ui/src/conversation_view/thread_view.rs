@@ -8153,12 +8153,9 @@ impl ThreadView {
                 .py_0p5()
                 .rounded_md()
                 .hover(|this| this.bg(cx.theme().colors().element_hover))
-                .on_click({
-                    let account_menu_handle = account_menu_handle.clone();
-                    cx.listener(move |_this, _, window, cx| {
-                        account_menu_handle.toggle(window, cx);
-                    })
-                })
+                .on_click(cx.listener(move |_this, _, window, cx| {
+                    account_menu_handle.toggle(window, cx);
+                }))
                 .tooltip(Tooltip::element(move |_window, _cx| {
                     v_flex()
                         .gap_1()

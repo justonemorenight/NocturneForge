@@ -978,9 +978,7 @@ mod tests {
     #[test]
     fn test_truncate_diff_for_mention_oversized_lines() {
         let line = "+added line content\n";
-        let oversized: String = std::iter::repeat(line)
-            .take(MENTION_DIFF_MAX_LINES + 500)
-            .collect();
+        let oversized = line.repeat(MENTION_DIFF_MAX_LINES + 500);
         let result = truncate_diff_for_mention(oversized.clone());
         assert!(
             result.len() < oversized.len(),
