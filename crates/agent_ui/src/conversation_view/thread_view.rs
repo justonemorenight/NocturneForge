@@ -7653,10 +7653,11 @@ impl ThreadView {
 
     fn render_cache_warming_control(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.as_native_thread(cx)?;
-        if !thread
-            .read(cx)
-            .model()
-            .is_some_and(|model| model.cache_warming_scope(cx).is_some())
+        let native_thread = thread.read(cx);
+        if native_thread.is_subagent()
+            || !native_thread
+                .model()
+                .is_some_and(|model| model.cache_warming_scope(cx).is_some())
         {
             return None;
         }
@@ -7664,10 +7665,14 @@ impl ThreadView {
         let enabled = agent::cache_keepalive::enabled_for_thread(&thread_id, cx);
         let owner = thread.downgrade();
         let tooltip_id = thread_id.clone();
-        Some(Button::new("cache-warming", if enabled { "Cache: On" } else { "Cache: Off" })
-            .disabled(!AgentSettings::get_global(cx).cache_keepalive)
+        Some(IconButton::new("cache-warming", IconName::DatabaseZap)
+            .aria_label(if enabled { "Disable cache warming" } else { "Enable cache warming" })
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .selected_icon_color(Color::Accent)
+            .toggle_state(enabled)
             .tooltip(move |window, cx| Tooltip::text(
-                format!("{}\nOpt-in warming consumes usage. Enable agent.cache_keepalive in settings first. Changes apply after the next successful turn.", agent::cache_keepalive::status(&tooltip_id, cx)))(window, cx))
+                format!("{}\nClick to {} cache warming for this thread. Warming consumes usage and starts after the next successful turn.", agent::cache_keepalive::status(&tooltip_id, cx), if enabled { "disable" } else { "enable" }))(window, cx))
             .on_click(cx.listener(move |_, _, _, cx| {
                 agent::cache_keepalive::toggle_thread(thread_id.clone(), owner.clone(), cx);
                 cx.notify();
