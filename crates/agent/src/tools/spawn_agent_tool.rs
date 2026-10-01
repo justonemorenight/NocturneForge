@@ -255,6 +255,12 @@ struct AgentDelivery {
 type ActiveDeliveries =
     Arc<parking_lot::RwLock<HashMap<acp::SessionId, async_channel::Sender<AgentDelivery>>>>;
 
+/// Tracks which subagent sessions currently have a running turn. It is owned
+/// by the parent thread so that separate orchestration runs cannot drive the
+/// same subagent session at the same time.
+#[derive(Clone, Default)]
+pub struct SubagentDeliveries(ActiveDeliveries);
+
 struct SteeringSession {
     session_id: acp::SessionId,
     receiver: async_channel::Receiver<AgentDelivery>,
@@ -280,7 +286,9 @@ impl SteeringSession {
                     entry.insert(sender);
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {
-                    anyhow::bail!("subagent session '{session_id}' already has an active owner");
+                    anyhow::bail!(
+                        "subagent session '{session_id}' is still running another turn; use send_message_to_agent to steer it or wait_for_agents before sending a follow-up"
+                    );
                 }
             }
         }
@@ -369,6 +377,7 @@ impl SubagentRuntimeExecutor {
                 collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
             >,
         >,
+        deliveries: SubagentDeliveries,
         maximum_pending_deliveries: usize,
         session_info: Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
     ) -> Self {
@@ -377,7 +386,7 @@ impl SubagentRuntimeExecutor {
             app,
             event_stream,
             roles_map,
-            active_deliveries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            active_deliveries: deliveries.0,
             maximum_pending_deliveries,
             session_info,
         }
@@ -538,7 +547,11 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             let Some(session_id) = session_id else {
                 return Ok(());
             };
-            let subagent = app.update(move |cx| environment.resume_subagent(session_id, cx))?;
+            let Some(subagent) =
+                app.update(move |cx| environment.existing_subagent(session_id, cx))?
+            else {
+                return Ok(());
+            };
             subagent.cancel(&app).await;
             Ok(())
         })
@@ -583,6 +596,8 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
         let env = self.environment.clone();
         let app = self.app.clone();
         let reporter = context.reporter.clone();
+        let active_deliveries = self.active_deliveries.clone();
+        let maximum_pending_deliveries = self.maximum_pending_deliveries;
         let task = task.clone();
         let feedback = feedback.to_string();
         let session_id = context.existing_session_id;
@@ -602,9 +617,16 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                 "{}\n\nVerification feedback for task `{}`:\n\n{}\n\nPlease address the feedback and return a corrected result with a new structured verification claim.",
                 execution_prompt, task.label, feedback
             );
+            let steering_session = SteeringSession::register(
+                session_id.clone(),
+                active_deliveries,
+                maximum_pending_deliveries,
+            )?;
             reporter.report_tool_call_started("subagent");
             let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
-            let send_result = subagent.send(repair_message, &app).await;
+            let send_result = steering_session
+                .send(subagent.clone(), repair_message, app.clone())
+                .await;
             reporter.report_tool_call_finished();
             let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
             let tokens_used = cumulative_token_delta(usage_before, usage_after);
@@ -673,6 +695,13 @@ fn batch_launch_policy(
         agent_settings::AgentExecutionStrategy::Plan => {
             agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
         }
+        // An approval card for one delegated task only adds a round trip; the
+        // plan checkpoint is kept for multi-task batches and manual autonomy.
+        agent_settings::AgentExecutionStrategy::Orchestrate
+            if task_count == 1 && autonomy != agent_settings::AgentAutonomy::Manual =>
+        {
+            agent_orchestration::RuntimeLaunchDisposition::Approved
+        }
         agent_settings::AgentExecutionStrategy::Orchestrate
             if configured_strategy == agent_settings::AgentExecutionStrategy::Auto =>
         {
@@ -699,57 +728,19 @@ fn batch_launch_policy(
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
-/// ### Designing delegated subtasks
-/// - An agent does not see your conversation history. Include all relevant context (file paths, requirements, constraints) in the message.
-/// - Write labels, messages, acceptance criteria, and follow-ups in English. Preserve exact identifiers, paths, code, and quoted source text.
-/// - Subtasks must be concrete, well-defined, and self-contained.
-/// - Delegated subtasks must materially advance the main task.
-/// - Do not duplicate work between your work and delegated subtasks.
-/// - Do not use this tool for tasks you could accomplish directly with one or two tool calls. For example, don't ask the agent to read a single file and return the contents, you can do this yourself.
-/// - When you delegate work, focus on coordinating and synthesizing results instead of duplicating the same work yourself.
-/// - Avoid issuing multiple delegate calls for the same unresolved subproblem unless the new delegated task is genuinely different and necessary.
-/// - Narrow the delegated ask to the concrete output you need next.
-/// - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
-/// - When sending a follow-up using an existing agent session_id, the agent already has the context from the previous turn. Send only a short, direct message. Do NOT repeat the original task or context.
-///
-/// ### Parallel delegation patterns
-/// - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-/// - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
-/// - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
-/// - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
-///
-/// ### Restricting subagent tools
-/// - By default a subagent inherits all of your tools. Pass `tools` to restrict it to an allowlist — for example read-only tools like ["read_file", "grep", "find_path"] for a search task, or an empty list for a pure reasoning task over content in the message.
-/// - A scoped allowlist keeps focused subtasks from performing side effects you did not intend.
-///
 /// ### Output
 /// - You will receive only the agent's final message as output.
-impl Default for SpawnAgentToolInput {
-    fn default() -> Self {
-        Self {
-            label: String::new(),
-            message: String::new(),
-            agent_type: None,
-            session_id: None,
-            tools: None,
-            tasks: None,
-            background: false,
-            agent: None,
-            model: None,
-            mode: None,
-            workspace: None,
-        }
-    }
-}
-
 /// - Successful calls return a session_id that you can use for follow-up messages.
 /// - Error results may also include a session_id if a session was already created.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// - Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
     /// Short English label displayed in the UI while the agent runs (e.g., "Researching alternatives")
+    #[serde(default)]
     pub label: String,
     /// The English prompt for the agent. For new sessions, include full context needed for the task. For follow-ups (with session_id), you can rely on the agent already having the previous message.
+    #[serde(default)]
     pub message: String,
     /// Agent type for a new native subagent. Use explorer for
     /// file/symbol lookup, flow-reader for flow/log analysis, and coding-worker
@@ -1216,6 +1207,45 @@ fn native_single_task_as_batch(input: &SpawnAgentToolInput) -> SpawnAgentTask {
     }
 }
 
+/// Queues a follow-up for a subagent session that already has a running turn,
+/// instead of starting a competing turn. Returns `None` when the session is idle.
+fn steer_running_session(
+    deliveries: &SubagentDeliveries,
+    environment: &dyn ThreadEnvironment,
+    session_id: acp::SessionId,
+    message: &str,
+    cx: &mut App,
+) -> Option<Result<SpawnAgentToolOutput, SpawnAgentToolOutput>> {
+    let sender = deliveries.0.read().get(&session_id).cloned()?;
+    if let Err(error) = sender.try_send(AgentDelivery {
+        message: message.to_string(),
+        interrupt: false,
+    }) {
+        return Some(Err(SpawnAgentToolOutput::Error {
+            session_id: Some(session_id),
+            error: format!("failed to steer the running subagent: {error}"),
+            session_info: None,
+        }));
+    }
+    let message_start_index = match environment.existing_subagent(session_id.clone(), cx) {
+        Ok(Some(subagent)) => subagent.num_entries(cx),
+        Ok(None) => 0,
+        Err(error) => {
+            log::warn!("failed to look up steered subagent '{session_id}': {error:#}");
+            0
+        }
+    };
+    Some(Ok(SpawnAgentToolOutput::Success {
+        session_id: session_id.clone(),
+        output: "The agent is still running. Your message was queued and will be incorporated at its next reasoning boundary; the call that is driving this session will receive the agent's final output.".to_string(),
+        session_info: SubagentSessionInfo {
+            session_id,
+            message_start_index,
+            message_end_index: None,
+        },
+    }))
+}
+
 fn validate_background_mode(input: &SpawnAgentToolInput) -> Result<(), SpawnAgentToolOutput> {
     if input.background && input.tasks.is_none() {
         return Err(SpawnAgentToolOutput::Error {
@@ -1254,6 +1284,8 @@ pub enum SpawnAgentToolOutput {
     },
     BatchSuccess {
         results: Vec<SpawnAgentBatchResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failures: Vec<SpawnAgentBatchFailure>,
     },
     BatchStarted {
         run_id: String,
@@ -1265,6 +1297,30 @@ pub enum SpawnAgentToolOutput {
         strategy: agent_settings::AgentExecutionStrategy,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnAgentBatchFailure {
+    pub task_id: String,
+    pub label: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn batch_output_text(
+    results: &[SpawnAgentBatchResult],
+    failures: &[SpawnAgentBatchFailure],
+) -> String {
+    let serialized = if failures.is_empty() {
+        serde_json::to_string(results)
+    } else {
+        serde_json::to_string(&serde_json::json!({
+            "results": results,
+            "failures": failures,
+        }))
+    };
+    serialized.unwrap_or_else(|error| format!("Failed to serialize batch output: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1296,9 +1352,9 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
             )
             .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
             .into(),
-            SpawnAgentToolOutput::BatchSuccess { results } => serde_json::to_string(&results)
-                .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
-                .into(),
+            SpawnAgentToolOutput::BatchSuccess { results, failures } => {
+                batch_output_text(&results, &failures).into()
+            }
             SpawnAgentToolOutput::BatchStarted { run_id, agents } => {
                 serde_json::to_string(&serde_json::json!({
                     "run_id": run_id,
@@ -1376,11 +1432,13 @@ impl SpawnAgentTool {
                 })
             })
             .collect::<Result<collections::HashMap<_, _>>>()?;
+        let deliveries = cx.update(|cx| parent_subagent_deliveries(&self.thread, cx));
         let native_executor = Rc::new(SubagentRuntimeExecutor::new(
             self.environment.clone(),
             cx.clone(),
             event_stream,
             Arc::new(parking_lot::RwLock::new(roles_map)),
+            deliveries,
             runtime_config.control_plane.max_messages_per_agent,
             None,
         ));
@@ -1463,6 +1521,13 @@ impl SpawnAgentTool {
 
         Ok(run_handle)
     }
+}
+
+fn parent_subagent_deliveries(thread: &gpui::WeakEntity<Thread>, cx: &App) -> SubagentDeliveries {
+    thread
+        .upgrade()
+        .map(|parent| parent.read(cx).subagent_deliveries())
+        .unwrap_or_default()
 }
 
 fn persist_snapshot_if_current(
@@ -1637,8 +1702,8 @@ impl BatchRunCompletion {
             Ok(Ok(_)) => {}
         }
 
-        let batch = match collect_batch_results(&self.run_handle, self.pending) {
-            Ok(batch) => batch,
+        let (batch, failures) = match collect_batch_results(&self.run_handle, self.pending) {
+            Ok(collected) => collected,
             Err(SpawnAgentToolOutput::Error {
                 session_id, error, ..
             }) if self.single_task => {
@@ -1684,26 +1749,33 @@ impl BatchRunCompletion {
                 session_info,
             });
         }
-        let raw_output =
-            serde_json::to_value(&batch).map_err(|error| SpawnAgentToolOutput::Error {
-                session_id: None,
-                error: format!("Failed to serialize batch output: {error}"),
-                session_info: None,
-            })?;
+        let raw_output = serde_json::to_value(serde_json::json!({
+            "results": &batch,
+            "failures": &failures,
+        }))
+        .map_err(|error| SpawnAgentToolOutput::Error {
+            session_id: None,
+            error: format!("Failed to serialize batch output: {error}"),
+            session_info: None,
+        })?;
         self.event_stream.update_fields(
             acp::ToolCallUpdateFields::new()
                 .title("Parallel agents completed")
                 .raw_output(raw_output),
         );
-        Ok(SpawnAgentToolOutput::BatchSuccess { results: batch })
+        Ok(SpawnAgentToolOutput::BatchSuccess {
+            results: batch,
+            failures,
+        })
     }
 }
 
 fn collect_batch_results(
     run_handle: &agent_orchestration::RunHandle,
     pending: Vec<(String, SpawnAgentTask)>,
-) -> Result<Vec<SpawnAgentBatchResult>, SpawnAgentToolOutput> {
+) -> Result<(Vec<SpawnAgentBatchResult>, Vec<SpawnAgentBatchFailure>), SpawnAgentToolOutput> {
     let mut batch = Vec::new();
+    let mut failures = Vec::new();
     let mut last_error = None;
     let mut last_session_id = None;
     for (task_id, task) in pending {
@@ -1725,16 +1797,27 @@ fn collect_batch_results(
                         .to_string(),
                 });
             }
-        } else if status.state == agent_orchestration::TaskState::Failed {
-            last_error = status
-                .latest_error
-                .or(Some(format!("Task `{task_id}` failed")));
-            last_session_id = status.active_session_id;
+        } else {
+            if status.state == agent_orchestration::TaskState::Failed {
+                last_error = status
+                    .latest_error
+                    .clone()
+                    .or(Some(format!("Task `{task_id}` failed")));
+                last_session_id = status.active_session_id;
+            }
+            failures.push(SpawnAgentBatchFailure {
+                task_id,
+                label: task.label,
+                state: format!("{:?}", status.state),
+                error: status.latest_error,
+            });
         }
     }
-    // Best-effort policy: retain successful results after another failure
+    // Best-effort policy: retain successful results after another failure, but
+    // still report the failures so the caller does not mistake a partial batch
+    // for a complete one.
     if !batch.is_empty() {
-        return Ok(batch);
+        return Ok((batch, failures));
     }
     if let Some(error) = last_error {
         return Err(SpawnAgentToolOutput::Error {
@@ -1743,7 +1826,7 @@ fn collect_batch_results(
             session_info: None,
         });
     }
-    Ok(batch)
+    Ok((batch, failures))
 }
 
 struct PreparedBatch {
@@ -1883,6 +1966,7 @@ struct OrchestrationExecutorInputs {
     environment: Rc<dyn ThreadEnvironment>,
     event_stream: ToolCallEventStream,
     roles: collections::HashMap<agent_orchestration::TaskId, Option<SubagentRole>>,
+    deliveries: SubagentDeliveries,
     enable_acp_delegation: bool,
 }
 
@@ -1897,6 +1981,7 @@ fn orchestration_executor(
         environment,
         event_stream,
         roles,
+        deliveries,
         enable_acp_delegation,
     } = inputs;
     let native_executor = Rc::new(SubagentRuntimeExecutor::new(
@@ -1904,6 +1989,7 @@ fn orchestration_executor(
         cx.clone(),
         event_stream,
         Arc::new(parking_lot::RwLock::new(roles)),
+        deliveries,
         config.control_plane.max_messages_per_agent,
         session_info,
     ));
@@ -2021,16 +2107,38 @@ async fn run_batch_tasks(
     // An approved orchestration run is event-driven: do not keep the parent
     // model turn blocked while workers execute. The runtime parks the parent
     // and resumes it once the run reaches a terminal state.
-    let background =
-        background || policy.strategy == agent_settings::AgentExecutionStrategy::Orchestrate;
+    // A single delegated task stays in the foreground so its result returns
+    // directly as the tool output instead of through a parked-parent resume.
+    let background = background
+        || (!single_task && policy.strategy == agent_settings::AgentExecutionStrategy::Orchestrate);
+
+    if disposition == agent_orchestration::RuntimeLaunchDisposition::AwaitApproval {
+        let pending_proposal = cx.update(|cx| {
+            thread.upgrade().and_then(|parent| {
+                parent
+                    .read(cx)
+                    .orchestration_runs()
+                    .iter()
+                    .find(|run| run.state() == agent_orchestration::RunState::Proposed)
+                    .map(|run| run.run_id().to_string())
+            })
+        });
+        if let Some(run_id) = pending_proposal {
+            return Err(batch_error(format!(
+                "Orchestration run {run_id} is already awaiting user approval. Do not propose another run; wait for the approval card action, then include any additional tasks in a single follow-up spawn_agent call."
+            )));
+        }
+    }
 
     let (runtime_config, enable_acp_delegation) = orchestration_runtime_config(cx);
     let session_info = single_task.then(|| Arc::new(parking_lot::Mutex::new(None)));
+    let deliveries = cx.update(|cx| parent_subagent_deliveries(&thread, cx));
     let executor = orchestration_executor(
         OrchestrationExecutorInputs {
             environment,
             event_stream: event_stream.clone(),
             roles,
+            deliveries,
             enable_acp_delegation,
         },
         &plan,
@@ -2237,6 +2345,43 @@ impl AgentTool for SpawnAgentTool {
                     session_info: None,
                 });
             }
+            if input.message.trim().is_empty() {
+                return Err(SpawnAgentToolOutput::Error {
+                    session_id: None,
+                    error: "spawn_agent requires either a non-empty `message` or a `tasks` array"
+                        .to_string(),
+                    session_info: None,
+                });
+            }
+            if let Some(session_id) = input.session_id.clone() {
+                let steered = cx.update(|cx| {
+                    let deliveries = parent_subagent_deliveries(&self.thread, cx);
+                    steer_running_session(
+                        &deliveries,
+                        self.environment.as_ref(),
+                        session_id,
+                        &input.message,
+                        cx,
+                    )
+                });
+                if let Some(result) = steered {
+                    if let Ok(SpawnAgentToolOutput::Success {
+                        output,
+                        session_info,
+                        ..
+                    }) = &result
+                    {
+                        event_stream.update_fields_with_meta(
+                            acp::ToolCallUpdateFields::new().content(vec![output.clone().into()]),
+                            Some(acp::Meta::from_iter([(
+                                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                serde_json::json!(session_info),
+                            )])),
+                        );
+                    }
+                    return result;
+                }
+            }
             let mut native_task = native_single_task_as_batch(&input);
             if input.session_id.is_some() {
                 // A resumed session keeps its original role, mode, and tool filter.
@@ -2292,12 +2437,9 @@ impl AgentTool for SpawnAgentTool {
                 session_info,
                 ..
             } => (error.into(), session_info),
-            SpawnAgentToolOutput::BatchSuccess { results } => (
-                serde_json::to_string(&results)
-                    .unwrap_or_else(|error| format!("Failed to serialize batch output: {error}"))
-                    .into(),
-                None,
-            ),
+            SpawnAgentToolOutput::BatchSuccess { results, failures } => {
+                (batch_output_text(&results, &failures).into(), None)
+            }
             SpawnAgentToolOutput::BatchStarted { run_id, agents } => (
                 serde_json::to_string(&serde_json::json!({
                     "run_id": run_id,
@@ -2452,6 +2594,65 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].label, "one");
         assert_eq!(tasks[1].tools, Some(vec!["read_file".to_string()]));
+    }
+
+    #[test]
+    fn runs_sharing_parent_deliveries_cannot_drive_the_same_session() {
+        let deliveries = SubagentDeliveries::default();
+        let session_id = acp::SessionId::new("shared-session");
+        let first = SteeringSession::register(session_id.clone(), deliveries.0.clone(), 4)
+            .expect("first run owns the session");
+        let error = SteeringSession::register(session_id.clone(), deliveries.0.clone(), 4)
+            .err()
+            .expect("second run must not take over a running session");
+        assert!(error.to_string().contains("still running another turn"));
+
+        drop(first);
+        SteeringSession::register(session_id, deliveries.0, 4)
+            .expect("ownership is released when the turn ends");
+    }
+
+    #[test]
+    fn tool_description_keeps_only_the_api_contract() {
+        let description = <SpawnAgentTool as AgentTool>::description();
+        assert!(description.starts_with("Spawn a sub-agent for a well-scoped task."));
+        assert!(description.contains("### Output"));
+        // Delegation guidance is rendered once from tool_guidance/spawn_agent.hbs.
+        assert!(!description.contains("Parallel delegation patterns"));
+    }
+
+    #[test]
+    fn batch_output_reports_failures_next_to_partial_results() {
+        let results = vec![SpawnAgentBatchResult {
+            task_id: "task-1".to_string(),
+            session_id: acp::SessionId::new("session-1"),
+            label: "one".to_string(),
+            output: "done".to_string(),
+        }];
+        assert!(batch_output_text(&results, &[]).starts_with('['));
+
+        let failures = vec![SpawnAgentBatchFailure {
+            task_id: "task-2".to_string(),
+            label: "two".to_string(),
+            state: "Failed".to_string(),
+            error: Some("boom".to_string()),
+        }];
+        let output: serde_json::Value =
+            serde_json::from_str(&batch_output_text(&results, &failures)).unwrap();
+        assert_eq!(output["results"][0]["task_id"], "task-1");
+        assert_eq!(output["failures"][0]["error"], "boom");
+    }
+
+    #[test]
+    fn deserializes_batch_tasks_without_top_level_label_or_message() {
+        let input: SpawnAgentToolInput = serde_json::from_value(json!({
+            "tasks": [{"label": "one", "message": "first", "agent_type": "explorer"}]
+        }))
+        .unwrap();
+
+        assert!(input.label.is_empty());
+        assert!(input.message.is_empty());
+        assert_eq!(input.tasks.map(|tasks| tasks.len()), Some(1));
     }
 
     #[test]
@@ -2708,7 +2909,7 @@ mod tests {
     }
 
     #[test]
-    fn single_and_batch_spawns_keep_the_same_launch_policy() {
+    fn single_spawn_skips_the_orchestration_approval_checkpoint() {
         for (configured_strategy, resolved_strategy, autonomy) in [
             (
                 agent_settings::AgentExecutionStrategy::Direct,
@@ -2766,7 +2967,18 @@ mod tests {
                 autonomy,
             );
 
-            assert_eq!(single, batch);
+            assert_eq!(single.0, batch.0);
+            let skips_approval = single.0.strategy
+                == agent_settings::AgentExecutionStrategy::Orchestrate
+                && autonomy != agent_settings::AgentAutonomy::Manual;
+            if skips_approval {
+                assert_eq!(
+                    single.1,
+                    agent_orchestration::RuntimeLaunchDisposition::Approved
+                );
+            } else {
+                assert_eq!(single.1, batch.1);
+            }
         }
     }
 

@@ -66,7 +66,9 @@ impl AgentExecutionStrategy {
                     form of `spawn_agent` for independent work so it starts concurrently. Verify\n\
                     each result against\n\
                     acceptance criteria, repair failures, and continue through dependent phases\n\
-                    until closure. Report actionable progress and evidence, not just intent. Do not\n\
+                    until closure. A question or a small change that needs no delegation can be\n\
+                    handled directly, but still close the goal as described below. Report\n\
+                    actionable progress and evidence, not just intent. Do not\n\
                     yield at an intermediate phase, and stop only when complete or when a concrete\n\
                     blocker requires the user's input. When `spawn_agent` returns an orchestration\n\
                     proposal awaiting approval, the native approval card is the only approval\n\

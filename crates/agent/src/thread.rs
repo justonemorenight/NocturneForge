@@ -5,7 +5,7 @@ use crate::{
     ForkThreadTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
     ListDirectoryTool, ListOrchestrationAgentsTool, MAX_TOOL_SEARCH_RESULTS, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SendMessageToAgentTool,
-    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    SpawnAgentTool, SubagentDeliveries, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, ToolSearchTool, UpdateOrchestrationGoalTool, UpdatePlanTool,
     WaitForAgentsTool, WebSearchTool, WriteFileTool, bounded_tool_description,
     decide_permission_from_settings, tool_search_relevance,
@@ -1103,6 +1103,16 @@ pub trait ThreadEnvironment {
         ))
     }
 
+    /// Returns a handle to an existing subagent session without starting a
+    /// new turn, or `None` when the session no longer exists.
+    fn existing_subagent(
+        &self,
+        session_id: acp::SessionId,
+        cx: &mut App,
+    ) -> Result<Option<Rc<dyn SubagentHandle>>> {
+        self.resume_subagent(session_id, cx).map(Some)
+    }
+
     /// Creates an independent sibling thread visible in the agent sidebar.
     /// Unlike subagents, sibling threads are first-class threads that persist
     /// and run in parallel without reporting results back to the parent.
@@ -1741,6 +1751,7 @@ pub struct Thread {
     /// The worker event subscription clears it and starts one follow-up turn.
     orchestration_waiting_for_workers: bool,
     orchestration_waiting_run_ids: Vec<agent_orchestration::RunId>,
+    subagent_deliveries: SubagentDeliveries,
     persisted_orchestration_runs: Vec<agent_orchestration::PersistedRun>,
     orchestration_goal: Option<agent_orchestration::GoalController>,
 }
@@ -1919,6 +1930,7 @@ impl Thread {
             orchestration_event_tasks: Vec::new(),
             orchestration_waiting_for_workers: false,
             orchestration_waiting_run_ids: Vec::new(),
+            subagent_deliveries: SubagentDeliveries::default(),
             persisted_orchestration_runs: Vec::new(),
             orchestration_goal: None,
         }
@@ -2398,6 +2410,7 @@ impl Thread {
             orchestration_event_tasks: Vec::new(),
             orchestration_waiting_for_workers: db_thread.orchestration_waiting_for_workers,
             orchestration_waiting_run_ids,
+            subagent_deliveries: SubagentDeliveries::default(),
             persisted_orchestration_runs,
             orchestration_goal,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
@@ -3038,6 +3051,10 @@ impl Thread {
             }
         }
         snapshots
+    }
+
+    pub(crate) fn subagent_deliveries(&self) -> SubagentDeliveries {
+        self.subagent_deliveries.clone()
     }
 
     pub fn orchestration_runs(&self) -> &[agent_orchestration::RunHandle] {
@@ -6503,10 +6520,11 @@ impl Thread {
                 AgentExecutionStrategy::Orchestrate => "Orchestrate",
                 AgentExecutionStrategy::Auto => "Direct",
             };
+             // Keep this text identical across turns that share a route. Per-turn
+            // details such as confidence or the heuristic reason would change the
+            // system prompt and invalidate the provider's prompt cache every turn.
             system_prompt.push_str(&format!(
-                "\n\n## Automatic execution route\nThe runtime selected `{strategy}` for this user turn before the first model completion (confidence: {:.0}%). {}. Treat this as the active execution strategy for the entire turn; do not reclassify it based on which tools you happen to call.",
-                decision.confidence * 100.0,
-                decision.reason
+                "\n\n## Automatic execution route\nThe runtime selected `{strategy}` for this user turn before the first model completion. Treat this as the active execution strategy for the entire turn; do not reclassify it based on which tools you happen to call."
             ));
         }
         if let Some(strategy_prompt) = self.effective_execution_strategy().system_prompt() {
@@ -7849,24 +7867,44 @@ pub fn build_thread_title_request(
 }
 
 fn worker_completion_summary(run: &agent_orchestration::PersistedRun) -> String {
+    const MAX_TASK_DETAIL_CHARS: usize = 500;
+    const MAX_SUMMARY_BYTES: usize = 4_000;
+    let mut truncated = false;
     let mut summary = format!("Run state: {:?}\n", run.state);
     for status in &run.task_statuses {
         summary.push_str(&format!("- {}: {:?}", status.task_id, status.state));
-        if let Some(error) = status.latest_error.as_deref() {
-            summary.push_str(&format!(
-                "; error: {}",
-                error.chars().take(500).collect::<String>()
-            ));
-        } else if let Some(output) = status.latest_output.as_deref() {
-            summary.push_str(&format!(
-                "; output: {}",
-                output.chars().take(500).collect::<String>()
-            ));
+        let detail = status
+            .latest_error
+            .as_deref()
+            .map(|error| ("error", error))
+            .or_else(|| {
+                status
+                    .latest_output
+                    .as_deref()
+                    .map(|output| ("output", output))
+            });
+        if let Some((kind, text)) = detail {
+            let mut chars = text.chars();
+            let shortened = chars
+                .by_ref()
+                .take(MAX_TASK_DETAIL_CHARS)
+                .collect::<String>();
+            truncated |= chars.next().is_some();
+            summary.push_str(&format!("; {kind}: {shortened}"));
         }
         summary.push('\n');
     }
-    if summary.len() > 4_000 {
-        summary.truncate(summary.floor_char_boundary(4_000));
+    if summary.len() > MAX_SUMMARY_BYTES {
+        summary.truncate(summary.floor_char_boundary(MAX_SUMMARY_BYTES));
+        summary.push('\n');
+        truncated = true;
+    }
+    // Without this hint the parent treats a clipped worker result as the whole
+    // answer and redoes or misjudges the delegated work.
+    if truncated {
+        summary.push_str(
+            "Some worker results above are truncated. Call list_orchestration_agents to read the full output before judging them.\n",
+        );
     }
     summary
 }

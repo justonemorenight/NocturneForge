@@ -5529,11 +5529,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
             .expect("subagent thread should be alive")
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
-    assert_eq!(
-        acp_thread.read_with(cx, |thread, _| thread.status()),
-        ThreadStatus::Idle
-    );
+    assert_parent_waits_on_worker(&model, &thread, cx);
     model.send_last_completion_stream_text_chunk("subagent task response");
     model.end_last_completion_stream();
 
@@ -5541,7 +5537,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     assert_ne!(
         acp_thread.read_with(cx, |thread, _| thread.status()),
         ThreadStatus::Idle,
-        "automatic parent wake should own an ACP turn"
+        "the parent turn continues with the worker result"
     );
 
     let delegated_prompt = delegated_task_prompt("label", "subagent task prompt");
@@ -5558,7 +5554,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
     assert!(markdown.contains("Status: Completed"), "{markdown}");
-    assert!(markdown.contains("run_id"), "{markdown}");
+    assert!(markdown.contains("subagent task response"), "{markdown}");
     assert!(
         markdown.ends_with("## Assistant\n\nResponse\n\n"),
         "{markdown}"
@@ -5597,26 +5593,22 @@ fn complete_parent_orchestration_goal(thread: &Entity<Thread>, cx: &mut TestAppC
     });
 }
 
-fn park_parent_before_worker_response(
+fn assert_parent_waits_on_worker(
     model: &FakeLanguageModel,
     thread: &Entity<Thread>,
     cx: &mut TestAppContext,
 ) {
     let thread_id = thread.read_with(cx, |thread, _| thread.id().to_string());
-    let request = model
-        .pending_completions()
-        .into_iter()
-        .find(|request| request.thread_id.as_deref() == Some(thread_id.as_str()))
-        .expect("parent should receive the launch result before parking");
-    model.end_completion_stream(&request);
-    cx.run_until_parked();
-    assert!(thread.read_with(cx, |thread, _| thread.is_turn_complete()));
+    assert!(
+        !thread.read_with(cx, |thread, _| thread.is_turn_complete()),
+        "a single delegated task keeps the parent turn open until the worker returns"
+    );
     assert!(
         model
             .pending_completions()
             .iter()
             .all(|request| { request.thread_id.as_deref() != Some(thread_id.as_str()) }),
-        "parked parent must not poll while the worker is active"
+        "parent must not poll while the worker is active"
     );
 }
 
@@ -5719,7 +5711,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
             .clone()
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     // The only pending completion is the subagent's; it should carry exactly
     // the allowlisted tools.
     assert_eq!(
@@ -5765,7 +5757,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
 
     cx.run_until_parked();
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     assert_eq!(
         pending_completion_tool_names(&model),
         vec!["grep".to_string(), "read_file".to_string()],
@@ -5865,7 +5857,7 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
             "subagent thread should be running"
         );
     });
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     assert!(
         pending_completion_tool_names(&model).is_empty(),
         "subagent spawned with an empty allowlist should see no tools"
@@ -6100,7 +6092,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
             .expect("subagent thread should be alive")
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     model.send_last_completion_stream_text_chunk("subagent task response 1");
     model.send_last_completion_stream_event(LanguageModelCompletionEvent::Thinking {
         text: "thinking more about the subagent task".into(),
@@ -6240,8 +6232,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     acp_thread.read_with(cx, |thread, cx| {
         assert_eq!(thread.status(), ThreadStatus::Idle);
         let markdown = thread.to_markdown(cx);
-        assert!(markdown.contains("Status: Completed"), "{markdown}");
-        assert!(markdown.contains("run_id"), "{markdown}");
+        assert!(markdown.contains("Status: Canceled"), "{markdown}");
     });
     subagent_acp_thread.read_with(cx, |thread, cx| {
         assert_eq!(thread.status(), ThreadStatus::Idle);
@@ -6348,7 +6339,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
             .expect("subagent thread should be alive")
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     // Subagent responds
     model.send_last_completion_stream_text_chunk("first task response");
     model.end_last_completion_stream();
@@ -6405,7 +6396,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         assert_eq!(running[0], subagent_session_id, "should be same session");
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     // Subagent responds to follow-up
     model.send_last_completion_stream_text_chunk("follow-up task response");
     model.end_last_completion_stream();
@@ -7120,7 +7111,7 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
             .clone()
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     // Send a usage update that crosses the warning threshold (80% of 1,000,000).
     // The thread owns compaction policy, so the subagent handle must not cancel
     // an otherwise healthy turn at this advisory threshold.
@@ -7262,7 +7253,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         );
     });
 
-    park_parent_before_worker_response(&model, &thread, cx);
+    assert_parent_waits_on_worker(&model, &thread, cx);
     // The subagent's model returns a non-retryable error
     model.send_last_completion_stream_error(LanguageModelCompletionError::from_http_status(
         LanguageModelProviderName::new("test"),
@@ -9528,10 +9519,12 @@ impl SubagentCompactionTest {
             acp_thread: acp_thread.downgrade(),
         };
         let handle = cx
-            .update(|cx| environment.create_subagent_thread(
-                NativeSubagentRequest::new("subagent".to_string(), None, None, None, None),
-                cx,
-            ))
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    NativeSubagentRequest::new("subagent".to_string(), None, None, None, None),
+                    cx,
+                )
+            })
             .unwrap();
         let thread = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&handle.id()).unwrap().thread.clone()

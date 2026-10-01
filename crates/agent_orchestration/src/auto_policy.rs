@@ -547,7 +547,22 @@ fn is_question_or_clarification(prompt: &str) -> bool {
     }
     let lower = prompt.to_lowercase();
     const QUESTION_WORDS: &[&str] = &[
-        "why", "what", "how", "when", "where", "who", "which", "explain", "clarify",
+        "why",
+        "what",
+        "how",
+        "when",
+        "where",
+        "who",
+        "which",
+        "explain",
+        "clarify",
+        // Vietnamese
+        "tại sao",
+        "vì sao",
+        "là gì",
+        "thế nào",
+        "sao lại",
+        "giải thích",
     ];
     QUESTION_WORDS
         .iter()
@@ -617,6 +632,19 @@ const PLAN_ONLY_PHRASES: &[&str] = &[
     "do not implement",
     "don't implement",
     "discussion only",
+    // Vietnamese
+    "chỉ lên kế hoạch",
+    "chỉ lập kế hoạch",
+    "chỉ plan",
+    "không code",
+    "đừng code",
+    "chưa code",
+    "không cần code",
+    "không triển khai",
+    "chưa triển khai",
+    "chỉ thảo luận",
+    "chi len ke hoach",
+    "khong code",
 ];
 const DIRECT_OVERRIDE_PHRASES: &[&str] = &[
     "do not delegate",
@@ -633,6 +661,17 @@ const DIRECT_OVERRIDE_PHRASES: &[&str] = &[
     "do it yourself",
     "no subagents",
     "no sub-agents",
+    // Vietnamese
+    "không dùng subagent",
+    "đừng dùng subagent",
+    "không cần subagent",
+    "không giao việc",
+    "làm trực tiếp",
+    "xử lý trực tiếp",
+    "tự làm đi",
+    "tự làm luôn",
+    "khong dung subagent",
+    "lam truc tiep",
 ];
 const ORCHESTRATION_OVERRIDE_PHRASES: &[&str] = &[
     "orchestrate",
@@ -644,6 +683,14 @@ const ORCHESTRATION_OVERRIDE_PHRASES: &[&str] = &[
     "delegate the",
     "in parallel",
     "concurrently",
+    // Vietnamese
+    "dùng subagent",
+    "dùng sub-agent",
+    "dùng nhiều subagent",
+    "chia việc cho subagent",
+    "điều phối",
+    "song song",
+    "dung subagent",
 ];
 const PLAN_REQUEST_PHRASES: &[&str] = &[
     "create a plan",
@@ -651,6 +698,14 @@ const PLAN_REQUEST_PHRASES: &[&str] = &[
     "draft a plan",
     "plan this",
     "plan the",
+    // Vietnamese
+    "lập kế hoạch",
+    "lên kế hoạch",
+    "lên plan",
+    "làm kế hoạch",
+    "đề xuất kế hoạch",
+    "lap ke hoach",
+    "len ke hoach",
 ];
 const PLAN_THEN_EXECUTE_PHRASES: &[&str] = &[
     "then implement",
@@ -658,12 +713,25 @@ const PLAN_THEN_EXECUTE_PHRASES: &[&str] = &[
     "plan and implement",
     "then execute",
     "and execute",
+    // Vietnamese
+    "rồi triển khai",
+    "rồi thực hiện",
+    "rồi làm",
+    "rồi code",
+    "sau đó triển khai",
+    "sau đó làm",
+    "và triển khai",
 ];
 const PLAN_MAINTENANCE_PHRASES: &[&str] = &[
     "update the plan",
     "revise the plan",
     "refine the plan",
     "review the plan",
+    // Vietnamese
+    "cập nhật kế hoạch",
+    "sửa kế hoạch",
+    "chỉnh kế hoạch",
+    "xem lại kế hoạch",
 ];
 const PLANNING_KEYWORDS: &[&str] = &[
     "plan",
@@ -675,6 +743,13 @@ const PLANNING_KEYWORDS: &[&str] = &[
     "proposal",
     "propose",
     "break down",
+    // Vietnamese
+    "kế hoạch",
+    "kiến trúc",
+    "thiết kế",
+    "lộ trình",
+    "đề xuất",
+    "phân rã",
 ];
 const ORCHESTRATION_KEYWORDS: &[&str] = &[
     "refactor across",
@@ -689,6 +764,16 @@ const ORCHESTRATION_KEYWORDS: &[&str] = &[
     "phase 2",
     "test suite",
     "end to end",
+    // Vietnamese
+    "nhiều file",
+    "nhiều module",
+    "nhiều crate",
+    "tất cả các file",
+    "toàn bộ các file",
+    "bước 1",
+    "bước 2",
+    "giai đoạn 1",
+    "giai đoạn 2",
 ];
 const BROAD_SCOPE_KEYWORDS: &[&str] = &[
     "codebase",
@@ -700,6 +785,14 @@ const BROAD_SCOPE_KEYWORDS: &[&str] = &[
     "whole repository",
     "entire project",
     "whole project",
+    // Vietnamese
+    "toàn bộ dự án",
+    "cả dự án",
+    "toàn dự án",
+    "toàn bộ codebase",
+    "cả codebase",
+    "toàn bộ repo",
+    "cả repo",
 ];
 const EXECUTION_KEYWORDS: &[&str] = &[
     "implement",
@@ -712,6 +805,14 @@ const EXECUTION_KEYWORDS: &[&str] = &[
     "change",
     "add",
     "remove",
+    // Vietnamese
+    "triển khai",
+    "sửa",
+    "thêm",
+    "xoá",
+    "xóa",
+    "cập nhật",
+    "thay đổi",
 ];
 const DIRECT_KEYWORDS: &[&str] = &[
     "fix typo",
@@ -720,6 +821,13 @@ const DIRECT_KEYWORDS: &[&str] = &[
     "one line",
     "quick fix",
     "simple change",
+    // Vietnamese
+    "sửa typo",
+    "giải thích hàm",
+    "là gì",
+    "một dòng",
+    "sửa nhanh",
+    "thay đổi nhỏ",
 ];
 
 fn contains_any(prompt: &str, phrases: &[&str]) -> bool {
@@ -906,6 +1014,31 @@ mod tests {
         );
         assert_eq!(decision.strategy, AgentExecutionStrategy::Direct);
         assert!(decision.reason.contains("no orchestration tool"));
+    }
+
+    #[test]
+    fn vietnamese_requests_route_like_their_english_equivalents() {
+        let route = |prompt: &str| AutoPolicyEngine::evaluate(prompt, capable_context()).strategy;
+        assert_eq!(
+            route("Lập kế hoạch cải thiện giao diện Git diff"),
+            AgentExecutionStrategy::Plan
+        );
+        assert_eq!(
+            route("Chỉ lên kế hoạch thôi, không code"),
+            AgentExecutionStrategy::Plan
+        );
+        assert_ne!(
+            route("Lập kế hoạch rồi triển khai thay đổi cho Git diff"),
+            AgentExecutionStrategy::Plan
+        );
+        assert_eq!(
+            route("Không dùng subagent, sửa lỗi này giúp tôi"),
+            AgentExecutionStrategy::Direct
+        );
+        assert_eq!(
+            route("Dùng subagent chạy song song để rà soát các crate agent"),
+            AgentExecutionStrategy::Orchestrate
+        );
     }
 
     #[test]

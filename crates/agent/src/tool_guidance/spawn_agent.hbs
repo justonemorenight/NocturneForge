@@ -22,11 +22,17 @@ Spawn a sub-agent for a well-scoped task.
 - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
 - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
 - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
+- Put all parallel subtasks in one call's `tasks` array instead of issuing several spawn_agent calls. A multi-task batch may need user approval, and only one proposal can await approval at a time.
+
+### Choosing the call shape
+- A single task (`label` + `message`) runs immediately and returns the agent's final message as this call's output. Prefer it for one focused investigation or edit.
+- A `tasks` batch is scheduled by the orchestration runtime: at most 4 workers run at once and the rest queue, `depends_on` orders dependent tasks, and failed tasks are reported under `failures` next to successful `results`.
+- Set `agent_type` for new native workers: `explorer` for file and symbol lookup, `flow-reader` for tracing flows or logs, `coding-worker` for bounded implementation.
 
 {{!--
 ### Output
 - You will receive only the agent's final message as output.
 - Successful calls return a session_id that you can use for follow-up messages.
 - Error results may also include a session_id if a session was already created.
-- Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session (a spawn_agent call, yours or a previous one) still receives its final output.
+- Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output.
 --}}

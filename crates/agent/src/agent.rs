@@ -3526,28 +3526,37 @@ impl NativeThreadEnvironment {
             })?
     }
 
-    pub(crate) fn resume_subagent_thread(
+    /// Looks up a live subagent session owned by this thread. Returns `None`
+    /// when the session is unknown or has already been released.
+    fn live_subagent_session(
         &self,
-        session_id: acp::SessionId,
+        session_id: &acp::SessionId,
         cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
+    ) -> Result<Option<(Entity<Thread>, Entity<acp_thread::AcpThread>)>> {
         let parent_id = self.thread.read_with(cx, |thread, _| thread.id().clone())?;
-        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
-            let session = agent
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
-            let acp_thread = session
-                .acp_thread
-                .upgrade()
-                .ok_or_else(|| anyhow!("Subagent session {session_id} was released"))?;
-            anyhow::Ok((session.thread.clone(), acp_thread))
-        })??;
+        let Some((subagent_thread, acp_thread)) = self.agent.update(cx, |agent, _cx| {
+            let session = agent.sessions.get(session_id)?;
+            Some((session.thread.clone(), session.acp_thread.upgrade()?))
+        })?
+        else {
+            return Ok(None);
+        };
 
         anyhow::ensure!(
             subagent_thread.read(cx).parent_thread_id().as_ref() == Some(&parent_id),
             "Subagent session {session_id} belongs to another conversation"
         );
+        Ok(Some((subagent_thread, acp_thread)))
+    }
+
+    pub(crate) fn resume_subagent_thread(
+        &self,
+        session_id: acp::SessionId,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let (subagent_thread, acp_thread) = self
+            .live_subagent_session(&session_id, cx)?
+            .ok_or_else(|| anyhow!("No live subagent session found with id {session_id}"))?;
 
         let depth = subagent_thread.read(cx).depth();
 
@@ -3708,6 +3717,19 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.resume_subagent_thread(session_id, cx)
+    }
+
+    fn existing_subagent(
+        &self,
+        session_id: acp::SessionId,
+        cx: &mut App,
+    ) -> Result<Option<Rc<dyn SubagentHandle>>> {
+        let Some((subagent_thread, acp_thread)) = self.live_subagent_session(&session_id, cx)?
+        else {
+            return Ok(None);
+        };
+        self.prompt_subagent(session_id, subagent_thread, acp_thread)
+            .map(Some)
     }
 
     fn create_sibling_thread(
