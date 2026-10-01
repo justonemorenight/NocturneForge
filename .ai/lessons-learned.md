@@ -38,7 +38,7 @@
 - **Wrong:** Pass unverified globs such as `crates/git_ui/src/*tests*` or `crates/acp_thread/src/stub*` to a zsh command.
 - **Right:** Use `rg --files` to discover real paths, or search the crate directory with `rg -n`; quote any glob supplied through an `rg -g` option.
 - **Rule:** zsh `NOMATCH` stops the command before `rg` runs.
-- **Seen:** 3x — 2026-09-30; includes unmatched app backup globs.
+- **Seen:** 6x — 2026-09-30 through 2026-10-01; includes missing stub, rules, and relocated Metal source paths.
 
 ### Move GPUI handles into their final callback
 
@@ -55,3 +55,11 @@
 - **Right:** Keep remote-server compilation separate and select `gpui_platform/runtime_shaders` in both invocations; add `-p gpui_platform` with its empty defaults when selecting workspace features.
 - **Rule:** `xcrun` cannot find `metal`; GPUI `runtime_shaders`.
 - **Seen:** 2x — GPUI test build and remote release build, 2026-09-30.
+
+### GPUI test clock APIs depend on the context type
+
+- **Pattern:** Timer tests mix `Context<T>`, `TestAppContext`, and `VisualTestContext` clock accessors.
+- **Wrong:** Copy `cx.advance_clock(...)` or `cx.background_executor()` from a different context type.
+- **Right:** In test contexts use `cx.executor().advance_clock(...)`; `VisualTestContext` exposes `cx.background_executor.now()` as a field, while entity contexts use `cx.background_executor().now()`.
+- **Rule:** Rust E0599; use the GPUI executor clock for deterministic timeout tests.
+- **Seen:** 2x — cache icon and ACP reaper tests, 2026-10-01.
