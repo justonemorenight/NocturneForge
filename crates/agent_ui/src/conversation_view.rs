@@ -10709,6 +10709,7 @@ pub(crate) mod tests {
             })
         });
 
+        cx.run_until_parked();
         conversation.read_with(cx, |conversation, cx| {
             assert_eq!(
                 conversation.pending_tool_call_for_session(&session_id, cx),
