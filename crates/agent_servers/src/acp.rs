@@ -3209,7 +3209,10 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};

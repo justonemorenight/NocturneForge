@@ -1595,7 +1595,7 @@ mod tests {
             let observed_session = observed_session.clone();
             let session_id = session_id.clone();
             move |context| {
-                *observed_session.lock() = context.existing_session_id.clone();
+                *observed_session.lock() = context.existing_session_id;
                 Ok(TaskExecutionOutput::new("continued").with_session_id(session_id.clone()))
             }
         }));
@@ -1658,7 +1658,7 @@ mod tests {
             let observed_session = observed_session.clone();
             let session_id = session_id.clone();
             move |context| {
-                *observed_session.lock() = context.existing_session_id.clone();
+                *observed_session.lock() = context.existing_session_id;
                 Ok(TaskExecutionOutput::new("resumed").with_session_id(session_id.clone()))
             }
         }));
@@ -3395,7 +3395,7 @@ mod tests {
         s2.state = TaskState::Completed;
 
         let controller = GoalController::new(
-            run_id.clone(),
+            run_id,
             "Parent goal".to_string(),
             vec![TaskId::new("t1"), TaskId::new("t2")],
             Default::default(),
