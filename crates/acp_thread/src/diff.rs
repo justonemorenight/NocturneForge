@@ -6,7 +6,12 @@ use language::{
     Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, TextBuffer,
 };
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
-use std::{cmp::Reverse, ops::Range, path::Path, sync::Arc};
+use std::{
+    cmp::Reverse,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use util::ResultExt;
 
 pub enum Diff {
@@ -24,6 +29,7 @@ impl Diff {
     ) -> Self {
         let multibuffer = cx.new(|_cx| MultiBuffer::without_headers(Capability::ReadOnly));
         let new_buffer = cx.new(|cx| Buffer::local(new_text, cx));
+        let new_text = Arc::<str>::from(new_buffer.read(cx).text());
         let base_text_exists = old_text.is_some();
         let base_text = old_text.clone().unwrap_or(String::new()).into();
         let task = cx.spawn({
@@ -79,6 +85,8 @@ impl Diff {
             multibuffer,
             path,
             base_text,
+            base_text_exists,
+            new_text,
             new_buffer: new_buffer.downgrade(),
             _update_diff: task,
         })
@@ -149,6 +157,21 @@ impl Diff {
                 .map(|file| file.full_path(cx).to_string_lossy().into_owned()),
             Self::Finalized(FinalizedDiff { path, .. }) => Some(path.clone()),
         }
+    }
+
+    /// Returns the file snapshot represented by a completed ACP diff.
+    pub fn review_snapshot(&self) -> Option<(PathBuf, String, String)> {
+        let Self::Finalized(diff) = self else {
+            return None;
+        };
+        if !diff.base_text_exists {
+            return None;
+        }
+        Some((
+            PathBuf::from(&diff.path),
+            diff.base_text.to_string(),
+            diff.new_text.to_string(),
+        ))
     }
 
     pub fn multibuffer(&self) -> &Entity<MultiBuffer> {
@@ -311,6 +334,8 @@ impl PendingDiff {
         FinalizedDiff {
             path,
             base_text: self.base_text.clone(),
+            base_text_exists: true,
+            new_text: Arc::from(self.new_buffer.read(cx).text()),
             multibuffer: self.multibuffer.clone(),
             new_buffer: self.new_buffer.downgrade(),
             _update_diff: update_diff,
@@ -375,6 +400,8 @@ impl PendingDiff {
 pub struct FinalizedDiff {
     path: String,
     base_text: Arc<str>,
+    base_text_exists: bool,
+    new_text: Arc<str>,
     new_buffer: WeakEntity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
     _update_diff: Task<Result<()>>,
@@ -402,7 +429,8 @@ async fn build_buffer_diff(
 #[cfg(test)]
 mod tests {
     use gpui::{AppContext as _, TestAppContext};
-    use language::Buffer;
+    use language::{Buffer, LanguageRegistry};
+    use std::sync::Arc;
 
     use crate::Diff;
 
@@ -414,5 +442,40 @@ mod tests {
             buffer.set_text("HELLO!", cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_finalized_diff_exposes_review_snapshot(cx: &mut TestAppContext) {
+        let languages = Arc::new(LanguageRegistry::test(cx.background_executor.clone()));
+        let diff = cx.new(|cx| {
+            Diff::finalized(
+                "README.md".to_owned(),
+                Some("before".to_owned()),
+                "after".to_owned(),
+                languages,
+                cx,
+            )
+        });
+
+        let snapshot = diff.read_with(cx, |diff, _cx| diff.review_snapshot());
+        assert_eq!(
+            snapshot,
+            Some(("README.md".into(), "before".to_owned(), "after".to_owned()))
+        );
+
+        let new_file_diff = cx.new(|cx| {
+            Diff::finalized(
+                "new.rs".to_owned(),
+                None,
+                "new file".to_owned(),
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone())),
+                cx,
+            )
+        });
+        assert!(
+            new_file_diff
+                .read_with(cx, |diff, _cx| diff.review_snapshot())
+                .is_none()
+        );
     }
 }

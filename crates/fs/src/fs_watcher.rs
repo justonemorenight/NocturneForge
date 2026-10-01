@@ -3,7 +3,7 @@ use gpui::{BackgroundExecutor, Task};
 use notify::{Event, EventKind};
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     ops::DerefMut,
     path::Path,
     pin::Pin,
@@ -117,6 +117,27 @@ pub struct FsWatcher {
 struct FsWatcherRegistration {
     id: WatcherRegistrationId,
     os_watcher: Arc<OsWatcher>,
+}
+
+// A blocking registration can finish after its awaiting poll task is cancelled.
+struct PendingFsWatcherRegistration {
+    registration: FsWatcherRegistration,
+    accepted: bool,
+}
+
+impl PendingFsWatcherRegistration {
+    fn accept(mut self) -> FsWatcherRegistration {
+        self.accepted = true;
+        self.registration.clone()
+    }
+}
+
+impl Drop for PendingFsWatcherRegistration {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.registration.os_watcher.remove(self.registration.id);
+        }
+    }
 }
 
 impl FsWatcher {
@@ -591,13 +612,22 @@ async fn poll_path_until_created(
             return;
         }
 
-        if !fs.path_exists(&path) {
+        let probe_path = {
+            let path = path.clone();
+            let fs = fs.clone();
+            move || {
+                fs.path_exists(&path)
+                    .then(|| !fs.is_path_case_sensitive(&path))
+            }
+        };
+        let case_insensitive = if fs.is_fake() {
+            probe_path()
+        } else {
+            smol::unblock(probe_path).await
+        };
+        let Some(case_insensitive) = case_insensitive else {
             continue;
-        }
-
-        // Probe case sensitivity now that the path exists, rather than at add
-        // time when it didn't.
-        let case_insensitive = !fs.is_path_case_sensitive(&path);
+        };
         let key = WatchKey::for_registration(SanitizedPath::new(&path), case_insensitive);
 
         if registrations.lock().contains_key(&key) {
@@ -605,23 +635,50 @@ async fn poll_path_until_created(
             return;
         }
 
-        match register_existing_path(
-            &native_watcher,
-            &poll_watcher,
-            fs.as_ref(),
-            path.clone(),
-            case_insensitive,
-            tx.clone(),
-            pending_path_events.clone(),
-        ) {
+        let register = {
+            let path = path.clone();
+            let tx = tx.clone();
+            let pending_path_events = pending_path_events.clone();
+            let fs = fs.clone();
+            let native_watcher = native_watcher.clone();
+            let poll_watcher = poll_watcher.clone();
+            move || {
+                register_existing_path(
+                    &native_watcher,
+                    &poll_watcher,
+                    fs.as_ref(),
+                    path,
+                    case_insensitive,
+                    tx,
+                    pending_path_events,
+                )
+                .map(|registration| {
+                    registration.map(|registration| PendingFsWatcherRegistration {
+                        registration,
+                        accepted: false,
+                    })
+                })
+            }
+        };
+        let registration = if fs.is_fake() {
+            register()
+        } else {
+            smol::unblock(register).await
+        };
+
+        match registration {
             Ok(Some(registration)) => {
                 {
                     let mut pending_registrations = pending_registrations.lock();
                     if pending_registrations.remove(path.as_ref()).is_none() {
-                        registration.os_watcher.remove(registration.id);
                         return;
                     }
-                    registrations.lock().insert(key, registration);
+                    let mut registrations = registrations.lock();
+                    // Another poll can register this key while blocking I/O is in flight.
+                    let Entry::Vacant(entry) = registrations.entry(key) else {
+                        return;
+                    };
+                    entry.insert(registration.accept());
                 }
                 enqueue_path_events(
                     &tx,
@@ -1521,6 +1578,128 @@ mod tests {
                 kind: Some(PathEventKind::Created),
             }]
         );
+    }
+
+    #[test]
+    fn pending_registration_cleanup_depends_on_ownership_transfer() {
+        let path = Path::new("/repo/file.txt");
+        for accepted in [false, true] {
+            let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+            let native = Arc::new(test_os_watcher(
+                OsWatcherKind::Native,
+                Some(backend.clone()),
+            ));
+            let id = native
+                .add(path.into(), false, |_| {})
+                .expect("register watch")
+                .expect("watch registration");
+            let pending = PendingFsWatcherRegistration {
+                registration: FsWatcherRegistration {
+                    id,
+                    os_watcher: native.clone(),
+                },
+                accepted: false,
+            };
+            if accepted {
+                let registration = pending.accept();
+                assert_eq!(native.state.lock().watchers.len(), 1);
+                assert!(backend.lock().unwatch_calls.is_empty());
+                registration.os_watcher.remove(registration.id);
+            } else {
+                drop(pending);
+            }
+            assert!(native.state.lock().watchers.is_empty());
+            assert_eq!(backend.lock().unwatch_calls, &[path.to_path_buf()]);
+        }
+    }
+
+    #[gpui::test]
+    async fn fake_pending_path_registers_without_leaving_test_executor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = crate::FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", serde_json::json!({})).await;
+        let path = Path::new("/repo/file.txt");
+        let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+        let (tx, rx) = async_channel::unbounded();
+        let pending_path_events = Arc::new(Mutex::new(Vec::new()));
+        let watcher = FsWatcher::new(
+            Arc::new(test_os_watcher(
+                OsWatcherKind::Native,
+                Some(backend.clone()),
+            )),
+            Arc::new(test_os_watcher(OsWatcherKind::Poll, None)),
+            fs.clone(),
+            cx.executor(),
+            tx,
+            pending_path_events.clone(),
+        );
+        watcher.add(path).expect("add missing fake path");
+        cx.run_until_parked();
+        cx.executor().advance_clock(poll_interval());
+        cx.run_until_parked();
+        assert!(watcher.registrations.lock().is_empty());
+        assert!(backend.lock().watch_calls.is_empty());
+
+        fs.insert_tree("/repo", serde_json::json!({"file.txt": "contents"}))
+            .await;
+        cx.executor().advance_clock(poll_interval());
+        cx.run_until_parked();
+        rx.try_recv().expect("fake registration event");
+        assert!(watcher.pending_registrations.lock().is_empty());
+        assert_eq!(watcher.registrations.lock().len(), 1);
+        assert_eq!(
+            pending_path_events.lock().as_slice(),
+            &[PathEvent {
+                path: path.to_path_buf(),
+                kind: Some(PathEventKind::Created),
+            }]
+        );
+        watcher.add(path).expect("deduplicate registered path");
+        assert_eq!(backend.lock().watch_calls.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn skipped_fake_registration_retries_after_watch_limit_cooldown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = crate::FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", serde_json::json!({"file.txt": "contents"}))
+            .await;
+        let path = Path::new("/repo/file.txt");
+        let backend = Arc::new(Mutex::new(FakeWatchBackend {
+            fail_with_watch_limit: true,
+            ..Default::default()
+        }));
+        let native = Arc::new(test_os_watcher(
+            OsWatcherKind::Native,
+            Some(backend.clone()),
+        ));
+        let (tx, rx) = async_channel::unbounded();
+        let watcher = FsWatcher::new(
+            native.clone(),
+            Arc::new(test_os_watcher(OsWatcherKind::Poll, None)),
+            fs,
+            cx.executor(),
+            tx,
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        watcher.add(path).expect("queue skipped registration");
+        cx.run_until_parked();
+        cx.executor().advance_clock(poll_interval());
+        cx.run_until_parked();
+        assert!(watcher.registrations.lock().is_empty());
+        assert!(watcher.pending_registrations.lock().contains_key(path));
+        assert_eq!(backend.lock().watch_calls.len(), 1);
+
+        backend.lock().fail_with_watch_limit = false;
+        native.state.lock().cooldown_until = None;
+        cx.executor().advance_clock(poll_interval());
+        cx.run_until_parked();
+        rx.try_recv().expect("retried fake registration event");
+        assert!(watcher.pending_registrations.lock().is_empty());
+        assert_eq!(watcher.registrations.lock().len(), 1);
+        assert_eq!(backend.lock().watch_calls.len(), 2);
     }
 
     #[test]

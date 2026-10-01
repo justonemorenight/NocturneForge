@@ -247,6 +247,7 @@ tools! {
 /// a tool the agent would silently drop (see #56778).
 pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
     match tool_name {
+        ForkThreadTool::NAME => false,
         RenameTool::NAME => cx.has_flag::<RenameToolFeatureFlag>(),
         FindReferencesTool::NAME
         | GetCodeActionsTool::NAME

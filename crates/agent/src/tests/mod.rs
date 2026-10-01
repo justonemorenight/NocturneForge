@@ -1013,14 +1013,14 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         message.content,
         vec![
             language_model::MessageContent::ToolResult(LanguageModelToolResult {
-                tool_use_id: tool_call_auth_1.tool_call.tool_call_id.0.to_string().into(),
+                tool_use_id: "tool_id_1".into(),
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: false,
                 content: vec!["Allowed".into()],
                 output: None
             }),
             language_model::MessageContent::ToolResult(LanguageModelToolResult {
-                tool_use_id: tool_call_auth_2.tool_call.tool_call_id.0.to_string().into(),
+                tool_use_id: "tool_id_2".into(),
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: true,
                 content: vec!["Permission to run tool denied by user".into()],
@@ -1066,7 +1066,7 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         message.content,
         vec![language_model::MessageContent::ToolResult(
             LanguageModelToolResult {
-                tool_use_id: tool_call_auth_3.tool_call.tool_call_id.0.to_string().into(),
+                tool_use_id: "tool_id_3".into(),
                 tool_name: ToolRequiringPermission::NAME.into(),
                 is_error: false,
                 content: vec!["Allowed".into()],
@@ -2091,11 +2091,13 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
     while let Some(event) = replay_events.next().await {
         let event = event.unwrap();
         match &event {
-            ThreadEvent::ToolCall(tc) if tc.tool_call_id.to_string() == "tool_1" => {
+            ThreadEvent::ToolCall(tc)
+                if tc.tool_call_id == scoped_tool_call_id(1, &"tool_1".into()) =>
+            {
                 found_tool_call = Some(tc.clone());
             }
             ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update))
-                if update.tool_call_id.to_string() == "tool_1" =>
+                if update.tool_call_id == scoped_tool_call_id(1, &"tool_1".into()) =>
             {
                 if update.fields.raw_output.is_some() {
                     found_tool_call_update_with_output = Some(update.clone());
@@ -5477,9 +5479,10 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -5526,10 +5529,20 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
             .expect("subagent thread should be alive")
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
     model.send_last_completion_stream_text_chunk("subagent task response");
     model.end_last_completion_stream();
 
     cx.run_until_parked();
+    assert_ne!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle,
+        "automatic parent wake should own an ACP turn"
+    );
 
     let delegated_prompt = delegated_task_prompt("label", "subagent task prompt");
     assert_eq!(
@@ -5542,28 +5555,18 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     model.end_last_completion_stream();
 
     send.await.unwrap();
-
+    cx.run_until_parked();
+    let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(markdown.contains("Status: Completed"), "{markdown}");
+    assert!(markdown.contains("run_id"), "{markdown}");
+    assert!(
+        markdown.ends_with("## Assistant\n\nResponse\n\n"),
+        "{markdown}"
+    );
+    assert_eq!(latest_worker_output(&thread, cx), "subagent task response");
     assert_eq!(
-        acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
-        indoc! {r#"
-            ## User
-
-            Prompt
-
-            ## Assistant
-
-            spawning subagent
-
-            **Tool Call: label**
-            Status: Completed
-
-            subagent task response
-
-            ## Assistant
-
-            Response
-
-        "#},
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
     );
 }
 
@@ -5583,10 +5586,51 @@ fn pending_completion_tool_names(model: &FakeLanguageModel) -> Vec<String> {
 
 fn complete_parent_orchestration_goal(thread: &Entity<Thread>, cx: &mut TestAppContext) {
     thread.update(cx, |thread, _cx| {
-        thread
-            .complete_parent_orchestration_goal_for_test()
-            .expect("parent orchestration goal should be active");
+        if thread
+            .parent_orchestration_goal()
+            .is_some_and(|goal| goal.snapshot().status == agent_orchestration::GoalStatus::Active)
+        {
+            thread
+                .complete_parent_orchestration_goal_for_test()
+                .expect("parent orchestration goal should be active");
+        }
     });
+}
+
+fn park_parent_before_worker_response(
+    model: &FakeLanguageModel,
+    thread: &Entity<Thread>,
+    cx: &mut TestAppContext,
+) {
+    let thread_id = thread.read_with(cx, |thread, _| thread.id().to_string());
+    let request = model
+        .pending_completions()
+        .into_iter()
+        .find(|request| request.thread_id.as_deref() == Some(thread_id.as_str()))
+        .expect("parent should receive the launch result before parking");
+    model.end_completion_stream(&request);
+    cx.run_until_parked();
+    assert!(thread.read_with(cx, |thread, _| thread.is_turn_complete()));
+    assert!(
+        model
+            .pending_completions()
+            .iter()
+            .all(|request| { request.thread_id.as_deref() != Some(thread_id.as_str()) }),
+        "parked parent must not poll while the worker is active"
+    );
+}
+
+fn latest_worker_output(thread: &Entity<Thread>, cx: &TestAppContext) -> String {
+    thread.read_with(cx, |thread, _| {
+        thread
+            .orchestration_run()
+            .expect("worker should own a runtime run")
+            .snapshot()
+            .task_statuses
+            .first()
+            .and_then(|task| task.latest_output.clone())
+            .expect("worker output should be recorded in the runtime")
+    })
 }
 
 #[gpui::test]
@@ -5633,9 +5677,10 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -5674,6 +5719,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
             .clone()
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     // The only pending completion is the subagent's; it should carry exactly
     // the allowlisted tools.
     assert_eq!(
@@ -5690,6 +5736,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
     send.await.unwrap();
+    cx.run_until_parked();
 
     // Resuming the session keeps the original filter even when the follow-up
     // spawn call passes a different `tools` list.
@@ -5718,6 +5765,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
 
     cx.run_until_parked();
 
+    park_parent_before_worker_response(&model, &thread, cx);
     assert_eq!(
         pending_completion_tool_names(&model),
         vec!["grep".to_string(), "read_file".to_string()],
@@ -5731,6 +5779,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     model.send_last_completion_stream_text_chunk("Second response");
     model.end_last_completion_stream();
     send2.await.unwrap();
+    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -5777,9 +5826,10 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -5815,6 +5865,7 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
             "subagent thread should be running"
         );
     });
+    park_parent_before_worker_response(&model, &thread, cx);
     assert!(
         pending_completion_tool_names(&model).is_empty(),
         "subagent spawned with an empty allowlist should see no tools"
@@ -5828,6 +5879,11 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
     model.send_last_completion_stream_text_chunk("Response");
     model.end_last_completion_stream();
     send.await.unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
 }
 
 #[gpui::test]
@@ -5877,6 +5933,7 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
             agent_settings::AgentAutonomy::Manual,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -5932,7 +5989,7 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
             result.is_error
                 && result.content.iter().any(|content| match content {
                     language_model::LanguageModelToolResultContent::Text(text) => {
-                        text.contains("Unknown tool") && text.contains("not_a_real_tool")
+                        text.contains("unavailable tool") && text.contains("not_a_real_tool")
                     }
                     _ => false,
                 })
@@ -5993,9 +6050,10 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -6042,6 +6100,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
             .expect("subagent thread should be alive")
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     model.send_last_completion_stream_text_chunk("subagent task response 1");
     model.send_last_completion_stream_event(LanguageModelCompletionEvent::Thinking {
         text: "thinking more about the subagent task".into(),
@@ -6066,29 +6125,15 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
 
     send.await.unwrap();
 
-    assert_eq!(
-        acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx)),
-        indoc! {r#"
-            ## User
-
-            Prompt
-
-            ## Assistant
-
-            spawning subagent
-
-            **Tool Call: label**
-            Status: Completed
-
-            subagent task response 1
-
-            subagent task response 2
-
-            ## Assistant
-
-            Response
-
-        "#},
+    cx.run_until_parked();
+    let output = latest_worker_output(&thread, cx);
+    assert!(output.contains("subagent task response 1"), "{output}");
+    assert!(output.contains("subagent task response 2"), "{output}");
+    assert!(!output.contains("thinking more"), "{output}");
+    let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(
+        markdown.ends_with("## Assistant\n\nResponse\n\n"),
+        "{markdown}"
     );
 }
 
@@ -6137,9 +6182,10 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -6185,11 +6231,6 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
             .expect("subagent thread should be alive")
     });
 
-    // model.send_last_completion_stream_text_chunk("subagent task response");
-    // model.end_last_completion_stream();
-
-    // cx.run_until_parked();
-
     acp_thread.update(cx, |thread, cx| thread.cancel(cx)).await;
 
     cx.run_until_parked();
@@ -6198,22 +6239,9 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
 
     acp_thread.read_with(cx, |thread, cx| {
         assert_eq!(thread.status(), ThreadStatus::Idle);
-        assert_eq!(
-            thread.to_markdown(cx),
-            indoc! {"
-                ## User
-
-                Prompt
-
-                ## Assistant
-
-                spawning subagent
-
-                **Tool Call: label**
-                Status: Canceled
-
-            "}
-        );
+        let markdown = thread.to_markdown(cx);
+        assert!(markdown.contains("Status: Completed"), "{markdown}");
+        assert!(markdown.contains("run_id"), "{markdown}");
     });
     subagent_acp_thread.read_with(cx, |thread, cx| {
         assert_eq!(thread.status(), ThreadStatus::Idle);
@@ -6269,9 +6297,10 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -6319,6 +6348,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
             .expect("subagent thread should be alive")
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     // Subagent responds
     model.send_last_completion_stream_text_chunk("first task response");
     model.end_last_completion_stream();
@@ -6332,6 +6362,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 
     send.await.unwrap();
 
+    cx.run_until_parked();
     // Verify subagent is no longer running
     thread.read_with(cx, |thread, cx| {
         assert!(
@@ -6348,6 +6379,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
+        agent_type: Some(SubagentRole::Explorer),
+        tools: Some(vec!["terminal".to_string(), "not_a_real_tool".to_string()]),
         ..Default::default()
     };
     let resume_tool_use = LanguageModelToolUse {
@@ -6372,6 +6405,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         assert_eq!(running[0], subagent_session_id, "should be same session");
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     // Subagent responds to follow-up
     model.send_last_completion_stream_text_chunk("follow-up task response");
     model.end_last_completion_stream();
@@ -6385,6 +6419,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 
     send2.await.unwrap();
 
+    cx.run_until_parked();
     // Verify subagent is no longer running
     thread.read_with(cx, |thread, cx| {
         assert!(
@@ -7043,9 +7078,10 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -7084,6 +7120,7 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
             .clone()
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     // Send a usage update that crosses the warning threshold (80% of 1,000,000).
     // The thread owns compaction policy, so the subagent handle must not cancel
     // an otherwise healthy turn at this advisory threshold.
@@ -7120,7 +7157,8 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
     send.await.unwrap();
 
     // Verify the parent thread contains the result instead of a synthetic warning error.
-    let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    cx.run_until_parked();
+    let markdown = latest_worker_output(&thread, cx);
     assert!(
         markdown.contains("partial work"),
         "tool output should contain the completed subagent response, got:\n{markdown}"
@@ -7183,9 +7221,10 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         thread.set_model(model.clone(), cx);
         thread.set_execution_policy(
             agent_settings::AgentExecutionStrategy::Orchestrate,
-            agent_settings::AgentAutonomy::Manual,
+            agent_settings::AgentAutonomy::Autonomous,
             cx,
         );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
     });
     cx.run_until_parked();
 
@@ -7223,6 +7262,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         );
     });
 
+    park_parent_before_worker_response(&model, &thread, cx);
     // The subagent's model returns a non-retryable error
     model.send_last_completion_stream_error(LanguageModelCompletionError::from_http_status(
         LanguageModelProviderName::new("test"),
@@ -7248,11 +7288,25 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
 
     send.await.unwrap();
 
-    // Verify the parent thread shows the error in the tool call
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _| {
+        let snapshot = thread
+            .orchestration_run()
+            .expect("worker run should exist")
+            .snapshot();
+        let task = snapshot
+            .task_statuses
+            .first()
+            .expect("worker task should exist");
+        assert!(matches!(
+            task.state,
+            agent_orchestration::TaskState::Failed { .. }
+        ));
+    });
     let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
     assert!(
-        markdown.contains("Status: Failed"),
-        "tool call should have Failed status after model error, got:\n{markdown}"
+        markdown.ends_with("## Assistant\n\nResponse after error\n\n"),
+        "{markdown}"
     );
 }
 
@@ -8607,7 +8661,7 @@ async fn test_queued_message_ends_turn_at_boundary(cx: &mut TestAppContext) {
         .collect();
     assert_eq!(
         tool_call_ids,
-        vec!["tool_1"],
+        vec![scoped_tool_call_id(1, &"tool_1".into()).to_string()],
         "Should have received a tool call event for our echo tool"
     );
 

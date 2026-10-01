@@ -177,7 +177,10 @@ mod tests {
             tool_filter: None,
             discovered_tools: Vec::new(),
             orchestration_run: None,
+            orchestration_runs: Vec::new(),
             orchestration_goal: None,
+            orchestration_waiting_for_workers: false,
+            orchestration_waiting_run_ids: Vec::new(),
             pending_edits: Vec::new(),
         }
     }

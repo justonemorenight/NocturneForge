@@ -880,6 +880,34 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(
+                &thread_handle,
+                |agent, thread, event: &AutomaticResume, cx| {
+                    let Some(events) = event.events.borrow_mut().take() else {
+                        return;
+                    };
+                    let Some(acp_thread) = agent
+                        .sessions
+                        .get(thread.read(cx).id())
+                        .and_then(|session| session.acp_thread.upgrade())
+                    else {
+                        log::warn!("automatic native resume lost its ACP session");
+                        return;
+                    };
+                    let connection = NativeAgentConnection(cx.entity());
+                    let response = NativeAgentConnection::handle_thread_events(
+                        events,
+                        acp_thread.downgrade(),
+                        Some(connection),
+                        cx,
+                    );
+                    let continuation = acp_thread.update(cx, |thread, cx| {
+                        thread.track_native_continuation(response, cx)
+                    });
+                    cx.spawn(async move |_, _| continuation.await.map(|_| ()))
+                        .detach_and_log_err(cx);
+                },
+            ),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.schedule_thread_save(thread, cx)
             }),
@@ -1764,9 +1792,6 @@ impl NativeAgent {
                     })
                     .await
                     .map_err(Arc::new)?;
-                    acp_thread.update(cx, |thread, cx| {
-                        thread.snapshot_completed_plan(cx);
-                    });
                     Ok(acp_thread)
                 }
             })
@@ -3832,6 +3857,49 @@ pub struct NativeSubagentHandle {
     acp_thread: Entity<acp_thread::AcpThread>,
 }
 
+struct NativeSubagentTurnGuard {
+    session_id: acp::SessionId,
+    parent_thread: WeakEntity<Thread>,
+    acp_thread: Entity<AcpThread>,
+    turn_id: Option<u32>,
+    app: AsyncApp,
+    settled: bool,
+}
+
+impl Drop for NativeSubagentTurnGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let session_id = self.session_id.clone();
+        let parent_thread = self.parent_thread.clone();
+        let acp_thread = self.acp_thread.clone();
+        let turn_id = self.turn_id;
+        // The send future can be dropped by the scheduler before it reaches
+        // its epilogue. Defer entity updates, but do not cancel a newer resume.
+        self.app
+            .spawn(async move |cx| {
+                let cancellation = cx.update(|cx| {
+                    let active_turn_id = acp_thread.read(cx).active_turn_id();
+                    if active_turn_id.is_some() && active_turn_id != turn_id {
+                        return None;
+                    }
+                    let cancellation = acp_thread.update(cx, |thread, cx| thread.cancel(cx));
+                    if let Some(parent_thread) = parent_thread.upgrade() {
+                        parent_thread.update(cx, |thread, cx| {
+                            thread.unregister_running_subagent(&session_id, cx);
+                        });
+                    }
+                    Some(cancellation)
+                });
+                if let Some(cancellation) = cancellation {
+                    cancellation.await;
+                }
+            })
+            .detach();
+    }
+}
+
 impl NativeSubagentHandle {
     fn new(
         session_id: acp::SessionId,
@@ -3880,18 +3948,19 @@ impl SubagentHandle for NativeSubagentHandle {
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
-            let task = cx.update(|cx| {
+            let (task, turn_id) = cx.update(|cx| {
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
                         parent_thread.register_running_subagent(thread.downgrade())
                     })
-                    .ok();
+                    .context("parent thread was released before the subagent turn started")?;
 
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
                 });
 
-                cx.background_spawn(async move {
+                let turn_id = acp_thread.read(cx).active_turn_id();
+                let task = cx.background_spawn(async move {
                     match task.await {
                         Ok(Some(response)) => {
                             match response.stop_reason {
@@ -3910,8 +3979,17 @@ impl SubagentHandle for NativeSubagentHandle {
                             }
                         }
                     }
-                })
-            });
+                });
+                anyhow::Ok((task, turn_id))
+            })?;
+            let mut turn_guard = NativeSubagentTurnGuard {
+                session_id: subagent_session_id.clone(),
+                parent_thread: parent_thread.clone(),
+                acp_thread: acp_thread.clone(),
+                turn_id,
+                app: cx.clone(),
+                settled: false,
+            };
 
             let result = match task.await {
                 SubagentPromptResult::Completed => thread.read_with(cx, |thread, _cx| {
@@ -3951,11 +4029,18 @@ impl SubagentHandle for NativeSubagentHandle {
                 }
             }
 
-            parent_thread
-                .update(cx, |parent_thread, cx| {
-                    parent_thread.unregister_running_subagent(&subagent_session_id, cx)
-                })
-                .ok();
+            if acp_thread
+                .read_with(cx, |thread, _| thread.active_turn_id())
+                .is_none_or(|active_turn_id| Some(active_turn_id) == turn_id)
+            {
+                parent_thread
+                    .update(cx, |parent_thread, cx| {
+                        parent_thread.unregister_running_subagent(&subagent_session_id, cx)
+                    })
+                    .log_err();
+            }
+
+            turn_guard.settled = true;
 
             result
         })
@@ -7318,6 +7403,119 @@ mod internal_tests {
                 Some(draft_blocks.as_slice()),
                 "releasing the session must save the thread; draft prompt was lost"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dropped_native_subagent_send_cleans_up_and_can_resume(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_connection, agent, _project, parent_acp_thread) =
+            setup_native_agent_session(cx).await;
+        let parent_id = parent_acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent = cx.update(|cx| native_thread_for_session(&agent, &parent_id, cx));
+        let model = Arc::new(FakeLanguageModel::default());
+        parent.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent.downgrade(),
+            acp_thread: parent_acp_thread.downgrade(),
+        };
+        let subagent = cx
+            .update(|cx| {
+                environment.create_subagent_thread(
+                    NativeSubagentRequest::new("worker".into(), None, None, None, None),
+                    cx,
+                )
+            })
+            .unwrap();
+        let session_id = subagent.id();
+        let worker = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let send = cx.spawn({
+            let subagent = subagent.clone();
+            async move |cx| subagent.send("work".into(), &cx).await
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            parent.read_with(cx, |thread, cx| thread.running_subagent_ids(cx)),
+            vec![session_id.clone()]
+        );
+        assert!(!worker.read_with(cx, |thread, _| thread.is_turn_complete()));
+        drop(send);
+        cx.run_until_parked();
+        assert!(
+            parent
+                .read_with(cx, |thread, cx| thread.running_subagent_ids(cx))
+                .is_empty()
+        );
+        assert!(worker.read_with(cx, |thread, _| thread.is_turn_complete()));
+
+        let resumed = cx
+            .update(|cx| environment.resume_subagent_thread(session_id.clone(), cx))
+            .unwrap();
+        assert_eq!(resumed.id(), session_id);
+        let send = cx.spawn(async move |cx| resumed.send("resume".into(), &cx).await);
+        cx.run_until_parked();
+        assert_eq!(
+            parent.read_with(cx, |thread, cx| thread.running_subagent_ids(cx)),
+            vec![session_id]
+        );
+        model.send_last_completion_stream_text_chunk("finished");
+        model.end_last_completion_stream();
+        assert_eq!(send.await.unwrap(), "finished");
+        assert!(
+            parent
+                .read_with(cx, |thread, cx| thread.running_subagent_ids(cx))
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stale_native_subagent_cleanup_does_not_cancel_resumed_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (_connection, agent, project, parent_acp_thread) = setup_native_agent_session(cx).await;
+        let parent_id = parent_acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let parent = cx.update(|cx| native_thread_for_session(&agent, &parent_id, cx));
+        let model = Arc::new(FakeLanguageModel::default());
+        parent.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        let worker = cx.new(|cx| Thread::new_subagent(&parent, None, cx));
+        let worker_id = worker.read_with(cx, |thread, _| thread.id().clone());
+        let worker_acp_thread = agent.update(cx, |agent, cx| {
+            agent.register_session(worker.clone(), project.entity_id(), cx)
+        });
+        let send = worker_acp_thread.update(cx, |thread, cx| thread.send_raw("resume", cx));
+        parent.update(cx, |thread, _| {
+            thread.register_running_subagent(worker.downgrade());
+            thread.register_running_subagent(worker.downgrade());
+        });
+        let guard = cx
+            .spawn({
+                let parent = parent.downgrade();
+                let worker_acp_thread = worker_acp_thread.clone();
+                let worker_id = worker_id.clone();
+                async move |cx| NativeSubagentTurnGuard {
+                    session_id: worker_id,
+                    parent_thread: parent,
+                    acp_thread: worker_acp_thread,
+                    turn_id: Some(0),
+                    app: cx,
+                    settled: false,
+                }
+            })
+            .await;
+        drop(guard);
+        cx.run_until_parked();
+        assert!(!worker.read_with(cx, |thread, _| thread.is_turn_complete()));
+        assert_eq!(
+            parent.read_with(cx, |thread, cx| thread.running_subagent_ids(cx)),
+            vec![worker_id.clone()]
+        );
+        model.send_last_completion_stream_text_chunk("still owned");
+        model.end_last_completion_stream();
+        send.await.unwrap();
+        parent.update(cx, |thread, cx| {
+            thread.unregister_running_subagent(&worker_id, cx)
         });
     }
 

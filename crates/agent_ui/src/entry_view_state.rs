@@ -10,8 +10,8 @@ use editor::{
     SizingBehavior,
 };
 use gpui::{
-    AnyEntity, App, AppContext as _, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ScrollHandle, TextStyleRefinement, WeakEntity, Window,
+    AnyEntity, App, AppContext as _, Corners, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, ScrollHandle, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
@@ -417,11 +417,6 @@ impl EntryViewState {
                 };
                 entry.sync(message);
             }
-            AgentThreadEntry::CompletedPlan(_) => {
-                if !matches!(self.entries.get(index), Some(Entry::CompletedPlan)) {
-                    self.set_entry(index, Entry::CompletedPlan);
-                }
-            }
             AgentThreadEntry::ContextCompaction(_) => {
                 if !matches!(self.entries.get(index), Some(Entry::ContextCompaction)) {
                     self.set_entry(index, Entry::ContextCompaction);
@@ -473,7 +468,6 @@ impl EntryViewState {
                 Entry::UserMessage { .. }
                 | Entry::AssistantMessage { .. }
                 | Entry::Elicitation { .. }
-                | Entry::CompletedPlan
                 | Entry::ContextCompaction => {}
                 Entry::ToolCall(ToolCallEntry { content, .. }) => {
                     for view in content.values() {
@@ -543,7 +537,6 @@ pub enum Entry {
     AssistantMessage(AssistantMessageEntry),
     ToolCall(ToolCallEntry),
     Elicitation { focus_handle: FocusHandle },
-    CompletedPlan,
     ContextCompaction,
 }
 
@@ -554,7 +547,7 @@ impl Entry {
             Self::AssistantMessage(message) => Some(message.focus_handle.clone()),
             Self::ToolCall(tool_call) => Some(tool_call.focus_handle.clone()),
             Self::Elicitation { focus_handle } => Some(focus_handle.clone()),
-            Self::CompletedPlan | Self::ContextCompaction => None,
+            Self::ContextCompaction => None,
         }
     }
 
@@ -564,7 +557,6 @@ impl Entry {
             Self::AssistantMessage(_)
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
-            | Self::CompletedPlan
             | Self::ContextCompaction => None,
         }
     }
@@ -595,7 +587,6 @@ impl Entry {
             Self::UserMessage(_)
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
-            | Self::CompletedPlan
             | Self::ContextCompaction => None,
         }
     }
@@ -614,7 +605,6 @@ impl Entry {
             Self::UserMessage(_)
             | Self::AssistantMessage(_)
             | Self::Elicitation { .. }
-            | Self::CompletedPlan
             | Self::ContextCompaction => false,
         }
     }
@@ -633,7 +623,7 @@ impl Focusable for Entry {
             Self::AssistantMessage(message) => message.focus_handle.clone(),
             Self::ToolCall(tool_call) => tool_call.focus_handle.clone(),
             Self::Elicitation { focus_handle } => focus_handle.clone(),
-            Self::CompletedPlan | Self::ContextCompaction => cx.focus_handle(),
+            Self::ContextCompaction => cx.focus_handle(),
         }
     }
 }
@@ -652,6 +642,15 @@ fn create_terminal(
             None,
             project,
             window,
+            cx,
+        );
+        // Keep this radius aligned with the tool card's rounded_md/rounded_b_md.
+        view.set_background_corner_radii(
+            Some(Corners {
+                bottom_left: gpui::rems(0.375),
+                bottom_right: gpui::rems(0.375),
+                ..Default::default()
+            }),
             cx,
         );
         view.set_embedded_mode(Some(1000), cx);

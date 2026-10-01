@@ -219,6 +219,33 @@ fn unregistering_a_subtree_removes_descendants_and_mailboxes() {
     assert!(control_plane.identity(&parent).is_none());
     assert!(control_plane.identity(&child).is_none());
     assert!(control_plane.drain(&child).is_err());
+    assert!(
+        control_plane
+            .edge_history()
+            .iter()
+            .filter(|edge| edge.identity.path == parent || edge.identity.path == child)
+            .all(|edge| edge.state == AgentEdgeState::Closed)
+    );
+}
+
+#[test]
+fn closing_a_task_releases_the_active_identity_but_keeps_edge_history() {
+    let control_plane = AgentControlPlane::new(AgentControlPlaneConfig::default()).unwrap();
+    let root = AgentPath::root();
+    let task_id = TaskId::new("worker");
+    let path = control_plane
+        .register_child(&root, task_id.clone(), "worker", None, WorkerTarget::Native)
+        .unwrap();
+
+    assert!(control_plane.close_task(&task_id, "completed"));
+    assert!(control_plane.identity(&path).is_some());
+    let edge = control_plane
+        .edge_history()
+        .into_iter()
+        .find(|edge| edge.identity.path == path)
+        .unwrap();
+    assert_eq!(edge.state, AgentEdgeState::Closed);
+    assert_eq!(edge.close_reason.as_deref(), Some("completed"));
 }
 
 #[test]

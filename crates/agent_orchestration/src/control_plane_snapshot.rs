@@ -10,6 +10,8 @@ pub struct AgentMailboxSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlPlaneSnapshot {
     pub identities: Vec<AgentIdentity>,
+    #[serde(default)]
+    pub edges: Vec<AgentEdgeSnapshot>,
     pub mailboxes: Vec<AgentMailboxSnapshot>,
     pub next_message_sequence: u64,
 }
@@ -17,11 +19,17 @@ pub struct AgentControlPlaneSnapshot {
 impl AgentControlPlane {
     pub fn snapshot(&self) -> AgentControlPlaneSnapshot {
         let state = self.inner.state.read();
-        let mut identities = state.identities.values().cloned().collect::<Vec<_>>();
+        let mut identities = state
+            .identities
+            .values()
+            .filter(|identity| self.is_open_locked(&state, &identity.path))
+            .cloned()
+            .collect::<Vec<_>>();
         identities.sort_by(|left, right| left.path.cmp(&right.path));
         let mut mailboxes = state
             .mailboxes
             .iter()
+            .filter(|(recipient, _)| self.is_open_locked(&state, recipient))
             .map(|(recipient, mailbox)| AgentMailboxSnapshot {
                 recipient: recipient.clone(),
                 messages: mailbox.queue.lock().messages.iter().cloned().collect(),
@@ -30,6 +38,7 @@ impl AgentControlPlane {
         mailboxes.sort_by(|left, right| left.recipient.cmp(&right.recipient));
         AgentControlPlaneSnapshot {
             identities,
+            edges: self.edge_history(),
             mailboxes,
             next_message_sequence: self.inner.next_message_sequence.load(Ordering::Acquire),
         }
@@ -47,9 +56,15 @@ impl AgentControlPlane {
             );
         }
         let execution_limiter = AgentExecutionLimiter::new(config.execution_limiter.clone())?;
+        let AgentControlPlaneSnapshot {
+            identities: snapshot_identities,
+            edges: snapshot_edges,
+            mailboxes: snapshot_mailboxes,
+            next_message_sequence,
+        } = snapshot;
         let mut identities = HashMap::default();
         let mut task_paths = HashMap::default();
-        for identity in snapshot.identities {
+        for identity in snapshot_identities {
             validate_identity(&identity)?;
             if identities
                 .insert(identity.path.clone(), identity.clone())
@@ -63,6 +78,54 @@ impl AgentControlPlane {
                     .is_some()
             {
                 bail!("agent snapshot contains duplicate task id '{task_id}'");
+            }
+        }
+        let mut edges = HashMap::default();
+        for edge in snapshot_edges {
+            validate_identity(&edge.identity)?;
+            if edge.identity.path == AgentPath::root() {
+                bail!("agent snapshot must not contain an edge for the root identity");
+            }
+            if edge.state == AgentEdgeState::Open && edge.closed_at.is_some() {
+                bail!(
+                    "open agent edge '{}' has a close timestamp",
+                    edge.identity.path
+                );
+            }
+            if edges
+                .insert(edge.identity.path.clone(), edge.clone())
+                .is_some()
+            {
+                bail!(
+                    "agent snapshot contains duplicate edge '{}'",
+                    edge.identity.path
+                );
+            }
+        }
+        for identity in identities.values() {
+            if identity.path != AgentPath::root() {
+                edges
+                    .entry(identity.path.clone())
+                    .or_insert_with(|| AgentEdgeSnapshot {
+                        identity: identity.clone(),
+                        state: AgentEdgeState::Open,
+                        closed_at: None,
+                        close_reason: None,
+                    });
+            }
+        }
+        for identity in identities
+            .values()
+            .filter(|identity| identity.parent.is_some())
+        {
+            let edge = edges.get(&identity.path).ok_or_else(|| {
+                anyhow::anyhow!("active agent '{}' is missing its graph edge", identity.path)
+            })?;
+            if edge.state != AgentEdgeState::Open || edge.identity != identity.clone() {
+                bail!(
+                    "active agent '{}' does not match its open graph edge",
+                    identity.path
+                );
             }
         }
         let root = identities
@@ -95,7 +158,7 @@ impl AgentControlPlane {
         let mut mailboxes = HashMap::default();
         let mut maximum_sequence = 0_u64;
         let mut message_sequences = HashSet::default();
-        for mailbox_snapshot in snapshot.mailboxes {
+        for mailbox_snapshot in snapshot_mailboxes {
             if !identities.contains_key(&mailbox_snapshot.recipient) {
                 bail!(
                     "agent snapshot contains a mailbox for unknown agent '{}'",
@@ -159,8 +222,7 @@ impl AgentControlPlane {
                 .entry(path.clone())
                 .or_insert_with(AgentMailbox::new);
         }
-        let next_message_sequence = snapshot
-            .next_message_sequence
+        let next_message_sequence = next_message_sequence
             .max(maximum_sequence.saturating_add(1))
             .max(1);
 
@@ -169,6 +231,7 @@ impl AgentControlPlane {
                 config,
                 state: RwLock::new(AgentControlPlaneState {
                     identities,
+                    edges,
                     task_paths,
                     mailboxes,
                 }),

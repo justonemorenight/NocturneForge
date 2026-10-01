@@ -1,0 +1,1 @@
+Send only focused context or a correction to a named worker. First use `list_orchestration_agents` to find the worker's canonical path and owning `run_id`; pass both the exact path as `recipient` and that `run_id`. If multiple runs are listed, never choose by worker name alone and never resend the original task. A queued message is not completion evidence.

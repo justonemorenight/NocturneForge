@@ -1,4 +1,5 @@
 use crate::budget::{BudgetExceeded, BudgetUsage};
+use crate::control_plane::AgentControlPlane;
 use crate::events::{RuntimeEvent, RuntimeEventContext, RuntimeEventStream};
 use crate::ids::{RunId, TaskId};
 use crate::state::{TaskState, TaskStatus};
@@ -13,6 +14,7 @@ pub struct TaskMutationGateway {
     run_id: RunId,
     registry: TaskRegistry,
     event_stream: RuntimeEventStream,
+    agent_control_plane: Option<AgentControlPlane>,
     lifecycle_lock: Arc<Mutex<()>>,
 }
 
@@ -22,6 +24,22 @@ impl TaskMutationGateway {
             run_id,
             registry,
             event_stream,
+            agent_control_plane: None,
+            lifecycle_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn new_with_control_plane(
+        run_id: RunId,
+        registry: TaskRegistry,
+        event_stream: RuntimeEventStream,
+        agent_control_plane: AgentControlPlane,
+    ) -> Self {
+        Self {
+            run_id,
+            registry,
+            event_stream,
+            agent_control_plane: Some(agent_control_plane),
             lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -274,13 +292,18 @@ impl TaskMutationGateway {
         let before = self.registry.status(task_id);
         mutation();
         let after = self.registry.status(task_id);
-        self.emit_transition(
-            task_id,
-            before.as_ref(),
-            after.as_ref(),
-            reason.into(),
-            context,
-        );
+        let reason = reason.into();
+        let should_close_agent = after
+            .as_ref()
+            .is_some_and(|status| status.state.is_terminal())
+            && before
+                .as_ref()
+                .is_none_or(|status| !status.state.is_terminal());
+        let close_reason = reason.clone();
+        self.emit_transition(task_id, before.as_ref(), after.as_ref(), reason, context);
+        if should_close_agent && let Some(control_plane) = &self.agent_control_plane {
+            control_plane.close_task(task_id, close_reason);
+        }
     }
 
     fn emit_transition(

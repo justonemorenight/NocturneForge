@@ -478,7 +478,9 @@ pub struct LanguageModelRequest {
     /// Supporting providers fall back to `thread_id` when absent for legacy callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
-    pub prompt_id: Option<String>,
+    /// Clones preserve the turn's lifetime so providers can retire routing state
+    /// when its owner drops, rather than expiring it during a long-running turn.
+    pub prompt_id: Option<Arc<str>>,
     pub intent: Option<CompletionIntent>,
     pub messages: Vec<LanguageModelRequestMessage>,
     pub tools: Vec<LanguageModelRequestTool>,
@@ -553,6 +555,29 @@ pub struct LanguageModelResponseMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_prompt_id_shares_live_owner_but_not_serialized_owner() -> serde_json::Result<()> {
+        let prompt_id: Arc<str> = "turn".into();
+        let request = LanguageModelRequest {
+            prompt_id: Some(prompt_id.clone()),
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        assert!(Arc::ptr_eq(
+            cloned.prompt_id.as_ref().expect("cloned prompt ID"),
+            &prompt_id,
+        ));
+        let serialized = serde_json::to_value(&request)?;
+        assert_eq!(serialized["prompt_id"], "turn");
+        let restored: LanguageModelRequest = serde_json::from_value(serialized)?;
+        assert_eq!(restored, request);
+        assert!(!Arc::ptr_eq(
+            restored.prompt_id.as_ref().expect("restored prompt ID"),
+            &prompt_id,
+        ));
+        Ok(())
+    }
 
     #[test]
     fn request_prompt_cache_key_serialization() -> serde_json::Result<()> {

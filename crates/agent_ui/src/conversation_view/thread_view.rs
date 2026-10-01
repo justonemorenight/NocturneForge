@@ -1,6 +1,5 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
-    agent_configuration::configure_context_server_modal::default_markdown_style,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
@@ -11,7 +10,7 @@ use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
     DelegatedTaskGroup, DelegatedTaskProgress, DelegatedTaskResult, DelegatedTaskToolActivity,
-    Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
+    Elicitation, ElicitationEntryId, ElicitationStatus, SandboxAuthorizationDetails,
     SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, TodoProgress,
     decode_path_escapes,
 };
@@ -121,16 +120,20 @@ impl AgentActivityStatus {
     fn from_orchestration_state(state: agent_orchestration::TaskState) -> Self {
         match state {
             agent_orchestration::TaskState::Pending
-            | agent_orchestration::TaskState::WaitingDependency => Self::Pending,
+            | agent_orchestration::TaskState::WaitingDependency
+            | agent_orchestration::TaskState::Queued => Self::Pending,
             agent_orchestration::TaskState::Blocked => Self::Blocked,
             agent_orchestration::TaskState::Parked => Self::Blocked,
             agent_orchestration::TaskState::AwaitingApply => Self::AwaitingApply,
-            agent_orchestration::TaskState::Running
+            agent_orchestration::TaskState::Starting
+            | agent_orchestration::TaskState::Running
             | agent_orchestration::TaskState::Verifying
             | agent_orchestration::TaskState::Repairing
             | agent_orchestration::TaskState::Retrying => Self::Running,
             agent_orchestration::TaskState::Completed => Self::Completed,
-            agent_orchestration::TaskState::Failed => Self::Failed,
+            agent_orchestration::TaskState::Failed
+            | agent_orchestration::TaskState::TimedOut
+            | agent_orchestration::TaskState::Orphaned => Self::Failed,
             agent_orchestration::TaskState::Cancelled => Self::Canceled,
             agent_orchestration::TaskState::Interrupted => Self::Stopped,
         }
@@ -213,6 +216,7 @@ fn activity_model_label(
 
 #[derive(Clone)]
 struct AgentActivityItem {
+    runtime_run_id: Option<agent_orchestration::RunId>,
     runtime_task_id: Option<agent_orchestration::TaskId>,
     canonical_path: Option<SharedString>,
     queued_messages: usize,
@@ -239,6 +243,44 @@ struct AgentActivityItem {
     last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
     awaiting_plan_approval: bool,
     has_final_output: bool,
+}
+
+fn activity_item_position_for_runtime_task(
+    items: &[AgentActivityItem],
+    session_id: Option<&acp::SessionId>,
+    run_id: &agent_orchestration::RunId,
+    task_id: &agent_orchestration::TaskId,
+    is_native: bool,
+    task_label: &str,
+) -> Option<usize> {
+    session_id
+        .and_then(|session_id| {
+            items.iter().position(|item| {
+                item.session_id.as_ref() == Some(session_id)
+                    && item
+                        .runtime_run_id
+                        .as_ref()
+                        .is_none_or(|item_run_id| item_run_id == run_id)
+            })
+        })
+        .or_else(|| {
+            items.iter().position(|item| {
+                item.runtime_run_id.as_ref() == Some(run_id)
+                    && item.runtime_task_id.as_ref() == Some(task_id)
+            })
+        })
+        .or_else(|| {
+            if !is_native {
+                return None;
+            }
+            let mut matches = items.iter().enumerate().filter(|(_, item)| {
+                item.runtime_task_id.is_none()
+                    && item.harness == "Native"
+                    && item.name.as_ref() == task_label
+            });
+            let position = matches.next().map(|(position, _)| position);
+            position.filter(|_| matches.next().is_none())
+        })
 }
 
 fn agent_activity_status_label(
@@ -674,7 +716,9 @@ fn markdown_fenced_block(text: &str, language: Option<&str>) -> String {
     block
 }
 
-fn format_review_feedback_message(feedback: &[ReviewFeedback]) -> anyhow::Result<String> {
+pub(crate) fn format_review_feedback_message(
+    feedback: &[ReviewFeedback],
+) -> anyhow::Result<String> {
     let mut message = String::from(
         "Address the following human-authored review feedback. Each card is anchored to a local diff; paths in backticks can be opened from the thread.\n",
     );
@@ -1100,6 +1144,26 @@ impl OrchestrationProposalPresentation {
     }
 }
 
+#[derive(IntoElement)]
+struct ToolOutputScroll {
+    id: SharedString,
+    scroll_handle: ScrollHandle,
+    content: AnyElement,
+}
+
+impl RenderOnce for ToolOutputScroll {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .id(self.id)
+            .w_full()
+            .max_h((window.viewport_size().height * 0.4).min(px(360.)))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .child(self.content)
+            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
+    }
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp::SessionId,
@@ -1135,7 +1199,8 @@ pub struct ThreadView {
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp::ToolCallId>,
-    pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
+    pub subagent_scroll_handles: RefCell<HashMap<(acp::SessionId, acp::ToolCallId), ScrollHandle>>,
+    tool_output_scroll_handles: RefCell<HashMap<acp::ToolCallId, ScrollHandle>>,
     floating_tool_call_scroll_handles: RefCell<HashMap<acp::ToolCallId, ScrollHandle>>,
     pub edits_expanded: bool,
     large_diff_review_prompt: bool,
@@ -1647,6 +1712,7 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            tool_output_scroll_handles: RefCell::new(HashMap::default()),
             floating_tool_call_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             large_diff_review_prompt: false,
@@ -3820,6 +3886,7 @@ impl ThreadView {
                     items.push(AgentActivityItem {
                         entry_ix,
                         session_id: None,
+                        runtime_run_id: None,
                         runtime_task_id: None,
                         canonical_path: None,
                         queued_messages: 0,
@@ -3906,51 +3973,52 @@ impl ThreadView {
                             )
                         })
                         .unwrap_or_default();
-                    let orchestration_status = self
-                        .as_native_thread(cx)
-                        .and_then(|thread| {
-                            let thread = thread.read(cx);
-                            let status = thread
-                                .orchestration_run()
-                                .and_then(|run| run.task_status_by_session_id(&session_id))
-                                .or_else(|| {
-                                    thread.persisted_orchestration_run().and_then(|run| {
-                                        run.task_statuses
-                                            .iter()
-                                            .find(|status| {
-                                                status.active_session_id.as_ref()
-                                                    == Some(&session_id)
-                                            })
-                                            .cloned()
-                                    })
-                                })?;
-                            let task = thread
-                                .orchestration_run()
-                                .and_then(|run| {
-                                    run.plan()
-                                        .tasks
-                                        .iter()
-                                        .find(|task| task.id == status.task_id)
-                                        .cloned()
-                                })
-                                .or_else(|| {
-                                    thread.persisted_orchestration_run().and_then(|run| {
-                                        run.plan
+                    let orchestration_status =
+                        self.as_native_thread(cx)
+                            .and_then(|thread| {
+                                let thread = thread.read(cx);
+                                thread
+                                    .orchestration_runs()
+                                    .iter()
+                                    .find_map(|run| {
+                                        let status = run.task_status_by_session_id(&session_id)?;
+                                        let task = run
+                                            .plan()
                                             .tasks
                                             .iter()
                                             .find(|task| task.id == status.task_id)
-                                            .cloned()
+                                            .cloned();
+                                        Some((status, task))
                                     })
-                                });
-                            Some((status, task))
-                        })
-                        .map(|(status, task)| {
-                            (
-                                AgentActivityStatus::from_orchestration_state(status.state),
-                                status,
-                                task,
-                            )
-                        });
+                                    .or_else(|| {
+                                        thread.persisted_orchestration_runs().iter().find_map(
+                                            |run| {
+                                                let status = run
+                                                    .task_statuses
+                                                    .iter()
+                                                    .find(|status| {
+                                                        status.active_session_id.as_ref()
+                                                            == Some(&session_id)
+                                                    })?
+                                                    .clone();
+                                                let task = run
+                                                    .plan
+                                                    .tasks
+                                                    .iter()
+                                                    .find(|task| task.id == status.task_id)
+                                                    .cloned();
+                                                Some((status, task))
+                                            },
+                                        )
+                                    })
+                            })
+                            .map(|(status, task)| {
+                                (
+                                    AgentActivityStatus::from_orchestration_state(status.state),
+                                    status,
+                                    task,
+                                )
+                            });
                     let (status, task_status, orchestration_task) = orchestration_status
                         .map(|(status, task_status, task)| (Some(status), Some(task_status), task))
                         .unwrap_or((None, None, None));
@@ -4011,9 +4079,10 @@ impl ThreadView {
                         }
                         status
                     });
-                    items.push(AgentActivityItem {
+                    let item = AgentActivityItem {
                         entry_ix,
-                        session_id: Some(session_id),
+                        session_id: Some(session_id.clone()),
+                        runtime_run_id: None,
                         runtime_task_id: None,
                         canonical_path: None,
                         queued_messages: 0,
@@ -4038,7 +4107,13 @@ impl ThreadView {
                         last_activity_at: None,
                         awaiting_plan_approval: false,
                         has_final_output: false,
-                    });
+                    };
+                    if let Some(position) = session_positions.get(&session_id).copied() {
+                        items[position] = item;
+                    } else {
+                        session_positions.insert(session_id, items.len());
+                        items.push(item);
+                    }
                 }
                 continue;
             }
@@ -4081,9 +4156,11 @@ impl ThreadView {
                         }
                         _ => {}
                     }
-                    items.push(AgentActivityItem {
+                    let session_id = acp::SessionId::from(session_id);
+                    let item = AgentActivityItem {
                         entry_ix,
-                        session_id: Some(session_id.into()),
+                        session_id: Some(session_id.clone()),
+                        runtime_run_id: None,
                         runtime_task_id: None,
                         canonical_path: None,
                         queued_messages: 0,
@@ -4108,7 +4185,13 @@ impl ThreadView {
                         last_activity_at: None,
                         awaiting_plan_approval: false,
                         has_final_output: false,
-                    });
+                    };
+                    if let Some(position) = session_positions.get(&session_id).copied() {
+                        items[position] = item;
+                    } else {
+                        session_positions.insert(session_id, items.len());
+                        items.push(item);
+                    }
                 }
                 continue;
             }
@@ -4236,6 +4319,7 @@ impl ThreadView {
             let item = AgentActivityItem {
                 entry_ix,
                 session_id: Some(session_id.clone()),
+                runtime_run_id: None,
                 runtime_task_id: None,
                 canonical_path: None,
                 queued_messages: 0,
@@ -4274,17 +4358,46 @@ impl ThreadView {
             }
         }
 
-        let orchestration_snapshot = self.as_native_thread(cx).and_then(|thread| {
-            let thread = thread.read(cx);
-            if let Some(run) = thread.orchestration_run() {
-                Some(run.activity_projection())
-            } else {
-                thread
-                    .persisted_orchestration_run()
-                    .map(|run| run.activity_projection())
-            }
-        });
-        if let Some(projection) = orchestration_snapshot {
+        let orchestration_snapshots = self
+            .as_native_thread(cx)
+            .map(|thread| {
+                let thread = thread.read(cx);
+                let mut projections = thread
+                    .orchestration_runs()
+                    .iter()
+                    .map(|run| {
+                        let projection = run.activity_projection();
+                        let mut stale = run.historical_session_ids();
+                        stale.extend(projection.stale_session_ids.iter().cloned());
+                        (projection, stale)
+                    })
+                    .collect::<Vec<_>>();
+                for run in thread.persisted_orchestration_runs() {
+                    if thread.orchestration_run_by_id(&run.run_id).is_none() {
+                        let projection = run.activity_projection();
+                        let mut stale = run.historical_session_ids();
+                        stale.extend(projection.stale_session_ids.iter().cloned());
+                        projections.push((projection, stale));
+                    }
+                }
+                projections
+            })
+            .unwrap_or_default();
+
+        if !orchestration_snapshots.is_empty() {
+            let stale_session_ids = orchestration_snapshots
+                .iter()
+                .flat_map(|(_, stale)| stale.iter().cloned())
+                .collect::<HashSet<_>>();
+            items.retain(|item| {
+                if let Some(session_id) = &item.session_id {
+                    if stale_session_ids.contains(session_id) {
+                        return false;
+                    }
+                }
+                true
+            });
+
             let fallback_entry_ix = entries
                 .iter()
                 .enumerate()
@@ -4297,52 +4410,54 @@ impl ThreadView {
                 })
                 .unwrap_or_default();
 
-            for status in projection.task_statuses.iter() {
-                let Some(task) = projection.task(&status.task_id) else {
-                    continue;
-                };
-                let activity_status = AgentActivityStatus::from_orchestration_state(status.state);
-                let awaiting_plan_approval = projection.state
-                    == agent_orchestration::RunState::Proposed
-                    && status.state == agent_orchestration::TaskState::Pending;
-                let metadata = status.worker_metadata.as_ref();
-                let active_model = status.model.as_deref().or(task.model_override.as_deref());
-                let thinking_effort = if status.model.is_some()
-                    && status.model.as_deref() == task.fallback_model_override.as_deref()
-                {
-                    task.fallback_thinking_effort.as_deref()
-                } else {
-                    task.thinking_effort.as_deref()
-                };
-                let model = activity_model_label(metadata, active_model, thinking_effort)
-                    .map(SharedString::from);
-                let mode = metadata
-                    .and_then(|metadata| metadata.mode.clone())
-                    .or_else(|| task.mode.clone())
-                    .map(SharedString::from);
-                let worktree_path = metadata
-                    .and_then(|metadata| metadata.worktree_path.clone())
-                    .map(SharedString::from);
-                let worker = Some(SharedString::from(
-                    match metadata.and_then(|metadata| metadata.nested_agent_count) {
-                        Some(count) => format!("{} · {count} nested", task.target),
-                        None => task.target.to_string(),
-                    },
-                ));
-                let current_tool =
-                    status
-                        .current_tool
-                        .clone()
-                        .map(|name| DelegatedTaskToolActivity {
-                            name,
-                            arguments: None,
-                        });
-                let wait_reason = status
-                    .wait_reason
-                    .as_ref()
-                    .map(|reason| SharedString::from(reason.description()))
-                    .or_else(|| status.latest_error.clone().map(SharedString::from));
-                let patch_status = if status.state == agent_orchestration::TaskState::AwaitingApply
+            for (projection, _) in &orchestration_snapshots {
+                for status in projection.task_statuses.iter() {
+                    let Some(task) = projection.task(&status.task_id) else {
+                        continue;
+                    };
+                    let activity_status =
+                        AgentActivityStatus::from_orchestration_state(status.state);
+                    let awaiting_plan_approval = projection.state
+                        == agent_orchestration::RunState::Proposed
+                        && status.state == agent_orchestration::TaskState::Pending;
+                    let metadata = status.worker_metadata.as_ref();
+                    let active_model = status.model.as_deref().or(task.model_override.as_deref());
+                    let thinking_effort = if status.model.is_some()
+                        && status.model.as_deref() == task.fallback_model_override.as_deref()
+                    {
+                        task.fallback_thinking_effort.as_deref()
+                    } else {
+                        task.thinking_effort.as_deref()
+                    };
+                    let model = activity_model_label(metadata, active_model, thinking_effort)
+                        .map(SharedString::from);
+                    let mode = metadata
+                        .and_then(|metadata| metadata.mode.clone())
+                        .or_else(|| task.mode.clone())
+                        .map(SharedString::from);
+                    let worktree_path = metadata
+                        .and_then(|metadata| metadata.worktree_path.clone())
+                        .map(SharedString::from);
+                    let worker = Some(SharedString::from(
+                        match metadata.and_then(|metadata| metadata.nested_agent_count) {
+                            Some(count) => format!("{} · {count} nested", task.target),
+                            None => task.target.to_string(),
+                        },
+                    ));
+                    let current_tool =
+                        status
+                            .current_tool
+                            .clone()
+                            .map(|name| DelegatedTaskToolActivity {
+                                name,
+                                arguments: None,
+                            });
+                    let wait_reason = status
+                        .wait_reason
+                        .as_ref()
+                        .map(|reason| SharedString::from(reason.description()))
+                        .or_else(|| status.latest_error.clone().map(SharedString::from));
+                    let patch_status = if status.state == agent_orchestration::TaskState::AwaitingApply
                 {
                     Some(SharedString::from("Awaiting apply"))
                 } else if matches!(
@@ -4367,89 +4482,112 @@ impl ThreadView {
                 } else {
                     None
                 };
-                let session_position = status.active_session_id.as_ref().and_then(|session_id| {
-                    items
-                        .iter()
-                        .position(|item| item.session_id.as_ref() == Some(session_id))
-                });
-                let (canonical_path, queued_messages) = projection
-                    .agent_for_task(&task.id)
-                    .map(|agent| {
-                        (
-                            Some(SharedString::from(agent.path.to_string())),
-                            agent.queued_messages,
-                        )
-                    })
-                    .unwrap_or_default();
+                    let session_position = activity_item_position_for_runtime_task(
+                        &items,
+                        status.active_session_id.as_ref(),
+                        &projection.run_id,
+                        &task.id,
+                        task.target.is_native(),
+                        &task.label,
+                    );
+                    let (canonical_path, queued_messages) = projection
+                        .agent_for_task(&task.id)
+                        .map(|agent| {
+                            (
+                                Some(SharedString::from(agent.path.to_string())),
+                                agent.queued_messages,
+                            )
+                        })
+                        .unwrap_or_default();
 
-                if let Some(position) = session_position {
-                    let item = &mut items[position];
-                    item.runtime_task_id = Some(task.id.clone());
-                    item.canonical_path = canonical_path;
-                    item.queued_messages = queued_messages;
-                    item.harness = if task.target.is_native() {
-                        "Native"
-                    } else {
-                        "ACP"
-                    };
-                    item.status = activity_status;
-                    item.worker = worker;
-                    item.model = model.or_else(|| item.model.clone());
-                    item.mode = mode;
-                    item.role = task
-                        .native_role
-                        .clone()
-                        .map(SharedString::from)
-                        .or_else(|| item.role.clone());
-                    item.scope = task.scope.clone().map(SharedString::from);
-                    item.objective = task.objective.clone().map(SharedString::from);
-                    item.current_tool = current_tool;
-                    item.last_intent = wait_reason.or_else(|| item.last_intent.clone());
-                    item.tokens = Some(status.tokens_used)
-                        .filter(|tokens| *tokens > 0)
-                        .or(item.tokens);
-                    item.worktree_path = worktree_path;
-                    item.patch_status = patch_status;
-                    item.verification = status.latest_verification.clone();
-                    item.last_activity_at = metadata.and_then(|metadata| metadata.last_activity_at);
-                    item.awaiting_plan_approval = awaiting_plan_approval;
-                    item.has_final_output = status.latest_output.is_some();
-                    continue;
+                    if let Some(position) = session_position {
+                        let item = &mut items[position];
+                        item.runtime_run_id = Some(projection.run_id.clone());
+                        item.runtime_task_id = Some(task.id.clone());
+                        item.canonical_path = canonical_path;
+                        item.queued_messages = queued_messages;
+                        item.harness = if task.target.is_native() {
+                            "Native"
+                        } else {
+                            "ACP"
+                        };
+                        item.status = activity_status;
+                        item.worker = worker;
+                        item.model = model.or_else(|| item.model.clone());
+                        item.mode = mode;
+                        item.role = task
+                            .native_role
+                            .clone()
+                            .map(SharedString::from)
+                            .or_else(|| item.role.clone());
+                        item.scope = task.scope.clone().map(SharedString::from);
+                        item.objective = task.objective.clone().map(SharedString::from);
+                        item.current_tool = current_tool;
+                        item.last_intent = wait_reason.or_else(|| item.last_intent.clone());
+                        item.tokens = Some(status.tokens_used)
+                            .filter(|tokens| *tokens > 0)
+                            .or(item.tokens);
+                        item.worktree_path = worktree_path;
+                        item.patch_status = patch_status;
+                        item.verification = status.latest_verification.clone();
+                        item.last_activity_at =
+                            metadata.and_then(|metadata| metadata.last_activity_at);
+                        item.awaiting_plan_approval = awaiting_plan_approval;
+                        item.has_final_output = status.latest_output.is_some();
+                        continue;
+                    }
+
+                    items.push(AgentActivityItem {
+                        entry_ix: fallback_entry_ix,
+                        runtime_run_id: Some(projection.run_id.clone()),
+                        runtime_task_id: Some(task.id.clone()),
+                        canonical_path,
+                        queued_messages,
+                        session_id: status.active_session_id.clone(),
+                        name: task.label.clone().into(),
+                        harness: if task.target.is_native() {
+                            "Native"
+                        } else {
+                            "ACP"
+                        },
+                        status: activity_status,
+                        model,
+                        role: task.native_role.clone().map(SharedString::from),
+                        task: Some(task.description.clone().into()),
+                        current_tool,
+                        last_intent: wait_reason,
+                        tool_count: None,
+                        requests: None,
+                        tokens: Some(status.tokens_used).filter(|tokens| *tokens > 0),
+                        worker,
+                        mode,
+                        scope: task.scope.clone().map(SharedString::from),
+                        objective: task.objective.clone().map(SharedString::from),
+                        worktree_path,
+                        patch_status,
+                        verification: status.latest_verification.clone(),
+                        last_activity_at: metadata.and_then(|metadata| metadata.last_activity_at),
+                        awaiting_plan_approval,
+                        has_final_output: status.latest_output.is_some(),
+                    });
                 }
-
-                items.push(AgentActivityItem {
-                    entry_ix: fallback_entry_ix,
-                    runtime_task_id: Some(task.id.clone()),
-                    canonical_path,
-                    queued_messages,
-                    session_id: status.active_session_id.clone(),
-                    name: task.label.clone().into(),
-                    harness: if task.target.is_native() {
-                        "Native"
-                    } else {
-                        "ACP"
-                    },
-                    status: activity_status,
-                    model,
-                    role: task.native_role.clone().map(SharedString::from),
-                    task: Some(task.description.clone().into()),
-                    current_tool,
-                    last_intent: wait_reason,
-                    tool_count: None,
-                    requests: None,
-                    tokens: Some(status.tokens_used).filter(|tokens| *tokens > 0),
-                    worker,
-                    mode,
-                    scope: task.scope.clone().map(SharedString::from),
-                    objective: task.objective.clone().map(SharedString::from),
-                    worktree_path,
-                    patch_status,
-                    verification: status.latest_verification.clone(),
-                    last_activity_at: metadata.and_then(|metadata| metadata.last_activity_at),
-                    awaiting_plan_approval,
-                    has_final_output: status.latest_output.is_some(),
-                });
             }
+
+            let mut seen_tasks = HashSet::default();
+            let mut seen_sessions = HashSet::default();
+            items.retain(|item| {
+                if let Some(task_id) = &item.runtime_task_id {
+                    if !seen_tasks.insert((item.runtime_run_id.clone(), task_id.clone())) {
+                        return false;
+                    }
+                }
+                if let Some(session_id) = &item.session_id {
+                    if !seen_sessions.insert(session_id.clone()) {
+                        return false;
+                    }
+                }
+                true
+            });
         }
 
         items
@@ -4672,6 +4810,7 @@ impl ThreadView {
 
     fn worker_patch_action(
         &mut self,
+        run_id: agent_orchestration::RunId,
         task_id: agent_orchestration::TaskId,
         action: WorkerPatchAction,
         window: &mut Window,
@@ -4679,7 +4818,7 @@ impl ThreadView {
     ) {
         let Some(run) = self
             .as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+            .and_then(|thread| thread.read(cx).orchestration_run_by_id(&run_id).cloned())
         else {
             return;
         };
@@ -4856,6 +4995,18 @@ impl ThreadView {
             .iter()
             .filter(|item| item.status == AgentActivityStatus::AwaitingApply)
             .count();
+        let completed_count = items
+            .iter()
+            .filter(|item| item.status == AgentActivityStatus::Completed)
+            .count();
+        let failed_count = items
+            .iter()
+            .filter(|item| {
+                item.status == AgentActivityStatus::Failed
+                    || item.status == AgentActivityStatus::Canceled
+            })
+            .count();
+
         let mut summary = if waiting_count > 0 {
             format!("{active_count} active · {waiting_count} need input")
         } else if active_count > 0 {
@@ -4866,6 +5017,10 @@ impl ThreadView {
             format!("{awaiting_approval_count} awaiting approval")
         } else if pending_count > 0 {
             format!("{pending_count} queued")
+        } else if completed_count > 0 && failed_count > 0 {
+            format!("{completed_count} completed · {failed_count} failed")
+        } else if failed_count > 0 {
+            format!("{failed_count} failed")
         } else {
             format!("{} finished", items.len())
         };
@@ -4948,25 +5103,26 @@ impl ThreadView {
                         .children(items.iter().cloned().enumerate().map(|(index, item)| {
                             let is_last = index + 1 == items.len();
                             let target_session_id = item.session_id.clone();
+                            let target_run_id = item.runtime_run_id.clone();
                             let target_task_id = item.runtime_task_id.clone();
                             let entry_ix = item.entry_ix;
                             let status = item.status;
                             let awaiting_plan_approval = item.awaiting_plan_approval;
                             let patch_reviewable = item.patch_status.is_some();
                             let has_final_output = item.has_final_output;
-                            let can_restart = item.runtime_task_id.as_ref().is_some_and(|task_id| {
+                            let can_restart = item.runtime_run_id.as_ref().zip(item.runtime_task_id.as_ref()).is_some_and(|(run_id, task_id)| {
                                 self.as_native_thread(cx)
-                                    .and_then(|thread| thread.read(cx).orchestration_run().cloned())
+                                    .and_then(|thread| thread.read(cx).orchestration_run_by_id(run_id).cloned())
                                     .is_some_and(|run| !run.state().is_terminal() && run.task_status(task_id).is_some_and(|task| {
                                         task.state == agent_orchestration::TaskState::Parked
                                             && matches!(&task.wait_reason, Some(agent_orchestration::StructuredWaitReason::AwaitingUserInput { .. }))
                                     }))
                             });
                             let can_cancel = !awaiting_plan_approval
-                                && item.runtime_task_id.as_ref().is_some_and(|task_id| {
+                                && item.runtime_run_id.as_ref().zip(item.runtime_task_id.as_ref()).is_some_and(|(run_id, task_id)| {
                                     self.as_native_thread(cx)
                                         .and_then(|thread| {
-                                            thread.read(cx).orchestration_run().cloned()
+                                            thread.read(cx).orchestration_run_by_id(run_id).cloned()
                                         })
                                         .is_some_and(|run| {
                                             !run.state().is_terminal()
@@ -5061,14 +5217,15 @@ impl ThreadView {
                                             ),
                                         )
                                         .when_some(
-                                            item.runtime_task_id
+                                            item.runtime_run_id
                                                 .clone()
+                                                .zip(item.runtime_task_id.clone())
                                                 .filter(|_| can_cancel),
-                                            |header, task_id| {
+                                            |header, (run_id, task_id)| {
                                                 header.child(
                                                     IconButton::new(
                                                         SharedString::from(format!(
-                                                            "cancel-{task_id}"
+                                                            "cancel-{run_id}-{task_id}"
                                                         )),
                                                         IconName::Stop,
                                                     )
@@ -5080,6 +5237,7 @@ impl ThreadView {
                                                         move |this, _, window, cx| {
                                                             cx.stop_propagation();
                                                             this.worker_patch_action(
+                                                                run_id.clone(),
                                                                 task_id.clone(),
                                                                 WorkerPatchAction::Cancel,
                                                                 window,
@@ -5119,28 +5277,28 @@ impl ThreadView {
                                         ))
                                     },
                                 )
-                                .when_some(item.runtime_task_id.clone().filter(|_| can_restart), |element, task_id| {
-                                    element.child(Button::new(SharedString::from(format!("restart-{task_id}")), "Restart Attempt")
+                                .when_some(item.runtime_run_id.clone().zip(item.runtime_task_id.clone()).filter(|_| can_restart), |element, (run_id, task_id)| {
+                                    element.child(Button::new(SharedString::from(format!("restart-{run_id}-{task_id}")), "Restart Attempt")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Restart, window, cx);
+                                            this.worker_patch_action(run_id.clone(), task_id.clone(), WorkerPatchAction::Restart, window, cx);
                                         })))
                                 })
-                                .when_some(item.runtime_task_id.clone().filter(|_| item.worktree_path.is_some()), |element, task_id| {
-                                    element.child(Button::new(SharedString::from(format!("open-worktree-{task_id}")), "Open Worktree")
+                                .when_some(item.runtime_run_id.clone().zip(item.runtime_task_id.clone()).filter(|_| item.worktree_path.is_some()), |element, (run_id, task_id)| {
+                                    element.child(Button::new(SharedString::from(format!("open-worktree-{run_id}-{task_id}")), "Open Worktree")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::OpenWorktree, window, cx);
+                                            this.worker_patch_action(run_id.clone(), task_id.clone(), WorkerPatchAction::OpenWorktree, window, cx);
                                         })))
                                 })
-                                .when_some(item.runtime_task_id.clone().filter(|_| item.worktree_path.is_some() && matches!(status, AgentActivityStatus::Completed | AgentActivityStatus::Failed | AgentActivityStatus::Canceled)), |element, task_id| {
-                                    element.child(Button::new(SharedString::from(format!("cleanup-{task_id}")), "Retry Cleanup")
+                                .when_some(item.runtime_run_id.clone().zip(item.runtime_task_id.clone()).filter(|_| item.worktree_path.is_some() && matches!(status, AgentActivityStatus::Completed | AgentActivityStatus::Failed | AgentActivityStatus::Canceled)), |element, (run_id, task_id)| {
+                                    element.child(Button::new(SharedString::from(format!("cleanup-{run_id}-{task_id}")), "Retry Cleanup")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.worker_patch_action(task_id.clone(), WorkerPatchAction::Cleanup, window, cx);
+                                            this.worker_patch_action(run_id.clone(), task_id.clone(), WorkerPatchAction::Cleanup, window, cx);
                                         })))
                                 })
-                                .when_some(item.runtime_task_id.filter(|_| patch_reviewable), |element, task_id| {
+                                .when_some(item.runtime_run_id.clone().zip(item.runtime_task_id).filter(|_| patch_reviewable), |element, (run_id, task_id)| {
                                     let apply_label = if status == AgentActivityStatus::Blocked {
                                         "Retry Apply"
                                     } else {
@@ -5151,11 +5309,12 @@ impl ThreadView {
                                         (apply_label, WorkerPatchAction::Apply),
                                         ("Reject", WorkerPatchAction::Reject),
                                     ].into_iter().map(|(label, action)| {
+                                        let run_id = run_id.clone();
                                         let task_id = task_id.clone();
-                                        Button::new(SharedString::from(format!("worker-{task_id}-{label}")), label)
+                                        Button::new(SharedString::from(format!("worker-{run_id}-{task_id}-{label}")), label)
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
-                                                this.worker_patch_action(task_id.clone(), action, window, cx);
+                                                this.worker_patch_action(run_id.clone(), task_id.clone(), action, window, cx);
                                             }))
                                     })))
                                 })
@@ -5171,14 +5330,14 @@ impl ThreadView {
                                             .read_with(cx, |view, _| view.thread_view(session_id).is_some())
                                             .unwrap_or(false)
                                     });
-                                    if let Some(task_id) = target_task_id.clone()
+                                    if let Some((run_id, task_id)) = target_run_id.clone().zip(target_task_id.clone())
                                         && should_open_worker_output(
                                             has_final_output,
                                             target_session_id.is_some(),
                                             session_is_loaded,
                                         )
                                     {
-                                        this.worker_patch_action(task_id, WorkerPatchAction::Output, window, cx);
+                                        this.worker_patch_action(run_id, task_id, WorkerPatchAction::Output, window, cx);
                                         return;
                                     }
                                     if let Some(session_id) = target_session_id.clone() {
@@ -5216,13 +5375,20 @@ impl ThreadView {
             .editor_background
             .blend(Color::Accent.color(cx).opacity(0.07));
         v_flex()
-            .id("orchestration-runtime-proposal")
+            .id(SharedString::from(format!(
+                "orchestration-runtime-proposal-{}",
+                run.run_id()
+            )))
             .w_full()
             .px_2()
             .py_1p5()
             .gap_1()
             .bg(background)
-            .child(self.render_orchestration_proposal_header(&presentation, cx))
+            .child(self.render_orchestration_proposal_header(
+                &presentation,
+                run.run_id().clone(),
+                cx,
+            ))
             .child(
                 Label::new(presentation.task_preview)
                     .size(LabelSize::XSmall)
@@ -5236,6 +5402,7 @@ impl ThreadView {
     fn render_orchestration_proposal_header(
         &self,
         presentation: &OrchestrationProposalPresentation,
+        run_id: agent_orchestration::RunId,
         cx: &Context<Self>,
     ) -> AnyElement {
         h_flex()
@@ -5270,43 +5437,56 @@ impl ThreadView {
                     ),
             )
             .child(div().flex_1())
-            .child(
-                self.render_orchestration_proposal_actions(presentation.approve_label.clone(), cx),
-            )
+            .child(self.render_orchestration_proposal_actions(
+                presentation.approve_label.clone(),
+                run_id,
+                cx,
+            ))
             .into_any_element()
     }
 
     fn render_orchestration_proposal_actions(
         &self,
         approve_label: String,
+        run_id: agent_orchestration::RunId,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let cancel_run_id = run_id.clone();
+        let approve_run_id = run_id.clone();
         h_flex()
             .gap_1p5()
             .child(
-                Button::new("cancel-orchestration-runtime", "Cancel")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            thread.update(cx, |thread, cx| {
-                                thread.cancel_orchestration_run(cx);
-                            });
-                        }
-                    })),
+                Button::new(
+                    SharedString::from(format!("cancel-orchestration-runtime-{run_id}")),
+                    "Cancel",
+                )
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(thread) = this.as_native_thread(cx) {
+                        let run_id = cancel_run_id.clone();
+                        thread.update(cx, |thread, cx| {
+                            thread.cancel_orchestration_run_by_id(&run_id, cx);
+                        });
+                    }
+                })),
             )
             .child(
-                Button::new("approve-orchestration-runtime", approve_label)
-                    .style(ButtonStyle::Filled)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(thread) = this.as_native_thread(cx)
-                            && let Err(error) =
-                                thread.update(cx, |thread, cx| thread.approve_orchestration_run(cx))
-                        {
-                            log::error!("failed to approve orchestration run: {error}");
-                        }
-                    })),
+                Button::new(
+                    SharedString::from(format!("approve-orchestration-runtime-{run_id}")),
+                    approve_label,
+                )
+                .style(ButtonStyle::Filled)
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(thread) = this.as_native_thread(cx)
+                        && let Err(error) = thread.update(cx, |thread, cx| {
+                            thread.approve_orchestration_run_by_id(&approve_run_id, cx)
+                        })
+                    {
+                        log::error!("failed to approve orchestration run: {error}");
+                    }
+                })),
             )
             .into_any_element()
     }
@@ -5327,8 +5507,13 @@ impl ThreadView {
             .map(|task| task.label.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        let resume_run_id = persisted.run_id.clone();
+        let discard_run_id = persisted.run_id.clone();
         h_flex()
-            .id("orchestration-runtime-resume")
+            .id(SharedString::from(format!(
+                "orchestration-runtime-resume-{}",
+                persisted.run_id
+            )))
             .p_1()
             .w_full()
             .gap_1()
@@ -5342,37 +5527,51 @@ impl ThreadView {
             )
             .child(div().flex_1())
             .child(
-                Button::new("resume-orchestration-runtime", "Resume")
-                    .style(ButtonStyle::Filled)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            let task =
-                                thread.update(cx, |thread, cx| thread.resume_orchestration_run(cx));
-                            cx.spawn(async move |_this, _cx| match task.await {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    log::error!("no interrupted orchestration run to resume");
-                                }
-                                Err(error) => {
-                                    log::error!("failed to resume orchestration run: {error}");
-                                }
-                            })
-                            .detach();
-                        }
-                    })),
+                Button::new(
+                    SharedString::from(format!(
+                        "resume-orchestration-runtime-{}",
+                        persisted.run_id
+                    )),
+                    "Resume",
+                )
+                .style(ButtonStyle::Filled)
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(thread) = this.as_native_thread(cx) {
+                        let run_id = resume_run_id.clone();
+                        let task = thread.update(cx, |thread, cx| {
+                            thread.resume_orchestration_run_by_id(Some(run_id), cx)
+                        });
+                        cx.spawn(async move |_this, _cx| match task.await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                log::error!("no interrupted orchestration run to resume");
+                            }
+                            Err(error) => {
+                                log::error!("failed to resume orchestration run: {error}");
+                            }
+                        })
+                        .detach();
+                    }
+                })),
             )
             .child(
-                Button::new("discard-orchestration-runtime", "Cancel")
-                    .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            thread.update(cx, |thread, cx| {
-                                thread.set_persisted_orchestration_run(None, cx);
-                            });
-                        }
-                    })),
+                Button::new(
+                    SharedString::from(format!(
+                        "discard-orchestration-runtime-{}",
+                        persisted.run_id
+                    )),
+                    "Cancel",
+                )
+                .style(ButtonStyle::Outlined)
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(thread) = this.as_native_thread(cx) {
+                        thread.update(cx, |thread, cx| {
+                            thread.remove_persisted_orchestration_run(&discard_run_id, cx);
+                        });
+                    }
+                })),
             )
             .tooltip(Tooltip::text(task_summary))
             .into_any_element()
@@ -5396,15 +5595,28 @@ impl ThreadView {
         let native_proposed_plan = self
             .as_native_thread(cx)
             .and_then(|thread| thread.read(cx).proposed_plan().cloned());
-        let orchestration_proposal = self
+        let (orchestration_proposals, orchestration_persisted) = self
             .as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).orchestration_run().cloned())
-            .filter(|run| run.state() == agent_orchestration::RunState::Proposed);
-        let orchestration_persisted = self
-            .as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).persisted_orchestration_run().cloned())
-            .filter(|run| !run.state.is_terminal())
-            .filter(|_| orchestration_proposal.is_none());
+            .map(|thread| {
+                let thread = thread.read(cx);
+                let proposals = thread
+                    .orchestration_runs()
+                    .iter()
+                    .filter(|run| run.state() == agent_orchestration::RunState::Proposed)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let persisted = thread
+                    .persisted_orchestration_runs()
+                    .iter()
+                    .filter(|run| !run.state.is_terminal())
+                    .filter(|run| thread.orchestration_run_by_id(&run.run_id).is_none())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (proposals, persisted)
+            })
+            .unwrap_or_default();
+        let has_orchestration_notice =
+            !orchestration_proposals.is_empty() || !orchestration_persisted.is_empty();
         let has_plan = !plan.is_empty() || native_plan.is_some() || native_proposed_plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
 
@@ -5418,8 +5630,7 @@ impl ThreadView {
             && queue_is_empty
             && !has_awaiting_permission
             && agent_activity.is_empty()
-            && orchestration_proposal.is_none()
-            && orchestration_persisted.is_none()
+            && !has_orchestration_notice
         {
             return None;
         }
@@ -5464,14 +5675,18 @@ impl ThreadView {
                         ])
                     })
                     .when_some(awaiting_permission, |this, element| this.child(element))
-                    .when_some(orchestration_proposal.as_ref(), |this, run| {
-                        this.child(self.render_orchestration_proposal(run, cx))
-                    })
-                    .when_some(orchestration_persisted.as_ref(), |this, run| {
-                        this.child(self.render_orchestration_resume(run, cx))
-                    })
+                    .children(
+                        orchestration_proposals
+                            .iter()
+                            .map(|run| self.render_orchestration_proposal(run, cx)),
+                    )
+                    .children(
+                        orchestration_persisted
+                            .iter()
+                            .map(|run| self.render_orchestration_resume(run, cx)),
+                    )
                     .when(
-                        (orchestration_proposal.is_some() || orchestration_persisted.is_some())
+                        has_orchestration_notice
                             && (!agent_activity.is_empty()
                                 || has_plan
                                 || !changed_buffers.is_empty()
@@ -6580,76 +6795,6 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn render_completed_plan(
-        &self,
-        entries: &[PlanEntry],
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        v_flex()
-            .px_5()
-            .py_1p5()
-            .w_full()
-            .child(
-                v_flex()
-                    .w_full()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(self.tool_card_border_color(cx))
-                    .child(
-                        h_flex()
-                            .px_2()
-                            .py_1()
-                            .gap_1()
-                            .bg(self.tool_card_header_bg(cx))
-                            .border_b_1()
-                            .border_color(self.tool_card_border_color(cx))
-                            .child(
-                                Label::new("Completed Plan")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new(format!(
-                                    "— {} {}",
-                                    entries.len(),
-                                    if entries.len() == 1 { "step" } else { "steps" }
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
-                    )
-                    .child(
-                        v_flex().children(entries.iter().enumerate().map(|(index, entry)| {
-                            h_flex()
-                                .py_1()
-                                .px_2()
-                                .gap_1p5()
-                                .when(index < entries.len() - 1, |this| {
-                                    this.border_b_1().border_color(cx.theme().colors().border)
-                                })
-                                .child(
-                                    Icon::new(IconName::TodoComplete)
-                                        .size(IconSize::Small)
-                                        .color(Color::Success),
-                                )
-                                .child(
-                                    div()
-                                        .max_w_full()
-                                        .overflow_x_hidden()
-                                        .text_xs()
-                                        .text_color(cx.theme().colors().text_muted)
-                                        .child(MarkdownElement::new(
-                                            entry.content.clone(),
-                                            default_markdown_style(window, cx),
-                                        )),
-                                )
-                        })),
-                    ),
-            )
-            .into_any()
-    }
-
     fn render_context_compaction(
         &self,
         entry_ix: usize,
@@ -7246,6 +7391,7 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .min_w_0()
+                                    .items_center()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
@@ -8014,6 +8160,12 @@ impl ThreadView {
                 return None;
             };
         let provider = LanguageModelRegistry::read_global(cx).provider(&provider_id)?;
+        if provider
+            .quota_pool(Some(native_thread.read(cx).model()?.id().0.as_ref()), cx)
+            .is_some()
+        {
+            return None;
+        }
         let accounts = provider.account_summaries(cx);
         if accounts.is_empty() {
             return None;
@@ -8119,14 +8271,33 @@ impl ThreadView {
         let ratio = remaining_pct
             .map(|p| (p / 100.0).clamp(0.0, 1.0) as f32)
             .unwrap_or(0.0);
-        let is_narrow_window = window.viewport_size().width < px(800.0);
+
+        let editor_width = self
+            .message_editor
+            .read(cx)
+            .editor()
+            .read(cx)
+            .last_bounds()
+            .map(|b| b.size.width)
+            .or_else(|| {
+                let list_width = self.list_state.viewport_bounds().size.width;
+                (list_width > px(0.0)).then_some(list_width)
+            })
+            .or_else(|| {
+                self.workspace
+                    .upgrade()
+                    .and_then(|ws| ws.read(cx).panel_size_state::<AgentPanel>(cx))
+                    .and_then(|s| s.size)
+            });
+
+        let is_narrow = editor_width
+            .map(|w| w < px(480.0))
+            .unwrap_or_else(|| window.viewport_size().width < px(800.0));
 
         let tooltip_accounts = quota_pool.accounts.clone();
         let tooltip_eligible = quota_pool.eligible_accounts;
         let tooltip_total = quota_pool.total_accounts;
         let is_pool_stale = quota_pool.is_stale;
-
-        let account_menu_handle = self.chatgpt_account_menu_handle.clone();
 
         let title_text = if tooltip_eligible == 0 {
             "Quota Pool: 0% remaining (Exhausted)".to_string()
@@ -8144,225 +8315,311 @@ impl ThreadView {
             "Quota Pool: Checking quota...".to_string()
         };
 
-        Some(
-            h_flex()
-                .id("quota-pool-bar")
-                .items_center()
-                .cursor_pointer()
-                .px_1()
-                .py_0p5()
-                .rounded_md()
-                .hover(|this| this.bg(cx.theme().colors().element_hover))
-                .on_click({
-                    let account_menu_handle = account_menu_handle.clone();
-                    cx.listener(move |_this, _, window, cx| {
-                        account_menu_handle.toggle(window, cx);
-                    })
-                })
-                .tooltip(Tooltip::element(move |_window, _cx| {
-                    v_flex()
-                        .gap_1()
-                        .p_1()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .gap_2()
-                                .child(Label::new(title_text.clone()).weight(FontWeight::SEMIBOLD))
-                                .child(
-                                    Label::new(format!(
-                                        "({}/{} accounts)",
-                                        tooltip_eligible, tooltip_total
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                ),
-                        )
-                        .when(!tooltip_accounts.is_empty(), |this| {
-                            this.child(v_flex().gap_0p5().children(tooltip_accounts.iter().map(
-                                |acc| {
-                                    let mut status_note = String::new();
-                                    if acc.is_active {
-                                        status_note.push_str(" · Active");
-                                    }
-                                    if !acc.is_eligible {
-                                        if acc.is_reauth_required {
-                                            status_note.push_str(" · Sign-in required");
-                                        } else if acc.is_rate_limited {
-                                            status_note.push_str(" · Rate-limited");
-                                        } else if acc.is_forbidden {
-                                            status_note.push_str(" · Restricted");
-                                        }
-                                    }
+        let (header, add_label, cancel_label) =
+            if provider_id == LanguageModelProviderId::new("openai-subscribed") {
+                (
+                    "ChatGPT accounts",
+                    "Add ChatGPT account",
+                    "Cancel ChatGPT sign-in",
+                )
+            } else if provider_id == LanguageModelProviderId::new("x_ai_subscribed") {
+                (
+                    "SuperGrok accounts",
+                    "Add SuperGrok account",
+                    "Cancel SuperGrok sign-in",
+                )
+            } else {
+                ("Accounts", "Add account", "Cancel sign-in")
+            };
 
-                                    let quota_label = if let Some(rem) = acc.remaining_percent {
-                                        let stale_tag = if acc.is_stale { " · stale" } else { "" };
-                                        format!("{:.0}%{stale_tag}", rem)
-                                    } else {
-                                        "Unknown".to_string()
-                                    };
+        let menu_accounts = provider.account_summaries(cx);
+        let menu_provider = provider.clone();
+        let busy = menu_accounts.iter().any(|account| account.is_busy);
+        let can_cancel_sign_in = provider.can_cancel_account_sign_in(cx);
 
-                                    h_flex()
-                                        .justify_between()
-                                        .gap_3()
-                                        .child(
-                                            Label::new(format!("• {}{status_note}", acc.label))
-                                                .size(LabelSize::Small)
-                                                .color(if acc.is_active {
-                                                    Color::Default
-                                                } else {
-                                                    Color::Muted
-                                                }),
-                                        )
-                                        .child(
-                                            Label::new(quota_label)
-                                                .size(LabelSize::Small)
-                                                .weight(FontWeight::MEDIUM),
-                                        )
-                                },
-                            )))
-                        })
-                        .into_any_element()
-                }))
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, _, window, cx| {
-                            // Algorithmic color distinguishing 0% vs 1%..100% vs Unknown:
-                            // - 0% Quota: Completely exhausted -> Desaturated muted gray (inactive/depleted).
-                            // - 1% Quota: Critical warning -> Pure vibrant Alert Red (Hue 0°).
-                            // - 1% to 100%: Mathematical smooth transition from Red (Hue 0°) to Green (Hue 120°).
-                            // - Unknown quota: Neutral muted color (does not masquerade as 100% full green).
-                            let (pool_color, is_zero) = if tooltip_eligible == 0 || is_empty {
-                                (cx.theme().colors().text_muted, true)
-                            } else if let Some(pct) = remaining_pct {
-                                let t = ((pct - 1.0) / 99.0).clamp(0.0, 1.0) as f32;
-                                let hue = t * (1.0 / 3.0);
-                                let saturation = if is_pool_stale { 0.50 } else { 0.90 };
-                                (gpui::hsla(hue, saturation, 0.48, 1.0), false)
+        let canvas_element = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                // Algorithmic color distinguishing 0% vs 1%..100% vs Unknown:
+                // - 0% Quota: Completely exhausted -> Desaturated muted gray (inactive/depleted).
+                // - 1% Quota: Critical warning -> Pure vibrant Alert Red (Hue 0°).
+                // - 1% to 100%: Mathematical smooth transition from Red (Hue 0°) to Green (Hue 120°).
+                // - Unknown quota: Neutral muted color (does not masquerade as 100% full green).
+                let (pool_color, is_zero) = if tooltip_eligible == 0 || is_empty {
+                    (cx.theme().colors().text_muted, true)
+                } else if let Some(pct) = remaining_pct {
+                    let t = ((pct - 1.0) / 99.0).clamp(0.0, 1.0) as f32;
+                    let hue = t * (1.0 / 3.0);
+                    let saturation = if is_pool_stale { 0.50 } else { 0.90 };
+                    (gpui::hsla(hue, saturation, 0.48, 1.0), false)
+                } else {
+                    (cx.theme().colors().text_muted, true)
+                };
+                let bg_color = cx.theme().colors().border_variant.opacity(0.5);
+
+                // Responsive check: if narrow space (< 50px), render as circle
+                if bounds.size.width < px(50.0) {
+                    let diameter = bounds.size.height.min(bounds.size.width).min(px(14.0));
+                    let center_x = bounds.origin.x + bounds.size.width * 0.5;
+                    let center_y = bounds.origin.y + bounds.size.height * 0.5;
+                    let stroke_width = px(2.5);
+                    let radius = (diameter - stroke_width) * 0.5;
+
+                    if radius > px(1.0) {
+                        let mut bg_builder = PathBuilder::stroke(stroke_width);
+                        bg_builder.move_to(point(center_x + radius, center_y));
+                        bg_builder.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center_x - radius, center_y),
+                        );
+                        bg_builder.arc_to(
+                            point(radius, radius),
+                            px(0.0),
+                            false,
+                            true,
+                            point(center_x + radius, center_y),
+                        );
+                        bg_builder.close();
+                        if let Ok(path) = bg_builder.build() {
+                            window.paint_path(path, bg_color);
+                        }
+
+                        // Active progress arc: drawn if quota > 0%
+                        if !is_zero {
+                            // Ensure at least a visible arc pip for 1%
+                            let arc_ratio = ratio.max(0.04);
+                            let mut progress_builder = PathBuilder::stroke(stroke_width);
+                            if arc_ratio >= 0.999 {
+                                progress_builder.move_to(point(center_x + radius, center_y));
+                                progress_builder.arc_to(
+                                    point(radius, radius),
+                                    px(0.0),
+                                    false,
+                                    true,
+                                    point(center_x - radius, center_y),
+                                );
+                                progress_builder.arc_to(
+                                    point(radius, radius),
+                                    px(0.0),
+                                    false,
+                                    true,
+                                    point(center_x + radius, center_y),
+                                );
+                                progress_builder.close();
                             } else {
-                                (cx.theme().colors().text_muted, true)
-                            };
-                            let bg_color = cx.theme().colors().border_variant.opacity(0.5);
+                                let start_x = center_x;
+                                let start_y = center_y - radius;
+                                progress_builder.move_to(point(start_x, start_y));
 
-                            // Responsive check: if narrow space (< 50px), render as circle
-                            if bounds.size.width < px(50.0) {
-                                let diameter =
-                                    bounds.size.height.min(bounds.size.width).min(px(14.0));
-                                let center_x = bounds.origin.x + bounds.size.width / 2.;
-                                let center_y = bounds.origin.y + bounds.size.height / 2.;
-                                let stroke_width = px(2.5);
-                                let radius = (diameter / 2.) - stroke_width / 2.;
+                                let angle = -std::f32::consts::PI / 2.0
+                                    + (arc_ratio * 2.0 * std::f32::consts::PI);
+                                let end_x = center_x + radius * angle.cos();
+                                let end_y = center_y + radius * angle.sin();
+                                let large_arc = arc_ratio > 0.5;
 
-                                if radius > px(1.0) {
-                                    let mut bg_builder = PathBuilder::stroke(stroke_width);
-                                    bg_builder.move_to(point(center_x + radius, center_y));
-                                    bg_builder.arc_to(
-                                        point(radius, radius),
-                                        px(0.),
-                                        false,
-                                        true,
-                                        point(center_x - radius, center_y),
-                                    );
-                                    bg_builder.arc_to(
-                                        point(radius, radius),
-                                        px(0.),
-                                        false,
-                                        true,
-                                        point(center_x + radius, center_y),
-                                    );
-                                    bg_builder.close();
-                                    if let Ok(path) = bg_builder.build() {
-                                        window.paint_path(path, bg_color);
-                                    }
+                                progress_builder.arc_to(
+                                    point(radius, radius),
+                                    px(0.0),
+                                    large_arc,
+                                    true,
+                                    point(end_x, end_y),
+                                );
+                            }
+                            if let Ok(path) = progress_builder.build() {
+                                window.paint_path(path, pool_color);
+                            }
+                        }
+                    }
+                } else {
+                    // 10-segmented bar ("Làm gì làm cứ chia thành 10 nấc")
+                    let num_segments = 10;
+                    let gap = px(2.0);
+                    let total_gap = gap * (num_segments - 1) as f32;
+                    let segment_w =
+                        ((bounds.size.width - total_gap) / num_segments as f32).max(px(3.0));
+                    let segment_h = px(10.0).min(bounds.size.height);
+                    let top = bounds.origin.y + (bounds.size.height - segment_h) / 2.0;
 
-                                    // Active progress arc: drawn if quota > 0%
-                                    if !is_zero {
-                                        // Ensure at least a visible arc pip for 1%
-                                        let arc_ratio = ratio.max(0.04);
-                                        let mut progress_builder =
-                                            PathBuilder::stroke(stroke_width);
-                                        if arc_ratio >= 0.999 {
-                                            progress_builder
-                                                .move_to(point(center_x + radius, center_y));
-                                            progress_builder.arc_to(
-                                                point(radius, radius),
-                                                px(0.),
-                                                false,
-                                                true,
-                                                point(center_x - radius, center_y),
-                                            );
-                                            progress_builder.arc_to(
-                                                point(radius, radius),
-                                                px(0.),
-                                                false,
-                                                true,
-                                                point(center_x + radius, center_y),
-                                            );
-                                            progress_builder.close();
-                                        } else {
-                                            let start_x = center_x;
-                                            let start_y = center_y - radius;
-                                            progress_builder.move_to(point(start_x, start_y));
+                    // At 0%: 0 segments lit.
+                    // At 1%..10%: 1 segment lit (in vibrant Alert Red).
+                    // At 100%: 10 segments lit (in vibrant Green).
+                    let fill_threshold = if is_zero {
+                        0
+                    } else {
+                        ((ratio * num_segments as f32).round() as usize).max(1)
+                    };
 
-                                            let angle = -std::f32::consts::PI / 2.0
-                                                + (arc_ratio * 2.0 * std::f32::consts::PI);
-                                            let end_x = center_x + radius * angle.cos();
-                                            let end_y = center_y + radius * angle.sin();
-                                            let large_arc = arc_ratio > 0.5;
+                    for i in 0..num_segments {
+                        let left = bounds.origin.x + (segment_w + gap) * i as f32;
+                        let segment_bounds =
+                            Bounds::new(point(left, top), size(segment_w, segment_h));
 
-                                            progress_builder.arc_to(
-                                                point(radius, radius),
-                                                px(0.),
-                                                large_arc,
-                                                true,
-                                                point(end_x, end_y),
-                                            );
-                                        }
-                                        if let Ok(path) = progress_builder.build() {
-                                            window.paint_path(path, pool_color);
-                                        }
+                        let is_active = i < fill_threshold;
+                        let color = if is_active { pool_color } else { bg_color };
+
+                        window.paint_quad(gpui::fill(segment_bounds, color).corner_radii(px(1.5)));
+                    }
+                }
+            },
+        )
+        .h(px(14.0))
+        .w_full();
+
+        let trigger = ButtonLike::new("quota-pool-bar")
+            .style(ButtonStyle::Subtle)
+            .width(gpui::relative(1.0))
+            .child(canvas_element);
+
+        let tooltip =
+            Tooltip::element(move |_window, cx| {
+                v_flex()
+                    .gap_1()
+                    .p_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(Label::new(title_text.clone()).weight(FontWeight::SEMIBOLD))
+                            .child(
+                                Label::new(format!(
+                                    "({}/{} accounts)",
+                                    tooltip_eligible, tooltip_total
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                    )
+                    .when(!tooltip_accounts.is_empty(), |this| {
+                        this.child(v_flex().gap_0p5().children(tooltip_accounts.iter().map(
+                            |acc| {
+                                let mut status_note = String::new();
+                                if acc.is_active {
+                                    status_note.push_str(" · Active");
+                                }
+                                if !acc.is_eligible {
+                                    if acc.is_reauth_required {
+                                        status_note.push_str(" · Sign-in required");
+                                    } else if acc.is_rate_limited {
+                                        status_note.push_str(" · Rate-limited");
+                                    } else if acc.is_forbidden {
+                                        status_note.push_str(" · Restricted");
                                     }
                                 }
-                            } else {
-                                // 10-segmented bar ("Làm gì làm cứ chia thành 10 nấc")
-                                let num_segments = 10;
-                                let gap = px(2.0);
-                                let total_gap = gap * (num_segments - 1) as f32;
-                                let segment_w = ((bounds.size.width - total_gap)
-                                    / num_segments as f32)
-                                    .max(px(3.0));
-                                let segment_h = px(10.0).min(bounds.size.height);
-                                let top = bounds.origin.y + (bounds.size.height - segment_h) / 2.;
 
-                                // At 0%: 0 segments lit.
-                                // At 1%..10%: 1 segment lit (in vibrant Alert Red).
-                                // At 100%: 10 segments lit (in vibrant Green).
-                                let fill_threshold = if is_zero {
-                                    0
+                                let quota_label = if let Some(rem) = acc.remaining_percent {
+                                    let stale_tag = if acc.is_stale { " · stale" } else { "" };
+                                    format!("{:.0}%{stale_tag}", rem)
                                 } else {
-                                    ((ratio * num_segments as f32).round() as usize).max(1)
+                                    "Unknown".to_string()
                                 };
 
-                                for i in 0..num_segments {
-                                    let left = bounds.origin.x + (segment_w + gap) * i as f32;
-                                    let segment_bounds =
-                                        Bounds::new(point(left, top), size(segment_w, segment_h));
-
-                                    let is_active = i < fill_threshold;
-                                    let color = if is_active { pool_color } else { bg_color };
-
-                                    window.paint_quad(
-                                        gpui::fill(segment_bounds, color).corner_radii(px(1.5)),
-                                    );
-                                }
-                            }
-                        },
+                                h_flex()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(
+                                        Label::new(format!("• {}{status_note}", acc.label))
+                                            .size(LabelSize::Small)
+                                            .color(if acc.is_active {
+                                                Color::Default
+                                            } else {
+                                                Color::Muted
+                                            }),
+                                    )
+                                    .child(
+                                        Label::new(quota_label)
+                                            .size(LabelSize::Small)
+                                            .weight(FontWeight::MEDIUM),
+                                    )
+                            },
+                        )))
+                    })
+                    .child(
+                        h_flex()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Click to switch account")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     )
-                    .h(px(14.0))
-                    .when(is_narrow_window, |this| this.w(px(14.0)))
-                    .when(!is_narrow_window, |this| {
-                        this.w(px(72.0)).min_w(px(14.0)).flex_shrink_1()
-                    }),
+                    .into_any_element()
+            });
+
+        Some(
+            div()
+                .when(is_narrow, |this| this.w(px(22.0)))
+                .when(!is_narrow, |this| {
+                    this.w(px(80.0)).min_w(px(22.0)).flex_shrink_1()
+                })
+                .child(
+                    PopoverMenu::new("quota-pool-menu")
+                        .full_width(true)
+                        .with_handle(self.chatgpt_account_menu_handle.clone())
+                        .trigger_with_tooltip(trigger, tooltip)
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .menu(move |window, cx| {
+                            let accounts = menu_accounts.clone();
+                            let provider = menu_provider.clone();
+                            Some(ContextMenu::build(
+                                window,
+                                cx,
+                                move |mut menu, _window, _cx| {
+                                    menu = menu.header(header);
+                                    for account in accounts.iter().cloned() {
+                                        let mut label = account.label.to_string();
+                                        if account.reauthentication_required {
+                                            label.push_str(" · sign in required");
+                                        }
+                                        if let Some(detail) = account.detail.as_ref() {
+                                            label.push_str(" · ");
+                                            label.push_str(detail);
+                                        }
+                                        if let Some(quota) = account.quota.as_ref() {
+                                            label.push_str(" · ");
+                                            label.push_str(quota);
+                                        }
+                                        let provider = provider.clone();
+                                        let account_id = account.id.clone();
+                                        menu.push_item(
+                                            ContextMenuEntry::new(label)
+                                                .toggleable(IconPosition::End, account.is_active)
+                                                .disabled(account.is_active || account.is_busy)
+                                                .handler(move |_window, cx| {
+                                                    provider
+                                                        .switch_account(account_id.clone(), cx)
+                                                        .detach_and_log_err(cx);
+                                                }),
+                                        );
+                                    }
+                                    let account_action_label = if can_cancel_sign_in {
+                                        cancel_label
+                                    } else {
+                                        add_label
+                                    };
+                                    menu.separator().item(
+                                        ContextMenuEntry::new(account_action_label)
+                                            .disabled(busy && !can_cancel_sign_in)
+                                            .handler({
+                                                let provider = provider.clone();
+                                                move |_window, cx| {
+                                                    if can_cancel_sign_in {
+                                                        provider.cancel_account_sign_in(cx);
+                                                    } else {
+                                                        provider
+                                                            .add_account(cx)
+                                                            .detach_and_log_err(cx);
+                                                    }
+                                                }
+                                            }),
+                                    )
+                                },
+                            ))
+                        }),
                 )
                 .into_any_element(),
         )
@@ -9845,6 +10102,12 @@ impl ThreadView {
                                             })
                                     })
                                     .text_xs()
+                                    .child(
+                                        Label::new(if is_subagent { "Task" } else { "You" })
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .mb_1(),
+                                    )
                                     .child(editor.clone().into_any_element())
                             )
                             .when(editor_focus, |this| {
@@ -9992,6 +10255,12 @@ impl ThreadView {
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
+                        .child(
+                            Label::new("Agent")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .mb_1(),
+                        )
                         .child(self.render_message_context_menu(entry_ix, message_body, cx))
                         .when_some(
                             self.entry_view_state
@@ -10009,12 +10278,15 @@ impl ThreadView {
                 // renders as a useless "Canceled" card — hide those entirely.
                 if matches!(tool_call.status, ToolCallStatus::Canceled) {
                     let has_visible_content =
-                        tool_call.content.iter().any(|content| match content {
-                            ToolCallContent::ContentBlock(block) => block.visible_content(cx),
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::Terminal(_)
-                            | ToolCallContent::PendingTerminal(_) => true,
-                        });
+                        tool_call
+                            .content_for_display()
+                            .iter()
+                            .any(|content| match content {
+                                ToolCallContent::ContentBlock(block) => block.visible_content(cx),
+                                ToolCallContent::Diff(_)
+                                | ToolCallContent::Terminal(_)
+                                | ToolCallContent::PendingTerminal(_) => true,
+                            });
                     if !has_visible_content {
                         return Empty.into_any();
                     }
@@ -10061,9 +10333,6 @@ impl ThreadView {
                 } else {
                     Empty.into_any()
                 }
-            }
-            AgentThreadEntry::CompletedPlan(entries) => {
-                self.render_completed_plan(entries, window, cx)
             }
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
@@ -11390,7 +11659,6 @@ impl ThreadView {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
@@ -12293,11 +12561,14 @@ impl ThreadView {
 
         let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
 
-        let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
+        let has_image_content = tool_call
+            .content_for_display()
+            .iter()
+            .any(|c| c.image().is_some());
 
         let should_show_raw_input = !is_terminal_tool && !is_edit && !has_image_content;
 
-        let has_content = !tool_call.content.is_empty()
+        let has_content = !tool_call.content_for_display().is_empty()
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
         let is_collapsible = has_content && !needs_confirmation;
@@ -12320,7 +12591,7 @@ impl ThreadView {
                 ToolCallStatus::WaitingForConfirmation { .. } => {
                     let confirmation_content = v_flex()
                         .w_full()
-                        .children(tool_call.content.iter().enumerate().map(
+                        .children(tool_call.content_for_display().iter().enumerate().map(
                             |(content_ix, content)| {
                                 div()
                                     .child(self.render_tool_call_content(
@@ -12431,7 +12702,7 @@ impl ThreadView {
                 }
                 ToolCallStatus::Pending | ToolCallStatus::InProgress
                     if is_edit
-                        && tool_call.content.is_empty()
+                        && tool_call.content_for_display().is_empty()
                         && self.as_native_connection(cx).is_some() =>
                 {
                     self.render_diff_loading(cx)
@@ -12463,32 +12734,28 @@ impl ThreadView {
                                 .child(input_output_header("Output:".into())),
                         )
                     })
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
-                                let output_id = SharedString::from(format!(
-                                    "tool-call-output-{entry_ix}-{content_ix}"
-                                ));
-                                div()
-                                    .id(output_id.clone())
-                                    .debug_selector(move || output_id.to_string())
-                                    .child(self.render_tool_call_content(
-                                        active_session_id,
-                                        entry_ix,
-                                        content,
-                                        content_ix,
-                                        tool_call,
-                                        use_card_layout,
-                                        failed_or_canceled,
-                                        focus_handle,
-                                        window,
-                                        cx,
-                                    ))
-                            }),
-                    )
+                    .children(tool_call.content_for_display().iter().enumerate().map(
+                        |(content_ix, content)| {
+                            let output_id = SharedString::from(format!(
+                                "tool-call-output-{entry_ix}-{content_ix}"
+                            ));
+                            div()
+                                .id(output_id.clone())
+                                .debug_selector(move || output_id.to_string())
+                                .child(self.render_tool_call_content(
+                                    active_session_id,
+                                    entry_ix,
+                                    content,
+                                    content_ix,
+                                    tool_call,
+                                    use_card_layout,
+                                    failed_or_canceled,
+                                    focus_handle,
+                                    window,
+                                    cx,
+                                ))
+                        },
+                    ))
                     .when(!use_card_layout, |this| {
                         let button_id =
                             SharedString::from(format!("tool_output-collapse-{:?}", tool_call.id));
@@ -12723,7 +12990,18 @@ impl ThreadView {
                     )
                 }
             })
-            .children(tool_output_display);
+            .children(tool_output_display.map(|output| {
+                if is_edit || is_terminal_tool {
+                    return output;
+                }
+                let scroll_handle = self.tool_output_scroll_handles.borrow_mut()
+                    .entry(tool_call.id.clone()).or_default().clone();
+                ToolOutputScroll {
+                    id: format!("tool-output-scroll-{}", tool_call.id.0).into(),
+                    scroll_handle,
+                    content: output,
+                }.into_any_element()
+            }));
 
         v_flex()
             .map(|this| {
@@ -14654,7 +14932,7 @@ impl ThreadView {
         );
 
         let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
-            || tool_call.content.iter().any(|c| match c {
+            || tool_call.content_for_display().iter().any(|c| match c {
                 ToolCallContent::ContentBlock(block) => {
                     block.text_content(cx) == Some("User canceled")
                 }
@@ -15033,11 +15311,14 @@ impl ThreadView {
         let scroll_handle = self
             .subagent_scroll_handles
             .borrow_mut()
-            .entry(subagent_view.session_id.clone())
+            .entry((subagent_view.session_id.clone(), tool_call.id.clone()))
             .or_default()
             .clone();
 
-        scroll_handle.scroll_to_bottom();
+        // Follow streaming output only while the user is already at the bottom.
+        if scroll_handle.offset().y <= -scroll_handle.max_offset().y + px(1.) {
+            scroll_handle.scroll_to_bottom();
+        }
 
         let rendered_entries: Vec<AnyElement> = entries
             .get(entry_range)
@@ -15050,27 +15331,21 @@ impl ThreadView {
             })
             .collect();
 
-        v_flex()
+        div()
+            .relative()
             .w_full()
             .border_t_1()
             .when(is_canceled_or_failed, |this| this.border_dashed())
             .border_color(self.tool_card_border_color(cx))
             .overflow_hidden()
-            .child(
-                div()
+            .child(ToolOutputScroll {
+                id: format!("subagent-entries-{}-{}", session_id, tool_call.id.0).into(),
+                scroll_handle,
+                content: v_flex()
                     .pb_1()
-                    .min_h_0()
-                    // Include the tool call id so the same subagent session
-                    // rendered in multiple parent cards gets distinct element
-                    // ids for its inlined entries (avoids duplicate a11y ids).
-                    .id(format!(
-                        "subagent-entries-{}-{}",
-                        session_id, tool_call.id.0
-                    ))
-                    .track_scroll(&scroll_handle)
-                    .children(rendered_entries),
-            )
-            .h_56()
+                    .children(rendered_entries)
+                    .into_any_element(),
+            })
             .child(overlay)
             .into_any_element()
     }
@@ -15082,7 +15357,7 @@ impl ThreadView {
         cx: &App,
     ) -> Option<SharedString> {
         if matches!(status, ToolCallStatus::Failed) {
-            tool_call.content.iter().find_map(|content| {
+            tool_call.content_for_display().iter().find_map(|content| {
                 if let ToolCallContent::ContentBlock(block) = content {
                     if let Some(source) = block.text_content(cx).filter(|source| !source.is_empty())
                     {
@@ -16805,6 +17080,56 @@ mod tests {
     use util::path;
     use workspace::MultiWorkspace;
 
+    #[gpui::test]
+    fn test_tool_output_scroll_keeps_short_content_natural_and_long_content_accessible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct TestToolOutput {
+            content_height: Pixels,
+            scroll_handle: ScrollHandle,
+        }
+
+        impl Render for TestToolOutput {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().child(ToolOutputScroll {
+                    id: "test-tool-output-scroll".into(),
+                    scroll_handle: self.scroll_handle.clone(),
+                    content: div().h(self.content_height).w_full().into_any_element(),
+                })
+            }
+        }
+
+        crate::conversation_view::tests::init_test(cx);
+        let scroll_handle = ScrollHandle::new();
+        let (view, cx) = cx.add_window_view(|_, _| TestToolOutput {
+            content_height: px(80.),
+            scroll_handle: scroll_handle.clone(),
+        });
+        cx.simulate_resize(size(px(800.), px(600.)));
+        cx.run_until_parked();
+        let max_height = cx.update(|window, _| (window.viewport_size().height * 0.4).min(px(360.)));
+
+        for content_height in [px(80.), px(1200.)] {
+            view.update(cx, |view, cx| {
+                view.content_height = content_height;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                scroll_handle.bounds().size.height,
+                content_height.min(max_height)
+            );
+            assert_eq!(
+                scroll_handle.max_offset().y > px(0.),
+                content_height > max_height
+            );
+        }
+    }
+
     #[test]
     fn test_tool_call_icon_tooltip() {
         for (name, interrupted_edit, expected) in [
@@ -16836,6 +17161,99 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Native,
         ))
+    }
+
+    fn activity_item(
+        session_id: Option<&str>,
+        runtime_task_id: Option<&str>,
+        name: &str,
+    ) -> AgentActivityItem {
+        AgentActivityItem {
+            runtime_run_id: None,
+            runtime_task_id: runtime_task_id.map(agent_orchestration::TaskId::new),
+            canonical_path: None,
+            queued_messages: 0,
+            entry_ix: 0,
+            session_id: session_id.map(acp::SessionId::new),
+            name: name.into(),
+            harness: "Native",
+            status: AgentActivityStatus::Running,
+            model: None,
+            role: None,
+            task: None,
+            current_tool: None,
+            last_intent: None,
+            tool_count: None,
+            requests: None,
+            tokens: None,
+            worker: None,
+            mode: None,
+            scope: None,
+            objective: None,
+            worktree_path: None,
+            patch_status: None,
+            verification: None,
+            last_activity_at: None,
+            awaiting_plan_approval: false,
+            has_final_output: false,
+        }
+    }
+
+    #[test]
+    fn runtime_projection_merges_single_batch_nested_and_resumed_workers_by_session() {
+        let run_id = agent_orchestration::RunId::from_string("run");
+        let task_id = agent_orchestration::TaskId::new("task");
+        for worker_kind in ["single", "batch", "nested", "resumed"] {
+            let session_id = format!("{worker_kind}-session");
+            let items = vec![activity_item(Some(&session_id), None, "Native worker")];
+
+            assert_eq!(
+                activity_item_position_for_runtime_task(
+                    &items,
+                    Some(&acp::SessionId::new(session_id)),
+                    &run_id,
+                    &task_id,
+                    true,
+                    "Different label",
+                ),
+                Some(0),
+                "{worker_kind} worker should merge into its existing session row",
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_projection_only_uses_a_unique_label_as_a_temporary_link() {
+        let run_id = agent_orchestration::RunId::from_string("run");
+        let task_id = agent_orchestration::TaskId::new("task");
+        let unique = vec![activity_item(None, None, "Native worker")];
+        assert_eq!(
+            activity_item_position_for_runtime_task(
+                &unique,
+                None,
+                &run_id,
+                &task_id,
+                true,
+                "Native worker",
+            ),
+            Some(0)
+        );
+
+        let ambiguous = vec![
+            activity_item(None, None, "Native worker"),
+            activity_item(None, None, "Native worker"),
+        ];
+        assert_eq!(
+            activity_item_position_for_runtime_task(
+                &ambiguous,
+                None,
+                &run_id,
+                &task_id,
+                true,
+                "Native worker",
+            ),
+            None
+        );
     }
 
     #[test]

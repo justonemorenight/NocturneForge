@@ -108,6 +108,25 @@ pub struct AgentIdentity {
     pub target: Option<WorkerTarget>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEdgeState {
+    #[default]
+    Open,
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEdgeSnapshot {
+    pub identity: AgentIdentity,
+    #[serde(default)]
+    pub state: AgentEdgeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMessageKind {
@@ -153,6 +172,7 @@ struct ControlPlaneRuntimeEvents {
 
 struct AgentControlPlaneState {
     identities: HashMap<AgentPath, AgentIdentity>,
+    edges: HashMap<AgentPath, AgentEdgeSnapshot>,
     task_paths: HashMap<TaskId, AgentPath>,
     mailboxes: HashMap<AgentPath, AgentMailbox>,
 }
@@ -206,6 +226,7 @@ impl AgentControlPlane {
                 config,
                 state: RwLock::new(AgentControlPlaneState {
                     identities: [(root_path.clone(), root)].into_iter().collect(),
+                    edges: HashMap::default(),
                     task_paths: HashMap::default(),
                     mailboxes: [(root_path, AgentMailbox::new())].into_iter().collect(),
                 }),
@@ -269,7 +290,13 @@ impl AgentControlPlane {
         if !state.identities.contains_key(parent) {
             bail!("parent agent '{parent}' is not registered");
         }
-        if state.identities.len() >= self.inner.config.max_registered_agents {
+        let active_agents = state
+            .edges
+            .values()
+            .filter(|edge| edge.state == AgentEdgeState::Open)
+            .count()
+            + 1;
+        if active_agents >= self.inner.config.max_registered_agents {
             bail!(
                 "agent registry reached its limit of {} entries",
                 self.inner.config.max_registered_agents
@@ -285,7 +312,7 @@ impl AgentControlPlane {
                 format!("{base}-{suffix}")
             };
             let candidate = parent.child(&segment)?;
-            if !state.identities.contains_key(&candidate) {
+            if !state.edges.contains_key(&candidate) && !state.identities.contains_key(&candidate) {
                 break candidate;
             }
             suffix = suffix.saturating_add(1);
@@ -297,6 +324,15 @@ impl AgentControlPlane {
             role,
             target: Some(target),
         };
+        state.edges.insert(
+            path.clone(),
+            AgentEdgeSnapshot {
+                identity: identity.clone(),
+                state: AgentEdgeState::Open,
+                closed_at: None,
+                close_reason: None,
+            },
+        );
         state.task_paths.insert(task_id, path.clone());
         state.mailboxes.insert(path.clone(), AgentMailbox::new());
         state.identities.insert(path.clone(), identity.clone());
@@ -327,6 +363,7 @@ impl AgentControlPlane {
         let mut identities = state
             .identities
             .values()
+            .filter(|identity| self.is_open_locked(&state, &identity.path))
             .filter(|identity| {
                 prefix.is_none_or(|prefix| {
                     identity.path == *prefix
@@ -345,7 +382,7 @@ impl AgentControlPlane {
 
     pub fn resolve(&self, caller: &AgentPath, reference: &str) -> Result<AgentPath> {
         let state = self.inner.state.read();
-        if !state.identities.contains_key(caller) {
+        if !state.identities.contains_key(caller) || !self.is_open_locked(&state, caller) {
             bail!("calling agent '{caller}' is not registered");
         }
         let reference = reference.trim();
@@ -354,7 +391,7 @@ impl AgentControlPlane {
         }
         if reference.starts_with('/') {
             let path = AgentPath::parse(reference)?;
-            if state.identities.contains_key(&path) {
+            if state.identities.contains_key(&path) && self.is_open_locked(&state, &path) {
                 return Ok(path);
             }
             bail!("agent '{path}' is not registered");
@@ -364,19 +401,21 @@ impl AgentControlPlane {
         }
 
         let direct_child = caller.child(reference)?;
-        if state.identities.contains_key(&direct_child) {
+        if state.identities.contains_key(&direct_child)
+            && self.is_open_locked(&state, &direct_child)
+        {
             return Ok(direct_child);
         }
         if let Some(parent) = caller.parent() {
             let sibling = parent.child(reference)?;
-            if state.identities.contains_key(&sibling) {
+            if state.identities.contains_key(&sibling) && self.is_open_locked(&state, &sibling) {
                 return Ok(sibling);
             }
         }
         let matches = state
             .identities
             .keys()
-            .filter(|path| path.name() == reference)
+            .filter(|path| path.name() == reference && self.is_open_locked(&state, path))
             .cloned()
             .collect::<Vec<_>>();
         match matches.as_slice() {
@@ -408,8 +447,11 @@ impl AgentControlPlane {
         }
         let mailbox = {
             let state = self.inner.state.read();
-            if !state.identities.contains_key(author) {
+            if !state.identities.contains_key(author) || !self.is_open_locked(&state, author) {
                 bail!("author agent '{author}' is not registered in this run");
+            }
+            if !self.is_open_locked(&state, recipient) {
+                bail!("recipient agent '{recipient}' is not registered in this run");
             }
             state.mailboxes.get(recipient).cloned().ok_or_else(|| {
                 anyhow::anyhow!("recipient agent '{recipient}' is not registered in this run")
@@ -543,6 +585,10 @@ impl AgentControlPlane {
     }
 
     pub fn unregister_subtree(&self, path: &AgentPath) -> Result<usize> {
+        self.close_subtree(path, "unregistered")
+    }
+
+    fn close_subtree(&self, path: &AgentPath, reason: &str) -> Result<usize> {
         if path.as_str() == AgentPath::ROOT {
             bail!("the root agent cannot be unregistered");
         }
@@ -564,6 +610,11 @@ impl AgentControlPlane {
                 state.task_paths.remove(&task_id);
             }
             state.mailboxes.remove(removed_path);
+            if let Some(edge) = state.edges.get_mut(removed_path) {
+                edge.state = AgentEdgeState::Closed;
+                edge.closed_at = Some(Utc::now());
+                edge.close_reason = Some(reason.to_string());
+            }
         }
         drop(state);
         for removed_path in &removed {
@@ -573,6 +624,51 @@ impl AgentControlPlane {
             });
         }
         Ok(removed.len())
+    }
+
+    pub fn close_task(&self, task_id: &TaskId, reason: impl Into<String>) -> bool {
+        let path = {
+            let state = self.inner.state.read();
+            let Some(path) = state.task_paths.get(task_id) else {
+                return false;
+            };
+            path.clone()
+        };
+        let reason = reason.into();
+        let mut state = self.inner.state.write();
+        let Some(edge) = state.edges.get_mut(&path) else {
+            return false;
+        };
+        if edge.state == AgentEdgeState::Closed {
+            return false;
+        }
+        edge.state = AgentEdgeState::Closed;
+        edge.closed_at = Some(Utc::now());
+        edge.close_reason = Some(reason);
+        drop(state);
+        self.emit(|run_id| RuntimeEvent::AgentUnregistered { run_id, path });
+        true
+    }
+
+    fn is_open_locked(&self, state: &AgentControlPlaneState, path: &AgentPath) -> bool {
+        path == &AgentPath::root()
+            || state
+                .edges
+                .get(path)
+                .is_some_and(|edge| edge.state == AgentEdgeState::Open)
+    }
+
+    pub fn edge_history(&self) -> Vec<AgentEdgeSnapshot> {
+        let mut edges = self
+            .inner
+            .state
+            .read()
+            .edges
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| left.identity.path.cmp(&right.identity.path));
+        edges
     }
 
     fn mailbox(&self, recipient: &AgentPath) -> Result<AgentMailbox> {

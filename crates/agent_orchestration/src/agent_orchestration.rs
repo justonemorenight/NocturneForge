@@ -41,8 +41,8 @@ pub use context_checkpoint::{
     ContextCheckpointStoreSnapshot, ContextDelta, ContextDiagnostic, ContextState,
 };
 pub use control_plane::{
-    AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentIdentity,
-    AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
+    AgentControlPlane, AgentControlPlaneConfig, AgentControlPlaneSnapshot, AgentEdgeSnapshot,
+    AgentEdgeState, AgentIdentity, AgentMailboxSnapshot, AgentMessage, AgentMessageKind, AgentPath,
 };
 pub use events::{
     EventReplayPage, RuntimeEvent, RuntimeEventContext, RuntimeEventStream, SequencedRuntimeEvent,
@@ -1586,6 +1586,131 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn existing_native_session_uses_the_runtime_task_identity(cx: &mut gpui::TestAppContext) {
+        let task_id = TaskId::new("delegated-task");
+        let session_id = acp::SessionId::new("existing-native-session");
+        let observed_session = Arc::new(parking_lot::Mutex::new(None));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let observed_session = observed_session.clone();
+            let session_id = session_id.clone();
+            move |context| {
+                *observed_session.lock() = context.existing_session_id;
+                Ok(TaskExecutionOutput::new("continued").with_session_id(session_id.clone()))
+            }
+        }));
+        let plan = OrchestrationPlan::new(
+            "Continue native worker",
+            vec![OrchestrationTask::new(
+                task_id.clone(),
+                "Continue worker",
+                "Continue from the existing session",
+            )],
+        );
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let initial_session_ids = [(task_id.clone(), session_id.clone())]
+            .into_iter()
+            .collect();
+
+        let (run, completion) = OrchestrationRuntime::start_with_disposition_and_sessions(
+            plan,
+            AgentExecutionPolicy {
+                strategy: AgentExecutionStrategy::Direct,
+                autonomy: AgentAutonomy::Manual,
+            },
+            RuntimeLaunchDisposition::Approved,
+            initial_session_ids,
+            executor,
+            config,
+        )
+        .expect("start direct worker run");
+
+        assert_eq!(
+            completion
+                .await
+                .expect("receive completion")
+                .expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(*observed_session.lock(), Some(session_id.clone()));
+        assert_eq!(
+            run.task_status_by_session_id(&session_id)
+                .map(|status| status.task_id),
+            Some(task_id.clone())
+        );
+        assert!(
+            run.activity_projection()
+                .task_statuses
+                .iter()
+                .any(|status| status.task_id == task_id
+                    && status.active_session_id == Some(session_id.clone()))
+        );
+    }
+
+    #[gpui::test]
+    async fn resumed_native_task_keeps_its_session_identity(cx: &mut gpui::TestAppContext) {
+        let task_id = TaskId::new("delegated-task");
+        let session_id = acp::SessionId::new("resumed-native-session");
+        let observed_session = Arc::new(parking_lot::Mutex::new(None));
+        let executor = Rc::new(MockTaskExecutor::new({
+            let observed_session = observed_session.clone();
+            let session_id = session_id.clone();
+            move |context| {
+                *observed_session.lock() = context.existing_session_id;
+                Ok(TaskExecutionOutput::new("resumed").with_session_id(session_id.clone()))
+            }
+        }));
+        let plan = OrchestrationPlan::new(
+            "Resume native worker",
+            vec![OrchestrationTask::new(
+                task_id.clone(),
+                "Resume worker",
+                "Continue from persisted state",
+            )],
+        );
+        let mut status = TaskStatus::new(task_id.clone());
+        status.state = TaskState::Running;
+        status.active_session_id = Some(session_id.clone());
+        let mut worker_metadata = WorkerMetadata::new(WorkerTarget::Native);
+        worker_metadata.capabilities.can_resume = true;
+        status.worker_metadata = Some(worker_metadata);
+        let persisted = PersistedRun::new(
+            RunId::new(),
+            plan,
+            RunState::Running,
+            AgentExecutionPolicy {
+                strategy: AgentExecutionStrategy::Direct,
+                autonomy: AgentAutonomy::Manual,
+            },
+            vec![status],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+
+        let (run, completion) =
+            OrchestrationRuntime::resume(persisted, executor, config).expect("resume run");
+
+        assert_eq!(
+            completion
+                .await
+                .expect("receive completion")
+                .expect("complete"),
+            RunState::Completed
+        );
+        assert_eq!(*observed_session.lock(), Some(session_id.clone()));
+        assert_eq!(
+            run.task_status_by_session_id(&session_id)
+                .map(|status| status.task_id),
+            Some(task_id)
+        );
+    }
+
     #[test]
     fn test_auto_policy_single_step_guardrail_prefers_direct() {
         let decision = AutoPolicyEngine::evaluate(
@@ -2482,7 +2607,7 @@ mod tests {
         );
 
         let final_state = completion.await.expect("receive").expect("completion");
-        assert_eq!(final_state, RunState::Failed);
+        assert_eq!(final_state, RunState::CompletedWithErrors);
         assert!(
             handle
                 .task_statuses()
@@ -2882,5 +3007,447 @@ mod tests {
         assert_eq!(final_state, RunState::Completed);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    async fn test_two_tasks_one_success_one_failure_completed_with_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let t1 = OrchestrationTask::new("task-success", "Success Task", "Does local work");
+        let t2 = OrchestrationTask::new("task-fail", "Fail Task", "External network call");
+        let plan = OrchestrationPlan::new("Mixed Run", vec![t1, t2]);
+
+        let executor = Rc::new(MockTaskExecutor::new(|context| {
+            if context.task.id.as_str() == "task-success" {
+                Ok(TaskExecutionOutput::new("local work done"))
+            } else {
+                Err(anyhow::anyhow!("network unreachable: 10.247.202.147"))
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start");
+
+        let state = completion.await.expect("receive").expect("completion");
+        assert_eq!(state, RunState::CompletedWithErrors);
+
+        let run_record = handle.authoritative_run();
+        assert_eq!(run_record.state, RunState::CompletedWithErrors);
+        assert_eq!(run_record.completed_count, 1);
+        assert_eq!(run_record.failed_count, 1);
+        assert_eq!(run_record.active_count, 0);
+
+        let tasks = handle.authoritative_tasks();
+        assert_eq!(tasks.len(), 2);
+        let s_task = tasks
+            .iter()
+            .find(|t| t.task_id.as_str() == "task-success")
+            .unwrap();
+        assert_eq!(s_task.state, TaskState::Completed);
+        let f_task = tasks
+            .iter()
+            .find(|t| t.task_id.as_str() == "task-fail")
+            .unwrap();
+        assert_eq!(f_task.state, TaskState::Failed);
+    }
+
+    #[gpui::test]
+    async fn test_retry_does_not_increase_task_count(cx: &mut gpui::TestAppContext) {
+        let mut t1 = OrchestrationTask::new("task-retry", "Retry Task", "Flaky task");
+        t1.max_retries = Some(1);
+        let plan = OrchestrationPlan::new("Retry Plan", vec![t1]);
+
+        let attempt_counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = attempt_counter.clone();
+        let executor = Rc::new(MockTaskExecutor::new(move |_context| {
+            let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                Err(anyhow::anyhow!("transient connection timeout"))
+            } else {
+                Ok(TaskExecutionOutput::new("succeeded on retry"))
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start");
+
+        let state = completion.await.expect("receive").expect("completion");
+        assert_eq!(state, RunState::Completed);
+
+        // Verify task count is exactly 1, not 2
+        let run_record = handle.authoritative_run();
+        assert_eq!(run_record.task_ids.len(), 1);
+        assert_eq!(run_record.completed_count, 1);
+        assert_eq!(run_record.failed_count, 0);
+
+        let tasks = handle.authoritative_tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, TaskId::new("task-retry"));
+        assert_eq!(tasks[0].task_id.as_str(), "task-retry");
+        assert_eq!(tasks[0].state, TaskState::Completed);
+        assert!(tasks[0].attempt >= 2);
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("task-retry"))
+                .unwrap()
+                .task_id,
+            TaskId::new("task-retry")
+        );
+    }
+
+    #[test]
+    fn test_timeout_and_orphan_recovery() {
+        let run_id = RunId::new();
+        let t1 = OrchestrationTask::new("t-running", "Running task", "desc");
+        let t2 = OrchestrationTask::new("t-timedout", "Timed out task", "desc");
+        let t3 = OrchestrationTask::new("t-completed", "Completed task", "desc");
+        let plan = OrchestrationPlan::new("Recovery Plan", vec![t1, t2, t3]);
+
+        let mut s1 = TaskStatus::new(TaskId::new("t-running"));
+        s1.state = TaskState::Running;
+        s1.active_session_id = Some(acp::SessionId::new("dead-sess-1"));
+
+        let mut s2 = TaskStatus::new(TaskId::new("t-timedout"));
+        s2.state = TaskState::Running;
+        s2.latest_error = Some("task timed out after 30s".to_string());
+        s2.active_session_id = Some(acp::SessionId::new("dead-sess-2"));
+
+        let mut s3 = TaskStatus::new(TaskId::new("t-completed"));
+        s3.state = TaskState::Completed;
+        s3.active_session_id = Some(acp::SessionId::new("sess-3"));
+
+        let run = PersistedRun::new(
+            run_id,
+            plan,
+            RunState::Running,
+            AgentExecutionPolicy::default(),
+            vec![s1, s2, s3],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // No live session processes remain
+        let recovered = run.recover_orphaned_tasks(&[]);
+
+        // s1 has no live process -> Orphaned
+        assert_eq!(recovered.task_statuses[0].state, TaskState::Orphaned);
+        // s2 timed out -> TimedOut
+        assert_eq!(recovered.task_statuses[1].state, TaskState::TimedOut);
+        // s3 remains completed
+        assert_eq!(recovered.task_statuses[2].state, TaskState::Completed);
+
+        // Since s3 completed, but s1 and s2 failed/orphaned, run state must be CompletedWithErrors, NOT hang in Running or Interrupted
+        assert_eq!(recovered.state, RunState::CompletedWithErrors);
+        assert!(recovered.state.is_terminal());
+
+        let authoritative = recovered.authoritative_run(None);
+        assert_eq!(authoritative.completed_count, 1);
+        assert_eq!(authoritative.failed_count, 2);
+        assert_eq!(authoritative.active_count, 0);
+    }
+
+    #[test]
+    fn test_parent_cannot_complete_while_task_running() {
+        let run_id = RunId::new();
+        let t1 = OrchestrationTask::new("t1", "T1", "desc");
+        let _plan = OrchestrationPlan::new("Goal test", vec![t1]);
+
+        let mut s1 = TaskStatus::new(TaskId::new("t1"));
+        s1.state = TaskState::Running;
+
+        let controller = GoalController::new(
+            run_id,
+            "Complete feature".to_string(),
+            vec![TaskId::new("t1")],
+            Default::default(),
+        )
+        .expect("controller");
+
+        controller.observe(RunState::Running, &[s1.clone()]);
+
+        // Attempting to complete while task is running MUST fail
+        let result = controller.mark_achieved();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains(
+            "cannot complete parent goal while tasks are still queued, starting, or running"
+        ));
+
+        // When task completes and run completes, mark_achieved succeeds
+        s1.state = TaskState::Completed;
+        controller.observe(RunState::Completed, &[s1]);
+        let achieved = controller
+            .mark_achieved()
+            .expect("complete after tasks terminal");
+        assert_eq!(achieved.status, GoalStatus::Achieved);
+    }
+
+    #[test]
+    fn test_old_persisted_child_excluded_from_new_run() {
+        let old_run_id = RunId::new();
+        let old_task = OrchestrationTask::new("old-task", "Old Task", "Old turn");
+        let old_plan = OrchestrationPlan::new("Old Run", vec![old_task]);
+        let mut old_s = TaskStatus::new(TaskId::new("old-task"));
+        old_s.state = TaskState::Completed;
+        old_s.active_session_id = Some(acp::SessionId::new("old-session-123"));
+
+        let _old_persisted = PersistedRun::new(
+            old_run_id,
+            old_plan,
+            RunState::Completed,
+            AgentExecutionPolicy::default(),
+            vec![old_s],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // New run with new tasks
+        let new_run_id = RunId::new();
+        let new_t1 = OrchestrationTask::new("new-task-1", "New 1", "New");
+        let new_t2 = OrchestrationTask::new("new-task-2", "New 2", "New");
+        let new_plan = OrchestrationPlan::new("New Run", vec![new_t1, new_t2]);
+        let mut new_s1 = TaskStatus::new(TaskId::new("new-task-1"));
+        new_s1.state = TaskState::Running;
+        new_s1.active_session_id = Some(acp::SessionId::new("new-session-456"));
+        let new_s2 = TaskStatus::new(TaskId::new("new-task-2"));
+
+        let new_persisted = PersistedRun::new(
+            new_run_id,
+            new_plan,
+            RunState::Running,
+            AgentExecutionPolicy::default(),
+            vec![new_s1, new_s2],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let authoritative = new_persisted.authoritative_run(None);
+        assert_eq!(authoritative.task_ids.len(), 2);
+        assert!(!authoritative.task_ids.contains(&TaskId::new("old-task")));
+
+        let tasks = new_persisted.authoritative_tasks(None);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.run_id == new_persisted.run_id));
+        assert!(tasks.iter().all(|t| t.task_id != TaskId::new("old-task")));
+        assert!(
+            tasks
+                .iter()
+                .all(|t| t.child_thread_id.as_deref() != Some("old-session-123"))
+        );
+        assert!(
+            !new_persisted
+                .historical_session_ids()
+                .contains(&acp::SessionId::new("old-session-123"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_mixed_success_failure_with_blocked_dependent_completed_with_errors(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let t1 = OrchestrationTask::new("task-success", "Success Task", "Local work");
+        let t2 = OrchestrationTask::new("task-fail", "Fail Task", "Failing step");
+        let mut t3 = OrchestrationTask::new("task-blocked", "Blocked Task", "Dependent step");
+        t3.depends_on = vec![TaskId::new("task-fail")];
+        let plan = OrchestrationPlan::new("Mixed Run With Dependency", vec![t1, t2, t3]);
+
+        let executor = Rc::new(MockTaskExecutor::new(|context| {
+            if context.task.id.as_str() == "task-success" {
+                Ok(TaskExecutionOutput::new("done"))
+            } else {
+                Err(anyhow::anyhow!("hard network failure"))
+            }
+        }));
+
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+
+        let (handle, completion) =
+            OrchestrationRuntime::start(plan, policy, executor, config).expect("start");
+
+        let state = completion.await.expect("receive").expect("completion");
+        assert_eq!(state, RunState::CompletedWithErrors);
+
+        let run_record = handle.authoritative_run();
+        assert_eq!(run_record.state, RunState::CompletedWithErrors);
+        assert_eq!(run_record.completed_count, 1);
+        assert_eq!(run_record.failed_count, 1);
+        assert_eq!(run_record.active_count, 0);
+
+        let tasks = handle.authoritative_tasks();
+        assert_eq!(tasks.len(), 3);
+        let s_task = tasks
+            .iter()
+            .find(|t| t.task_id.as_str() == "task-success")
+            .unwrap();
+        assert_eq!(s_task.state, TaskState::Completed);
+        let f_task = tasks
+            .iter()
+            .find(|t| t.task_id.as_str() == "task-fail")
+            .unwrap();
+        assert_eq!(f_task.state, TaskState::Failed);
+        let b_task = tasks
+            .iter()
+            .find(|t| t.task_id.as_str() == "task-blocked")
+            .unwrap();
+        assert_eq!(b_task.state, TaskState::Blocked);
+    }
+
+    #[test]
+    fn test_orphan_recovery_on_reload_preserves_active_run_with_live_session() {
+        let run_id = RunId::new();
+        let t1 = OrchestrationTask::new("t-live", "Live task", "desc");
+        let t2 = OrchestrationTask::new("t-dead", "Dead task", "desc");
+        let t3 = OrchestrationTask::new("t-done", "Done task", "desc");
+        let plan = OrchestrationPlan::new("Recovery Plan", vec![t1, t2, t3]);
+
+        let live_session = acp::SessionId::new("live-session-1");
+        let mut s1 = TaskStatus::new(TaskId::new("t-live"));
+        s1.state = TaskState::Running;
+        s1.active_session_id = Some(live_session.clone());
+
+        let mut s2 = TaskStatus::new(TaskId::new("t-dead"));
+        s2.state = TaskState::Running;
+        s2.active_session_id = Some(acp::SessionId::new("dead-session-2"));
+
+        let mut s3 = TaskStatus::new(TaskId::new("t-done"));
+        s3.state = TaskState::Completed;
+
+        let run = PersistedRun::new(
+            run_id,
+            plan.clone(),
+            RunState::Running,
+            AgentExecutionPolicy::default(),
+            vec![s1, s2, s3],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // When live_session_1 is still active, t-live MUST NOT be orphaned
+        let preserved = run.clone().recover_orphaned_tasks(&[live_session]);
+        assert_eq!(preserved.task_statuses[0].state, TaskState::Running);
+        assert_eq!(preserved.task_statuses[1].state, TaskState::Orphaned);
+        assert_eq!(preserved.task_statuses[2].state, TaskState::Completed);
+        // Run has runnable work (t-live is still running)
+        assert_eq!(preserved.state, RunState::Interrupted);
+
+        // When reloading without any live runtime, all active tasks without live process are recovered
+        let all_recovered = run.recover_orphaned_tasks(&[]);
+        assert_eq!(all_recovered.task_statuses[0].state, TaskState::Orphaned);
+        assert_eq!(all_recovered.task_statuses[1].state, TaskState::Orphaned);
+        assert_eq!(all_recovered.task_statuses[2].state, TaskState::Completed);
+        // Since t-done completed and remaining tasks were recovered, run reaches CompletedWithErrors
+        assert_eq!(all_recovered.state, RunState::CompletedWithErrors);
+        assert!(all_recovered.state.is_terminal());
+
+        // Proposed run must remain Proposed after orphan recovery
+        let proposed_run = PersistedRun::new(
+            RunId::new(),
+            plan,
+            RunState::Proposed,
+            AgentExecutionPolicy::default(),
+            vec![TaskStatus::new(TaskId::new("t-live"))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let recovered_proposed = proposed_run.recover_orphaned_tasks(&[]);
+        assert_eq!(recovered_proposed.state, RunState::Proposed);
+    }
+
+    #[test]
+    fn test_parent_terminal_guard_queued_and_starting() {
+        let run_id = RunId::new();
+        let t1 = OrchestrationTask::new("t1", "T1", "desc");
+        let t2 = OrchestrationTask::new("t2", "T2", "desc");
+        let _plan = OrchestrationPlan::new("Goal test", vec![t1, t2]);
+
+        let mut s1 = TaskStatus::new(TaskId::new("t1"));
+        s1.state = TaskState::Queued;
+        let mut s2 = TaskStatus::new(TaskId::new("t2"));
+        s2.state = TaskState::Completed;
+
+        let controller = GoalController::new(
+            run_id,
+            "Parent goal".to_string(),
+            vec![TaskId::new("t1"), TaskId::new("t2")],
+            Default::default(),
+        )
+        .expect("controller");
+
+        controller.observe(RunState::Running, &[s1.clone(), s2.clone()]);
+        assert!(controller.mark_achieved().is_err());
+
+        // Starting state must also prevent completing parent goal
+        s1.state = TaskState::Starting;
+        controller.observe(RunState::Running, &[s1.clone(), s2.clone()]);
+        assert!(controller.mark_achieved().is_err());
+
+        // A run can finish with errors after at least one task completed.
+        // Failed tasks count as finished, leaving the parent to decide whether
+        // the overall objective was still achieved.
+        s1.state = TaskState::TimedOut;
+        let snap = controller.observe(RunState::CompletedWithErrors, &[s1, s2]);
+        assert_eq!(snap.failed_tasks, vec![TaskId::new("t1")]);
+        assert_eq!(snap.completed_tasks, 1);
+        assert_eq!(snap.status, GoalStatus::Active);
+        // All tasks are terminal, so the parent may complete after verifying
+        // that the overall objective was achieved despite the failed worker.
+        assert!(controller.mark_achieved().is_ok());
+    }
+
+    #[test]
+    fn test_preflight_and_auth_401_classified_nonretryable() {
+        use crate::verification::{ErrorClass, VerificationPolicy};
+
+        let policy = VerificationPolicy::default();
+
+        // 401 Unauthorized must be classified as ProviderUnavailable (non-retryable)
+        let auth_err = "API request failed: 401 Unauthorized - invalid authentication token";
+        let class = VerificationPolicy::classify_error(auth_err);
+        assert_eq!(class, ErrorClass::ProviderUnavailable);
+        assert!(!class.is_retryable());
+        assert!(!policy.should_retry(1, &class, Some(3)));
+
+        // 403 Forbidden must also be non-retryable
+        let forbidden_err = "HTTP 403 Forbidden: access denied to repository";
+        let class = VerificationPolicy::classify_error(forbidden_err);
+        assert_eq!(class, ErrorClass::ProviderUnavailable);
+        assert!(!class.is_retryable());
+        assert!(!policy.should_retry(1, &class, Some(3)));
+
+        // external_source_unreachable must be classified as FatalError (non-retryable)
+        let preflight_err = "external_source_unreachable: host 'gitlab.corp.local' DNS lookup failed: connection timed out";
+        let class = VerificationPolicy::classify_error(preflight_err);
+        assert_eq!(class, ErrorClass::FatalError);
+        assert!(!class.is_retryable());
+        assert!(!policy.should_retry(1, &class, Some(3)));
     }
 }

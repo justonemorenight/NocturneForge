@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result, anyhow};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
+    http::HeaderMap,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned, ser::SerializeSeq as _};
 use serde_json::Value;
@@ -14,7 +15,7 @@ use language_model_core::{
 
 pub const COMPACTION_STATE_FORMAT: &str = "openai.responses.input-items.v1";
 
-#[derive(Serialize, Debug)]
+#[derive(Clone, Serialize, Debug)]
 pub struct Request {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,7 +260,7 @@ fn validate_compaction_items(items: &[Value]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ResponseInput {
     provider_items: Vec<Value>,
     generated_items: Vec<ResponseInputItem>,
@@ -326,7 +327,7 @@ pub enum ResponseIncludable {
     ReasoningEncryptedContent,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
     Message(ResponseMessageItem),
@@ -360,7 +361,7 @@ pub struct ResponseCompactionItem {
     pub encrypted_content: Arc<str>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseMessageItem {
     pub role: Role,
     pub content: Vec<ResponseInputContent>,
@@ -368,20 +369,20 @@ pub struct ResponseMessageItem {
     pub phase: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseFunctionCallItem {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseFunctionCallOutputItem {
     pub call_id: String,
     pub output: ResponseFunctionCallOutputContent,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseCustomToolCallItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -390,7 +391,7 @@ pub struct ResponseCustomToolCallItem {
     pub input: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseCustomToolCallOutputItem {
     pub call_id: String,
     pub output: ResponseFunctionCallOutputContent,
@@ -416,7 +417,7 @@ pub enum ResponseReasoningSummaryPart {
     SummaryText { text: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseFunctionCallOutputContent {
     List(Vec<ResponseInputContent>),
@@ -440,7 +441,7 @@ pub enum ResponseInputContent {
     Refusal { refusal: String },
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Clone, Serialize, Debug)]
 pub struct ReasoningConfig {
     pub effort: ReasoningEffort,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -455,7 +456,7 @@ pub enum ReasoningSummaryMode {
     Detailed,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDefinition {
     Function {
@@ -708,6 +709,8 @@ pub enum StreamEvent {
 pub struct ResponseSummary {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -997,9 +1000,32 @@ pub async fn stream_response(
     request: Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    Ok(stream_response_with_metadata(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        request,
+        extra_headers,
+    )
+    .await?
+    .0)
+}
+
+/// Sends a Responses request and preserves successful response headers for
+/// callers that need provider-specific response metadata. The existing
+/// `stream_response` API intentionally discards headers for compatibility.
+pub async fn stream_response_with_metadata(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    request: Request,
+    extra_headers: &CustomHeaders,
+) -> Result<(BoxStream<'static, Result<StreamEvent>>, HeaderMap), RequestError> {
     let is_streaming = request.stream;
     let body = serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?;
-    stream_response_with_body(
+    stream_response_with_body_with_metadata(
         client,
         provider_name,
         api_url,
@@ -1024,6 +1050,28 @@ pub async fn stream_response_with_body(
     is_streaming: bool,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent>>, RequestError> {
+    Ok(stream_response_with_body_with_metadata(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        body,
+        is_streaming,
+        extra_headers,
+    )
+    .await?
+    .0)
+}
+
+pub async fn stream_response_with_body_with_metadata(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    body: String,
+    is_streaming: bool,
+    extra_headers: &CustomHeaders,
+) -> Result<(BoxStream<'static, Result<StreamEvent>>, HeaderMap), RequestError> {
     let uri = format!("{api_url}/responses");
     let request = HttpRequest::builder()
         .method(Method::POST)
@@ -1044,9 +1092,10 @@ pub async fn stream_response_with_body(
             error,
         })?;
     if response.status().is_success() {
+        let response_headers = response.headers().clone();
         if is_streaming {
             let reader = BufReader::new(response.into_body());
-            Ok(reader
+            Ok((reader
                 .lines()
                 .filter_map(|line| async move {
                     match line {
@@ -1073,7 +1122,7 @@ pub async fn stream_response_with_body(
                         Err(error) => Some(Err(anyhow!(error))),
                     }
                 })
-                .boxed())
+                .boxed(), response_headers))
         } else {
             let mut body = String::new();
             response
@@ -1182,7 +1231,10 @@ pub async fn stream_response_with_body(
                         },
                     });
 
-                    Ok(futures::stream::iter(all_events.into_iter().map(Ok)).boxed())
+                    Ok((
+                        futures::stream::iter(all_events.into_iter().map(Ok)).boxed(),
+                        response_headers,
+                    ))
                 }
                 Err(error) => {
                     log::error!(
@@ -1474,6 +1526,47 @@ mod tests {
                 assert_eq!(error.to_string(), "network unavailable");
             }
             error => panic!("expected an HTTP send error, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_transport_preserves_success_headers_and_model() {
+        let state = "s".repeat(780);
+        let response_state = state.clone();
+        let http_client = FakeHttpClient::create(move |_| {
+            let response_state = response_state.clone();
+            async move {
+                Ok(http_client::Response::builder()
+                .status(200)
+                .header("x-codex-turn-state", response_state)
+                .header("openai-model", "served-model")
+                .body(AsyncBody::from(
+                    "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-test\"}}\n\n",
+                ))?)
+            }
+        });
+
+        let (mut stream, headers) = block_on(stream_response_with_body_with_metadata(
+            http_client.as_ref(),
+            "OpenAI",
+            "https://api.openai.com/v1",
+            "secret",
+            "{}".to_string(),
+            true,
+            &CustomHeaders::default(),
+        ))
+        .expect("successful response");
+
+        assert_eq!(headers["x-codex-turn-state"], state);
+        assert_eq!(headers["openai-model"], "served-model");
+        let event = block_on(stream.next())
+            .expect("event")
+            .expect("valid event");
+        match event {
+            StreamEvent::Created { response } => {
+                assert_eq!(response.model.as_deref(), Some("gpt-test"));
+            }
+            event => panic!("expected response.created, got {event:?}"),
         }
     }
 

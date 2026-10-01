@@ -5965,6 +5965,18 @@ impl Window {
         None
     }
 
+    /// Returns quads from the last rendered frame for paint-order assertions.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_quads(&self) -> &[Quad] {
+        &self.rendered_frame.scene.quads
+    }
+
+    /// Returns underlines from the last rendered frame for paint-order assertions.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_underlines(&self) -> &[Underline] {
+        &self.rendered_frame.scene.underlines
+    }
+
     /// For testing: set the current modifier keys state.
     /// This does not generate any events.
     #[cfg(any(test, feature = "test-support"))]

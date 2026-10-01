@@ -39,7 +39,12 @@ use std::ops::Range;
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
+use std::{
+    fmt::Display,
+    mem,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
 use text::Bias;
@@ -393,7 +398,6 @@ pub enum AgentThreadEntry {
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
     Elicitation(ElicitationEntryId),
-    CompletedPlan(Vec<PlanEntry>),
     ContextCompaction(ContextCompaction),
 }
 
@@ -743,7 +747,7 @@ impl ElicitationStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContextCompactionId(pub Arc<str>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,7 +856,6 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
             Self::Elicitation(_) => false,
-            Self::CompletedPlan(_) => false,
             Self::ContextCompaction(_) => false,
         }
     }
@@ -863,14 +866,6 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.to_markdown(cx),
             Self::ToolCall(tool_call) => tool_call.to_markdown(cx),
             Self::Elicitation(_) => "## Input Requested\n\n".to_string(),
-            Self::CompletedPlan(entries) => {
-                let mut md = String::from("## Plan\n\n");
-                for entry in entries {
-                    let source = entry.content.read(cx).source().to_string();
-                    md.push_str(&format!("- [x] {}\n", source));
-                }
-                md
-            }
             Self::ContextCompaction(compaction) => {
                 let status = match &compaction.status {
                     ContextCompactionStatus::InProgress => "In Progress",
@@ -949,6 +944,7 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_input_markdown: Option<Entity<Markdown>>,
     pub raw_output: Option<serde_json::Value>,
+    raw_output_content: Option<Box<ToolCallContent>>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
@@ -1065,11 +1061,11 @@ impl ToolCall {
             title.as_ref(),
             tool_name.as_ref(),
             tool_call.kind,
-            language_registry,
+            language_registry.clone(),
             cx,
         );
 
-        let result = Self {
+        let mut result = Self {
             id: tool_call.tool_call_id,
             label,
             title,
@@ -1081,12 +1077,14 @@ impl ToolCall {
             raw_input: tool_call.raw_input,
             raw_input_markdown,
             raw_output: tool_call.raw_output,
+            raw_output_content: None,
             tool_name,
             subagent_session_info,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
         };
+        result.update_raw_output_content(&language_registry, cx);
         Ok(result)
     }
 
@@ -1150,6 +1148,7 @@ impl ToolCall {
             raw_output,
             ..
         } = fields;
+        let output_changed = content.is_some() || raw_output.is_some();
 
         let was_plain_text = self.title.is_none() || self.kind == acp::ToolKind::Execute;
         let mut label_changed = title.is_some() || kind.is_some();
@@ -1255,17 +1254,49 @@ impl ToolCall {
         }
 
         if let Some(raw_output) = raw_output {
-            if self.content.is_empty()
-                && let Some(markdown) = markdown_for_raw_output(&raw_output, &language_registry, cx)
-            {
-                self.content
-                    .push(ToolCallContent::ContentBlock(ContentBlock::Markdown {
-                        markdown,
-                    }));
-            }
             self.raw_output = Some(raw_output);
         }
+        if output_changed {
+            self.update_raw_output_content(&language_registry, cx);
+        }
         Ok(())
+    }
+
+    fn update_raw_output_content(
+        &mut self,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) {
+        if !self.content.is_empty() {
+            self.raw_output_content = None;
+            return;
+        }
+        let Some(text) = self.raw_output.as_ref().and_then(raw_output_text) else {
+            self.raw_output_content = None;
+            return;
+        };
+        if let Some(ToolCallContent::ContentBlock(block)) = self.raw_output_content.as_deref()
+            && let Some(markdown) = block.markdown()
+        {
+            update_markdown_in_place(markdown, &text, cx);
+        } else {
+            let markdown =
+                cx.new(|cx| Markdown::new(text.into(), Some(language_registry.clone()), None, cx));
+            self.raw_output_content = Some(Box::new(ToolCallContent::ContentBlock(
+                ContentBlock::Markdown { markdown },
+            )));
+        }
+    }
+
+    pub fn content_for_display(&self) -> &[ToolCallContent] {
+        if self.content.is_empty() {
+            self.raw_output_content
+                .as_deref()
+                .map(std::slice::from_ref)
+                .unwrap_or_default()
+        } else {
+            &self.content
+        }
     }
 
     fn update_status(&mut self, status: ToolCallStatus) {
@@ -1451,7 +1482,7 @@ impl ToolCall {
             label.to_string()
         };
         let mut markdown = format!("**Tool Call: {}**\nStatus: {}\n\n", label, self.status);
-        for content in &self.content {
+        for content in self.content_for_display() {
             markdown.push_str(content.to_markdown(cx).as_str());
             markdown.push_str("\n\n");
         }
@@ -2124,14 +2155,7 @@ impl ContentBlock {
         let acp::ContentBlock::Text(text_content) = block else {
             return false;
         };
-        let new_content = &text_content.text;
-        markdown.update(cx, |markdown, cx| {
-            match new_content.strip_prefix(markdown.source()) {
-                Some("") => {}
-                Some(suffix) => markdown.append(suffix, cx),
-                None => markdown.reset(new_content.clone().into(), cx),
-            }
-        });
+        update_markdown_in_place(markdown, &text_content.text, cx);
         true
     }
 
@@ -2813,10 +2837,206 @@ const ACP_AUTO_COMPACTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 const ACP_AUTO_COMPACTION_MAX_ATTEMPTS: u8 = 2;
 const CLAUDE_ACP_STALLED_TURN_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const CLAUDE_ACP_STALLED_TURN_SILENT_POLLS: u8 = 10;
+const CODEX_ACP_AGENT_ID: &str = "codex-acp";
+const CODEX_FILE_CHANGE_REPORT_VERSION: u64 = 1;
+const CODEX_FILE_CHANGE_REPORT_MAX_PATH_LENGTH: usize = 4_096;
+const CODEX_FILE_CHANGE_REPORT_MAX_CONTENT_BYTES: usize = 64 * 1_024;
+const CODEX_FILE_CHANGE_REPORT_MAX_TOTAL_BYTES: usize = 256 * 1_024;
+const CODEX_FILE_CHANGE_REPORT_MAX_CHANGES: usize = 1_024;
 
 /// Supplies the editor's authoritative draft at lifecycle boundaries where the
 /// debounced `draft_prompt` cache may not have caught up yet.
 pub type DraftPromptSnapshotProvider = Rc<dyn Fn(&App) -> Option<Vec<acp::ContentBlock>>>;
+
+struct AgentFileChangeSnapshot {
+    path: PathBuf,
+    before_text: String,
+    after_text: String,
+    is_new_file: bool,
+    git_patch: Option<String>,
+}
+
+fn git_checkpoint_file_changes(root: &Path, diff: &str) -> Vec<AgentFileChangeSnapshot> {
+    const MAX_PATCH_BYTES: usize = 1024 * 1024;
+    diff.strip_prefix("diff --git ")
+        .into_iter()
+        .flat_map(|diff| diff.split("\ndiff --git "))
+        .filter_map(|section| {
+            if section.len() > MAX_PATCH_BYTES
+                || section.contains("\nBinary files ")
+                || section.contains("\nrename from ")
+            {
+                return None;
+            }
+            let patch_start = section.find("\n--- ")? + 1;
+            let patch = &section[patch_start..];
+            let mut lines = patch.lines();
+            let old_path = lines.next()?.strip_prefix("--- ")?;
+            let new_path = lines.next()?.strip_prefix("+++ b/")?;
+            if !patch.contains("\n@@ ") || new_path.chars().any(char::is_control) {
+                return None;
+            }
+            let relative_path = PathBuf::from(new_path);
+            if !relative_path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            {
+                return None;
+            }
+            Some(AgentFileChangeSnapshot {
+                path: root.join(relative_path),
+                before_text: String::new(),
+                after_text: String::new(),
+                is_new_file: old_path == "/dev/null",
+                git_patch: Some(if patch.ends_with('\n') {
+                    patch.to_owned()
+                } else {
+                    format!("{patch}\n")
+                }),
+            })
+        })
+        .collect()
+}
+
+fn reconstruct_before_text(
+    after_text: &str,
+    changes: &[AgentFileChangeSnapshot],
+) -> Option<String> {
+    if changes.len() == 1 && changes[0].after_text == after_text {
+        return Some(changes[0].before_text.clone());
+    }
+
+    let mut replacements = Vec::with_capacity(changes.len());
+    for change in changes {
+        if change.after_text.is_empty() || change.before_text == change.after_text {
+            return None;
+        }
+        let mut matches = after_text.match_indices(&change.after_text);
+        let (start, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        replacements.push((start..start + change.after_text.len(), &change.before_text));
+    }
+    replacements.sort_by_key(|(range, _)| range.start);
+    if replacements
+        .windows(2)
+        .any(|pair| pair[0].0.end > pair[1].0.start)
+    {
+        return None;
+    }
+
+    let mut before_text = after_text.to_owned();
+    for (range, original) in replacements.into_iter().rev() {
+        before_text.replace_range(range, original);
+    }
+    Some(before_text)
+}
+
+struct CodexFileChangeReport {
+    request_id: String,
+    reported: bool,
+    changes: Vec<AgentFileChangeSnapshot>,
+}
+
+fn codex_file_change_report_request_meta(request_id: &str) -> acp::Meta {
+    acp::Meta::from_iter([(
+        "jetbrains".into(),
+        serde_json::json!({
+            "air": {
+                "agentFileChangeReportRequest": {
+                    "version": CODEX_FILE_CHANGE_REPORT_VERSION,
+                    "requestId": request_id,
+                },
+            },
+        }),
+    )])
+}
+
+fn codex_file_change_report_from_meta(meta: &Option<acp::Meta>) -> Option<CodexFileChangeReport> {
+    let report = meta
+        .as_ref()?
+        .get("jetbrains")?
+        .get("air")?
+        .get("agentFileChangeReport")?;
+    if report.get("version")?.as_u64()? != CODEX_FILE_CHANGE_REPORT_VERSION {
+        return None;
+    }
+
+    let request_id = report.get("requestId")?.as_str()?;
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return None;
+    }
+
+    let reported = match report.get("status")?.as_str()? {
+        "reported" => true,
+        "unavailable" => false,
+        _ => return None,
+    };
+    let mut changes = Vec::new();
+    if reported {
+        let mut total_bytes = 0usize;
+        for change in report.get("changes")?.as_array()? {
+            if changes.len() >= CODEX_FILE_CHANGE_REPORT_MAX_CHANGES {
+                break;
+            }
+            let Some(path) = change.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(before_text) = change.get("beforeText").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(after_text) = change.get("afterText").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            if !path.is_absolute()
+                || path.as_os_str().len() > CODEX_FILE_CHANGE_REPORT_MAX_PATH_LENGTH
+                || path.to_string_lossy().chars().any(char::is_control)
+                || before_text == after_text
+                || before_text.len() > CODEX_FILE_CHANGE_REPORT_MAX_CONTENT_BYTES
+                || after_text.len() > CODEX_FILE_CHANGE_REPORT_MAX_CONTENT_BYTES
+            {
+                continue;
+            }
+            let Some(change_bytes) = path
+                .as_os_str()
+                .len()
+                .checked_add(before_text.len())
+                .and_then(|bytes| bytes.checked_add(after_text.len()))
+            else {
+                break;
+            };
+            let Some(next_total_bytes) = total_bytes.checked_add(change_bytes) else {
+                break;
+            };
+            if next_total_bytes > CODEX_FILE_CHANGE_REPORT_MAX_TOTAL_BYTES {
+                break;
+            }
+            total_bytes = next_total_bytes;
+            changes.push(AgentFileChangeSnapshot {
+                path,
+                before_text: before_text.to_owned(),
+                after_text: after_text.to_owned(),
+                is_new_file: false,
+                git_patch: None,
+            });
+        }
+    }
+
+    Some(CodexFileChangeReport {
+        request_id: request_id.to_owned(),
+        reported,
+        changes,
+    })
+}
 
 pub struct AcpThread {
     session_id: acp::SessionId,
@@ -2835,8 +3055,15 @@ pub struct AcpThread {
     turn_id: u32,
     turn_cancellation_generation: u64,
     running_turn: Option<RunningTurn>,
+    compaction_interrupted: bool,
+    interrupted_compaction_ids: HashSet<ContextCompactionId>,
     auto_compaction: AcpAutoCompactionState,
     connection: Rc<dyn AgentConnection>,
+    agent_file_change_report_request_id: Option<String>,
+    restored_tool_call_diffs: HashSet<(acp::ToolCallId, PathBuf)>,
+    claude_review_checkpoint: Option<GitStoreCheckpoint>,
+    claude_review_task: Option<Task<Result<()>>>,
+    claude_reviewed_tool_calls: HashSet<acp::ToolCallId>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
@@ -3100,10 +3327,17 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            compaction_interrupted: false,
+            interrupted_compaction_ids: HashSet::default(),
             auto_compaction: AcpAutoCompactionState::default(),
             turn_id: 0,
             turn_cancellation_generation: 0,
             connection,
+            agent_file_change_report_request_id: None,
+            restored_tool_call_diffs: HashSet::default(),
+            claude_review_checkpoint: None,
+            claude_review_task: None,
+            claude_reviewed_tool_calls: HashSet::default(),
             session_id,
             token_usage: None,
             cost: None,
@@ -3241,6 +3475,10 @@ impl AcpThread {
         &self.connection
     }
 
+    pub fn active_turn_id(&self) -> Option<u32> {
+        self.running_turn.as_ref().map(|turn| turn.id)
+    }
+
     pub fn action_log(&self) -> &Entity<ActionLog> {
         &self.action_log
     }
@@ -3341,7 +3579,6 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
@@ -3371,7 +3608,6 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
@@ -3392,7 +3628,6 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
@@ -3416,7 +3651,6 @@ impl AcpThread {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_)
                 | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
@@ -3429,7 +3663,6 @@ impl AcpThread {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
                 AgentThreadEntry::AssistantMessage(..)
-                | AgentThreadEntry::CompletedPlan(..)
                 | AgentThreadEntry::ContextCompaction(_)
                 | AgentThreadEntry::Elicitation(_) => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
@@ -3509,12 +3742,32 @@ impl AcpThread {
                 self.update_plan(plan, cx);
             }
             acp::SessionUpdate::CompactionUpdate(update) => {
-                self.upsert_context_compaction_update(update, cx);
+                let id = ContextCompactionId(update.compaction_id.0.clone());
+                if self.compaction_interrupted {
+                    self.interrupted_compaction_ids.insert(id);
+                } else if !self.interrupted_compaction_ids.contains(&id) {
+                    self.upsert_context_compaction_update(update, cx);
+                }
             }
             acp::SessionUpdate::CompactionSummaryChunk(chunk) => {
-                self.append_context_compaction_summary(chunk, cx);
+                let id = ContextCompactionId(chunk.compaction_id.0.clone());
+                if self.compaction_interrupted {
+                    self.interrupted_compaction_ids.insert(id);
+                } else if !self.interrupted_compaction_ids.contains(&id) {
+                    self.append_context_compaction_summary(chunk, cx);
+                }
             }
             acp::SessionUpdate::SessionInfoUpdate(info_update) => {
+                if let Some(report) = codex_file_change_report_from_meta(&info_update.meta)
+                    && self.agent_file_change_report_request_id.as_deref()
+                        == Some(report.request_id.as_str())
+                {
+                    self.agent_file_change_report_request_id = None;
+                    if report.reported {
+                        self.restore_agent_file_changes(report.changes, cx);
+                    }
+                }
+
                 if let MaybeUndefined::Value(title) = info_update.title {
                     let had_provisional = self.provisional_title.take().is_some();
                     let title: SharedString = title.into();
@@ -3558,6 +3811,181 @@ impl AcpThread {
             _ => {}
         }
         Ok(())
+    }
+
+    fn restore_agent_file_changes(
+        &mut self,
+        changes: Vec<AgentFileChangeSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_agent_file_changes_task(changes, cx)
+            .detach_and_log_err(cx);
+    }
+
+    fn restore_agent_file_changes_task(
+        &mut self,
+        changes: Vec<AgentFileChangeSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if changes.is_empty() {
+            return Task::ready(Ok(()));
+        }
+
+        let project = self.project.clone();
+        let action_log = self.action_log.clone();
+        let work_dirs = self.work_dirs.clone();
+        cx.spawn(async move |_this, cx| {
+            let mut changes_by_path: HashMap<PathBuf, Vec<AgentFileChangeSnapshot>> = HashMap::new();
+            for change in changes {
+                changes_by_path.entry(change.path.clone()).or_default().push(change);
+            }
+            for (path, changes) in changes_by_path {
+                let load_task = match project.update(cx, |project, cx| {
+                    let absolute_path = if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        anyhow::ensure!(
+                            path.components().all(|component| matches!(component, Component::Normal(_) | Component::CurDir)),
+                            "reported ACP path contains a traversal component"
+                        );
+                        let roots = work_dirs
+                            .as_ref()
+                            .map(|dirs| dirs.ordered_paths().cloned().collect::<Vec<_>>())
+                            .unwrap_or_else(|| {
+                                project
+                                    .worktrees(cx)
+                                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                                    .collect()
+                            });
+                        let mut candidates = roots
+                            .into_iter()
+                            .map(|root| root.join(&path))
+                            .filter(|candidate| {
+                                project.project_path_for_absolute_path(candidate, cx).is_some()
+                            });
+                        let candidate = candidates
+                            .next()
+                            .context("reported ACP path is outside the project")?;
+                        anyhow::ensure!(
+                            candidates.next().is_none(),
+                            "reported ACP path is ambiguous across work directories"
+                        );
+                        candidate
+                    };
+                    let project_path = project
+                        .project_path_for_absolute_path(&absolute_path, cx)
+                        .context("reported ACP path is outside the project")?;
+                    anyhow::Ok((absolute_path, project.open_buffer(project_path, cx)))
+                }) {
+                    Ok(task) => task,
+                    Err(error) => {
+                        log::warn!(
+                            "Skipping ACP file review for {}: {error:#}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
+                let (absolute_path, load_task) = load_task;
+                let buffer = match load_task.await {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        log::warn!(
+                            "Skipping ACP file review for {}: {error:#}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                };
+
+                if buffer.read_with(cx, |buffer, _cx| buffer.is_dirty()) {
+                    log::warn!(
+                        "Skipping ACP file review for {} because its buffer conflicts with the diff",
+                        path.display()
+                    );
+                    continue;
+                }
+
+                let reload_task = match project.update(cx, |project, cx| {
+                    if buffer.read(cx).is_dirty() {
+                        return None;
+                    }
+                    let mut buffers = HashSet::default();
+                    buffers.insert(buffer.clone());
+                    Some(project.reload_buffers(buffers, false, cx))
+                }) {
+                    Some(task) => task,
+                    None => continue,
+                };
+                if let Err(error) = reload_task.await {
+                    log::warn!(
+                        "Skipping ACP file review for {} because its buffer could not be reloaded: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+
+                let (is_dirty, content) = buffer.read_with(cx, |buffer, _cx| {
+                    (buffer.is_dirty(), buffer.text())
+                });
+                if is_dirty {
+                    log::warn!(
+                        "Skipping ACP file review for {} because its buffer conflicts with the diff",
+                        path.display()
+                    );
+                    continue;
+                }
+
+                let is_new_file = changes.len() == 1 && changes[0].is_new_file;
+                let before_text = if changes.len() == 1 {
+                    if let Some(patch) = &changes[0].git_patch {
+                        let before = if is_new_file {
+                            Some(String::new())
+                        } else {
+                            language::apply_reversed_diff_patch(&content, patch).ok()
+                        };
+                        before.filter(|before| {
+                            language::apply_diff_patch(before, patch)
+                                .is_ok_and(|after| after == content)
+                        })
+                    } else if is_new_file {
+                        (content == changes[0].after_text).then(String::new)
+                    } else {
+                        reconstruct_before_text(&content, &changes)
+                    }
+                } else if changes.iter().all(|change| !change.is_new_file) {
+                    reconstruct_before_text(&content, &changes)
+                } else {
+                    None
+                };
+                let Some(before_text) = before_text else {
+                    log::warn!(
+                        "Skipping ACP file review for {} because its diff does not match the file",
+                        path.display()
+                    );
+                    continue;
+                };
+
+                let has_pending_edit = action_log.read_with(cx, |action_log, cx| {
+                    action_log
+                        .pending_edits(cx)
+                        .iter()
+                        .any(|(pending_path, _)| pending_path == &absolute_path)
+                });
+                action_log.update(cx, |action_log, cx| {
+                    if has_pending_edit {
+                        action_log.buffer_edited(buffer, cx);
+                    } else {
+                        action_log.restore_pending_file_change(
+                            buffer,
+                            (!is_new_file).then_some(before_text),
+                            cx,
+                        );
+                    }
+                });
+            }
+            anyhow::Ok(())
+        })
     }
 
     pub fn push_user_content_block(
@@ -4067,6 +4495,13 @@ impl AcpThread {
                     _ => None,
                 })
         {
+            if matches!(
+                &self.entries[ix],
+                AgentThreadEntry::ContextCompaction(existing)
+                    if matches!(existing.status, ContextCompactionStatus::Canceled | ContextCompactionStatus::Failed)
+            ) {
+                return;
+            }
             self.entries[ix] = AgentThreadEntry::ContextCompaction(compaction);
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
         } else {
@@ -4095,6 +4530,12 @@ impl AcpThread {
                     _ => None,
                 })
         {
+            if matches!(
+                compaction.status,
+                ContextCompactionStatus::Canceled | ContextCompactionStatus::Failed
+            ) {
+                return;
+            }
             compaction.apply_update(update, &language_registry, path_style, cx);
             cx.emit(AcpThreadEvent::EntryUpdated(entry_index));
             return;
@@ -4157,6 +4598,12 @@ impl AcpThread {
             return;
         };
 
+        if matches!(
+            compaction.status,
+            ContextCompactionStatus::Canceled | ContextCompactionStatus::Failed
+        ) {
+            return;
+        }
         if !update.summary_delta.is_empty() {
             compaction.append_summary(
                 acp::ContentBlock::Text(acp::TextContent::new(update.summary_delta)),
@@ -4217,10 +4664,10 @@ impl AcpThread {
             }
             _ => None,
         }) {
-            self.subagent_sessions_by_tool
-                .entry(tool_call)
-                .or_default()
-                .push(session_id.clone());
+            let sessions = self.subagent_sessions_by_tool.entry(tool_call).or_default();
+            if !sessions.contains(&session_id) {
+                sessions.push(session_id.clone());
+            }
         }
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
@@ -4253,6 +4700,7 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let update = update.into();
+        let id = update.id().clone();
         let languages = self.project.read(cx).languages().clone();
         let path_style = self.project.read(cx).path_style(cx);
 
@@ -4277,6 +4725,7 @@ impl AcpThread {
                     raw_input: None,
                     raw_input_markdown: None,
                     raw_output: None,
+                    raw_output_content: None,
                     tool_name: None,
                     subagent_session_info: None,
                     sandbox_authorization_details: None,
@@ -4309,13 +4758,18 @@ impl AcpThread {
             ToolCallUpdate::UpdateDiff(update) => {
                 call.content.clear();
                 call.content.push(ToolCallContent::Diff(update.diff));
+                call.update_raw_output_content(&languages, cx);
             }
             ToolCallUpdate::UpdateTerminal(update) => {
                 call.content.clear();
                 call.content
                     .push(ToolCallContent::Terminal(update.terminal));
+                call.update_raw_output_content(&languages, cx);
             }
         }
+
+        self.restore_completed_tool_call_diffs(&id, cx);
+        self.queue_claude_tool_review(&id, cx);
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
 
@@ -4410,8 +4864,103 @@ impl AcpThread {
             }
         }
 
-        self.resolve_locations(id, cx);
+        self.resolve_locations(id.clone(), cx);
+        self.restore_completed_tool_call_diffs(&id, cx);
+        self.queue_claude_tool_review(&id, cx);
         Ok(())
+    }
+
+    fn queue_claude_tool_review(&mut self, tool_call_id: &acp::ToolCallId, cx: &mut Context<Self>) {
+        if self.connection.agent_id().as_ref() != CLAUDE_ACP_AGENT_ID
+            || self
+                .claude_review_checkpoint
+                .as_ref()
+                .is_none_or(GitStoreCheckpoint::is_empty)
+        {
+            return;
+        }
+        let Some((_, call)) = self.tool_call(tool_call_id) else {
+            return;
+        };
+        if !matches!(call.status, ToolCallStatus::Completed) {
+            return;
+        }
+        let tool_name = call.tool_name.as_ref().map(SharedString::as_ref);
+        if !matches!(tool_name, Some("Bash" | "PowerShell" | "Edit" | "Write")) {
+            return;
+        }
+        if !self.claude_reviewed_tool_calls.insert(tool_call_id.clone()) {
+            return;
+        }
+
+        let previous_task = self.claude_review_task.take();
+        let git_store = self.project.read(cx).git_store().clone();
+        self.claude_review_task = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous_task) = previous_task {
+                previous_task.await.log_err();
+            }
+            let next_checkpoint = git_store.update(cx, |git, cx| git.checkpoint(cx)).await?;
+            let previous_checkpoint = this.update(cx, |this, _cx| {
+                this.claude_review_checkpoint
+                    .replace(next_checkpoint.clone())
+            })?;
+            if let Some(previous_checkpoint) = previous_checkpoint {
+                let diffs = git_store
+                    .update(cx, |git, cx| {
+                        git.diff_checkpoints(previous_checkpoint, next_checkpoint, cx)
+                    })
+                    .await?;
+                let changes = diffs
+                    .into_iter()
+                    .flat_map(|(root, patch)| git_checkpoint_file_changes(&root, &patch))
+                    .collect();
+                let restore = this.update(cx, |this, cx| {
+                    this.restore_agent_file_changes_task(changes, cx)
+                })?;
+                restore.await?;
+            }
+            Ok(())
+        }));
+    }
+
+    fn restore_completed_tool_call_diffs(
+        &mut self,
+        tool_call_id: &acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.connection.agent_id().as_ref() == CLAUDE_ACP_AGENT_ID
+            && self
+                .claude_review_checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| !checkpoint.is_empty())
+        {
+            return;
+        }
+        let changes: Vec<_> = self
+            .tool_call(tool_call_id)
+            .filter(|(_, call)| matches!(call.status, ToolCallStatus::Completed))
+            .into_iter()
+            .flat_map(|(_, call)| call.content.iter())
+            .filter_map(|content| match content {
+                ToolCallContent::Diff(diff) => diff.read(cx).review_snapshot(),
+                _ => None,
+            })
+            .map(|(path, before_text, after_text)| AgentFileChangeSnapshot {
+                path,
+                before_text,
+                after_text,
+                is_new_file: false,
+                git_patch: None,
+            })
+            .collect();
+        let changes = changes
+            .into_iter()
+            .filter(|change| {
+                self.restored_tool_call_diffs
+                    .insert((tool_call_id.clone(), change.path.clone()))
+            })
+            .collect();
+        self.restore_agent_file_changes(changes, cx);
     }
 
     fn index_for_tool_call(&self, id: &acp::ToolCallId) -> Option<usize> {
@@ -4759,13 +5308,6 @@ impl AcpThread {
         cx.notify();
     }
 
-    pub fn snapshot_completed_plan(&mut self, cx: &mut Context<Self>) {
-        if !self.plan.is_empty() && self.plan.stats().pending == 0 {
-            let completed_entries = std::mem::take(&mut self.plan.entries);
-            self.push_entry(AgentThreadEntry::CompletedPlan(completed_entries), cx);
-        }
-    }
-
     fn clear_completed_plan_entries(&mut self, cx: &mut Context<Self>) {
         self.plan
             .entries
@@ -5062,9 +5604,16 @@ impl AcpThread {
             self.project.read(cx).path_style(cx),
             cx,
         );
-        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
+        let agent_file_change_report_request_id = (self.connection.agent_id().as_ref()
+            == CODEX_ACP_AGENT_ID)
+            .then(|| Uuid::new_v4().to_string());
+        let mut request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
+        if let Some(request_id) = &agent_file_change_report_request_id {
+            request = request.meta(Some(codex_file_change_report_request_meta(request_id)));
+        }
         let git_store = self.project.read(cx).git_store().clone();
         let enable_checkpoints = AgentSettings::get_global(cx).enable_checkpoints;
+        let capture_claude_review = self.connection.agent_id().as_ref() == CLAUDE_ACP_AGENT_ID;
 
         self.set_draft_prompt(None, cx);
 
@@ -5072,8 +5621,19 @@ impl AcpThread {
         let client_id = client_user_message_ids
             .as_ref()
             .map(|client_user_message_ids| client_user_message_ids.new_id());
+        let request_id_to_clear = agent_file_change_report_request_id.clone();
 
         self.run_turn(cx, async move |this, cx| {
+            if capture_claude_review {
+                let previous_review_task = this.update(cx, |this, _cx| {
+                    this.claude_review_checkpoint = None;
+                    this.claude_reviewed_tool_calls.clear();
+                    this.claude_review_task.take()
+                })?;
+                if let Some(previous_review_task) = previous_review_task {
+                    previous_review_task.await.log_err();
+                }
+            }
             if push_user_message {
                 this.update(cx, |this, cx| {
                     this.push_entry(
@@ -5090,33 +5650,57 @@ impl AcpThread {
                     );
                 })
                 .ok();
-
-                if enable_checkpoints {
-                    let old_checkpoint = git_store
-                        .update(cx, |git, cx| git.checkpoint(cx))
-                        .await
-                        .context("failed to get old checkpoint")
-                        .log_err();
-                    this.update(cx, |this, _cx| {
-                        if let Some((_ix, message)) = this.last_user_message() {
-                            message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
-                                git_checkpoint,
-                                show: false,
-                            });
-                        }
-                    })
-                    .ok();
-                }
+            }
+            if (enable_checkpoints && push_user_message) || capture_claude_review {
+                let old_checkpoint = git_store
+                    .update(cx, |git, cx| git.checkpoint(cx))
+                    .await
+                    .context("failed to get old checkpoint")
+                    .log_err();
+                this.update(cx, |this, _cx| {
+                    if capture_claude_review {
+                        this.claude_review_checkpoint = old_checkpoint.clone();
+                    }
+                    if enable_checkpoints
+                        && push_user_message
+                        && let Some((_ix, message)) = this.last_user_message()
+                    {
+                        message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
+                            git_checkpoint,
+                            show: false,
+                        });
+                    }
+                })
+                .ok();
             }
 
-            this.update(cx, |this, cx| {
+            let prompt_task = this.update(cx, |this, cx| {
+                this.agent_file_change_report_request_id = agent_file_change_report_request_id;
                 if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
                     prompt.prompt(client_id, request, cx)
                 } else {
                     this.connection.prompt(request, cx)
                 }
-            })?
-            .await
+            })?;
+            let response = prompt_task.await;
+            if capture_claude_review {
+                if let Some(review_task) =
+                    this.update(cx, |this, _cx| this.claude_review_task.take())?
+                {
+                    review_task.await.log_err();
+                }
+                this.update(cx, |this, _cx| this.claude_review_checkpoint = None)?;
+            }
+            if let Some(request_id) = request_id_to_clear {
+                this.update(cx, |this, _cx| {
+                    if this.agent_file_change_report_request_id.as_deref()
+                        == Some(request_id.as_str())
+                    {
+                        this.agent_file_change_report_request_id = None;
+                    }
+                })?;
+            }
+            response
         })
     }
 
@@ -5144,20 +5728,37 @@ impl AcpThread {
         cx: &mut Context<Self>,
         f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp::PromptResponse>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        self.run_turn_with_previous_turn(cx, false, f)
+    }
+
+    pub fn track_native_continuation(
+        &mut self,
+        response: Task<Result<acp::PromptResponse>>,
+        cx: &mut Context<Self>,
+    ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        self.run_turn_with_previous_turn(cx, true, async move |_, _| response.await)
+    }
+
+    fn run_turn_with_previous_turn(
+        &mut self,
+        cx: &mut Context<Self>,
+        native_continuation: bool,
+        f: impl 'static + AsyncFnOnce(WeakEntity<Self>, &mut AsyncApp) -> Result<acp::PromptResponse>,
+    ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
 
         let (tx, rx) = oneshot::channel();
-        let defer_until_background_subagents_finish = self.connection.agent_id().as_ref()
-            == CLAUDE_ACP_AGENT_ID
-            && self.running_turn.is_some()
-            && self.has_in_progress_subagent_tool_calls();
+        let defer_until_background_subagents_finish = self.running_turn.is_some()
+            && (native_continuation || self.has_in_progress_subagent_tool_calls());
         let previous_turn = if defer_until_background_subagents_finish {
             self.running_turn.take()
         } else {
             None
         };
-        let cancel_task = if previous_turn.is_none() {
+        // The native turn has already started; canceling the old ACP lifecycle
+        // here would cancel the newly-woken native turn instead.
+        let cancel_task = if previous_turn.is_none() && !native_continuation {
             Some(self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx))
         } else {
             None
@@ -5193,6 +5794,8 @@ impl AcpThread {
                     }
                 }
 
+                this.update(cx, |this, _| this.compaction_interrupted = false)
+                    .log_err();
                 tx.send(f(this, cx).await).ok();
             }),
             settled: settled_rx,
@@ -5231,6 +5834,7 @@ impl AcpThread {
 
                     let Ok(response) = response else {
                         if is_same_turn {
+                            this.cancel_pending_turn_entries(cx);
                             cx.emit(AcpThreadEvent::StatusChanged);
                         }
                         // tx dropped, just return
@@ -5275,10 +5879,6 @@ impl AcpThread {
                             let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
                             if canceled && is_same_turn {
                                 this.cancel_pending_turn_entries(cx);
-                            }
-
-                            if !canceled {
-                                this.snapshot_completed_plan(cx);
                             }
 
                             // Handle refusal - distinguish between user prompt and tool call refusals
@@ -5370,6 +5970,7 @@ impl AcpThread {
     ) -> Task<()> {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.cancel_outstanding_elicitations(cx);
+        self.interrupt_compactions(cx);
 
         let Some(turn) = self.running_turn.take() else {
             return Task::ready(());
@@ -5420,11 +6021,26 @@ impl AcpThread {
         self.cancel_outstanding_elicitations(cx);
     }
 
+    fn interrupt_compactions(&mut self, cx: &mut Context<Self>) {
+        self.compaction_interrupted = true;
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if let AgentThreadEntry::ContextCompaction(compaction) = entry
+                && compaction.is_in_progress()
+            {
+                self.interrupted_compaction_ids
+                    .insert(compaction.id.clone());
+                compaction.status = ContextCompactionStatus::Canceled;
+                cx.emit(AcpThreadEvent::EntryUpdated(index));
+            }
+        }
+    }
+
     fn mark_pending_entries_as_canceled(
         &mut self,
         permission_outcome: RequestPermissionOutcome,
         cx: &mut Context<Self>,
     ) {
+        self.interrupt_compactions(cx);
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
@@ -5445,12 +6061,6 @@ impl AcpThread {
                                 "Permission request closed before cancellation was delivered"
                             );
                         }
-                        cx.emit(AcpThreadEvent::EntryUpdated(ix));
-                    }
-                }
-                AgentThreadEntry::ContextCompaction(compaction) => {
-                    if compaction.status == ContextCompactionStatus::InProgress {
-                        compaction.status = ContextCompactionStatus::Canceled;
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
                     }
                 }
@@ -6320,43 +6930,31 @@ fn markdown_for_raw_output(
     language_registry: &Arc<LanguageRegistry>,
     cx: &mut App,
 ) -> Option<Entity<Markdown>> {
+    let text = raw_output_text(raw_output)?;
+    Some(cx.new(|cx| Markdown::new(text.into(), Some(language_registry.clone()), None, cx)))
+}
+
+fn raw_output_text(raw_output: &serde_json::Value) -> Option<String> {
     match raw_output {
         serde_json::Value::Null => None,
-        serde_json::Value::Bool(value) => Some(cx.new(|cx| {
-            Markdown::new(
-                value.to_string().into(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        })),
-        serde_json::Value::Number(value) => Some(cx.new(|cx| {
-            Markdown::new(
-                value.to_string().into(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        })),
-        serde_json::Value::String(value) => Some(cx.new(|cx| {
-            Markdown::new(
-                value.clone().into(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        })),
-        value => Some(cx.new(|cx| {
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        value => {
             let pretty_json = to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-
-            Markdown::new(
-                format!("```json\n{}\n```", pretty_json).into(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        })),
+            Some(format!("```json\n{pretty_json}\n```"))
+        }
     }
+}
+
+fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut App) {
+    markdown.update(cx, |markdown, cx| {
+        match text.strip_prefix(markdown.source()) {
+            Some("") => {}
+            Some(suffix) => markdown.append(suffix, cx),
+            None => markdown.reset(text.to_owned().into(), cx),
+        }
+    });
 }
 
 #[cfg(test)]
@@ -6455,6 +7053,175 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[gpui::test]
+    fn test_tool_call_raw_output_creation_and_updates_export_latest_content(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        let mut created_with_raw_output = cx.update(|cx| {
+            ToolCall::from_acp(
+                acp::ToolCall::new("created", "Tool").raw_output(json!("first")),
+                ToolCallStatus::Pending,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("raw-only tool call should convert")
+        });
+        let mut updated_with_raw_output = cx.update(|cx| {
+            ToolCall::from_acp(
+                acp::ToolCall::new("updated", "Tool"),
+                ToolCallStatus::Pending,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("empty tool call should convert")
+        });
+
+        let created_export = cx.read(|cx| created_with_raw_output.to_markdown(cx));
+        cx.update(|cx| {
+            updated_with_raw_output
+                .update_fields(
+                    acp::ToolCallUpdateFields::new().raw_output(json!("first")),
+                    None,
+                    languages.clone(),
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("first raw output update should apply");
+        });
+        let first_update_export = cx.read(|cx| updated_with_raw_output.to_markdown(cx));
+        let Some(ToolCallContent::ContentBlock(block)) =
+            updated_with_raw_output.content_for_display().first()
+        else {
+            panic!("expected raw output content");
+        };
+        let raw_markdown = block
+            .markdown()
+            .expect("raw output should be Markdown")
+            .clone();
+        cx.update(|cx| {
+            created_with_raw_output
+                .update_fields(
+                    acp::ToolCallUpdateFields::new().raw_output(json!("second")),
+                    None,
+                    languages.clone(),
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("second raw output update should apply");
+            updated_with_raw_output
+                .update_fields(
+                    acp::ToolCallUpdateFields::new().raw_output(json!("second")),
+                    None,
+                    languages,
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("second raw output update should apply");
+        });
+        let latest_exports = cx.read(|cx| {
+            assert_eq!(raw_markdown.read(cx).source(), "second");
+            (
+                created_with_raw_output.to_markdown(cx),
+                updated_with_raw_output.to_markdown(cx),
+            )
+        });
+        assert_eq!(
+            (created_export, first_update_export, latest_exports),
+            (
+                "**Tool Call: Tool**\nStatus: Pending\n\nfirst\n\n".to_string(),
+                "**Tool Call: Tool**\nStatus: Pending\n\nfirst\n\n".to_string(),
+                (
+                    "**Tool Call: Tool**\nStatus: Pending\n\nsecond\n\n".to_string(),
+                    "**Tool Call: Tool**\nStatus: Pending\n\nsecond\n\n".to_string(),
+                ),
+            )
+        );
+    }
+
+    #[gpui::test]
+    fn test_tool_call_clearing_structured_content_restores_raw_output(cx: &mut TestAppContext) {
+        init_test(cx);
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        let mut call = cx.update(|cx| {
+            ToolCall::from_acp(
+                acp::ToolCall::new("tool", "Tool")
+                    .content(vec!["structured".into()])
+                    .raw_output(json!("raw")),
+                ToolCallStatus::Pending,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("tool call should convert")
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                call.to_markdown(cx),
+                "**Tool Call: Tool**\nStatus: Pending\n\nstructured\n\n"
+            );
+        });
+        cx.update(|cx| {
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().raw_output(json!("new raw")),
+                None,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("raw output should update without replacing structured content");
+            assert_eq!(
+                call.to_markdown(cx),
+                "**Tool Call: Tool**\nStatus: Pending\n\nstructured\n\n"
+            );
+        });
+        cx.update(|cx| {
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().content(vec![]),
+                None,
+                languages.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("clearing structured content should apply");
+        });
+        cx.read(|cx| {
+            assert_eq!(call.raw_output, Some(json!("new raw")));
+            assert_eq!(
+                call.to_markdown(cx),
+                "**Tool Call: Tool**\nStatus: Pending\n\nnew raw\n\n"
+            );
+        });
+        cx.update(|cx| {
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().content(vec!["replacement".into()]),
+                None,
+                languages,
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("structured content should replace the raw fallback");
+            assert_eq!(
+                call.to_markdown(cx),
+                "**Tool Call: Tool**\nStatus: Pending\n\nreplacement\n\n"
+            );
+        });
     }
 
     #[gpui::test]
@@ -6588,6 +7355,116 @@ mod tests {
         let unknown =
             acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), "future-category".into())]);
         assert_eq!(command_category_from_meta(&Some(unknown)), None);
+    }
+
+    #[test]
+    fn codex_file_change_report_metadata_is_versioned_and_bounded() {
+        let request_id = "turn-1";
+        let request_meta = codex_file_change_report_request_meta(request_id);
+        assert_eq!(
+            request_meta
+                .get("jetbrains")
+                .and_then(|value| value.get("air"))
+                .and_then(|value| value.get("agentFileChangeReportRequest")),
+            Some(&json!({"version": 1, "requestId": request_id}))
+        );
+
+        let report_meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": request_id,
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/workspace/file.rs",
+                            "beforeText": "before",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        let report = codex_file_change_report_from_meta(&Some(report_meta))
+            .expect("valid report metadata should be decoded");
+        assert_eq!(report.request_id, request_id);
+        assert!(report.reported);
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].path, PathBuf::from("/workspace/file.rs"));
+        assert_eq!(report.changes[0].before_text, "before");
+        assert_eq!(report.changes[0].after_text, "after");
+
+        let invalid_meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 2,
+                        "requestId": request_id,
+                        "status": "reported",
+                        "changes": [],
+                    },
+                },
+            }),
+        )]);
+        assert!(codex_file_change_report_from_meta(&Some(invalid_meta)).is_none());
+    }
+
+    #[test]
+    fn acp_hunks_reconstruct_only_unambiguous_before_text() {
+        let changes = vec![
+            AgentFileChangeSnapshot {
+                path: "file.rs".into(),
+                before_text: "old first".into(),
+                after_text: "new first".into(),
+                is_new_file: false,
+                git_patch: None,
+            },
+            AgentFileChangeSnapshot {
+                path: "file.rs".into(),
+                before_text: "old second".into(),
+                after_text: "new second".into(),
+                is_new_file: false,
+                git_patch: None,
+            },
+        ];
+        assert_eq!(
+            reconstruct_before_text("prefix\nnew first\nmiddle\nnew second\nsuffix", &changes),
+            Some("prefix\nold first\nmiddle\nold second\nsuffix".into())
+        );
+        assert_eq!(
+            reconstruct_before_text("new first\nnew first\nnew second", &changes),
+            None
+        );
+        assert_eq!(reconstruct_before_text("unrelated", &changes), None);
+    }
+
+    #[test]
+    fn git_checkpoint_diff_extracts_text_edits_and_creations() {
+        let diff = "diff --git a/file.txt b/file.txt\nindex 111..222 100644\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+        let changes = git_checkpoint_file_changes(Path::new("/repo"), diff);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].path, PathBuf::from("/repo/file.txt"));
+        assert!(!changes[0].is_new_file);
+        assert_eq!(
+            language::apply_reversed_diff_patch(
+                "first\nnew\nlast\n",
+                changes[0].git_patch.as_deref().expect("patch should exist")
+            )
+            .expect("the patch should reverse cleanly"),
+            "first\nold\nlast\n"
+        );
+        assert_eq!(changes[1].path, PathBuf::from("/repo/new.txt"));
+        assert!(changes[1].is_new_file);
+        assert_eq!(
+            language::apply_diff_patch(
+                "",
+                changes[1].git_patch.as_deref().expect("patch should exist")
+            )
+            .expect("creation patch should apply"),
+            "hello\n"
+        );
     }
 
     #[test]
@@ -11672,14 +12549,21 @@ mod tests {
         // First handler waits for this signal before completing
         let (first_complete_tx, first_complete_rx) = futures::channel::oneshot::channel::<()>();
         let first_complete_rx = RefCell::new(Some(first_complete_rx));
+        let (second_complete_tx, second_complete_rx) = futures::channel::oneshot::channel::<()>();
+        let second_complete_rx = RefCell::new(Some(second_complete_rx));
 
         let connection = Rc::new(FakeAgentConnection::new().on_user_message({
             move |params, _thread, _cx| {
-                let first_complete_rx = first_complete_rx.borrow_mut().take();
                 let is_first = params
                     .prompt
                     .iter()
                     .any(|c| matches!(c, acp::ContentBlock::Text(t) if t.text.contains("first")));
+                let first_complete_rx = is_first
+                    .then(|| first_complete_rx.borrow_mut().take())
+                    .flatten();
+                let second_complete_rx = (!is_first)
+                    .then(|| second_complete_rx.borrow_mut().take())
+                    .flatten();
 
                 async move {
                     if is_first {
@@ -11687,6 +12571,8 @@ mod tests {
                         if let Some(rx) = first_complete_rx {
                             rx.await.ok();
                         }
+                    } else if let Some(rx) = second_complete_rx {
+                        rx.await.ok();
                     }
                     Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
                 }
@@ -11751,6 +12637,7 @@ mod tests {
         );
 
         // Second request completes - SHOULD clear running_turn
+        second_complete_tx.send(()).ok();
         second_request.await.unwrap();
 
         let running_turn_after_second =
@@ -11760,6 +12647,59 @@ mod tests {
             "second turn completing should clear running_turn"
         );
         assert_eq!(cx.active_idle_sleep_preventions(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_native_continuation_waits_for_previous_lifecycle_without_canceling(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (first_complete_tx, first_complete_rx) = oneshot::channel::<()>();
+        let first_complete_rx = RefCell::new(Some(first_complete_rx));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(move |_, _, _| {
+            let receiver = first_complete_rx.borrow_mut().take().expect("first prompt");
+            async move {
+                receiver.await?;
+                Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+            }
+            .boxed_local()
+        }));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+        let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
+        cx.run_until_parked();
+        let (continuation_tx, continuation_rx) = oneshot::channel::<()>();
+        let response = cx.spawn(async move |_| {
+            continuation_rx.await?;
+            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        });
+        let continuation = thread.update(cx, |thread, cx| {
+            thread.track_native_continuation(response, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.active_turn_id()),
+            Some(2)
+        );
+        first_complete_tx
+            .send(())
+            .expect("previous lifecycle must not be canceled");
+        first_request.await.unwrap();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.active_turn_id()),
+            Some(2)
+        );
+        continuation_tx.send(()).unwrap();
+        continuation.await.unwrap();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
     }
 
     #[gpui::test]
@@ -11976,6 +12916,55 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_codex_prompt_requests_agent_file_change_report(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let captured_meta = Arc::new(parking_lot::Mutex::new(None));
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .with_agent_id(CODEX_ACP_AGENT_ID)
+                .on_user_message({
+                    let captured_meta = captured_meta.clone();
+                    move |request, _thread, _cx| {
+                        *captured_meta.lock() = request.meta;
+                        async move { Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)) }
+                            .boxed_local()
+                    }
+                }),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("test", cx))
+            .await
+            .expect("Codex prompt should succeed");
+
+        let request = captured_meta
+            .lock()
+            .clone()
+            .expect("Codex prompt should include request metadata");
+        let request = request
+            .get("jetbrains")
+            .and_then(|value| value.get("air"))
+            .and_then(|value| value.get("agentFileChangeReportRequest"))
+            .expect("Codex report request should be nested under AIR metadata");
+        assert_eq!(request.get("version"), Some(&json!(1)));
+        assert!(
+            request
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|request_id| !request_id.is_empty())
+        );
+    }
+
+    #[gpui::test]
     async fn test_send_returns_cancelled_response_and_marks_tools_as_cancelled(
         cx: &mut TestAppContext,
     ) {
@@ -12186,6 +13175,549 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_completed_acp_diff_restores_review_once_for_relative_path(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "after"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("pi-acp"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        let tool_call = || {
+            acp::ToolCall::new("edit-1", "Edit file.rs")
+                .kind(acp::ToolKind::Edit)
+                .status(acp::ToolCallStatus::Completed)
+                .content(vec![acp::ToolCallContent::Diff(
+                    acp::Diff::new("file.rs", "after").old_text("before"),
+                )])
+        };
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(acp::SessionUpdate::ToolCall(tool_call()), cx)
+                .expect("completed ACP diff should be handled");
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(PathBuf::from(path!("/test/file.rs")), "before".to_owned())]
+        );
+
+        action_log.update(cx, |action_log, cx| action_log.keep_all_edits(None, cx));
+        cx.run_until_parked();
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(acp::SessionUpdate::ToolCall(tool_call()), cx)
+                .expect("repeated ACP diff should be handled");
+        });
+        cx.run_until_parked();
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_completed_acp_hunk_restores_whole_file_review(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "prefix\nnew\nsuffix\n"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("claude-acp"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("edit-hunk", "Edit file.rs")
+                            .kind(acp::ToolKind::Edit)
+                            .status(acp::ToolCallStatus::Completed)
+                            .content(vec![acp::ToolCallContent::Diff(
+                                acp::Diff::new("file.rs", "new").old_text("old"),
+                            )]),
+                    ),
+                    cx,
+                )
+                .expect("completed ACP hunk should be handled");
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(
+                PathBuf::from(path!("/test/file.rs")),
+                "prefix\nold\nsuffix\n".to_owned()
+            )]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_git_checkpoint_creation_can_be_rejected(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"new.txt": "hello\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CLAUDE_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Claude ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+        let patch = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+        let changes = git_checkpoint_file_changes(Path::new(path!("/test")), patch);
+        thread.update(cx, |thread, cx| {
+            thread.restore_agent_file_changes(changes, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(PathBuf::from(path!("/test/new.txt")), String::new())]
+        );
+        action_log
+            .update(cx, |action_log, cx| action_log.reject_all_edits(None, cx))
+            .await;
+        assert!(fs.read_file_sync(path!("/test/new.txt")).is_err());
+    }
+
+    #[gpui::test]
+    async fn test_git_checkpoint_edit_can_be_kept(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.txt": "first\nnew\nlast\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CLAUDE_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Claude ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+        let patch = "diff --git a/file.txt b/file.txt\nindex 111..222 100644\n--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n first\n-old\n+new\n last\n";
+        let changes = git_checkpoint_file_changes(Path::new(path!("/test")), patch);
+        thread.update(cx, |thread, cx| {
+            thread.restore_agent_file_changes(changes, cx)
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(
+                PathBuf::from(path!("/test/file.txt")),
+                "first\nold\nlast\n".to_owned()
+            )]
+        );
+        action_log.update(cx, |action_log, cx| action_log.keep_all_edits(None, cx));
+        cx.run_until_parked();
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+        assert_eq!(
+            fs.read_file_sync(path!("/test/file.txt"))
+                .expect("kept file should remain"),
+            b"first\nnew\nlast\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_claude_bash_review_is_queued_once_per_tool(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({".git": {}, "file.txt": "old"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let git_store = project.read_with(cx, |project, _cx| project.git_store().clone());
+        let checkpoint = git_store
+            .update(cx, |git, cx| git.checkpoint(cx))
+            .await
+            .unwrap();
+        assert!(!checkpoint.is_empty());
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CLAUDE_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Claude ACP test session should be created");
+        thread.update(cx, |thread, _cx| {
+            thread.claude_review_checkpoint = Some(checkpoint)
+        });
+
+        let completed_bash = || {
+            acp::ToolCall::new("bash-1", "Modify file")
+                .name("Bash")
+                .kind(acp::ToolKind::Execute)
+                .status(acp::ToolCallStatus::Completed)
+        };
+        for _ in 0..2 {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(acp::SessionUpdate::ToolCall(completed_bash()), cx)
+                    .expect("Bash tool update should be handled");
+            });
+        }
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.claude_reviewed_tool_calls.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_codex_file_change_report_restores_action_log_review(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "after"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CODEX_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        thread.update(cx, |thread, _cx| {
+            thread.agent_file_change_report_request_id = Some("request-1".to_owned());
+        });
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": "request-1",
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/test/file.rs",
+                            "beforeText": "before",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+                    cx,
+                )
+                .expect("file-change report should be handled");
+        });
+        cx.run_until_parked();
+
+        let pending_edits = action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx));
+        assert_eq!(
+            pending_edits,
+            vec![(PathBuf::from(path!("/test/file.rs")), "before".to_owned())]
+        );
+        thread.read_with(cx, |thread, _cx| {
+            assert!(thread.agent_file_change_report_request_id.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_codex_file_change_report_reloads_clean_stale_buffer_before_review(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "before"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/test"))], cx).await;
+        let project_path = project
+            .read_with(cx, |project, cx| project.find_project_path("file.rs", cx))
+            .expect("file should be in the project");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("file should open");
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CODEX_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        fs.pause_events();
+        fs.insert_file(path!("/test/file.rs"), b"after".to_vec())
+            .await;
+        thread.update(cx, |thread, _cx| {
+            thread.agent_file_change_report_request_id = Some("request-1".to_owned());
+        });
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": "request-1",
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/test/file.rs",
+                            "beforeText": "before",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+                    cx,
+                )
+                .expect("file-change report should be handled");
+        });
+        cx.run_until_parked();
+
+        let pending_edits = action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx));
+        assert_eq!(
+            pending_edits,
+            vec![(PathBuf::from(path!("/test/file.rs")), "before".to_owned())]
+        );
+        buffer.read_with(cx, |buffer, _cx| {
+            assert!(!buffer.is_dirty());
+            assert_eq!(buffer.text(), "after");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_codex_file_change_report_does_not_reload_a_dirty_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "after"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let project_path = project
+            .read_with(cx, |project, cx| project.find_project_path("file.rs", cx))
+            .expect("file should be in the project");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("file should open");
+        buffer.update(cx, |buffer, cx| buffer.set_text("user draft", cx));
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CODEX_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        thread.update(cx, |thread, _cx| {
+            thread.agent_file_change_report_request_id = Some("request-1".to_owned());
+        });
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": "request-1",
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/test/file.rs",
+                            "beforeText": "before",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+                    cx,
+                )
+                .expect("file-change report should be handled");
+        });
+        cx.run_until_parked();
+
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+        buffer.read_with(cx, |buffer, _cx| {
+            assert!(buffer.is_dirty());
+            assert_eq!(buffer.text(), "user draft");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_codex_file_change_report_preserves_existing_review_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "after"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let project_path = project
+            .read_with(cx, |project, cx| project.find_project_path("file.rs", cx))
+            .expect("file should be in the project");
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(project_path, cx))
+            .await
+            .expect("file should open");
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CODEX_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+        action_log.update(cx, |action_log, cx| {
+            action_log.restore_pending_edit(buffer, "earlier baseline".to_owned(), cx);
+        });
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, _cx| {
+            thread.agent_file_change_report_request_id = Some("request-1".to_owned());
+        });
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": "request-1",
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/test/file.rs",
+                            "beforeText": "codex baseline",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+                    cx,
+                )
+                .expect("file-change report should be handled");
+        });
+        cx.run_until_parked();
+
+        let pending_edits = action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx));
+        assert_eq!(pending_edits.len(), 1);
+        assert_eq!(pending_edits[0].1, "earlier baseline");
+    }
+
+    #[gpui::test]
+    async fn test_codex_file_change_report_ignores_stale_request_ids(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({"file.rs": "after"}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id(CODEX_ACP_AGENT_ID));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("Codex ACP test session should be created");
+        let action_log = thread.read_with(cx, |thread, _cx| thread.action_log().clone());
+
+        thread.update(cx, |thread, _cx| {
+            thread.agent_file_change_report_request_id = Some("current-request".to_owned());
+        });
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".into(),
+            json!({
+                "air": {
+                    "agentFileChangeReport": {
+                        "version": 1,
+                        "requestId": "stale-request",
+                        "status": "reported",
+                        "changes": [{
+                            "path": "/test/file.rs",
+                            "beforeText": "before",
+                            "afterText": "after",
+                        }],
+                    },
+                },
+            }),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
+                    cx,
+                )
+                .expect("stale file-change report should be ignored");
+        });
+        cx.run_until_parked();
+
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(
+                thread.agent_file_change_report_request_id.as_deref(),
+                Some("current-request")
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_usage_update_populates_token_usage_and_cost(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -12284,6 +13816,190 @@ mod tests {
                 .expect("token_usage should be restored by the next usage update");
             assert_eq!(usage.used_tokens, 1000);
             assert_eq!(usage.max_tokens, 10000);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_interrupted_compaction_rejects_late_events_and_allows_fresh_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |_, thread, mut cx| {
+                async move {
+                    thread.update(&mut cx, |thread, cx| {
+                        for id in ["interrupted", "late-unknown"] {
+                            thread
+                                .handle_session_update(
+                                    acp::SessionUpdate::CompactionUpdate(
+                                        acp::CompactionUpdate::new(
+                                            id,
+                                            acp::CompactionStatus::InProgress,
+                                        ),
+                                    ),
+                                    cx,
+                                )
+                                .unwrap();
+                        }
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                                    "fresh",
+                                    acp::CompactionStatus::InProgress,
+                                )),
+                                cx,
+                            )
+                            .unwrap();
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                                    "fresh",
+                                    acp::CompactionStatus::Completed,
+                                )),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                        "interrupted",
+                        acp::CompactionStatus::InProgress,
+                    )),
+                    cx,
+                )
+                .unwrap();
+        });
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+        thread.update(cx, |thread, cx| {
+            for id in ["interrupted", "late-unknown"] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::CompactionUpdate(
+                            acp::CompactionUpdate::new(id, acp::CompactionStatus::Completed)
+                                .summary(vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                    "late",
+                                ))]),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+            thread.update_context_compaction(
+                ContextCompactionUpdate {
+                    id: ContextCompactionId("interrupted".into()),
+                    summary_delta: "late native summary".into(),
+                    status: Some(ContextCompactionStatus::Completed),
+                    error: None,
+                },
+                cx,
+            );
+            thread.push_context_compaction(
+                ContextCompaction {
+                    id: ContextCompactionId("interrupted".into()),
+                    status: ContextCompactionStatus::InProgress,
+                    error: None,
+                    summary: Vec::new(),
+                },
+                cx,
+            );
+            let [AgentThreadEntry::ContextCompaction(compaction)] = thread.entries() else {
+                panic!("late compaction must not create another entry");
+            };
+            assert_eq!(compaction.status, ContextCompactionStatus::Canceled);
+            assert!(compaction.summary.is_empty());
+        });
+        thread
+            .update(cx, |thread, cx| thread.send_raw("next", cx))
+            .await
+            .unwrap();
+        thread.read_with(cx, |thread, _| {
+            let compactions = thread
+                .entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    AgentThreadEntry::ContextCompaction(compaction) => Some(compaction),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(compactions.len(), 2);
+            assert_eq!(compactions[0].status, ContextCompactionStatus::Canceled);
+            assert_eq!(compactions[1].status, ContextCompactionStatus::Completed);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prompt_error_closes_compaction_before_settling(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            |_, thread, mut cx| {
+                async move {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                                    "failed-prompt",
+                                    acp::CompactionStatus::InProgress,
+                                )),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Err(anyhow!("connection failed"))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+        assert!(
+            thread
+                .update(cx, |thread, cx| thread.send_raw("compact", cx))
+                .await
+                .is_err()
+        );
+        thread.update(cx, |thread, cx| {
+            assert!(!thread.is_compacting());
+            assert!(thread.compaction_interrupted);
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::CompactionUpdate(acp::CompactionUpdate::new(
+                        "failed-prompt",
+                        acp::CompactionStatus::InProgress,
+                    )),
+                    cx,
+                )
+                .unwrap();
+            let compaction = thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ContextCompaction(compaction) => Some(compaction),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(compaction.status, ContextCompactionStatus::Canceled);
         });
     }
 
@@ -12408,6 +14124,7 @@ mod tests {
     #[gpui::test]
     async fn test_response_usage_does_not_clobber_session_usage(cx: &mut TestAppContext) {
         init_test(cx);
+        enable_acp_beta(cx);
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;

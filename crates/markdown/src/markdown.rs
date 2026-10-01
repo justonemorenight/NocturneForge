@@ -1146,7 +1146,13 @@ impl Markdown {
             let mut fallback_code_block_language = None;
             if let Some(registry) = language_registry.as_ref() {
                 for name in language_names {
-                    if let Ok(language) = registry.language_for_name_or_extension(&name).await {
+                    let mut language = registry.language_for_name_or_extension(&name).await;
+                    if language.is_err()
+                        && let Some((first_word, _)) = name.split_once(char::is_whitespace)
+                    {
+                        language = registry.language_for_name_or_extension(first_word).await;
+                    }
+                    if let Ok(language) = language {
                         languages_by_name.insert(name, language);
                     }
                 }
@@ -4418,7 +4424,7 @@ impl MarkdownElementBuilder {
             self.rendered_lines.push(rendered_line.clone());
             self.append_child(
                 HighlightedLine {
-                    text: text.into_any(),
+                    text,
                     line: rendered_line,
                 }
                 .into_any_element(),
@@ -4445,7 +4451,7 @@ impl MarkdownElementBuilder {
 }
 
 struct HighlightedLine {
-    text: AnyElement,
+    text: StyledText,
     line: Rc<RenderedLine>,
 }
 
@@ -4464,23 +4470,24 @@ impl Element for HighlightedLine {
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        (self.text.request_layout(window, cx), ())
+        self.text.request_layout(None, inspector_id, window, cx)
     }
 
     fn prepaint(
         &mut self,
         _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.text.prepaint(window, cx);
+        self.text
+            .prepaint(None, inspector_id, bounds, request_layout, window, cx);
     }
 
     fn paint(
@@ -4493,9 +4500,11 @@ impl Element for HighlightedLine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let layout = self.text.layout();
         self.line.paint_code_chips(window);
-        self.text.paint(window, cx);
+        layout.paint_background(window, cx).log_err();
         self.line.paint_highlights(window);
+        layout.paint_foreground(window, cx).log_err();
     }
 }
 
@@ -5282,12 +5291,149 @@ impl RenderedText {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{RenderImage, TestAppContext, UpdateGlobal, size};
+    use gpui::{Background, RenderImage, TestAppContext, UpdateGlobal, size};
     use language::{Language, LanguageConfig, LanguageMatcher};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    struct MarkdownPaintTestView {
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+    }
+
+    impl Render for MarkdownPaintTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            MarkdownElement::new(self.markdown.clone(), self.style.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn test_search_and_selection_below_aligned_inline_code(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        for alignment in ["---", ":---:", "---:"] {
+            for text in ["xx", "é中🙂"] {
+                let source = format!(
+                    "| WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW |\n| {alignment} |\n| ~~`{text}`~~ |\n"
+                );
+                let start = source.find(text).expect("inline code is present");
+                let range = start..start + text.len();
+                let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+                markdown.update(cx, |markdown, cx| {
+                    markdown.selection.start = range.start;
+                    markdown.selection.end = range.end;
+                    markdown.set_search_highlights(vec![range], None, cx);
+                });
+                let (_, cx) = cx.add_window_view(move |_, _| MarkdownPaintTestView {
+                    markdown,
+                    style: MarkdownStyle {
+                        inline_code: TextStyleRefinement {
+                            background_color: Some(gpui::green()),
+                            ..TextStyleRefinement::default()
+                        },
+                        selection_background_color: gpui::red(),
+                        ..MarkdownStyle::default()
+                    },
+                });
+                cx.run_until_parked();
+                cx.update(|window, cx| {
+                    let quads = window.painted_quads();
+                    let selection_bounds = quads
+                        .iter()
+                        .find(|quad| quad.background == Background::from(gpui::red()))
+                        .expect("selection is painted")
+                        .bounds;
+                    let order_for_color = |color| {
+                        let orders = quads
+                            .iter()
+                            .filter(|quad| {
+                                quad.background == Background::from(color)
+                                    && quad.bounds.intersects(&selection_bounds)
+                            })
+                            .map(|quad| quad.order)
+                            .collect::<Vec<_>>();
+                        assert_eq!(orders.len(), 1);
+                        orders[0]
+                    };
+                    let chip_order = order_for_color(gpui::green());
+                    let search_order = order_for_color(cx.theme().colors().search_match_background);
+                    let selection_order = order_for_color(gpui::red());
+                    let text_order = window
+                        .painted_underlines()
+                        .iter()
+                        .map(|underline| underline.order)
+                        .min()
+                        .expect("strikethrough is painted");
+                    assert!(chip_order < search_order);
+                    assert!(search_order < selection_order);
+                    assert!(
+                        selection_order < text_order,
+                        "alignment={alignment}, text={text}, selection={selection_order}, glyphs={text_order}",
+                    );
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_search_highlights_are_painted_between_text_backgrounds_and_glyphs(
+        cx: &mut TestAppContext,
+    ) {
+        ensure_theme_initialized(cx);
+        let source = "~~[struck](https://zed.dev) through~~";
+        let highlight_start = source
+            .find("struck")
+            .expect("highlighted text should be present");
+        let highlight_range = highlight_start..highlight_start + "struck".len();
+        let run_background_color = gpui::red();
+
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        markdown.update(cx, |markdown, cx| {
+            markdown.set_search_highlights(vec![highlight_range], None, cx);
+        });
+        let (_, cx) = cx.add_window_view(move |_, _| MarkdownPaintTestView {
+            markdown,
+            style: MarkdownStyle {
+                link: TextStyleRefinement {
+                    background_color: Some(run_background_color),
+                    ..Default::default()
+                },
+                ..MarkdownStyle::default()
+            },
+        });
+        cx.run_until_parked();
+
+        let highlight_color = cx.update(|_, cx| cx.theme().colors().search_match_background);
+        cx.update(|window, _| {
+            let quads = window.painted_quads();
+            let order_of_quad_with = |color: Hsla| {
+                quads
+                    .iter()
+                    .find(|quad| quad.background == color.into())
+                    .map(|quad| quad.order)
+            };
+            let run_background_order =
+                order_of_quad_with(run_background_color).expect("link background should be painted");
+            let highlight_order =
+                order_of_quad_with(highlight_color).expect("search highlight should be painted");
+            // Strikethroughs are painted in the same layer as the glyphs
+            let text_order = window
+                .painted_underlines()
+                .iter()
+                .map(|underline| underline.order)
+                .min()
+                .expect("strikethrough should be painted");
+            assert!(
+                run_background_order < highlight_order,
+                "text run backgrounds must not cover search highlights"
+            );
+            assert!(
+                highlight_order < text_order,
+                "search highlight must be drawn below the text, otherwise opaque theme colors hide it"
+            );
+        });
+    }
 
     struct TestWindow;
 
@@ -5970,6 +6116,44 @@ mod tests {
             !stale.is_current(),
             "a theme change must make parse-time highlights stale so rendering re-resolves them"
         );
+    }
+
+    #[gpui::test]
+    fn test_code_block_language_uses_first_word_of_info_string(cx: &mut TestAppContext) {
+        for info in ["rust import.meta.vitest", "rust\tmetadata"] {
+            let source = format!("```{info}\nfn main() {{}}\n```");
+            let (_, markdown) = markdown_with_rust_language(&source, cx);
+            let code_start = source.find("fn main").expect("code block body");
+            let cached = cached_code_block_highlights(&markdown, code_start, cx);
+            assert!(!cached.runs.is_empty());
+        }
+    }
+
+    #[gpui::test]
+    fn test_code_block_language_prefers_full_info_string(cx: &mut TestAppContext) {
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        for name in ["Go", "Go Mod"] {
+            language_registry.add(Arc::new(Language::new(
+                LanguageConfig {
+                    name: name.into(),
+                    ..LanguageConfig::default()
+                },
+                None,
+            )));
+        }
+        let source = "```Go Mod\nmodule example\n```\n\n```Go extra\npackage main\n```";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), Some(language_registry), None, cx));
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| {
+            let languages = &markdown.parsed_markdown().languages_by_name;
+            let resolved = |info: &str| {
+                languages
+                    .get(&SharedString::from(info.to_string()))
+                    .map(|language| language.name())
+            };
+            assert_eq!(resolved("Go Mod"), Some("Go Mod".into()));
+            assert_eq!(resolved("Go extra"), Some("Go".into()));
+        });
     }
 
     #[gpui::test]
@@ -7499,7 +7683,10 @@ mod tests {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.theme.ui_font_size = Some(16.0.into());
-                    settings.theme.markdown_preview_font_size = None;
+                    settings
+                        .markdown_preview
+                        .get_or_insert_with(Default::default)
+                        .font_size = None;
                 });
             });
         });
@@ -7527,7 +7714,10 @@ mod tests {
             settings::SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.theme.ui_font_size = Some(20.0.into());
-                    settings.theme.markdown_preview_font_size = None;
+                    settings
+                        .markdown_preview
+                        .get_or_insert_with(Default::default)
+                        .font_size = None;
                 });
             });
         });

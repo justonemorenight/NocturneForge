@@ -7,6 +7,7 @@ use language_model::{
     AuthenticateError, FastModeConfirmation, IconOrSvg, InlineDescription, LanguageModel,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, ProviderAccountSummary, ProviderSettingsView,
+    QuotaPoolAccountSummary, QuotaPoolSummary,
 };
 use openai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, create_language_model};
 use std::sync::Arc;
@@ -153,6 +154,80 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
                 }
             })
             .collect()
+    }
+
+    fn quota_pool(&self, _model_id: Option<&str>, cx: &App) -> Option<QuotaPoolSummary> {
+        let state = self.state.read(cx);
+        let summaries = state.account_summaries();
+        if summaries.is_empty() {
+            return None;
+        }
+
+        let mut total_known_remaining = 0.0;
+        let mut has_unknown_eligible = false;
+        let mut pool_has_stale = false;
+        let mut accounts = Vec::new();
+
+        for account in &summaries {
+            let is_reauth = account.reauthentication_required;
+            let is_stale = account.quota_stale;
+            let is_eligible = !is_reauth;
+
+            let rem = if !is_eligible {
+                Some(0.0)
+            } else if let Some(quota) = &account.quota {
+                if let Some(primary) = &quota.primary {
+                    if is_stale {
+                        pool_has_stale = true;
+                    }
+                    Some(remaining_percent(primary.used_percent))
+                } else {
+                    None
+                }
+            } else {
+                has_unknown_eligible = true;
+                None
+            };
+
+            if let Some(r) = rem {
+                total_known_remaining += r;
+            }
+
+            let label = account
+                .email
+                .clone()
+                .or(account.display_name.clone())
+                .unwrap_or_else(|| account.session_id.clone());
+
+            accounts.push(QuotaPoolAccountSummary {
+                id: account.session_id.clone(),
+                label,
+                remaining_percent: rem,
+                is_stale,
+                is_active: account.is_active,
+                is_eligible,
+                is_rate_limited: false,
+                is_reauth_required: is_reauth,
+                is_forbidden: false,
+            });
+        }
+
+        let eligible_count = accounts.iter().filter(|a| a.is_eligible).count();
+        let avg_remaining = if eligible_count == 0 {
+            Some(0.0)
+        } else if has_unknown_eligible {
+            None
+        } else {
+            Some((total_known_remaining / summaries.len() as f64).clamp(0.0, 100.0))
+        };
+
+        Some(QuotaPoolSummary {
+            remaining_percent: avg_remaining,
+            total_accounts: summaries.len(),
+            eligible_accounts: eligible_count,
+            is_stale: pool_has_stale,
+            accounts,
+        })
     }
 
     fn switch_account(&self, account_id: SharedString, cx: &mut App) -> Task<Result<()>> {

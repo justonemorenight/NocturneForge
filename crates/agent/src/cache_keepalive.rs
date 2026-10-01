@@ -1376,7 +1376,7 @@ mod tests {
         // Now subagent runs turn activity with the root's affinity
         let subagent_request = LanguageModelRequest {
             thread_id: Some("subagent-id".into()),
-            prompt_cache_key: Some(affinity.clone()),
+            prompt_cache_key: Some(affinity),
             ..Default::default()
         };
         let guard = cx.update(|cx| {
@@ -1474,7 +1474,7 @@ mod tests {
             config: Config::default(),
             abort: None,
         };
-        registry.lock().insert(affinity.clone(), capture);
+        registry.lock().insert(affinity, capture);
         assert_eq!(registry.lock().captures.len(), 1);
 
         // Now toggle off root_thread

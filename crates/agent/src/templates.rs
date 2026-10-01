@@ -18,6 +18,20 @@ impl Templates {
         handlebars.set_strict_mode(true);
         handlebars.register_helper("contains", Box::new(agent_settings::contains_helper));
         handlebars.register_embed_templates::<Assets>().unwrap();
+        if let Some(partial) = Assets::get("orchestration_protocol.hbs") {
+            let source = String::from_utf8(partial.data.into_owned())
+                .expect("embedded orchestration protocol must be valid UTF-8");
+            handlebars
+                .register_partial("orchestration_protocol", source)
+                .expect("embedded orchestration protocol must register");
+        }
+        if let Some(partial) = Assets::get("nested_orchestration_protocol.hbs") {
+            let source = String::from_utf8(partial.data.into_owned())
+                .expect("embedded nested orchestration protocol must be valid UTF-8");
+            handlebars
+                .register_partial("nested_orchestration_protocol", source)
+                .expect("embedded nested orchestration protocol must register");
+        }
         Arc::new(Self(handlebars))
     }
 }
@@ -99,6 +113,45 @@ mod tests {
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Fixing Diagnostics"));
         assert!(rendered.contains("test-model"));
+    }
+
+    #[test]
+    fn test_system_prompt_gates_the_orchestration_protocol_on_spawn_agent() {
+        let project = prompt_store::ProjectContext::default();
+        let templates = Templates::new();
+        let render = |available_tools| {
+            SystemPromptTemplate {
+                project: &project,
+                available_tools,
+                model_name: Some("test-model".to_string()),
+                date: "2026-01-01".to_string(),
+                user_agents_md: None,
+                tool_guidance: Vec::new(),
+                sandboxing: false,
+                is_linux: false,
+                is_windows: false,
+            }
+            .render(&templates)
+            .expect("system prompt should render")
+        };
+
+        let nested = render(vec!["spawn_agent".into()]);
+        assert!(!nested.contains("## Orchestration protocol"));
+        assert!(nested.contains("## Nested delegation protocol"));
+        assert!(nested.contains("Do not call `list_orchestration_agents`"));
+
+        let direct = render(vec!["echo".into()]);
+        assert!(!direct.contains("## Orchestration protocol"));
+        assert!(!direct.contains("## Nested delegation protocol"));
+
+        let orchestrated = render(vec![
+            "spawn_agent".into(),
+            "update_orchestration_goal".into(),
+        ]);
+        assert!(orchestrated.contains("## Orchestration protocol"));
+        assert!(orchestrated.contains("do not create a model-level polling loop"));
+        assert!(orchestrated.contains("runtime parks the parent"));
+        assert!(orchestrated.contains("independently verified the goal"));
     }
 
     #[test]

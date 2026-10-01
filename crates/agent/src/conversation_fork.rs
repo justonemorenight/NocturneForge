@@ -24,17 +24,43 @@ pub(crate) fn prepare_fork(
     source_session_id: acp::SessionId,
     title: String,
 ) -> Result<DbThread> {
-    // The last user turn owns the fork tool call and must never be copied:
-    // its tool results are incomplete and replaying its intent can fork again.
-    let boundary = snapshot
+    // Find the last completed user turn. If the trailing user turn is already complete
+    // (has a non-empty agent response with all tool calls finished), a manual fork
+    // can fork through the end of that completed turn. If the trailing turn is incomplete
+    // (e.g. in-flight user message or unfinished tool invocation), truncate back to the
+    // previous completed turn.
+    let last_user_index = snapshot
         .messages
         .iter()
         .rposition(|message| matches!(message.as_ref(), Message::User(message) if !message.content.is_empty()))
         .ok_or_else(|| anyhow::anyhow!("There is no completed turn to fork"))?;
-    let checkpoint_index = snapshot.messages[..boundary]
-        .iter()
-        .rposition(|message| matches!(message.as_ref(), Message::User(message) if !message.content.is_empty()))
-        .ok_or_else(|| anyhow::anyhow!("Finish the first turn before forking its context"))?;
+
+    let is_last_turn_complete = snapshot.messages[last_user_index + 1..].iter().any(|message| {
+        matches!(message.as_ref(), Message::Agent(message)
+            if message.content.iter().any(|content| matches!(content, AgentMessageContent::Text(text) if !text.trim().is_empty())))
+    }) && snapshot.messages[last_user_index + 1..].iter().all(|message| {
+        if let Message::Agent(message) = message.as_ref() {
+            message.content.iter().all(|content| {
+                if let AgentMessageContent::ToolUse(tool_use) = content {
+                    tool_use.is_input_complete && message.tool_results.contains_key(&tool_use.id)
+                } else {
+                    true
+                }
+            })
+        } else {
+            true
+        }
+    });
+
+    let (checkpoint_index, boundary) = if is_last_turn_complete {
+        (last_user_index, snapshot.messages.len())
+    } else {
+        let prev_user_index = snapshot.messages[..last_user_index]
+            .iter()
+            .rposition(|message| matches!(message.as_ref(), Message::User(message) if !message.content.is_empty()))
+            .ok_or_else(|| anyhow::anyhow!("Finish the first turn before forking its context"))?;
+        (prev_user_index, last_user_index)
+    };
     let Message::User(checkpoint) = snapshot.messages[checkpoint_index].as_ref() else {
         anyhow::bail!("Invalid fork checkpoint");
     };
@@ -93,7 +119,10 @@ pub(crate) fn prepare_fork(
     snapshot.sandbox_grants = Default::default();
     snapshot.discovered_tools.clear();
     snapshot.orchestration_run = None;
+    snapshot.orchestration_runs.clear();
     snapshot.orchestration_goal = None;
+    snapshot.orchestration_waiting_for_workers = false;
+    snapshot.orchestration_waiting_run_ids.clear();
     snapshot.pending_edits.clear();
     Ok(snapshot)
 }
@@ -136,7 +165,22 @@ mod tests {
                 "old context".into(),
             ))),
             user(),
-            answer("current partial response"),
+            Arc::new(Message::Agent(AgentMessage {
+                content: vec![
+                    AgentMessageContent::Text("current partial response".into()),
+                    AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                        id: "unfinished-current-turn".into(),
+                        name: "read_file".into(),
+                        raw_input: "{}".into(),
+                        input: language_model::LanguageModelToolUseInput::Json(serde_json::json!(
+                            {}
+                        )),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    }),
+                ],
+                ..Default::default()
+            })),
             Arc::new(Message::Compaction(CompactionInfo::Summary(
                 "future context".into(),
             ))),
@@ -161,11 +205,26 @@ mod tests {
     #[test]
     fn fork_resets_session_state_but_preserves_restrictions() {
         let mut source = snapshot(vec![user(), answer("baseline"), user()]);
+        let run_id = agent_orchestration::RunId::new();
+        let run = agent_orchestration::PersistedRun::new(
+            run_id.clone(),
+            agent_orchestration::OrchestrationPlan::new("plan", Vec::new()),
+            agent_orchestration::RunState::Running,
+            agent_settings::AgentExecutionPolicy::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         source.detailed_summary = Some("includes current turn".into());
         source.sandboxed_terminal_temp_dir = Some("/tmp/source-thread".into());
         source.sandbox_grants.network_any_host = true;
         source.draft_prompt = Some(Vec::new());
         source.discovered_tools = vec!["terminal".into()];
+        source.orchestration_run = Some(run.clone());
+        source.orchestration_runs = vec![run];
+        source.orchestration_waiting_for_workers = true;
+        source.orchestration_waiting_run_ids = vec![run_id];
         source.tool_filter = Some(vec!["read_file".into()]);
         source.thinking_effort = Some("high".into());
         source.pending_edits.push(crate::db::DbPendingEdit {
@@ -181,6 +240,10 @@ mod tests {
         assert_eq!(fork.tool_filter, Some(vec!["read_file".into()]));
         assert_eq!(fork.thinking_effort.as_deref(), Some("high"));
         assert!(fork.pending_edits.is_empty());
+        assert!(fork.orchestration_run.is_none());
+        assert!(fork.orchestration_runs.is_empty());
+        assert!(!fork.orchestration_waiting_for_workers);
+        assert!(fork.orchestration_waiting_run_ids.is_empty());
     }
 
     #[test]
@@ -321,6 +384,22 @@ mod tests {
         assert_eq!(
             derived_fork.fork_origin.as_ref().unwrap().root_session_id(),
             &acp::SessionId::new("legacy-parent")
+        );
+    }
+
+    #[test]
+    fn fork_single_completed_turn_succeeds() {
+        let messages = vec![user(), answer("only turn")];
+        let fork = prepare_fork(
+            snapshot(messages),
+            acp::SessionId::new("parent"),
+            "single-turn-fork".into(),
+        )
+        .expect("a single completed turn should be forkable");
+        assert_eq!(fork.messages.len(), 2);
+        assert_eq!(
+            fork.fork_origin.as_ref().unwrap().inherited_message_count,
+            2
         );
     }
 }

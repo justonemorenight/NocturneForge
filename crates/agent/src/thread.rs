@@ -112,10 +112,10 @@ impl SubagentRole {
         }
     }
 
-    pub(crate) fn role_settings<'a>(
+    pub(crate) fn role_settings(
         self,
-        roles: &'a NativeSubagentRolesSettings,
-    ) -> &'a NativeSubagentRoleSettings {
+        roles: &NativeSubagentRolesSettings,
+    ) -> &NativeSubagentRoleSettings {
         match self {
             Self::Explorer => &roles.explorer,
             Self::FlowReader => &roles.flow_reader,
@@ -157,7 +157,7 @@ impl SubagentRole {
         )
     }
 
-    fn allows_tool(self, tool_name: &str) -> bool {
+    pub(crate) fn allows_tool(self, tool_name: &str) -> bool {
         if matches!(
             tool_name,
             CreateThreadTool::NAME | ForkThreadTool::NAME | ListAgentsAndModelsTool::NAME
@@ -399,6 +399,15 @@ pub enum Message {
 pub enum OrchestrationResumeReason {
     GoalIncomplete,
     RepairMalformedToolCall,
+    WorkersCompleted {
+        run_id: agent_orchestration::RunId,
+        event_seq: u64,
+        summary: SharedString,
+    },
+    RunsCompleted {
+        run_ids: Vec<agent_orchestration::RunId>,
+        summary: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -467,10 +476,23 @@ impl Message {
                 content: vec![match reason {
                     OrchestrationResumeReason::GoalIncomplete => {
                         "The orchestration goal is still active. Continue the work from the latest evidence. Do not summarize or stop at an intermediate phase. When the goal and its verification are complete, call update_orchestration_goal with action complete before presenting the final response."
+                            .to_string()
                     }
                     OrchestrationResumeReason::RepairMalformedToolCall => {
                         "Your previous response ended with a tool call encoded as plain text, so it was not executed. Reissue that operation through the registered structured tool interface. Continue the active orchestration goal afterward, and call update_orchestration_goal with action complete only when the goal is actually verified."
+                            .to_string()
                     }
+                    OrchestrationResumeReason::WorkersCompleted {
+                        run_id,
+                        event_seq,
+                        summary,
+                    } => format!(
+                        "Native orchestration run {run_id} reached a terminal worker state (event {event_seq}). Review the worker results below, fix or verify anything still needed, and call update_orchestration_goal with action complete only when the goal is actually verified.\n\n{summary}"
+                    ),
+                    OrchestrationResumeReason::RunsCompleted { run_ids, summary } => format!(
+                        "Native orchestration runs {} reached terminal worker states. Review the worker results below, fix or verify anything still needed, and call update_orchestration_goal with the matching run_id only when that run's goal is actually verified.\n\n{summary}",
+                        run_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                    ),
                 }
                 .into()],
                 cache: false,
@@ -1658,9 +1680,13 @@ pub struct Thread {
     /// Optional tools discovered through `tool_search` for this thread.
     /// Persisted so restored sessions can continue with the same tool surface.
     discovered_tools: HashSet<SharedString>,
-    orchestration_run: Option<agent_orchestration::RunHandle>,
-    orchestration_event_task: Option<Task<()>>,
-    persisted_orchestration_run: Option<agent_orchestration::PersistedRun>,
+    orchestration_runs: Vec<agent_orchestration::RunHandle>,
+    orchestration_event_tasks: Vec<Task<()>>,
+    /// True after a parent turn parks while native workers are still running.
+    /// The worker event subscription clears it and starts one follow-up turn.
+    orchestration_waiting_for_workers: bool,
+    orchestration_waiting_run_ids: Vec<agent_orchestration::RunId>,
+    persisted_orchestration_runs: Vec<agent_orchestration::PersistedRun>,
     orchestration_goal: Option<agent_orchestration::GoalController>,
 }
 
@@ -1833,9 +1859,11 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
             tool_filter: None,
             discovered_tools: HashSet::default(),
-            orchestration_run: None,
-            orchestration_event_task: None,
-            persisted_orchestration_run: None,
+            orchestration_runs: Vec::new(),
+            orchestration_event_tasks: Vec::new(),
+            orchestration_waiting_for_workers: false,
+            orchestration_waiting_run_ids: Vec::new(),
+            persisted_orchestration_runs: Vec::new(),
             orchestration_goal: None,
         }
     }
@@ -2070,8 +2098,6 @@ impl Thread {
         let Some(tool) = tool else {
             // Tool not found (e.g., MCP server not connected after restart),
             // but still display the saved result if available.
-            // We need to send both ToolCall and ToolCallUpdate events because the UI
-            // only converts raw_output to displayable content in update_fields, not from_acp.
             stream
                 .0
                 .unbounded_send(Ok(ThreadEvent::ToolCall(
@@ -2198,9 +2224,10 @@ impl Thread {
             .is_none();
         let profile_id = db_thread
             .profile
+            .clone()
             .unwrap_or_else(|| settings.default_profile.clone());
 
-        let saved_selection = db_thread.model.map(|model| SelectedModel {
+        let saved_selection = db_thread.model.clone().map(|model| SelectedModel {
             provider: model.provider.into(),
             model: model.model.into(),
         });
@@ -2231,7 +2258,7 @@ impl Thread {
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let pending_edits = db_thread.pending_edits.clone();
 
-        let orchestration_goal = db_thread.orchestration_goal.and_then(|snapshot| {
+        let orchestration_goal = db_thread.orchestration_goal.clone().and_then(|snapshot| {
             agent_orchestration::GoalController::restore(
                 snapshot,
                 agent_orchestration::GoalControllerConfig::default(),
@@ -2241,6 +2268,22 @@ impl Thread {
             })
             .ok()
         });
+        let persisted_orchestration_runs = db_thread
+            .all_orchestration_runs()
+            .into_iter()
+            .map(|run| run.recover_orphaned_tasks(&[]))
+            .collect::<Vec<_>>();
+        let orchestration_waiting_run_ids = if db_thread.orchestration_waiting_run_ids.is_empty()
+            && db_thread.orchestration_waiting_for_workers
+        {
+            persisted_orchestration_runs
+                .iter()
+                .filter(|run| run.state != agent_orchestration::RunState::Proposed)
+                .map(|run| run.run_id.clone())
+                .collect()
+        } else {
+            db_thread.orchestration_waiting_run_ids
+        };
 
         let thread = Self {
             id,
@@ -2294,11 +2337,11 @@ impl Thread {
             }),
             running_subagents: Vec::new(),
             inherits_parent_model_settings,
-            orchestration_run: None,
-            orchestration_event_task: None,
-            persisted_orchestration_run: db_thread
-                .orchestration_run
-                .map(agent_orchestration::PersistedRun::for_resume),
+            orchestration_runs: Vec::new(),
+            orchestration_event_tasks: Vec::new(),
+            orchestration_waiting_for_workers: db_thread.orchestration_waiting_for_workers,
+            orchestration_waiting_run_ids,
+            persisted_orchestration_runs,
             orchestration_goal,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
@@ -2407,6 +2450,7 @@ impl Thread {
 
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
+        let orchestration_runs = self.orchestration_snapshots();
         let pending_edits = self
             .action_log
             .read(cx)
@@ -2452,15 +2496,14 @@ impl Thread {
                 tools.sort();
                 tools
             },
-            orchestration_run: self
-                .orchestration_run
-                .as_ref()
-                .map(|run| run.snapshot())
-                .or_else(|| self.persisted_orchestration_run.clone()),
+            orchestration_run: orchestration_runs.last().cloned(),
+            orchestration_runs,
             orchestration_goal: self
                 .orchestration_goal
                 .as_ref()
                 .map(agent_orchestration::GoalController::snapshot),
+            orchestration_waiting_for_workers: self.orchestration_waiting_for_workers,
+            orchestration_waiting_run_ids: self.orchestration_waiting_run_ids.clone(),
             pending_edits,
         };
 
@@ -2479,7 +2522,7 @@ impl Thread {
             )
     }
 
-    pub(crate) fn fork_snapshot(&self, title: String, cx: &App) -> Result<Task<Result<DbThread>>> {
+    pub fn fork_snapshot(&self, title: String, cx: &App) -> Result<Task<Result<DbThread>>> {
         anyhow::ensure!(self.depth() == 0, "Subagents cannot fork conversations");
         anyhow::ensure!(
             self.execution_strategy != AgentExecutionStrategy::Plan,
@@ -2822,7 +2865,7 @@ impl Thread {
         // to the model is gated by `CreateThreadToolFeatureFlag` in
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
-        self.add_tool(ForkThreadTool::new(cx.weak_entity(), environment.clone()));
+        // Note: Fork is manual UI-triggered only; ForkThreadTool is not registered to the model.
         self.add_tool(ListAgentsAndModelsTool::new(environment));
     }
 
@@ -2924,8 +2967,37 @@ impl Thread {
         }
     }
 
+    fn orchestration_snapshots(&self) -> Vec<agent_orchestration::PersistedRun> {
+        let mut snapshots = self.persisted_orchestration_runs.clone();
+        for run in &self.orchestration_runs {
+            let snapshot = run.snapshot();
+            if let Some(previous) = snapshots
+                .iter_mut()
+                .find(|previous| previous.run_id == snapshot.run_id)
+            {
+                *previous = snapshot;
+            } else {
+                snapshots.push(snapshot);
+            }
+        }
+        snapshots
+    }
+
+    pub fn orchestration_runs(&self) -> &[agent_orchestration::RunHandle] {
+        &self.orchestration_runs
+    }
+
+    pub fn orchestration_run_by_id(
+        &self,
+        run_id: &agent_orchestration::RunId,
+    ) -> Option<&agent_orchestration::RunHandle> {
+        self.orchestration_runs
+            .iter()
+            .find(|run| run.run_id() == run_id)
+    }
+
     pub fn orchestration_run(&self) -> Option<&agent_orchestration::RunHandle> {
-        self.orchestration_run.as_ref()
+        self.orchestration_runs.last()
     }
 
     pub(crate) fn parent_orchestration_goal(&self) -> Option<agent_orchestration::GoalController> {
@@ -2993,10 +3065,34 @@ impl Thread {
     }
 
     fn orchestration_continuation_reason(&self) -> Option<OrchestrationResumeReason> {
-        let goal = self.orchestration_goal.as_ref()?.snapshot();
-        if goal.status != agent_orchestration::GoalStatus::Active {
+        let snapshots = self.orchestration_snapshots();
+        let goal_active =
+            self.orchestration_goal.as_ref().is_some_and(|goal| {
+                goal.snapshot().status == agent_orchestration::GoalStatus::Active
+            }) || snapshots.iter().any(|run| {
+                run.goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status == agent_orchestration::GoalStatus::Active)
+            });
+        let run_waiting_for_approval = snapshots
+            .iter()
+            .any(|run| run.state == agent_orchestration::RunState::Proposed);
+        if self.all_waiting_orchestration_runs_terminal() {
+            return self.waiting_workers_completed_reason();
+        }
+        if run_waiting_for_approval {
             return None;
         }
+        let run_is_terminal =
+            !snapshots.is_empty() && snapshots.iter().all(|run| run.state.is_terminal());
+        let goal_needs_follow_up = goal_active && !run_is_terminal;
+        let has_active_orchestration_run = snapshots.iter().any(|run| !run.state.is_terminal());
+        let has_running_subagents = self.has_running_subagents();
+
+        if !goal_needs_follow_up && !has_active_orchestration_run && !has_running_subagents {
+            return None;
+        }
+
         let has_malformed_tool_call = self.last_message().is_some_and(|message| {
             let Message::Agent(message) = message else {
                 return false;
@@ -3024,18 +3120,31 @@ impl Thread {
         run: agent_orchestration::RunHandle,
         cx: &mut Context<Self>,
     ) {
-        if let Some(previous) = &self.orchestration_run
-            && previous.run_id() != run.run_id()
-            && !previous.state().is_terminal()
-        {
-            previous.cancel(agent_orchestration::CancellationReason::Custom(
-                "superseded by another orchestration run".to_string(),
-            ));
-        }
+        let run_id = run.run_id().clone();
         let subscription = run.subscribe_live();
-        self.orchestration_run = Some(run);
-        self.orchestration_event_task = Some(cx.spawn(async move |this, cx| {
+        let event_run = run.clone();
+        self.orchestration_goal = Some(run.goal_controller());
+        self.upsert_persisted_orchestration_run(run.snapshot());
+        if let Some(existing) = self
+            .orchestration_runs
+            .iter_mut()
+            .find(|existing| existing.run_id() == &run_id)
+        {
+            *existing = run;
+        } else {
+            self.orchestration_runs.push(run);
+        }
+        let event_task = cx.spawn(async move |this, cx| {
             while let Ok(event) = subscription.receiver.recv().await {
+                let snapshot = event_run.snapshot();
+                if let Err(error) = this.update(cx, |thread, cx| {
+                    thread.set_persisted_orchestration_run(Some(snapshot.clone()), cx);
+                }) {
+                    log::debug!(
+                        "orchestration event subscriber stopped because the parent thread was dropped: {error:#}"
+                    );
+                    break;
+                }
                 let terminal = match event.event {
                     agent_orchestration::RuntimeEvent::RunCompleted { .. }
                     | agent_orchestration::RuntimeEvent::RunFailed { .. }
@@ -3045,6 +3154,44 @@ impl Thread {
                     }
                     _ => false,
                 };
+                let resume_reason = if terminal {
+                    match this.update(cx, |thread, cx| {
+                        if thread.running_turn.is_some()
+                            || !thread.all_waiting_orchestration_runs_terminal()
+                        {
+                            cx.notify();
+                            return None;
+                        }
+                        let reason = thread.waiting_workers_completed_reason();
+                        if reason.is_none() {
+                            return None;
+                        }
+                        thread.orchestration_waiting_for_workers = false;
+                        thread.orchestration_waiting_run_ids.clear();
+                        reason
+                    }) {
+                        Ok(reason) => reason,
+                        Err(error) => {
+                            log::debug!(
+                                "orchestration event subscriber could not resume parent thread: {error:#}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(reason) = resume_reason {
+                    match this.update(cx, |thread, cx| {
+                        thread.set_persisted_orchestration_run(Some(snapshot.clone()), cx);
+                        thread.resume_after_orchestration_workers(reason, cx)
+                    }) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) | Err(error) => {
+                            log::error!("failed to resume parked orchestration thread: {error:#}");
+                        }
+                    }
+                }
                 if this.update(cx, |_thread, cx| cx.notify()).is_err() {
                     break;
                 }
@@ -3052,27 +3199,56 @@ impl Thread {
                     break;
                 }
             }
-        }));
+        });
+        self.orchestration_event_tasks.push(event_task);
         self.updated_at = Utc::now();
         cx.notify();
     }
 
+    pub(crate) fn mark_orchestration_waiting_for_workers(
+        &mut self,
+        run_id: agent_orchestration::RunId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.orchestration_waiting_run_ids.contains(&run_id) {
+            self.orchestration_waiting_run_ids.push(run_id);
+        }
+        self.orchestration_waiting_for_workers = !self.orchestration_waiting_run_ids.is_empty();
+        cx.notify();
+    }
+
     pub fn approve_orchestration_run(&mut self, cx: &mut Context<Self>) -> Result<bool> {
-        let Some(run) = self.orchestration_run.clone() else {
+        let Some(run) = self.orchestration_runs.last().cloned() else {
+            return Ok(false);
+        };
+        self.approve_orchestration_run_by_id(run.run_id(), cx)
+    }
+
+    pub fn approve_orchestration_run_by_id(
+        &mut self,
+        run_id: &agent_orchestration::RunId,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        let Some(run) = self.orchestration_run_by_id(run_id).cloned() else {
             return Ok(false);
         };
         if run.state() != agent_orchestration::RunState::Proposed {
             return Ok(false);
         }
         run.approve()?;
-        self.persisted_orchestration_run = Some(run.snapshot());
+        self.mark_orchestration_waiting_for_workers(run.run_id().clone(), cx);
+        self.upsert_persisted_orchestration_run(run.snapshot());
         self.updated_at = Utc::now();
         cx.notify();
         Ok(true)
     }
 
+    pub fn persisted_orchestration_runs(&self) -> &[agent_orchestration::PersistedRun] {
+        &self.persisted_orchestration_runs
+    }
+
     pub fn persisted_orchestration_run(&self) -> Option<&agent_orchestration::PersistedRun> {
-        self.persisted_orchestration_run.as_ref()
+        self.persisted_orchestration_runs.last()
     }
 
     pub fn set_persisted_orchestration_run(
@@ -3080,20 +3256,83 @@ impl Thread {
         run: Option<agent_orchestration::PersistedRun>,
         cx: &mut Context<Self>,
     ) {
-        self.persisted_orchestration_run = run;
+        if let Some(run) = run {
+            self.upsert_persisted_orchestration_run(run);
+        } else {
+            self.persisted_orchestration_runs.clear();
+        }
+        self.updated_at = Utc::now();
+        cx.notify();
+    }
+
+    fn upsert_persisted_orchestration_run(&mut self, run: agent_orchestration::PersistedRun) {
+        if let Some(existing) = self
+            .persisted_orchestration_runs
+            .iter_mut()
+            .find(|existing| existing.run_id == run.run_id)
+        {
+            *existing = run;
+        } else {
+            self.persisted_orchestration_runs.push(run);
+        }
+    }
+
+    pub(crate) fn update_persisted_orchestration_goal(
+        &mut self,
+        run_id: &agent_orchestration::RunId,
+        goal: agent_orchestration::GoalSnapshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(run) = self
+            .persisted_orchestration_runs
+            .iter_mut()
+            .find(|run| &run.run_id == run_id)
+        else {
+            return false;
+        };
+        run.goal = Some(goal);
+        self.updated_at = Utc::now();
+        cx.notify();
+        true
+    }
+
+    pub fn remove_persisted_orchestration_run(
+        &mut self,
+        run_id: &agent_orchestration::RunId,
+        cx: &mut Context<Self>,
+    ) {
+        self.persisted_orchestration_runs
+            .retain(|run| &run.run_id != run_id);
+        self.orchestration_waiting_run_ids
+            .retain(|waiting_run_id| waiting_run_id != run_id);
+        self.orchestration_waiting_for_workers = !self.orchestration_waiting_run_ids.is_empty();
         self.updated_at = Utc::now();
         cx.notify();
     }
 
     pub fn cancel_orchestration_run(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(run) = self.orchestration_run.clone() else {
+        let Some(run) = self.orchestration_runs.last().cloned() else {
+            return false;
+        };
+        self.cancel_orchestration_run_by_id(run.run_id(), cx)
+    }
+
+    pub fn cancel_orchestration_run_by_id(
+        &mut self,
+        run_id: &agent_orchestration::RunId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(run) = self.orchestration_run_by_id(run_id).cloned() else {
             return false;
         };
         if run.state().is_terminal() {
             return false;
         }
         run.cancel(agent_orchestration::CancellationReason::UserRequested);
-        self.persisted_orchestration_run = Some(run.snapshot());
+        self.orchestration_waiting_run_ids
+            .retain(|pending_run_id| pending_run_id != run_id);
+        self.orchestration_waiting_for_workers = !self.orchestration_waiting_run_ids.is_empty();
+        self.upsert_persisted_orchestration_run(run.snapshot());
         self.updated_at = Utc::now();
         cx.notify();
         true
@@ -3102,10 +3341,41 @@ impl Thread {
     /// Resumes a persisted orchestration run that was interrupted, if the
     /// spawn_agent tool is available. Returns true when a run was resumed.
     pub fn resume_orchestration_run(&mut self, cx: &mut Context<Self>) -> Task<Result<bool>> {
-        let Some(persisted) = self.persisted_orchestration_run.clone() else {
+        self.resume_orchestration_run_by_id(None, cx)
+    }
+
+    pub fn resume_orchestration_run_by_id(
+        &mut self,
+        run_id: Option<agent_orchestration::RunId>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
+        let persisted = self
+            .persisted_orchestration_runs
+            .iter()
+            .rev()
+            .find(|run| {
+                run_id.as_ref().is_none_or(|run_id| &run.run_id == run_id)
+                    && !self
+                        .orchestration_runs
+                        .iter()
+                        .any(|active| active.run_id() == &run.run_id)
+            })
+            .cloned();
+        let Some(persisted) = persisted else {
             return Task::ready(Ok(false));
         };
         if persisted.state.is_terminal() {
+            if self.all_waiting_orchestration_runs_terminal() {
+                let Some(reason) = self.waiting_workers_completed_reason() else {
+                    return Task::ready(Ok(false));
+                };
+                self.orchestration_waiting_for_workers = false;
+                self.orchestration_waiting_run_ids.clear();
+                return Task::ready(
+                    self.resume_after_orchestration_workers(reason, cx)
+                        .map(|_| true),
+                );
+            }
             return Task::ready(Ok(false));
         }
         let Some(tool) = self.tools.get("spawn_agent").cloned() else {
@@ -3125,12 +3395,33 @@ impl Thread {
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
         );
+        self.mark_orchestration_waiting_for_workers(persisted.run_id.clone(), cx);
+        cx.notify();
         cx.spawn(async move |_this, cx| {
             spawn_tool
                 .resume_orchestration_run(persisted, event_stream, cx)
                 .await?;
             Ok(true)
         })
+    }
+
+    fn waiting_orchestration_snapshots(&self) -> Vec<agent_orchestration::PersistedRun> {
+        let snapshots = self.orchestration_snapshots();
+        self.orchestration_waiting_run_ids
+            .iter()
+            .filter_map(|run_id| snapshots.iter().find(|run| &run.run_id == run_id).cloned())
+            .collect()
+    }
+
+    fn all_waiting_orchestration_runs_terminal(&self) -> bool {
+        let snapshots = self.waiting_orchestration_snapshots();
+        !self.orchestration_waiting_run_ids.is_empty()
+            && snapshots.len() == self.orchestration_waiting_run_ids.len()
+            && snapshots.iter().all(|run| run.state.is_terminal())
+    }
+
+    fn waiting_workers_completed_reason(&self) -> Option<OrchestrationResumeReason> {
+        workers_completed_reason(&self.waiting_orchestration_snapshots())
     }
 
     pub fn set_execution_policy(
@@ -3212,12 +3503,21 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.orchestration_waiting_for_workers = false;
+        self.orchestration_waiting_run_ids.clear();
         cache_keepalive::invalidate(&self.prompt_cache_affinity(), cx);
-        if let Some(run) = self.orchestration_run.clone()
-            && !run.state().is_terminal()
-        {
-            run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
-            self.persisted_orchestration_run = Some(run.snapshot());
+        for run in &self.orchestration_runs {
+            if !run.state().is_terminal() {
+                run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
+            }
+        }
+        let snapshots = self
+            .orchestration_runs
+            .iter()
+            .map(agent_orchestration::RunHandle::snapshot)
+            .collect::<Vec<_>>();
+        for snapshot in snapshots {
+            self.upsert_persisted_orchestration_run(snapshot);
         }
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
@@ -3472,6 +3772,7 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.orchestration_waiting_for_workers = false;
         if self.resolved_turn_policy.is_none() {
             self.resolve_turn_policy_for_latest_user_message(cx);
         }
@@ -3481,6 +3782,22 @@ impl Thread {
 
         log::debug!("Total messages in thread: {}", self.messages.len());
         self.run_turn(cx)
+    }
+
+    fn resume_after_orchestration_workers(
+        &mut self,
+        reason: OrchestrationResumeReason,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.orchestration_waiting_for_workers = false;
+        self.messages
+            .push(Arc::new(Message::OrchestrationResume(reason)));
+        cx.notify();
+        let events = self.run_turn(cx)?;
+        cx.emit(AutomaticResume {
+            events: RefCell::new(Some(events)),
+        });
+        Ok(())
     }
 
     /// Sending a message results in the model streaming a response, which could include tool calls.
@@ -3509,6 +3826,7 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.orchestration_waiting_for_workers = false;
         let model = self
             .model()
             .cloned()
@@ -3560,9 +3878,9 @@ impl Thread {
                 agent_orchestration::GoalStatus::Active | agent_orchestration::GoalStatus::Blocked
             )
         }) || self
-            .orchestration_run
-            .as_ref()
-            .is_some_and(|run| !run.state().is_terminal());
+            .orchestration_runs
+            .iter()
+            .any(|run| !run.state().is_terminal());
 
         // Capability detection must use the user's configured tool surface,
         // not the previous turn's resolved profile. Otherwise one Direct turn
@@ -4207,6 +4525,30 @@ impl Thread {
                 let continuation_reason =
                     this.read_with(cx, |thread, _| thread.orchestration_continuation_reason())?;
                 if let Some(reason) = continuation_reason {
+                    let should_park = reason == OrchestrationResumeReason::GoalIncomplete
+                        && this.update(cx, |thread, cx| {
+                            for run in &thread.orchestration_runs {
+                                if !run.state().is_terminal()
+                                    && run.state() != agent_orchestration::RunState::Proposed
+                                    && !thread.orchestration_waiting_run_ids.contains(run.run_id())
+                                {
+                                    thread
+                                        .orchestration_waiting_run_ids
+                                        .push(run.run_id().clone());
+                                }
+                            }
+                            if !thread.orchestration_waiting_run_ids.is_empty() {
+                                thread.orchestration_waiting_for_workers = true;
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        })?;
+                    if should_park {
+                        log::debug!("parking parent turn until orchestration workers finish");
+                        return Ok(());
+                    }
                     let maximum_continuations = cx.update(|cx| {
                         AgentSettings::get_global(cx)
                             .orchestration
@@ -4219,7 +4561,16 @@ impl Thread {
                         ));
                     }
                     orchestration_continuations += 1;
-                    this.update(cx, |thread, _| {
+                    this.update(cx, |thread, cx| {
+                        if matches!(
+                            reason,
+                            OrchestrationResumeReason::WorkersCompleted { .. }
+                                | OrchestrationResumeReason::RunsCompleted { .. }
+                        ) {
+                            thread.orchestration_waiting_for_workers = false;
+                            thread.orchestration_waiting_run_ids.clear();
+                            cx.notify();
+                        }
                         thread
                             .messages
                             .push(Arc::new(Message::OrchestrationResume(reason)));
@@ -5555,7 +5906,7 @@ impl Thread {
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_cache_key,
-            prompt_id: Some(self.prompt_id.to_string()),
+            prompt_id: Some(self.prompt_id.0.clone()),
             intent: Some(completion_intent),
             messages,
             tools,
@@ -5619,7 +5970,6 @@ impl Thread {
                 | UpdateOrchestrationGoalTool::NAME
                 | WaitForAgentsTool::NAME
                 | CreateThreadTool::NAME
-                | ForkThreadTool::NAME
         )
     }
 
@@ -5838,8 +6188,18 @@ impl Thread {
         self.tools.contains_key(name)
     }
 
+    pub fn has_running_subagents(&self) -> bool {
+        self.running_subagents.iter().any(|s| s.upgrade().is_some())
+    }
+
     pub(crate) fn register_running_subagent(&mut self, subagent: WeakEntity<Thread>) {
-        self.running_subagents.push(subagent);
+        if !self
+            .running_subagents
+            .iter()
+            .any(|registered| registered.entity_id() == subagent.entity_id())
+        {
+            self.running_subagents.push(subagent);
+        }
     }
 
     pub(crate) fn unregister_running_subagent(
@@ -6397,7 +6757,7 @@ impl Thread {
     ) -> LanguageModelRequest {
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
-            prompt_id: Some(self.prompt_id.to_string()),
+            prompt_id: Some(self.prompt_id.0.clone()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(model, cx),
             messages: self.build_request_messages_for_history_until_with_retained_user_budget(
@@ -7354,6 +7714,58 @@ pub fn build_thread_title_request(
     request
 }
 
+fn worker_completion_summary(run: &agent_orchestration::PersistedRun) -> String {
+    let mut summary = format!("Run state: {:?}\n", run.state);
+    for status in &run.task_statuses {
+        summary.push_str(&format!("- {}: {:?}", status.task_id, status.state));
+        if let Some(error) = status.latest_error.as_deref() {
+            summary.push_str(&format!(
+                "; error: {}",
+                error.chars().take(500).collect::<String>()
+            ));
+        } else if let Some(output) = status.latest_output.as_deref() {
+            summary.push_str(&format!(
+                "; output: {}",
+                output.chars().take(500).collect::<String>()
+            ));
+        }
+        summary.push('\n');
+    }
+    if summary.len() > 4_000 {
+        summary.truncate(summary.floor_char_boundary(4_000));
+    }
+    summary
+}
+
+fn workers_completed_reason(
+    snapshots: &[agent_orchestration::PersistedRun],
+) -> Option<OrchestrationResumeReason> {
+    let completed = snapshots
+        .iter()
+        .filter(|run| run.state.is_terminal())
+        .collect::<Vec<_>>();
+    match completed.as_slice() {
+        [] => None,
+        [run] => Some(OrchestrationResumeReason::WorkersCompleted {
+            run_id: run.run_id.clone(),
+            event_seq: run.last_event_seq,
+            summary: worker_completion_summary(run).into(),
+        }),
+        runs => {
+            let run_ids = runs.iter().map(|run| run.run_id.clone()).collect();
+            let summary = runs
+                .iter()
+                .map(|run| format!("Run {}:\n{}", run.run_id, worker_completion_summary(run)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(OrchestrationResumeReason::RunsCompleted {
+                run_ids,
+                summary: summary.into(),
+            })
+        }
+    }
+}
+
 pub async fn stream_thread_title(
     model: Arc<dyn LanguageModel>,
     request: LanguageModelRequest,
@@ -7376,10 +7788,10 @@ pub async fn stream_thread_title(
 
 impl Drop for Thread {
     fn drop(&mut self) {
-        if let Some(run) = &self.orchestration_run
-            && !run.state().is_terminal()
-        {
-            run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
+        for run in &self.orchestration_runs {
+            if !run.state().is_terminal() {
+                run.cancel(agent_orchestration::CancellationReason::ParentCancelled);
+            }
         }
     }
 }
@@ -7395,6 +7807,12 @@ impl EventEmitter<TitleUpdated> for Thread {}
 pub struct ModelChanged;
 
 impl EventEmitter<ModelChanged> for Thread {}
+
+pub(crate) struct AutomaticResume {
+    pub events: RefCell<Option<mpsc::UnboundedReceiver<Result<ThreadEvent>>>>,
+}
+
+impl EventEmitter<AutomaticResume> for Thread {}
 
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///
@@ -9491,7 +9909,7 @@ mod tests {
         let task = cx.update(|cx| {
             thread.update(cx, |_, cx| {
                 tool.run(
-                    ToolInput::resolved(crate::ListOrchestrationAgentsInput {}),
+                    ToolInput::resolved(crate::ListOrchestrationAgentsInput { run_id: None }),
                     event_stream,
                     cx,
                 )
@@ -9500,7 +9918,7 @@ mod tests {
         assert!(matches!(
             task.await,
             Err(crate::OrchestrationControlOutput::Error { error })
-                if error == "no orchestration run is active"
+                if error == "no orchestration runs are available"
         ));
     }
 
@@ -9910,7 +10328,7 @@ mod tests {
                 },
                 LanguageModelRequestMessage {
                     role: Role::User,
-                    content: vec![MessageContent::Text(chunk.clone())],
+                    content: vec![MessageContent::Text(chunk)],
                     cache: false,
                     reasoning_details: None,
                 },
@@ -10671,6 +11089,88 @@ mod tests {
                 assert_eq!(thread.compaction_message_target_ix(cx), None);
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_compaction_preserves_current_orchestration_guidance_and_tool_schema(
+        cx: &mut TestAppContext,
+    ) {
+        use feature_flags::FeatureFlagAppExt as _;
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        cx.update(|cx| cx.update_flags(true, vec!["subagents".to_string()]));
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.set_execution_policy(
+                AgentExecutionStrategy::Orchestrate,
+                AgentAutonomy::Manual,
+                cx,
+            );
+            thread.add_tool(crate::SpawnAgentTool::new(
+                Rc::new(crate::tests::FakeThreadEnvironment::default()),
+                cx.entity().downgrade(),
+            ));
+            thread.add_tool(crate::UpdateOrchestrationGoalTool::new(
+                cx.entity().downgrade(),
+            ));
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old user"));
+            thread.messages.push(agent_text_message("old assistant"));
+        });
+        thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), ["new user"], cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let before = model.pending_completions().pop().unwrap();
+        thread.update(cx, |thread, cx| {
+            CompactionMode::Auto
+                .install(
+                    &mut thread.messages,
+                    2,
+                    CompactionInfo::Summary("summary".into()),
+                )
+                .unwrap();
+            let after = thread
+                .build_completion_request(CompletionIntent::UserPrompt, cx)
+                .unwrap();
+            let system_prompt = after.messages.first().unwrap();
+            assert_eq!(system_prompt.role, Role::System);
+            assert!(
+                system_prompt
+                    .string_contents()
+                    .contains("## Orchestration protocol")
+            );
+            assert!(
+                system_prompt
+                    .string_contents()
+                    .contains("do not create a model-level polling loop")
+            );
+            assert_eq!(
+                system_prompt.string_contents(),
+                before.messages.first().unwrap().string_contents()
+            );
+            assert_eq!(
+                serde_json::to_value(&after.tools).unwrap(),
+                serde_json::to_value(&before.tools).unwrap()
+            );
+            assert!(after.tools.iter().any(|tool| tool.name == "spawn_agent"));
+            assert!(
+                after
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "update_orchestration_goal")
+            );
+            assert!(
+                request_texts_after_system(&after.messages)
+                    .iter()
+                    .any(|text| text.contains("summary"))
+            );
+        });
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -12179,8 +12679,14 @@ mod tests {
             }
         }
 
-        assert!(tool_use_ids_with_image_content.contains(&registered_tool_use_id.to_string()));
-        assert!(tool_use_ids_with_image_content.contains(&missing_tool_use_id.to_string()));
+        assert!(
+            tool_use_ids_with_image_content
+                .contains(&scoped_tool_call_id(0, &registered_tool_use_id).to_string())
+        );
+        assert!(
+            tool_use_ids_with_image_content
+                .contains(&scoped_tool_call_id(0, &missing_tool_use_id).to_string())
+        );
     }
 
     #[gpui::test]

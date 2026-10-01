@@ -25,6 +25,7 @@ oauth_callback_server.workspace = true
 open_ai.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+reqwest = { workspace = true, features = ["cookies"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

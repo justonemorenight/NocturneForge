@@ -8,12 +8,13 @@ use crate::plan_graph::{OrchestrationPlan, OrchestrationTask};
 use crate::projection::RunActivityProjection;
 use crate::residency::AgentResidencySnapshot;
 use crate::state::{RunState, TaskAttempt, TaskState, TaskStatus};
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PERSISTENCE_SCHEMA_VERSION: u32 = 7;
+pub const PERSISTENCE_SCHEMA_VERSION: u32 = 8;
 
 /// A completely serializable, database-safe snapshot of an orchestration run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -56,6 +57,25 @@ impl PersistedRun {
             self.agent_control_plane.as_ref(),
             self.last_event_seq,
         )
+    }
+
+    pub fn historical_session_ids(&self) -> collections::HashSet<acp::SessionId> {
+        let mut stale = collections::HashSet::default();
+        for (task_id, attempts) in &self.task_attempts {
+            let active_session_id = self
+                .task_statuses
+                .iter()
+                .find(|s| &s.task_id == task_id)
+                .and_then(|s| s.active_session_id.as_ref());
+            for attempt in attempts {
+                if let Some(session_id) = &attempt.session_id {
+                    if active_session_id != Some(session_id) {
+                        stale.insert(session_id.clone());
+                    }
+                }
+            }
+        }
+        stale
     }
 
     pub fn new(
@@ -266,5 +286,183 @@ impl PersistedRun {
         }
         self.updated_at = Utc::now();
         self
+    }
+
+    /// Recovers running/parked tasks that have no live process or heartbeat as Orphaned or TimedOut.
+    /// Ensures the run reaches a terminal state (CompletedWithErrors or Failed) rather than hanging indefinitely.
+    pub fn recover_orphaned_tasks(mut self, live_session_ids: &[acp::SessionId]) -> Self {
+        for status in &mut self.task_statuses {
+            let has_live_process = status
+                .active_session_id
+                .as_ref()
+                .is_some_and(|id| live_session_ids.contains(id));
+
+            if !has_live_process
+                && (status.state.is_active()
+                    || matches!(
+                        status.state,
+                        TaskState::Parked
+                            | TaskState::Interrupted
+                            | TaskState::Queued
+                            | TaskState::Starting
+                    ))
+            {
+                let is_timeout = status
+                    .latest_error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("timed out"))
+                    || matches!(
+                        &status.wait_reason,
+                        Some(crate::worker::StructuredWaitReason::Custom { description }) if description.contains("timed out")
+                    );
+
+                if is_timeout {
+                    status.state = TaskState::TimedOut;
+                    status.latest_error = Some("task timed out and was recovered".to_string());
+                } else {
+                    status.state = TaskState::Orphaned;
+                    status.latest_error =
+                        Some("task process/heartbeat was lost; recovered as orphaned".to_string());
+                }
+                status.wait_reason = None;
+                status.updated_at = Utc::now();
+            }
+        }
+
+        if !self.state.is_terminal() && !matches!(self.state, RunState::Proposed | RunState::Paused)
+        {
+            let has_runnable_work = self.task_statuses.iter().any(|status| {
+                !status.state.is_terminal()
+                    && !matches!(status.state, TaskState::AwaitingApply | TaskState::Blocked)
+            });
+            let has_awaiting_apply = self
+                .task_statuses
+                .iter()
+                .any(|status| status.state == TaskState::AwaitingApply);
+            let has_completed = self
+                .task_statuses
+                .iter()
+                .any(|status| status.state == TaskState::Completed);
+
+            self.state = if !has_runnable_work && has_awaiting_apply {
+                RunState::AwaitingApply
+            } else if !has_runnable_work {
+                if has_completed {
+                    RunState::CompletedWithErrors
+                } else {
+                    RunState::Failed
+                }
+            } else {
+                RunState::Interrupted
+            };
+            self.updated_at = Utc::now();
+        }
+
+        self
+    }
+
+    pub fn authoritative_run(
+        &self,
+        root_thread_id: Option<String>,
+    ) -> crate::state::OrchestrationRunRecord {
+        let task_ids = self
+            .plan
+            .tasks
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        let active_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state.is_active())
+            .count();
+        let completed_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state == TaskState::Completed)
+            .count();
+        let failed_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    TaskState::Failed | TaskState::TimedOut | TaskState::Orphaned
+                )
+            })
+            .count();
+        let cancelled_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state == TaskState::Cancelled)
+            .count();
+        let finished_at = if self.state.is_terminal() {
+            Some(self.updated_at)
+        } else {
+            None
+        };
+        crate::state::OrchestrationRunRecord {
+            run_id: self.run_id.clone(),
+            root_thread_id,
+            state: self.state,
+            task_ids,
+            active_count,
+            completed_count,
+            failed_count,
+            cancelled_count,
+            created_at: self.created_at,
+            finished_at,
+        }
+    }
+
+    pub fn authoritative_tasks(
+        &self,
+        parent_thread_id: Option<String>,
+    ) -> Vec<crate::state::OrchestrationTaskRecord> {
+        let mut attempts_by_task: collections::HashMap<TaskId, Vec<TaskAttempt>> =
+            collections::HashMap::default();
+        for (task_id, attempts) in &self.task_attempts {
+            attempts_by_task.insert(task_id.clone(), attempts.clone());
+        }
+
+        self.plan
+            .tasks
+            .iter()
+            .map(|task| {
+                let status = self.task_statuses.iter().find(|s| s.task_id == task.id);
+                let state = status.map_or(TaskState::Pending, |s| s.state);
+                let attempt = status.map_or(0, |s| s.current_attempt);
+                let child_thread_id =
+                    status.and_then(|s| s.active_session_id.as_ref().map(|id| id.0.to_string()));
+                let error = status.and_then(|s| s.latest_error.clone());
+
+                let attempts = attempts_by_task.get(&task.id);
+                let started_at = attempts
+                    .and_then(|att| att.first())
+                    .map(|a| a.started_at)
+                    .unwrap_or(self.created_at);
+                let finished_at = if state.is_terminal() {
+                    attempts
+                        .and_then(|att| att.last())
+                        .and_then(|a| a.finished_at)
+                        .or(Some(self.updated_at))
+                } else {
+                    None
+                };
+
+                crate::state::OrchestrationTaskRecord {
+                    task_id: task.id.clone(),
+                    run_id: self.run_id.clone(),
+                    parent_thread_id: parent_thread_id.clone(),
+                    label: task.label.clone(),
+                    state,
+                    attempt,
+                    child_thread_id,
+                    error,
+                    started_at,
+                    finished_at,
+                }
+            })
+            .collect()
     }
 }

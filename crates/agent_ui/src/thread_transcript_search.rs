@@ -608,7 +608,6 @@ fn extract_acp_transcript(thread: &AcpThread, cx: &App) -> Vec<ThreadSearchDocum
             AgentThreadEntry::AssistantMessage(_)
             | AgentThreadEntry::ToolCall(_)
             | AgentThreadEntry::Elicitation(_)
-            | AgentThreadEntry::CompletedPlan(_)
             | AgentThreadEntry::ContextCompaction(_) => {}
         }
     }

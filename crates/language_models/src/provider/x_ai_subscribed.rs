@@ -60,7 +60,7 @@ impl LanguageModelProvider for XAiSubscribedProvider {
     }
 
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        Some(self.create_model(SuperGrokModel::Grok46, cx))
+        Some(self.create_model(SuperGrokModel::Grok47, cx))
     }
 
     fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
@@ -120,7 +120,7 @@ impl LanguageModelProvider for XAiSubscribedProvider {
         }
 
         let now = x_ai_subscribed::now_ms();
-        let target_model = model_id.unwrap_or("grok-4.6");
+        let target_model = model_id.unwrap_or("grok-4.7");
         let eligible_session_ids: std::collections::HashSet<_> = state
             .eligible_accounts(target_model)
             .into_iter()

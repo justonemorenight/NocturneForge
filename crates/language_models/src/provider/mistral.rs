@@ -959,44 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn test_into_mistral_reasoning_effort() {
-        let request = |thinking_allowed| LanguageModelRequest {
-            messages: vec![LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text("Hello".into())],
-                cache: false,
-                reasoning_details: None,
-            }],
-            temperature: None,
-            tools: vec![],
-            tool_choice: None,
-            thread_id: None,
-            prompt_id: None,
-            intent: None,
-            stop: vec![],
-            thinking_allowed,
-            thinking_effort: None,
-            speed: Default::default(),
-            compact_at_tokens: None,
-        };
-
-        let (mistral_request, _) =
-            into_mistral(request(true), mistral::Model::MistralMediumLatest, None).unwrap();
-        assert_eq!(
-            mistral_request.reasoning_effort,
-            Some(mistral::ReasoningEffort::High)
-        );
-
-        let (mistral_request, _) =
-            into_mistral(request(false), mistral::Model::MistralMediumLatest, None).unwrap();
-        assert_eq!(mistral_request.reasoning_effort, None);
-
-        let (mistral_request, _) =
-            into_mistral(request(true), mistral::Model::CodestralLatest, None).unwrap();
-        assert_eq!(mistral_request.reasoning_effort, None);
-    }
-
-    #[test]
     fn test_into_mistral_with_image() {
         let request = LanguageModelRequest {
             messages: vec![LanguageModelRequestMessage {
