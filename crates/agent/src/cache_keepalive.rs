@@ -12,7 +12,7 @@ use language_model::{
     LanguageModelToolChoice, MessageContent, Role, StopReason, TokenUsage,
 };
 use parking_lot::Mutex;
-use settings::{Settings as _, SettingsStore};
+use settings::Settings as _;
 use uuid::Uuid;
 
 // Never append warming output to the conversation or route it through tool execution.
@@ -332,11 +332,6 @@ struct PendingPing {
 }
 
 impl Registry {
-    fn disable_all(&mut self) {
-        self.captures.clear();
-        self.enabled_threads.clear();
-    }
-
     fn insert(&mut self, affinity: String, capture: Capture) {
         self.captures.retain(|(id, _)| id != &affinity);
         while self.captures.len() >= capture.config.max_captures {
@@ -492,15 +487,14 @@ pub fn invalidate(target: &str, cx: &App) {
 }
 
 pub fn enabled_for_thread(thread_id: &str, cx: &App) -> bool {
-    AgentSettings::get_global(cx).cache_keepalive
-        && cx.try_global::<GlobalKeepAlive>().is_some_and(|global| {
-            global
-                .registry
-                .lock()
-                .enabled_threads
-                .iter()
-                .any(|(id, _)| id == thread_id)
-        })
+    cx.try_global::<GlobalKeepAlive>().is_some_and(|global| {
+        global
+            .registry
+            .lock()
+            .enabled_threads
+            .iter()
+            .any(|(id, _)| id == thread_id)
+    })
 }
 
 fn thread_affinity(id: &str, owner: &WeakEntity<crate::Thread>, cx: &App) -> String {
@@ -585,9 +579,6 @@ pub fn toggle_thread(thread_id: String, owner: WeakEntity<crate::Thread>, cx: &A
 }
 
 pub fn status(thread_id: &str, cx: &App) -> String {
-    if !AgentSettings::get_global(cx).cache_keepalive {
-        return "Cache warming: Off".into();
-    }
     let Some(global) = cx.try_global::<GlobalKeepAlive>() else {
         return "Cache warming: Unavailable".into();
     };
@@ -642,10 +633,6 @@ pub fn record_turn_activity(
     request: &LanguageModelRequest,
 ) -> Option<RequestCapture> {
     let global = cx.try_global::<GlobalKeepAlive>()?;
-    if !AgentSettings::get_global(cx).cache_keepalive {
-        global.registry.lock().disable_all();
-        return None;
-    }
     let thread_id = request.thread_id.clone()?;
     let affinity = request
         .prompt_cache_key
@@ -705,18 +692,10 @@ pub fn init(cx: &mut App) {
         registry: Arc::new(Mutex::new(Registry::default())),
         _ticker: ticker,
     });
-    cx.observe_global::<SettingsStore>(|cx| {
-        if !AgentSettings::get_global(cx).cache_keepalive
-            && let Some(global) = cx.try_global::<GlobalKeepAlive>()
-        {
-            global.registry.lock().disable_all();
-        }
-    })
-    .detach();
 }
 
 fn pending_valid(pending: &PendingPing, cx: &App) -> bool {
-    if !AgentSettings::get_global(cx).cache_keepalive || Config::current(cx) != pending.config {
+    if Config::current(cx) != pending.config {
         return false;
     }
     cx.try_global::<GlobalKeepAlive>().is_some_and(|global| {
@@ -736,10 +715,6 @@ async fn ticker(cx: &mut AsyncApp) {
         cx.background_executor().timer(TICK).await;
         let pending = cx.update(|cx| {
             let global = cx.try_global::<GlobalKeepAlive>()?;
-            if !AgentSettings::get_global(cx).cache_keepalive {
-                global.registry.lock().disable_all();
-                return None;
-            }
             global
                 .registry
                 .lock()
@@ -1396,12 +1371,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
-            let mut settings_store = settings::SettingsStore::test(cx);
-            settings_store.update_user_settings(cx, |settings| {
-                settings.agent.get_or_insert_default().cache_keepalive = Some(true);
-            });
+            let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             language_model::init(cx);
+            assert!(!AgentSettings::get_global(cx).cache_keepalive);
         });
         let fs = fs::FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -1453,14 +1426,23 @@ mod tests {
                 });
             });
             init(cx);
+            assert!(!enabled_for_thread(&root_id, cx));
+            assert!(!enabled_for_thread(&fork_id, cx));
             toggle_thread(root_id.clone(), root_thread.downgrade(), cx);
             toggle_thread(fork_id.clone(), fork_thread.downgrade(), cx);
+            assert!(enabled_for_thread(&root_id, cx));
+            assert!(enabled_for_thread(&fork_id, cx));
         });
+        cx.run_until_parked();
+        cx.executor().advance_clock(TICK);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| enabled_for_thread(&root_id, cx)));
+        assert!(cx.read(|cx| enabled_for_thread(&fork_id, cx)));
 
         let registry = cx.read(|cx| cx.global::<GlobalKeepAlive>().registry.clone());
         let affinity = root_thread.read_with(cx, |t, _| t.prompt_cache_affinity());
 
-        // Root captures
+        let (abort, cancellation) = future::AbortHandle::new_pair();
         let capture = Capture {
             owner: root_thread.downgrade(),
             scope: "test".into(),
@@ -1472,7 +1454,7 @@ mod tests {
             },
             state: CaptureState::new(Instant::now()),
             config: Config::default(),
-            abort: None,
+            abort: Some(abort),
         };
         registry.lock().insert(affinity, capture);
         assert_eq!(registry.lock().captures.len(), 1);
@@ -1485,7 +1467,13 @@ mod tests {
         // The capture owned by root must be dropped, even though fork is still enabled for that affinity
         assert!(registry.lock().captures.is_empty());
         // Fork is still enabled
+        assert!(!cx.read(|cx| enabled_for_thread(&root_id, cx)));
         assert!(cx.read(|cx| enabled_for_thread(&fork_id, cx)));
+        assert!(
+            future::Abortable::new(future::pending::<()>(), cancellation)
+                .await
+                .is_err()
+        );
     }
 
     #[gpui::test]
