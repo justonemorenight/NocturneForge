@@ -31,7 +31,7 @@ Spawn a sub-agent for a well-scoped task.
 - Give every concurrent task its own files. When tasks must touch the same file, make one task own it and order the others with `depends_on`.
 - Workers skip formatters and workspace-wide builds and tests because concurrent siblings make those runs unreliable. Run them yourself once after the batch finishes.
 - If a worker's result is incomplete or wrong, resume that worker with its `session_id` and name the gap instead of redoing the work yourself.
-- Set `agent_type` for new native workers: `explorer` for file and symbol lookup, `flow-reader` for tracing flows or logs, `coding-worker` for bounded implementation.
+- Set `agent_type` for new native workers: `explorer` for file and symbol lookup, `flow-reader` for tracing flows or logs, `coding-worker` for bounded implementation. `explorer` and `flow-reader` are read-only and have no terminal, so a task that must run a command or a CLI-backed skill needs `coding-worker`.
 
 {{!--
 ### Output

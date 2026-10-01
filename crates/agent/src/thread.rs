@@ -6545,7 +6545,7 @@ impl Thread {
                 AgentExecutionStrategy::Orchestrate => "Orchestrate",
                 AgentExecutionStrategy::Auto => "Direct",
             };
-             // Keep this text identical across turns that share a route. Per-turn
+            // Keep this text identical across turns that share a route. Per-turn
             // details such as confidence or the heuristic reason would change the
             // system prompt and invalidate the provider's prompt cache every turn.
             system_prompt.push_str(&format!(

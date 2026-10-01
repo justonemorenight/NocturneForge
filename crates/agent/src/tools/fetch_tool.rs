@@ -100,8 +100,11 @@ impl FetchTool {
             .context("error reading response body")?;
 
         if status.is_client_error() {
-            let text = String::from_utf8_lossy(body.as_slice());
-            bail!("status error {}, response: {text:?}", status.as_u16());
+            bail!(
+                "status error {}, response: {:?}",
+                status.as_u16(),
+                error_body_excerpt(&body)
+            );
         }
 
         let Some(content_type) = response.headers().get("content-type") else {
@@ -152,6 +155,24 @@ impl FetchTool {
         };
 
         Ok(FetchStep::Complete(text))
+    }
+}
+
+/// Error pages are often full HTML documents (100KB+ for a 404). The model only
+/// needs enough to recognize the failure, and the whole body would otherwise be
+/// resent with every later request in the conversation.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+fn error_body_excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    match text.char_indices().nth(MAX_ERROR_BODY_CHARS) {
+        Some((cutoff, _)) => format!(
+            "{}… [{} more bytes omitted]",
+            &text[..cutoff],
+            text.len() - cutoff
+        ),
+        None => text.to_string(),
     }
 }
 
@@ -386,6 +407,16 @@ mod tests {
                 "expected {url} to be refused as a forbidden destination"
             );
         }
+    }
+
+    #[test]
+    fn error_body_excerpt_bounds_large_error_pages() {
+        let page = format!("<!DOCTYPE html>{}", "é".repeat(100_000));
+        let excerpt = error_body_excerpt(page.as_bytes());
+        assert!(excerpt.chars().count() < MAX_ERROR_BODY_CHARS + 50);
+        assert!(excerpt.ends_with("more bytes omitted]"));
+
+        assert_eq!(error_body_excerpt(b"  Not Found\n"), "Not Found");
     }
 
     #[test]

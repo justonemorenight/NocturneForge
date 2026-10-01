@@ -871,12 +871,22 @@ fn select_live_run(thread: &Thread, requested_run_id: Option<&str>) -> Result<Ru
 }
 
 fn summaries(run: &RunHandle) -> Result<Vec<OrchestrationAgentSummary>> {
-    let paths = run
-        .agent_control_plane()
+    let control_plane = run.agent_control_plane();
+    let mut paths = control_plane
         .list(None)
         .into_iter()
         .map(|identity| identity.path)
         .collect::<Vec<_>>();
+    // Finished workers have closed edges and drop out of `list`, but their
+    // results are what the parent is told to read here after a run ends.
+    for status in run.task_statuses() {
+        if let Some(identity) = control_plane.identity_for_task(&status.task_id)
+            && !paths.contains(&identity.path)
+        {
+            paths.push(identity.path);
+        }
+    }
+    paths.sort();
     selected_summaries(run, &paths)
 }
 
@@ -989,6 +999,53 @@ fn agent_needs_attention(agent: &OrchestrationAgentSummary) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn completed_run_summary_keeps_finished_workers(cx: &mut gpui::TestAppContext) {
+        let executor = std::rc::Rc::new(agent_orchestration::MockTaskExecutor::new(|context| {
+            Ok(agent_orchestration::TaskExecutionOutput::new(format!(
+                "full report from {}",
+                context.task.id
+            )))
+        }));
+        let plan = agent_orchestration::OrchestrationPlan::new(
+            "Parallel delegation",
+            vec![
+                agent_orchestration::OrchestrationTask::new("first", "First", "first task"),
+                agent_orchestration::OrchestrationTask::new("second", "Second", "second task"),
+            ],
+        );
+        let policy = agent_settings::AgentExecutionPolicy {
+            strategy: agent_settings::AgentExecutionStrategy::Orchestrate,
+            autonomy: agent_settings::AgentAutonomy::Autonomous,
+        };
+        let mut config = agent_orchestration::RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.background_executor = Some(cx.background_executor.clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (run, completion) =
+            agent_orchestration::OrchestrationRuntime::start(plan, policy, executor, config)
+                .expect("run should start");
+        let state = completion
+            .await
+            .expect("completion should be sent")
+            .expect("run should finish");
+        assert_eq!(state, RunState::Completed);
+
+        let summary = run_summary(&run).expect("summary should build");
+        let outputs = summary
+            .agents
+            .iter()
+            .filter_map(|agent| Some((agent.task_id.clone()?, agent.latest_output.clone()?)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec![
+                ("first".to_string(), "full report from first".to_string()),
+                ("second".to_string(), "full report from second".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn restored_goal_accepts_control_actions() {
