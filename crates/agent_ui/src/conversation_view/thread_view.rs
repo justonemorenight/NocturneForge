@@ -7389,15 +7389,19 @@ impl ThreadView {
                             }),
                     )
                     .child(
+                        // Only the middle group wraps. Its zero flex basis gives it a
+                        // definite width, so its controls wrap inside it instead of the
+                        // whole group dropping to its own line, and the send button
+                        // stays anchored at the bottom-right corner.
                         h_flex()
                             .w_full()
                             .min_w_0()
                             .flex_none()
-                            .flex_wrap()
-                            .justify_between()
+                            .items_end()
+                            .gap_1()
                             .child(
                                 h_flex()
-                                    .min_w_0()
+                                    .flex_none()
                                     .items_center()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
@@ -7408,9 +7412,10 @@ impl ThreadView {
                             )
                             .child(
                                 h_flex()
+                                    .flex_1()
                                     .min_w_0()
-                                    .ml_auto()
                                     .flex_wrap()
+                                    .items_center()
                                     .justify_end()
                                     .gap_1()
                                     .children(self.render_cache_warming_control(cx))
@@ -7423,9 +7428,9 @@ impl ThreadView {
                                         None => this
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
-                                    })
-                                    .child(self.render_send_button(cx)),
-                            ),
+                                    }),
+                            )
+                            .child(div().flex_none().child(self.render_send_button(cx))),
                     ),
             )
             .into_any()
