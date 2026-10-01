@@ -6252,15 +6252,6 @@ impl Thread {
         self.running_turn.is_none()
     }
 
-    pub(crate) fn auto_compaction_enabled(&self, cx: &App) -> bool {
-        AgentSettings::get_global(cx).auto_compact.enabled
-            && self.input_token_capacity().is_some_and(|max_input_tokens| {
-                // Models with a small context window don't leave enough headroom for a
-                // compaction pass; the UI warns the user about the token limit instead.
-                max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW
-            })
-    }
-
     pub(crate) fn subagent_partial_output(&self) -> String {
         subagent_partial_output_from_messages(&self.messages, self.pending_message.as_ref())
     }
@@ -6519,12 +6510,17 @@ impl Thread {
 
     #[cfg(test)]
     fn compaction_message_target_ix(&self, cx: &App) -> Option<usize> {
-        if !self.auto_compaction_enabled(cx) {
+        let auto_compact = AgentSettings::get_global(cx).auto_compact;
+        if !auto_compact.enabled {
             return None;
         }
 
-        let auto_compact = AgentSettings::get_global(cx).auto_compact;
         let max_input_tokens = self.input_token_capacity()?;
+        // Models with a small context window don't leave enough headroom for a
+        // compaction pass; the UI warns the user about the token limit instead.
+        if max_input_tokens < MIN_COMPACTION_CONTEXT_WINDOW {
+            return None;
+        }
         let (usage_ix, usage) = {
             let this = &self;
             this.messages
