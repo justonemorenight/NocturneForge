@@ -26,12 +26,12 @@ use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{
-    AgentId, AgentLocation, Project,
+    AgentId, AgentLocation, Project, WorktreeSettings,
     git_store::{GitStoreCheckpoint, GitStoreEvent, RepositoryEvent},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
-use settings::{Settings, SettingsStore};
+use settings::{Settings, SettingsLocation, SettingsStore};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Formatter, Write};
@@ -2898,6 +2898,45 @@ fn git_checkpoint_file_changes(root: &Path, diff: &str) -> Vec<AgentFileChangeSn
         .collect()
 }
 
+/// A checkpoint diff covers the whole repository, so a single command that
+/// writes build output can surface thousands of files. Opening a buffer for each
+/// of them freezes the UI, so review only what the project itself shows.
+const MAX_CHECKPOINT_REVIEW_FILES: usize = 50;
+
+fn reviewable_checkpoint_file_changes(
+    project: &Project,
+    changes: Vec<AgentFileChangeSnapshot>,
+    cx: &App,
+) -> Vec<AgentFileChangeSnapshot> {
+    let changes = changes
+        .into_iter()
+        .filter(|change| {
+            let Some((worktree, relative_path)) = project.find_worktree(&change.path, cx) else {
+                return false;
+            };
+            let worktree = worktree.read(cx);
+            let settings = WorktreeSettings::get(
+                Some(SettingsLocation {
+                    worktree_id: worktree.id(),
+                    path: &relative_path,
+                }),
+                cx,
+            );
+            !settings.is_path_excluded(&relative_path)
+                && !settings.is_path_private(&relative_path)
+                && !worktree.is_path_ignored(&relative_path)
+        })
+        .collect::<Vec<_>>();
+    if changes.len() > MAX_CHECKPOINT_REVIEW_FILES {
+        log::warn!(
+            "Skipping ACP checkpoint review of {} changed files; the limit is {MAX_CHECKPOINT_REVIEW_FILES}",
+            changes.len()
+        );
+        return Vec::new();
+    }
+    changes
+}
+
 fn reconstruct_before_text(
     after_text: &str,
     changes: &[AgentFileChangeSnapshot],
@@ -4915,6 +4954,8 @@ impl AcpThread {
                     .flat_map(|(root, patch)| git_checkpoint_file_changes(&root, &patch))
                     .collect();
                 let restore = this.update(cx, |this, cx| {
+                    let changes =
+                        reviewable_checkpoint_file_changes(this.project.read(cx), changes, cx);
                     this.restore_agent_file_changes_task(changes, cx)
                 })?;
                 restore.await?;
@@ -13352,6 +13393,58 @@ mod tests {
                 .expect("kept file should remain"),
             b"first\nnew\nlast\n"
         );
+    }
+
+    #[gpui::test]
+    async fn test_checkpoint_review_skips_files_hidden_from_the_project(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/test"),
+            json!({
+                ".git": {},
+                ".gitignore": "build/\n",
+                ".DS_Store": "",
+                "build": {"out.rs": ""},
+                "src": {"main.rs": ""},
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+        cx.run_until_parked();
+
+        let change = |path: &str| AgentFileChangeSnapshot {
+            path: PathBuf::from(path),
+            before_text: String::new(),
+            after_text: String::new(),
+            is_new_file: true,
+            git_patch: None,
+        };
+        let changes = vec![
+            change(path!("/test/src/main.rs")),
+            change(path!("/test/build/out.rs")),
+            change(path!("/test/.DS_Store")),
+            change(path!("/outside/file.rs")),
+        ];
+        let reviewable = project.read_with(cx, |project, cx| {
+            reviewable_checkpoint_file_changes(project, changes, cx)
+        });
+        assert_eq!(
+            reviewable
+                .iter()
+                .map(|change| change.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from(path!("/test/src/main.rs"))]
+        );
+
+        let bulk_changes = (0..=MAX_CHECKPOINT_REVIEW_FILES)
+            .map(|index| change(&format!("{}/{index}.rs", path!("/test/src"))))
+            .collect::<Vec<_>>();
+        let reviewable = project.read_with(cx, |project, cx| {
+            reviewable_checkpoint_file_changes(project, bulk_changes, cx)
+        });
+        assert!(reviewable.is_empty());
     }
 
     #[gpui::test]

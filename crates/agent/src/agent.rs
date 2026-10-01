@@ -3771,6 +3771,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 enum SubagentPromptResult {
     Completed,
     Cancelled,
+    Refused,
     Error(anyhow::Error),
 }
 
@@ -3967,7 +3968,7 @@ impl SubagentHandle for NativeSubagentHandle {
                                 acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
                                 acp::StopReason::MaxTokens => SubagentPromptResult::Error(anyhow!("The agent reached the maximum number of tokens.")),
                                 acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error(anyhow!("The agent reached the maximum number of allowed requests between user turns. Try prompting again.")),
-                                acp::StopReason::Refusal => SubagentPromptResult::Error(anyhow!("The agent refused to process that prompt. Try again.")),
+                                acp::StopReason::Refusal => SubagentPromptResult::Refused,
                                 acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
                             }
                         }
@@ -3991,7 +3992,12 @@ impl SubagentHandle for NativeSubagentHandle {
                 settled: false,
             };
 
-            let result = match task.await {
+            let prompt_result = task.await;
+            let discard_partial_output = matches!(
+                prompt_result,
+                SubagentPromptResult::Cancelled | SubagentPromptResult::Refused
+            );
+            let result = match prompt_result {
                 SubagentPromptResult::Completed => thread.read_with(cx, |thread, _cx| {
                     thread
                         .last_message()
@@ -4013,6 +4019,7 @@ impl SubagentHandle for NativeSubagentHandle {
                         .context("No response from subagent")
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),
+                SubagentPromptResult::Refused => Err(anyhow!("The agent refused to process that prompt. Try again.")),
                 SubagentPromptResult::Error(error) => Err(error),
             };
 
@@ -4042,7 +4049,35 @@ impl SubagentHandle for NativeSubagentHandle {
 
             turn_guard.settled = true;
 
-            result
+            if discard_partial_output {
+                result
+            } else {
+                result.map_err(|error| {
+                    let partial_output = thread.read_with(cx, |thread, _| thread.subagent_partial_output());
+                    if partial_output.is_empty() {
+                        error
+                    } else {
+                        // Attach as context rather than rebuilding the error so the orchestration
+                        // scheduler can still find a typed `TaskExecutionFailure` in the chain.
+                        // Typed failures repeat their source's message, so skip adjacent duplicates.
+                        let mut description = String::new();
+                        let mut previous = None;
+                        for source in error.chain() {
+                            let text = source.to_string();
+                            if previous.as_ref() == Some(&text) {
+                                continue;
+                            }
+                            if !description.is_empty() {
+                                description.push_str(": ");
+                            }
+                            description.push_str(&text);
+                            previous = Some(text);
+                        }
+                        let message = format!("{description}\n\nPartial subagent output (last 3 messages, up to 4096 characters each):\n\n{partial_output}");
+                        error.context(message)
+                    }
+                })
+            }
         })
     }
 

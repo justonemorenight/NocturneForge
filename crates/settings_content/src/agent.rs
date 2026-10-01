@@ -356,6 +356,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left
     pub sidebar_side: Option<SidebarDockPosition>,
+    /// Maximum number of idle threads with loadable sessions to retain in the
+    /// agent panel. Set to 0 to unload every eligible idle thread when it is
+    /// no longer active.
+    ///
+    /// Default: 5
+    pub max_idle_retained_threads: Option<usize>,
     /// Default width in pixels when the agent panel is docked to the left or right.
     ///
     /// Default: 640

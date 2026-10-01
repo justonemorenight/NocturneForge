@@ -395,6 +395,7 @@ pub struct AgentSettings {
     pub dock: DockPosition,
     pub flexible: bool,
     pub sidebar_side: SidebarDockPosition,
+    pub max_idle_retained_threads: usize,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub max_content_width: Option<Pixels>,
@@ -949,6 +950,7 @@ impl Settings for AgentSettings {
             cache_keepalive_config: agent.cache_keepalive_config.clone().unwrap_or_default(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),
+            max_idle_retained_threads: agent.max_idle_retained_threads.unwrap(),
             sidebar_side: agent.sidebar_side.unwrap(),
             default_width: px(agent.default_width.unwrap()),
             default_height: px(agent.default_height.unwrap()),
@@ -1394,6 +1396,40 @@ mod tests {
             });
             assert_eq!(
                 AgentSettings::get_global(cx).prevent_idle_sleep,
+                expected,
+                "{content}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_max_idle_retained_threads_defaults_to_five_and_follows_user_settings(
+        cx: &mut gpui::App,
+    ) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        assert_eq!(
+            AgentSettings::get_global(cx).max_idle_retained_threads,
+            5,
+            "default.json supplies the retained thread limit"
+        );
+
+        for (content, expected) in [
+            (r#"{ "agent": { "max_idle_retained_threads": 0 } }"#, 0),
+            (r#"{ "agent": { "max_idle_retained_threads": 12 } }"#, 12),
+            (r#"{ "agent": { "max_idle_retained_threads": null } }"#, 5),
+            (r#"{ "agent": {} }"#, 5),
+        ] {
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(content, cx)
+                    .expect("user settings should load");
+            });
+            assert_eq!(
+                AgentSettings::get_global(cx).max_idle_retained_threads,
                 expected,
                 "{content}"
             );
