@@ -53,6 +53,9 @@ use super::elicitation::{
 };
 use super::*;
 
+/// Below this message editor width the toolbar splits into a tools/status row
+/// and a selectors/send row instead of one crowded row.
+const COMPACT_MESSAGE_EDITOR_TOOLBAR_WIDTH: Pixels = px(640.);
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 const STICKY_PROMPT_PREVIEW_CHARS: usize = 240;
 const MAX_DELEGATED_TASK_RECENT_TOOLS: usize = 5;
@@ -1210,6 +1213,7 @@ pub struct ThreadView {
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
+    message_editor_toolbar_width: Rc<std::cell::Cell<Option<Pixels>>>,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
@@ -1722,6 +1726,7 @@ impl ThreadView {
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
+            message_editor_toolbar_width: Rc::default(),
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
@@ -7389,51 +7394,126 @@ impl ThreadView {
                             }),
                     )
                     .child(
-                        // Only the middle group wraps. Its zero flex basis gives it a
-                        // definite width, so its controls wrap inside it instead of the
-                        // whole group dropping to its own line, and the send button
-                        // stays anchored at the bottom-right corner.
-                        h_flex()
-                            .w_full()
-                            .min_w_0()
-                            .flex_none()
-                            .items_end()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .items_center()
-                                    .gap_0p5()
-                                    .child(self.render_add_context_button(cx))
-                                    .child(self.render_follow_toggle(cx))
-                                    .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx))
-                                    .children(self.render_quota_pool_control(window, cx)),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .justify_end()
-                                    .gap_1()
-                                    .children(self.render_cache_warming_control(cx))
-                                    .children(self.render_token_usage(cx))
-                                    .children(self.profile_selector.clone())
-                                    .children(self.execution_strategy_selector.clone())
-                                    .children(self.render_chatgpt_account_picker(cx))
-                                    .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
-                                        None => this
-                                            .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
-                                    }),
-                            )
-                            .child(div().flex_none().child(self.render_send_button(cx))),
+                        self.render_message_editor_toolbar(window, cx),
                     ),
             )
             .into_any()
+    }
+
+    fn render_message_editor_toolbar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toolbar_width = self.message_editor_toolbar_width.clone();
+        let is_compact = toolbar_width
+            .get()
+            .is_some_and(|width| width < COMPACT_MESSAGE_EDITOR_TOOLBAR_WIDTH);
+        // The layout is chosen from the width measured in the previous frame, so
+        // re-render once whenever the current frame's width crosses the threshold.
+        let this = cx.entity().downgrade();
+        let measure_width = canvas(
+            move |bounds, window, _| {
+                toolbar_width.set(Some(bounds.size.width));
+                if (bounds.size.width < COMPACT_MESSAGE_EDITOR_TOOLBAR_WIDTH) != is_compact {
+                    window.on_next_frame(move |_, cx| {
+                        if let Some(this) = this.upgrade() {
+                            this.update(cx, |_, cx| cx.notify());
+                        }
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
+        let tools = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_0p5()
+            .child(self.render_add_context_button(cx))
+            .child(self.render_follow_toggle(cx))
+            .children(self.render_fast_mode_control(cx))
+            .children(self.render_thinking_control(cx))
+            .children(self.render_quota_pool_control(window, cx));
+
+        let status = h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .children(self.render_cache_warming_control(cx))
+            .children(self.render_token_usage(cx));
+
+        let selectors = h_flex()
+            .min_w_0()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .children(self.profile_selector.clone())
+            .children(self.execution_strategy_selector.clone())
+            .children(self.render_chatgpt_account_picker(cx))
+            .map(|this| match self.config_options_view.clone() {
+                Some(config_view) => this.child(config_view),
+                None => this
+                    .children(self.mode_selector.clone())
+                    .children(self.model_selector.clone()),
+            });
+
+        let send_button = div().flex_none().child(self.render_send_button(cx));
+
+        let layout = if is_compact {
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .gap_1()
+                        .child(tools)
+                        .child(status),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_end()
+                        .gap_1()
+                        .child(selectors.flex_1())
+                        .child(send_button),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .child(tools)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .justify_end()
+                        .gap_1()
+                        .child(status)
+                        .child(selectors.justify_end()),
+                )
+                .child(send_button)
+                .into_any_element()
+        };
+
+        div()
+            .relative()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .child(measure_width)
+            .child(layout)
+            .into_any_element()
     }
 
     fn render_queue_steer_button(
