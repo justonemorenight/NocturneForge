@@ -1,9 +1,10 @@
 You are compacting this conversation into a handoff for another agent that will resume the work.
 
 Include:
-- Goal: what the user is ultimately trying to achieve
+- Goal: what the user is ultimately trying to achieve, plus the latest user request quoted verbatim
 - State: progress so far, current blockers, and decisions made
 - Context: constraints, preferences, and critical data/examples/references needed to continue
+- Files: repository-relative paths read and modified so far, with one line on what changed in each modified file
 - Next: the specific steps that remain
 - Pitfalls: anything tried that didn't work
 

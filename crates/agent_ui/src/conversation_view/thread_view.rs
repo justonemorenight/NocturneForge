@@ -7409,7 +7409,9 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .min_w_0()
+                                    .ml_auto()
                                     .flex_wrap()
+                                    .justify_end()
                                     .gap_1()
                                     .children(self.render_cache_warming_control(cx))
                                     .children(self.render_token_usage(cx))

@@ -289,6 +289,10 @@ const TOOL_OUTPUT_FIT_SAFETY_BYTES: usize = 16 * 1024;
 const REQUEST_IMAGE_TOKEN_ESTIMATE: usize = 4_000;
 const COMPACTION_TARGET_THRESHOLD_PERCENT: u64 = 90;
 const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 2;
+const MAX_IDENTICAL_CONSECUTIVE_TOOL_CALLS: usize = 3;
+/// Tools whose results depend on elapsed time or external progress, so an
+/// identical repeated call can legitimately return something new.
+const TIME_DEPENDENT_TOOLS: &[&str] = &["terminal", "sandboxed_terminal", "wait_for_agents"];
 const COMPACTION_USER_TEXT_PER_MESSAGE_BYTE_LIMIT: usize = 128 * 1024;
 const COMPACTION_USER_TEXT_TOTAL_BYTE_BUDGET: usize = 384 * 1024;
 
@@ -475,7 +479,7 @@ impl Message {
                 role: Role::User,
                 content: vec![match reason {
                     OrchestrationResumeReason::GoalIncomplete => {
-                        "The orchestration goal is still active. Continue the work from the latest evidence. Do not summarize or stop at an intermediate phase. When the goal and its verification are complete, call update_orchestration_goal with action complete before presenting the final response."
+                        "The orchestration goal is still active. Continue the work from the latest evidence, inspecting the current files and command output rather than relying on earlier messages. Do not summarize or stop at an intermediate phase, and do not narrow the goal to what already works. If your previous turn changed nothing and produced no new evidence, take a different concrete action now; if the same blocker remains, record it with update_orchestration_goal observe_blocker. Before calling update_orchestration_goal with action complete, check every explicit requirement against current evidence such as file contents, test output, or command results; a requirement without direct evidence is not done."
                             .to_string()
                     }
                     OrchestrationResumeReason::RepairMalformedToolCall => {
@@ -5169,6 +5173,11 @@ impl Thread {
             None,
         );
         this.update(cx, |this, _cx| {
+            if tool_result.is_error
+                && let Some(running_turn) = this.running_turn.as_mut()
+            {
+                running_turn.forget_failed_tool_call(&tool_result.tool_use_id);
+            }
             this.pending_message()
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result)
@@ -5421,6 +5430,7 @@ impl Thread {
                 running_turn
                     .streaming_tool_inputs
                     .insert(tool_use.id.clone(), sender);
+                running_turn.last_tool_call = None;
 
                 let tool = tool.clone();
                 log::debug!("Running streaming tool {}", tool_use.name);
@@ -5447,6 +5457,21 @@ impl Thread {
         {
             sender.send_full(input);
             return None;
+        }
+
+        if let Some(error) = self.running_turn.as_mut().and_then(|running_turn| {
+            running_turn.record_tool_call(&tool_use.id, &tool_use.name, &input)
+        }) {
+            return Some(Task::ready((
+                owning_message_ix,
+                LanguageModelToolResult {
+                    content: vec![LanguageModelToolResultContent::Text(Arc::from(error))],
+                    tool_use_id: tool_use.id,
+                    tool_name: tool_use.name,
+                    is_error: true,
+                    output: None,
+                },
+            )));
         }
 
         log::debug!("Running tool {}", tool_use.name);
@@ -7712,6 +7737,14 @@ struct RunningTurn {
     /// Senders for tools that support input streaming and have already been
     /// started but are still receiving input from the LLM.
     streaming_tool_inputs: HashMap<LanguageModelToolUseId, ToolInputSender>,
+    last_tool_call: Option<RepeatedToolCall>,
+}
+
+struct RepeatedToolCall {
+    tool_use_id: LanguageModelToolUseId,
+    tool_name: Arc<str>,
+    input: serde_json::Value,
+    count: usize,
 }
 
 impl RunningTurn {
@@ -7727,7 +7760,57 @@ impl RunningTurn {
             tools,
             cancellation_tx,
             streaming_tool_inputs: HashMap::default(),
+            last_tool_call: None,
         }
+    }
+
+    /// A failed call may succeed when retried after the user grants permission
+    /// or the environment changes, so it does not count toward the streak.
+    /// Calls rejected by the streak check itself keep counting.
+    fn forget_failed_tool_call(&mut self, tool_use_id: &LanguageModelToolUseId) {
+        if self.last_tool_call.as_ref().is_some_and(|last| {
+            last.tool_use_id == *tool_use_id && last.count <= MAX_IDENTICAL_CONSECUTIVE_TOOL_CALLS
+        }) {
+            self.last_tool_call = None;
+        }
+    }
+
+    /// Returns an error message when the model keeps issuing the same call
+    /// with identical input and nothing else in between, since rerunning it
+    /// cannot produce a different result.
+    fn record_tool_call(
+        &mut self,
+        tool_use_id: &LanguageModelToolUseId,
+        tool_name: &Arc<str>,
+        input: &serde_json::Value,
+    ) -> Option<String> {
+        if TIME_DEPENDENT_TOOLS.contains(&tool_name.as_ref()) {
+            self.last_tool_call = None;
+            return None;
+        }
+        let count = match &mut self.last_tool_call {
+            Some(last) if last.tool_use_id == *tool_use_id => return None,
+            Some(last) if last.tool_name == *tool_name && last.input == *input => {
+                last.tool_use_id = tool_use_id.clone();
+                last.count += 1;
+                last.count
+            }
+            _ => {
+                self.last_tool_call = Some(RepeatedToolCall {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                    count: 1,
+                });
+                1
+            }
+        };
+        (count > MAX_IDENTICAL_CONSECUTIVE_TOOL_CALLS).then(|| {
+            format!(
+                "`{tool_name}` was already called {} times in a row with identical arguments, so this call was not run: the result would not change. Use different arguments or another tool, or finish with the information you already have.",
+                count - 1
+            )
+        })
     }
 
     fn cancel(mut self) -> Task<()> {

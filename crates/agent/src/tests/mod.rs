@@ -1105,6 +1105,83 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_identical_consecutive_tool_calls_are_not_rerun(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.add_tool(EchoTool);
+            thread.send(ClientUserMessageId::new(), ["Echo repeatedly"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let echo = |id: &str, text: &str| {
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: id.into(),
+            name: EchoTool::NAME.into(),
+            raw_input: json!({ "text": text }).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({ "text": text })),
+            is_input_complete: true,
+            thought_signature: None,
+        })
+    };
+    for id in ["echo-1", "echo-2", "echo-3", "echo-4"] {
+        fake_model.send_last_completion_stream_event(echo(id, "same"));
+    }
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let completion = fake_model.pending_completions().pop().unwrap();
+    let mut results = completion
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    results.sort_by_key(|result| result.tool_use_id.to_string());
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.tool_use_id.to_string(), result.is_error))
+            .collect::<Vec<_>>(),
+        vec![
+            ("echo-1".to_string(), false),
+            ("echo-2".to_string(), false),
+            ("echo-3".to_string(), false),
+            ("echo-4".to_string(), true),
+        ]
+    );
+    let blocked_text = match results[3].content.as_slice() {
+        [language_model::LanguageModelToolResultContent::Text(text)] => text.to_string(),
+        content => panic!("unexpected blocked result content: {content:?}"),
+    };
+    assert!(blocked_text.contains("identical arguments"));
+
+    // Changing the arguments ends the streak.
+    fake_model.send_last_completion_stream_event(echo("echo-5", "different"));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+    let completion = fake_model.pending_completions().pop().unwrap();
+    assert_eq!(
+        completion.messages.last().unwrap().content,
+        vec![MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "echo-5".into(),
+            tool_name: EchoTool::NAME.into(),
+            is_error: false,
+            content: vec!["different".into()],
+            output: None,
+        })]
+    );
+}
+
+#[gpui::test]
 async fn test_tool_hallucination(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();

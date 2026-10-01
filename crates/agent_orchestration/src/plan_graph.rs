@@ -13,6 +13,10 @@ pub struct OrchestrationTask {
     pub id: TaskId,
     pub label: String,
     pub description: String,
+    /// Background, constraints, and cross-task contracts shared by every task
+    /// in the same batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +101,7 @@ impl OrchestrationTask {
             id: id.into(),
             label: label.into(),
             description: description.into(),
+            shared_context: None,
             role: None,
             model_override: None,
             fallback_model_override: None,

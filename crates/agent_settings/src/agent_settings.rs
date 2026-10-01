@@ -472,7 +472,8 @@ impl AgentSettings {
     }
 
     pub fn set_message_editor_max_lines(&self) -> usize {
-        self.message_editor_min_lines * 2
+        // Keep enough room to type longer prompts even with a small minimum.
+        (self.message_editor_min_lines * 2).max(8)
     }
 
     pub fn favorite_model_ids(&self) -> HashSet<SharedString> {

@@ -1386,8 +1386,8 @@
     "use_modifier_to_send": false,
     // Minimum number of lines to display in the agent message editor.
     //
-    // Default: 4
-    "message_editor_min_lines": 4,
+    // Default: 2
+    "message_editor_min_lines": 2,
     // Whether to show turn statistics (elapsed time during generation, final turn duration).
     //
     // Default: false

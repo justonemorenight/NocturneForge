@@ -27,6 +27,10 @@ Spawn a sub-agent for a well-scoped task.
 ### Choosing the call shape
 - A single task (`label` + `message`) runs immediately and returns the agent's final message as this call's output. Prefer it for one focused investigation or edit.
 - A `tasks` batch is scheduled by the orchestration runtime: at most 4 workers run at once and the rest queue, `depends_on` orders dependent tasks, and failed tasks are reported under `failures` next to successful `results`.
+- In a batch, put background, constraints, and cross-task contracts in `context` once instead of repeating them in every task. Decide contracts up front (for example, the interface one task implements and another consumes) rather than leaving workers to negotiate them.
+- Give every concurrent task its own files. When tasks must touch the same file, make one task own it and order the others with `depends_on`.
+- Workers skip formatters and workspace-wide builds and tests because concurrent siblings make those runs unreliable. Run them yourself once after the batch finishes.
+- If a worker's result is incomplete or wrong, resume that worker with its `session_id` and name the gap instead of redoing the work yourself.
 - Set `agent_type` for new native workers: `explorer` for file and symbol lookup, `flow-reader` for tracing flows or logs, `coding-worker` for bounded implementation.
 
 {{!--

@@ -38,6 +38,7 @@ impl From<AcpTaskBridge> for OrchestrationTask {
             id: TaskId::new(bridge.task_id),
             label: bridge.label,
             description: bridge.prompt,
+            shared_context: None,
             role: None,
             model_override: None,
             fallback_model_override: None,
