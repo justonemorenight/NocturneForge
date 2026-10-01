@@ -7,10 +7,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
@@ -160,6 +160,21 @@ impl MaxIdleRetainedThreads {
         cx.try_global::<Self>().map_or(5, |g| g.0)
     }
 }
+
+/// A retained thread holds its agent connection open, and an external agent
+/// server is a live process, so a few stale background threads keep several of
+/// them resident for the lifetime of the window. Defaults to 10 minutes.
+pub struct IdleRetainedThreadTimeout(pub Duration);
+impl gpui::Global for IdleRetainedThreadTimeout {}
+
+impl IdleRetainedThreadTimeout {
+    pub fn global(cx: &App) -> Duration {
+        cx.try_global::<Self>()
+            .map_or(Duration::from_secs(10 * 60), |timeout| timeout.0)
+    }
+}
+
+const IDLE_RETAINED_THREAD_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TerminalId(uuid::Uuid);
@@ -1337,6 +1352,7 @@ impl BaseView {
 }
 
 pub struct AgentPanel {
+    _idle_thread_sweep: Task<()>,
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
@@ -1752,6 +1768,20 @@ impl AgentPanel {
         })
         .detach();
 
+        let idle_thread_sweep = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(IDLE_RETAINED_THREAD_SWEEP_INTERVAL)
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.cleanup_retained_threads(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         let panel = Self {
             workspace_id,
             base_view,
@@ -1790,6 +1820,7 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
+            _idle_thread_sweep: idle_thread_sweep,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -4604,27 +4635,35 @@ impl AgentPanel {
     }
 
     fn cleanup_retained_threads(&mut self, cx: &App) {
+        self.cleanup_retained_threads_at(cx.background_executor().now(), cx);
+    }
+
+    fn cleanup_retained_threads_at(&mut self, now: Instant, cx: &App) {
         let mut potential_removals = self
             .retained_threads
             .iter()
-            .filter(|(_id, view)| {
-                let Some(thread_view) = view.read(cx).root_thread_view() else {
-                    return true;
-                };
-                let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
-            })
+            .filter(|(_id, view)| view.read(cx).can_unload_retained_thread(cx))
             .collect::<Vec<_>>();
 
         let max_idle = MaxIdleRetainedThreads::global(cx);
+        let idle_timeout = IdleRetainedThreadTimeout::global(cx);
+
+        // Idle past the timeout goes regardless of how few are retained: each
+        // one holds an agent server process open, and the filter above already
+        // limited this to threads `session/load` can restore.
+        let mut to_remove = potential_removals
+            .iter()
+            .filter(|(_, view)| {
+                view.read(cx).updated_at(cx).is_some_and(|updated_at| {
+                    now.saturating_duration_since(updated_at) >= idle_timeout
+                })
+            })
+            .map(|(id, _)| **id)
+            .collect::<Vec<_>>();
 
         potential_removals.sort_unstable_by_key(|(_, view)| view.read(cx).updated_at(cx));
         let n = potential_removals.len().saturating_sub(max_idle);
-        let to_remove = potential_removals
-            .into_iter()
-            .map(|(id, _)| *id)
-            .take(n)
-            .collect::<Vec<_>>();
+        to_remove.extend(potential_removals.into_iter().map(|(id, _)| *id).take(n));
         for id in to_remove {
             self.retained_threads.remove(&id);
         }
@@ -12352,6 +12391,178 @@ mod tests {
             missing.is_none(),
             "unknown session ids should not produce initial content"
         );
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_threads_preserves_pending_client_work(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (session_id, thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel.active_thread_view(cx).expect("thread should be open")
+        });
+        open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        let base_time = cx.background_executor.now();
+        panel.update(&mut cx, |panel, cx| {
+            panel
+                .retained_threads
+                .get(&thread_id)
+                .expect("thread should be retained")
+                .update(cx, |view, cx| view.set_updated_at(base_time, cx));
+            cx.set_global(MaxIdleRetainedThreads(0));
+        });
+
+        for pending_work in ["draft", "queue", "loading"] {
+            thread_view.update_in(&mut cx, |view, window, cx| match pending_work {
+                "draft" => view.message_editor.update(cx, |editor, cx| {
+                    editor.set_text("unsent prompt", window, cx);
+                }),
+                "queue" => view.add_to_queue(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "queued prompt",
+                    ))],
+                    Vec::new(),
+                    window,
+                    cx,
+                ),
+                _ => view.is_loading_contents = true,
+            });
+            panel.update(&mut cx, |panel, cx| {
+                panel.cleanup_retained_threads_at(base_time + Duration::from_secs(3600), cx);
+                assert!(
+                    panel.retained_threads.contains_key(&thread_id),
+                    "cleanup must preserve {pending_work} even beyond the timeout and count limit"
+                );
+            });
+            thread_view.update_in(&mut cx, |view, window, cx| {
+                view.message_editor
+                    .update(cx, |editor, cx| editor.clear(window, cx));
+                view.message_queue.clear();
+                view.is_loading_contents = false;
+            });
+        }
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads_at(base_time + Duration::from_secs(3600), cx);
+            assert!(
+                !panel.retained_threads.contains_key(&thread_id),
+                "cleanup should resume once pending client work is gone"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_threads_preserves_unreviewed_edits(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (session_id, thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        let (project, action_log) = panel.read_with(&cx, |panel, cx| {
+            let thread = panel
+                .active_agent_thread(cx)
+                .expect("thread should be open");
+            (panel.project.clone(), thread.read(cx).action_log().clone())
+        });
+        let buffer = project
+            .update(&mut cx, |project, cx| {
+                let path = project
+                    .project_path_for_absolute_path(Path::new("/project/file.txt"), cx)
+                    .expect("file should belong to the project");
+                project.open_buffer(path, cx)
+            })
+            .await
+            .expect("file should open");
+        action_log.update(&mut cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        buffer.update(&mut cx, |buffer, cx| {
+            buffer.edit([(0..0, "changed")], None, cx)
+        });
+        action_log.update(&mut cx, |log, cx| log.buffer_edited(buffer, cx));
+        cx.run_until_parked();
+        open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        panel.update(&mut cx, |panel, cx| {
+            cx.set_global(MaxIdleRetainedThreads(0));
+            panel.cleanup_retained_threads_at(
+                cx.background_executor().now() + Duration::from_secs(3600),
+                cx,
+            );
+            assert!(panel.retained_threads.contains_key(&thread_id));
+        });
+        action_log.update(&mut cx, |log, cx| log.keep_all_edits(None, cx));
+        cx.run_until_parked();
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads_at(
+                cx.background_executor().now() + Duration::from_secs(3600),
+                cx,
+            );
+            assert!(!panel.retained_threads.contains_key(&thread_id));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_threads_drops_threads_idle_past_timeout(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let mut session_ids = Vec::new();
+        let mut thread_ids = Vec::new();
+
+        for _ in 0..3 {
+            let (session_id, thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            session_ids.push(session_id);
+            thread_ids.push(thread_id);
+        }
+
+        let base_time = Instant::now();
+
+        for session_id in session_ids.iter().take(2) {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        }
+        cx.run_until_parked();
+
+        let timeout = cx.update(|_window, cx| IdleRetainedThreadTimeout::global(cx));
+
+        panel.update(&mut cx, |panel, cx| {
+            let stale = panel
+                .retained_threads
+                .get(&thread_ids[0])
+                .expect("retained thread should exist")
+                .clone();
+            stale.update(cx, |view, cx| view.set_updated_at(base_time, cx));
+
+            let fresh = panel
+                .retained_threads
+                .get(&thread_ids[1])
+                .expect("retained thread should exist")
+                .clone();
+            fresh.update(cx, |view, cx| {
+                view.set_updated_at(base_time + timeout + Duration::from_secs(60), cx)
+            });
+
+            panel.cleanup_retained_threads_at(base_time + timeout, cx);
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                !panel.retained_threads.contains_key(&thread_ids[0]),
+                "a thread idle past the timeout should be dropped so its agent server can exit"
+            );
+            assert!(
+                panel.retained_threads.contains_key(&thread_ids[1]),
+                "a recently active thread should be retained"
+            );
+        });
     }
 
     #[gpui::test]
