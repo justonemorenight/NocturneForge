@@ -10655,6 +10655,7 @@ impl ThreadView {
             }));
 
         let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
+        let completion_stats = show_stats.then(|| self.completed_turn_stats(cx)).flatten();
 
         let last_turn_clock = show_stats
             .then(|| {
@@ -10674,6 +10675,7 @@ impl ThreadView {
             .then(|| {
                 self.turn_fields
                     .last_turn_tokens
+                    .map(|tokens| completion_stats.map_or(tokens, |stats| stats.output_tokens))
                     .filter(|&tokens| tokens > TOKEN_THRESHOLD)
                     .map(|tokens| {
                         Label::new(format!("{} tokens", crate::humanize_token_count(tokens)))
@@ -10682,6 +10684,8 @@ impl ThreadView {
                     })
             })
             .flatten();
+
+        let completion_rate = completion_stats.and_then(Self::render_completion_rate);
 
         let feedback_buttons = is_thread_bottom
             .then(|| {
@@ -10749,12 +10753,24 @@ impl ThreadView {
             .opacity(0.4)
             .hover(|s| s.opacity(1.))
             .when(
-                last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
+                last_turn_tokens_label.is_some()
+                    || last_turn_clock.is_some()
+                    || completion_rate.is_some(),
                 |this| {
                     this.child(
                         h_flex()
                             .px_1()
                             .gap_1()
+                            .when_some(completion_rate, |this, rate| {
+                                this.child(rate).when(last_turn_clock.is_some(), |this| {
+                                    this.child(
+                                        Label::new("•")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .alpha(0.5),
+                                    )
+                                })
+                            })
                             .when_some(last_turn_tokens_label, |this, label| {
                                 this.child(label).child(
                                     Label::new("•")
@@ -10772,6 +10788,45 @@ impl ThreadView {
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
             .into_any_element()
+    }
+
+    fn completed_turn_stats(&self, cx: &App) -> Option<agent::TurnCompletionStats> {
+        self.turn_fields.last_turn_duration?;
+        let stats = self.as_native_thread(cx)?.read(cx).turn_completion_stats();
+        stats.tokens_per_second()?;
+        Some(stats)
+    }
+
+    fn render_completion_rate(stats: agent::TurnCompletionStats) -> Option<impl IntoElement> {
+        let rate = stats.tokens_per_second()?;
+        let mut tooltip = format!(
+            concat!(
+                "Client-measured output rate, including request latency\n",
+                "{} output tokens / {:.2}s across {} model requests\n",
+                "Uses provider-reported output tokens, which may include reasoning and tool arguments.\n",
+                "Excludes time between requests, such as tool execution and approval waits.\n",
+                "Tool execution overlapping a model stream remains included.",
+            ),
+            stats.output_tokens,
+            stats.request_duration.as_secs_f64(),
+            stats.request_count,
+        );
+        if let Some(latency) = stats.first_text_latency {
+            tooltip.push_str(&format!(
+                "\nFirst text-producing request: {:.2}s to first text",
+                latency.as_secs_f64(),
+            ));
+        }
+        Some(
+            div()
+                .id("turn-completion-rate")
+                .child(
+                    Label::new(format!("≈ {rate:.1} tok/s"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text(tooltip)),
+        )
     }
 
     fn is_thread_feedback_enabled(&self, cx: &App) -> bool {

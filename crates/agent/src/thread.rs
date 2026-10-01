@@ -1603,6 +1603,60 @@ pub enum NativePlanStatus {
     Completed,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnCompletionStats {
+    pub output_tokens: u64,
+    pub request_count: u32,
+    pub request_duration: Duration,
+    pub first_text_latency: Option<Duration>,
+    incomplete: bool,
+}
+
+impl TurnCompletionStats {
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        if self.incomplete
+            || self.output_tokens == 0
+            || self.request_duration < Duration::from_millis(250)
+        {
+            return None;
+        }
+        Some(self.output_tokens as f64 / self.request_duration.as_secs_f64())
+    }
+
+    fn record_request(&mut self, request: CompletionRequestStats, duration: Duration) {
+        let Some(output_tokens) = request.output_tokens else {
+            self.incomplete = true;
+            return;
+        };
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.request_count = self.request_count.saturating_add(1);
+        self.request_duration = self.request_duration.saturating_add(duration);
+        if self.first_text_latency.is_none() {
+            self.first_text_latency = request.first_text_latency;
+        }
+    }
+}
+
+#[derive(Default)]
+struct CompletionRequestStats {
+    output_tokens: Option<u64>,
+    first_text_latency: Option<Duration>,
+}
+
+impl CompletionRequestStats {
+    fn observe(&mut self, event: &LanguageModelCompletionEvent, elapsed: Duration) {
+        match event {
+            LanguageModelCompletionEvent::UsageUpdate(usage) => {
+                self.output_tokens = Some(self.output_tokens.unwrap_or(0).max(usage.output_tokens));
+            }
+            LanguageModelCompletionEvent::Text(text) if !text.is_empty() => {
+                self.first_text_latency.get_or_insert(elapsed);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct Thread {
     id: acp::SessionId,
     pub(crate) fork_origin: Option<crate::ForkOrigin>,
@@ -1631,6 +1685,7 @@ pub struct Thread {
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    turn_completion_stats: TurnCompletionStats,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1824,6 +1879,7 @@ impl Thread {
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
+            turn_completion_stats: TurnCompletionStats::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -2307,6 +2363,7 @@ impl Thread {
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
+            turn_completion_stats: TurnCompletionStats::default(),
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -3530,6 +3587,7 @@ impl Thread {
             return Task::ready(());
         };
 
+        self.turn_completion_stats.incomplete = true;
         let turn_task = running_turn.cancel();
 
         cx.spawn(async move |this, cx| {
@@ -3671,6 +3729,10 @@ impl Thread {
 
     pub fn cumulative_token_usage(&self) -> language_model::TokenUsage {
         self.cumulative_token_usage
+    }
+
+    pub fn turn_completion_stats(&self) -> TurnCompletionStats {
+        self.turn_completion_stats
     }
 
     /// Maximum input after reserving the selected model's output allowance.
@@ -3923,6 +3985,7 @@ impl Thread {
         // compaction we're about to perform.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.turn_completion_stats = TurnCompletionStats::default();
 
         let compaction = self
             .forced_compaction_target_ix()
@@ -4054,6 +4117,7 @@ impl Thread {
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.turn_completion_stats = TurnCompletionStats::default();
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream(events_tx);
@@ -4228,6 +4292,10 @@ impl Thread {
                 cache_keepalive::record_turn_activity(cx, this.clone(), model.clone(), &request)
             });
 
+            // Usage may include hidden reasoning, whose generation starts before visible deltas.
+            let request_started_at = Instant::now();
+            let mut request_stats = CompletionRequestStats::default();
+            let mut stream_finished = false;
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
@@ -4274,6 +4342,7 @@ impl Thread {
                     }
                 };
                 let Some(first_event) = first_event else {
+                    stream_finished = true;
                     break;
                 };
 
@@ -4292,6 +4361,7 @@ impl Thread {
                         log::trace!("Received completion event: {:?}", event);
                         match event {
                             Ok(event) => {
+                                request_stats.observe(&event, request_started_at.elapsed());
                                 match this.handle_completion_event(
                                     event,
                                     event_stream,
@@ -4331,6 +4401,20 @@ impl Thread {
                     break;
                 }
             }
+
+            let request_duration = request_started_at.elapsed();
+            this.update(cx, |this, cx| {
+                if *cancellation_rx.borrow() {
+                    return;
+                }
+                if stream_finished && error.is_none() {
+                    this.turn_completion_stats
+                        .record_request(request_stats, request_duration);
+                } else {
+                    this.turn_completion_stats.incomplete = true;
+                }
+                cx.notify();
+            })?;
 
             // Drop the stream to release the rate limit permit before tool execution.
             // The stream holds a semaphore guard that limits concurrent requests.
@@ -9699,6 +9783,161 @@ mod tests {
     use language_model::LanguageModelToolUseId;
     use language_model::fake_provider::{FakeLanguageModel, FakeLanguageModelProvider};
     use serde_json::json;
+
+    #[test]
+    fn completion_rate_weights_requests_and_deduplicates_usage() {
+        let mut stats = TurnCompletionStats::default();
+        let mut first_request = CompletionRequestStats::default();
+        for output_tokens in [50, 100, 100, 75] {
+            first_request.observe(
+                &LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                    output_tokens,
+                    ..Default::default()
+                }),
+                Duration::from_secs(1),
+            );
+        }
+        stats.record_request(first_request, Duration::from_secs(2));
+        stats.record_request(
+            CompletionRequestStats {
+                output_tokens: Some(900),
+                first_text_latency: Some(Duration::from_secs(3)),
+            },
+            Duration::from_secs(30),
+        );
+        assert_eq!(stats.output_tokens, 1_000);
+        assert_eq!(stats.request_count, 2);
+        assert_eq!(stats.request_duration, Duration::from_secs(32));
+        assert_eq!(stats.tokens_per_second(), Some(31.25));
+        assert_eq!(stats.first_text_latency, Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn completion_rate_hides_missing_usage_and_short_measurements() {
+        let mut stats = TurnCompletionStats::default();
+        assert_eq!(stats.tokens_per_second(), None);
+        stats.record_request(
+            CompletionRequestStats {
+                output_tokens: Some(20),
+                ..Default::default()
+            },
+            Duration::from_millis(100),
+        );
+        assert_eq!(stats.tokens_per_second(), None);
+        stats.record_request(
+            CompletionRequestStats {
+                output_tokens: Some(80),
+                ..Default::default()
+            },
+            Duration::from_millis(900),
+        );
+        assert_eq!(stats.tokens_per_second(), Some(100.0));
+        stats.record_request(CompletionRequestStats::default(), Duration::from_secs(2));
+        assert_eq!(stats.tokens_per_second(), None);
+    }
+
+    #[test]
+    fn completion_rate_keeps_first_visible_text_latency_separate() {
+        let mut request = CompletionRequestStats::default();
+        request.observe(
+            &LanguageModelCompletionEvent::Thinking {
+                text: "reasoning".into(),
+                signature: None,
+            },
+            Duration::from_secs(1),
+        );
+        request.observe(
+            &LanguageModelCompletionEvent::Text(String::new()),
+            Duration::from_secs(2),
+        );
+        assert_eq!(request.first_text_latency, None);
+        request.observe(
+            &LanguageModelCompletionEvent::Text("answer".into()),
+            Duration::from_secs(4),
+        );
+        request.observe(
+            &LanguageModelCompletionEvent::Text("continues".into()),
+            Duration::from_secs(5),
+        );
+        assert_eq!(request.first_text_latency, Some(Duration::from_secs(4)));
+    }
+
+    #[gpui::test]
+    async fn completion_rate_tracks_stream_usage_and_resets_for_new_turn(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let mut streams = Vec::new();
+        for expected_tokens in [100, 40] {
+            streams.push(
+                cx.update(|cx| {
+                    thread.update(cx, |thread, cx| {
+                        thread.set_model(model.clone(), cx);
+                        thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+                    })
+                })
+                .expect("turn starts"),
+            );
+            thread.read_with(cx, |thread, _| {
+                assert_eq!(thread.turn_completion_stats().request_count, 0);
+                assert_eq!(thread.turn_completion_stats().output_tokens, 0);
+            });
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("model request");
+            for output_tokens in [expected_tokens / 2, expected_tokens, expected_tokens] {
+                model.send_completion_stream_event(
+                    &request,
+                    LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        output_tokens,
+                        ..Default::default()
+                    }),
+                );
+            }
+            model.send_completion_stream_text_chunk(&request, "hello back");
+            model.end_completion_stream(&request);
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, _| {
+                let stats = thread.turn_completion_stats();
+                assert_eq!(stats.output_tokens, expected_tokens);
+                assert_eq!(stats.request_count, 1);
+                assert!(stats.first_text_latency.is_some());
+                assert!(!stats.incomplete);
+            });
+        }
+
+        for prompt in ["cancel this request", "replacement request"] {
+            streams.push(
+                cx.update(|cx| {
+                    thread.update(cx, |thread, cx| {
+                        thread.send(ClientUserMessageId::new(), vec![prompt], cx)
+                    })
+                })
+                .expect("turn starts"),
+            );
+            cx.run_until_parked();
+        }
+        let request = model
+            .pending_completions()
+            .pop()
+            .expect("replacement request");
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                output_tokens: 60,
+                ..Default::default()
+            }),
+        );
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            let stats = thread.turn_completion_stats();
+            assert_eq!(stats.output_tokens, 60);
+            assert_eq!(stats.request_count, 1);
+            assert!(
+                !stats.incomplete,
+                "cancelled request must not alter its replacement"
+            );
+        });
+    }
 
     #[test]
     fn compaction_capacity_respects_prompt_and_combined_limits() {
