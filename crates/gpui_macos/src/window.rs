@@ -3331,6 +3331,18 @@ extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
     send_file_drop_event(window_state, FileDropEvent::Exited);
 }
 
+fn synthetic_drag_button_is_pressed(button: Option<MouseButton>, pressed: NSUInteger) -> bool {
+    let bit = match button {
+        Some(MouseButton::Left) => 0,
+        Some(MouseButton::Right) => 1,
+        Some(MouseButton::Middle) => 2,
+        Some(MouseButton::Navigate(gpui::NavigationDirection::Back)) => 3,
+        Some(MouseButton::Navigate(gpui::NavigationDirection::Forward)) => 4,
+        None => return false,
+    };
+    pressed & (1 << bit) != 0
+}
+
 async fn synthetic_drag(
     window_state: Weak<Mutex<MacWindowState>>,
     drag_id: usize,
@@ -3339,17 +3351,24 @@ async fn synthetic_drag(
 ) {
     loop {
         executor.timer(Duration::from_millis(16)).await;
-        if let Some(window_state) = window_state.upgrade() {
-            let mut lock = window_state.lock();
-            if lock.synthetic_drag_counter == drag_id {
-                if let Some(mut callback) = lock.event_callback.take() {
-                    drop(lock);
-                    callback(PlatformInput::MouseMove(event.clone()));
-                    window_state.lock().event_callback = Some(callback);
-                }
-            } else {
-                break;
-            }
+        let Some(window_state) = window_state.upgrade() else {
+            break;
+        };
+        let mut lock = window_state.lock();
+        if lock.synthetic_drag_counter != drag_id {
+            break;
+        }
+        // Native menus can consume mouse-up, so the physical button state must
+        // end the drag even when the counter never received that event.
+        let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
+        if !synthetic_drag_button_is_pressed(event.pressed_button, pressed) {
+            lock.synthetic_drag_counter += 1;
+            break;
+        }
+        if let Some(mut callback) = lock.event_callback.take() {
+            drop(lock);
+            callback(PlatformInput::MouseMove(event.clone()));
+            window_state.lock().event_callback = Some(callback);
         }
     }
 }
@@ -3568,6 +3587,26 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_drag_checks_the_original_mouse_button() {
+        let buttons = [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Navigate(gpui::NavigationDirection::Back),
+            MouseButton::Navigate(gpui::NavigationDirection::Forward),
+        ];
+        for (index, button) in buttons.iter().enumerate() {
+            assert!(!synthetic_drag_button_is_pressed(Some(*button), 0));
+            assert!(synthetic_drag_button_is_pressed(Some(*button), 1 << index));
+            assert!(!synthetic_drag_button_is_pressed(
+                Some(*button),
+                1 << ((index + 1) % buttons.len())
+            ));
+        }
+        assert!(!synthetic_drag_button_is_pressed(None, NSUInteger::MAX));
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {

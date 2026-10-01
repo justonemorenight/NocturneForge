@@ -1,6 +1,9 @@
+mod codex_transport;
+
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use codex_transport::{CodexTransportState, TurnState};
 use credentials_provider::CredentialsProvider;
 use futures::{
     FutureExt, StreamExt,
@@ -9,7 +12,7 @@ use futures::{
 use gpui::{App, AsyncApp, BackgroundExecutor, Context, Entity, SharedString, Task, WeakEntity};
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
-    http::{HeaderName, HeaderValue},
+    http::{HeaderMap, HeaderName, HeaderValue},
 };
 use language_model::{
     CompactionResult, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -19,7 +22,7 @@ use language_model::{
 };
 use open_ai::{
     ReasoningEffort,
-    responses::{ResponseInputItem, stream_response, stream_response_with_body},
+    responses::{ResponseInputItem, StreamEvent, stream_response_with_metadata},
 };
 use parking_lot::Mutex;
 use rand::RngCore as _;
@@ -52,18 +55,15 @@ const MAX_ACCOUNT_SESSIONS: usize = 5;
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const QUOTA_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const TOKEN_REFRESH_BUFFER_MS: u64 = 5 * 60 * 1000;
-/// Requests the complete account catalog without Codex CLI version filtering.
-///
-/// The backend treats this exact version as an ungated sentinel. Other versions
-/// are compared with each model's `minimal_client_version`.
-const UNGATED_MODEL_CATALOG_CLIENT_VERSION: &str = "0.0.0";
+/// Client compatibility version sent to the ChatGPT model catalog.
+const MODEL_CATALOG_CLIENT_VERSION: &str = "0.999.0";
 const RESPONSE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const COMPACTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(100);
 const COMPACTION_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPACTION_MAX_ATTEMPTS: usize = 3;
 const COMPACTION_RETRY_DELAYS: [Duration; COMPACTION_MAX_ATTEMPTS - 1] =
     [Duration::from_millis(500), Duration::from_secs(1)];
-const MODEL_CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(32);
 const OAUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -250,6 +250,7 @@ pub struct State {
     /// when switching accounts or re-authenticating while a cycle is running.
     quota_refresh_task: Option<Task<()>>,
     active_operations: Arc<BusyNotifier>,
+    transport: Arc<CodexTransportState>,
     manifest_load_state: ManifestLoadState,
     client_version: String,
 }
@@ -284,7 +285,7 @@ impl State {
         Self::new_with_client_version(
             http_client,
             credentials_provider,
-            UNGATED_MODEL_CATALOG_CLIENT_VERSION.to_string(),
+            MODEL_CATALOG_CLIENT_VERSION.to_string(),
             cx,
         )
     }
@@ -489,6 +490,7 @@ impl State {
             model_fetch_task: None,
             quota_refresh_task: None,
             active_operations: Arc::new(BusyNotifier::new()),
+            transport: Arc::new(CodexTransportState::default()),
             manifest_load_state: ManifestLoadState::Pending,
             client_version,
         }
@@ -569,6 +571,21 @@ impl State {
         self.active_operations.is_busy() || self.account_mutation_in_progress
     }
 
+    pub fn mark_reauthentication_required(&mut self, session_id: &str) {
+        if let Some(session) = self
+            .manifest
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.reauthentication_required = true;
+        }
+        if self.active_session_id.as_deref() == Some(session_id) {
+            self.credentials = None;
+            self.last_auth_error = Some("Your session has expired. Please sign in again.".into());
+        }
+    }
+
     fn begin_account_mutation(&mut self) -> Result<()> {
         if self.is_busy() {
             return Err(anyhow!(
@@ -641,7 +658,6 @@ impl State {
                     .find(|session| session.session_id == session_id)
                 {
                     session.last_used_at_ms = now_ms();
-                    session.reauthentication_required = false;
                 }
                 write_manifest(&provider, &manifest, cx).await?;
                 Ok(Some((manifest, credentials)))
@@ -1421,6 +1437,7 @@ pub fn create_language_model(
         model,
         state: state.clone(),
         request_limiter: RateLimiter::new(4),
+        transport: state.read(cx).transport.clone(),
     })
 }
 
@@ -1430,6 +1447,7 @@ struct OpenAiSubscribedLanguageModel {
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
+    transport: Arc<CodexTransportState>,
 }
 
 impl LanguageModel for OpenAiSubscribedLanguageModel {
@@ -1543,6 +1561,7 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
+        let transport = self.transport.clone();
         let future = cx.spawn(async move |cx| {
             // Mark the whole operation busy up front, including credential
             // refresh and request preparation, so account mutations are
@@ -1572,6 +1591,13 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     "ChatGPT account changed while preparing compaction"
                 )));
             }
+            let turn_state = transport.turn(
+                account_scope.as_deref(),
+                auth_generation,
+                &model_id,
+                request.prompt_id.clone(),
+            );
+            let http_client = transport.client(http_client, account_scope.as_deref(), auth_generation);
             let mut responses_request = into_open_ai_response_with_account_scope(
                 request,
                 &model_id,
@@ -1593,7 +1619,6 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             let request_body = serde_json::to_string(&responses_request)
                 .map_err(|error| LanguageModelCompletionError::Other(error.into()))?;
             let is_streaming = responses_request.stream;
-            let extra_headers = codex_headers(&creds, responses_request.prompt_cache_key.as_deref());
             let access_token = creds.access_token.clone();
             let provider_name = PROVIDER_NAME.0.to_string();
             let background_executor = cx.background_executor().clone();
@@ -1610,15 +1635,22 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     }
                     let started_at = Instant::now();
                     let attempt_body = request_body.clone();
-                    let attempt_headers = extra_headers.clone();
+                    let attempt_headers = codex_headers_with_turn_state(
+                        &creds,
+                        responses_request.prompt_cache_key.as_deref(),
+                        turn_state.value(),
+                    );
                     let attempt_access_token = access_token.clone();
                     let attempt_http_client = http_client.clone();
                     let attempt_provider_name = provider_name.clone();
                     let attempt_account_scope = account_scope.clone();
+                    let attempt_turn_state = turn_state.clone();
+                    let attempt_model_id = model_id.clone();
                     let attempt_background_executor = background_executor.clone();
                     let attempt_request = request_limiter
                         .run(async move {
-                            let response_stream = stream_response_with_body(
+                            let (response_stream, response_headers) =
+                                open_ai::responses::stream_response_with_body_with_metadata(
                                 attempt_http_client.as_ref(),
                                 attempt_provider_name.as_str(),
                                 CODEX_BASE_URL,
@@ -1629,6 +1661,12 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                             )
                             .await
                             .map_err(LanguageModelCompletionError::from)?;
+                            let response_stream = observe_codex_response_metadata(
+                                response_stream,
+                                response_headers,
+                                &attempt_model_id,
+                                attempt_turn_state,
+                            );
                             let mapper = OpenAiResponseEventMapper::new_with_account_scope(
                                 PROVIDER_ID,
                                 attempt_account_scope,
@@ -1764,6 +1802,7 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
         let request_limiter = self.request_limiter.clone();
+        let transport = self.transport.clone();
         let background_executor = cx.background_executor().clone();
 
         let expected_auth_generation = state.read_with(cx, |state, _| state.auth_generation);
@@ -1801,6 +1840,13 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     "ChatGPT account changed while preparing request"
                 )));
             }
+            let turn_state = transport.turn(
+                account_scope.as_deref(),
+                auth_generation,
+                &model_id,
+                request.prompt_id.clone(),
+            );
+            let http_client = transport.client(http_client, account_scope.as_deref(), auth_generation);
             let effective_reasoning_effort = if request.thinking_allowed {
                 request
                     .thinking_effort
@@ -1831,15 +1877,23 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
             // `instructions`, which is the only form the Codex backend accepts.
             responses_request.instructions.get_or_insert_default();
 
-            let extra_headers = codex_headers(&creds, responses_request.prompt_cache_key.as_deref());
             let access_token = creds.access_token.clone();
             let timeout = cx
                 .background_executor()
                 .timer(RESPONSE_STREAM_IDLE_TIMEOUT);
+            let state_clone = state.clone();
+            let http_client_clone = http_client.clone();
+            let creds_clone = creds.clone();
+            let responses_request_clone = responses_request.clone();
             request_limiter
                 .stream(async move {
                     let provider_name = PROVIDER_NAME;
-                    let response = stream_response(
+                    let extra_headers = codex_headers_with_turn_state(
+                        &creds,
+                        responses_request.prompt_cache_key.as_deref(),
+                        turn_state.value(),
+                    );
+                    let response = stream_response_with_metadata(
                         http_client.as_ref(),
                         provider_name.0.as_str(),
                         CODEX_BASE_URL,
@@ -1850,11 +1904,220 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
                     .fuse();
                     let timeout = FutureExt::fuse(timeout);
                     futures::pin_mut!(response, timeout);
-                    futures::select! {
+                    let result = futures::select! {
                         result = response => result.map_err(LanguageModelCompletionError::from),
                         _ = timeout => Err(LanguageModelCompletionError::Other(anyhow!(
                             "ChatGPT subscription response did not start within {RESPONSE_STREAM_IDLE_TIMEOUT:?}"
                         ))),
+                    };
+
+                    match result {
+                        Ok((stream, headers)) => {
+                            Ok(observe_codex_response_metadata(
+                                stream,
+                                headers,
+                                &model_id,
+                                turn_state.clone(),
+                            ))
+                        }
+                        Err(comp_err) if is_authentication_error(&comp_err) => {
+                            let session_id = state_clone
+                                .read_with(&*cx, |s, _| s.active_session_id.clone())
+                                .ok()
+                                .flatten();
+
+                            if let Some(session_id) = session_id {
+                                if creds_clone.refresh_token.is_empty() {
+                                    state_clone
+                                        .update(cx, |s, cx| {
+                                            s.mark_reauthentication_required(&session_id);
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    if let Ok(credentials_provider) =
+                                        state_clone.read_with(&*cx, |s, _| s.credentials_provider.clone())
+                                    {
+                                        persist_manifest(&credentials_provider, &state_clone, cx)
+                                            .await
+                                            .log_err();
+                                    }
+                                    return Err(LanguageModelCompletionError::ProviderRejection {
+                                        provider: PROVIDER_NAME,
+                                        status: Some(http_client::StatusCode::UNAUTHORIZED),
+                                        code: Some("reauthentication_required".to_string()),
+                                        message: "ChatGPT subscription session has expired or was revoked. Please sign in again.".to_string(),
+                                        retry_after: None,
+                                        category: ProviderErrorCategory::Authentication,
+                                    });
+                                }
+
+                                let refresh_res =
+                                    refresh_token(&http_client_clone, &creds_clone.refresh_token).await;
+                                match refresh_res {
+                                    Ok(mut refreshed) => {
+                                        refreshed.account_id =
+                                            refreshed.account_id.or(creds_clone.account_id.clone());
+                                        refreshed.email =
+                                            refreshed.email.or(creds_clone.email.clone());
+                                        refreshed.user_id =
+                                            refreshed.user_id.or(creds_clone.user_id.clone());
+                                        refreshed.plan_type =
+                                            refreshed.plan_type.or(creds_clone.plan_type.clone());
+
+                                        let new_access_token = refreshed.access_token.clone();
+                                        let updated = state_clone
+                                            .update(cx, |s, cx| {
+                                                if s.active_session_id.as_deref() == Some(&session_id) {
+                                                    s.credentials = Some(refreshed.clone());
+                                                    if let Some(session) = s
+                                                        .manifest
+                                                        .sessions
+                                                        .iter_mut()
+                                                        .find(|session| session.session_id == session_id)
+                                                    {
+                                                        session.token_expires_at_ms =
+                                                            Some(refreshed.expires_at_ms);
+                                                    }
+                                                    cx.notify();
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            })
+                                            .unwrap_or(false);
+
+                                        if updated {
+                                            if let Ok(credentials_provider) = state_clone
+                                                .read_with(&*cx, |s, _| s.credentials_provider.clone())
+                                            {
+                                                if let Ok(json) = serde_json::to_vec(&refreshed) {
+                                                    credentials_provider
+                                                        .write_credentials(
+                                                            &account_credentials_key(&session_id),
+                                                            "Bearer",
+                                                            &json,
+                                                            &*cx,
+                                                        )
+                                                        .await
+                                                        .log_err();
+                                                }
+                                                persist_manifest(
+                                                    &credentials_provider,
+                                                    &state_clone,
+                                                    cx,
+                                                )
+                                                .await
+                                                .log_err();
+                                            }
+
+                                            let retry_headers = codex_headers_with_turn_state(
+                                                &refreshed,
+                                                responses_request_clone.prompt_cache_key.as_deref(),
+                                                turn_state.value(),
+                                            );
+                                            match stream_response_with_metadata(
+                                                http_client_clone.as_ref(),
+                                                provider_name.0.as_str(),
+                                                CODEX_BASE_URL,
+                                                &new_access_token,
+                                                responses_request_clone,
+                                                &retry_headers,
+                                            )
+                                            .await
+                                            {
+                                                Ok((stream, headers)) => Ok(
+                                                    observe_codex_response_metadata(
+                                                        stream,
+                                                        headers,
+                                                        &model_id,
+                                                        turn_state.clone(),
+                                                    ),
+                                                ),
+                                                Err(retry_err) => {
+                                                    let retry_comp_err =
+                                                        LanguageModelCompletionError::from(retry_err);
+                                                    if is_authentication_error(&retry_comp_err) {
+                                                        state_clone
+                                                            .update(cx, |s, cx| {
+                                                                s.mark_reauthentication_required(
+                                                                    &session_id,
+                                                                );
+                                                                cx.notify();
+                                                            })
+                                                            .ok();
+                                                        if let Ok(credentials_provider) = state_clone
+                                                            .read_with(&*cx, |s, _| {
+                                                                s.credentials_provider.clone()
+                                                            })
+                                                        {
+                                                            persist_manifest(
+                                                                &credentials_provider,
+                                                                &state_clone,
+                                                                cx,
+                                                            )
+                                                            .await
+                                                            .log_err();
+                                                        }
+                                                        Err(LanguageModelCompletionError::ProviderRejection {
+                                                            provider: PROVIDER_NAME,
+                                                            status: Some(
+                                                                http_client::StatusCode::UNAUTHORIZED,
+                                                            ),
+                                                            code: Some(
+                                                                "reauthentication_required".to_string(),
+                                                            ),
+                                                            message: "ChatGPT subscription session has expired or was revoked. Please sign in again.".to_string(),
+                                                            retry_after: None,
+                                                            category:
+                                                                ProviderErrorCategory::Authentication,
+                                                        })
+                                                    } else {
+                                                        Err(retry_comp_err)
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            Err(comp_err)
+                                        }
+                                    }
+                                    Err(RefreshError::Fatal(e)) => {
+                                        state_clone
+                                            .update(cx, |s, cx| {
+                                                s.mark_reauthentication_required(&session_id);
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        if let Ok(credentials_provider) = state_clone
+                                            .read_with(&*cx, |s, _| s.credentials_provider.clone())
+                                        {
+                                            persist_manifest(
+                                                &credentials_provider,
+                                                &state_clone,
+                                                cx,
+                                            )
+                                            .await
+                                            .log_err();
+                                        }
+                                        Err(LanguageModelCompletionError::ProviderRejection {
+                                            provider: PROVIDER_NAME,
+                                            status: Some(http_client::StatusCode::UNAUTHORIZED),
+                                            code: Some("reauthentication_required".to_string()),
+                                            message: format!(
+                                                "ChatGPT subscription session has expired or was revoked. Please sign in again: {e}"
+                                            ),
+                                            retry_after: None,
+                                            category: ProviderErrorCategory::Authentication,
+                                        })
+                                    }
+                                    Err(RefreshError::Transient(e)) => {
+                                        Err(LanguageModelCompletionError::Other(e))
+                                    }
+                                }
+                            } else {
+                                Err(comp_err)
+                            }
+                        }
+                        Err(other) => Err(other),
                     }
                 })
                 .await
@@ -1862,7 +2125,8 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         });
 
         async move {
-            let (stream, account_scope, operation_guard, effective_reasoning_effort) = future.await?;
+            let (stream, account_scope, operation_guard, effective_reasoning_effort) =
+                future.await?;
             let mapper =
                 OpenAiResponseEventMapper::new_with_account_scope(PROVIDER_ID, account_scope)
                     .with_effective_reasoning_effort(effective_reasoning_effort);
@@ -1880,7 +2144,105 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CodexResponseMetadata {
+    server_model: Option<String>,
+    request_id: Option<String>,
+    safety_buffering_enabled: Option<bool>,
+    faster_model: Option<String>,
+}
+
+impl CodexResponseMetadata {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let text = |name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Self {
+            server_model: text("openai-model"),
+            request_id: text("x-request-id"),
+            safety_buffering_enabled: text("x-codex-safety-buffering-enabled")
+                .and_then(|value| value.parse().ok()),
+            faster_model: text("x-codex-safety-buffering-faster-model"),
+        }
+    }
+}
+
+fn observe_codex_response_metadata(
+    stream: futures::stream::BoxStream<'static, Result<StreamEvent>>,
+    headers: HeaderMap,
+    requested_model: &str,
+    turn_state: TurnState,
+) -> futures::stream::BoxStream<'static, Result<StreamEvent>> {
+    let response_state = headers
+        .get("x-codex-turn-state")
+        .and_then(|value| value.to_str().ok());
+    let turn_state_length = response_state.map(str::len);
+    let state_captured = response_state.is_some_and(|value| turn_state.capture(value));
+    let metadata = CodexResponseMetadata::from_headers(&headers);
+    log::debug!(
+        "ChatGPT subscription response metadata requested_model={} server_model={:?} request_id={:?} safety_buffering_enabled={:?} faster_model={:?} turn_state_length={:?} state_captured={}",
+        requested_model,
+        metadata.server_model,
+        metadata.request_id,
+        metadata.safety_buffering_enabled,
+        metadata.faster_model,
+        turn_state_length,
+        state_captured,
+    );
+
+    let requested_model = requested_model.to_string();
+    let mut model_observed = false;
+    stream
+        .inspect(move |event| {
+            let _turn_lifetime = &turn_state;
+            let summary = match event {
+                Ok(StreamEvent::Created { response })
+                | Ok(StreamEvent::InProgress { response })
+                | Ok(StreamEvent::Completed { response })
+                | Ok(StreamEvent::Incomplete { response })
+                | Ok(StreamEvent::Failed { response }) => response,
+                _ => return,
+            };
+            if let Some(actual_model) = summary.model.as_deref()
+                && !model_observed
+            {
+                model_observed = true;
+                if actual_model != requested_model.as_str()
+                    || metadata.server_model.as_deref()
+                        .is_some_and(|model| model != requested_model.as_str())
+                {
+                    log::warn!(
+                        "ChatGPT subscription reported model names differ requested_model={} response_model={} server_model={:?} request_id={:?}",
+                        requested_model,
+                        actual_model,
+                        metadata.server_model,
+                        metadata.request_id,
+                    );
+                }
+                log::debug!(
+                    "ChatGPT subscription response model requested_model={} response_model={} server_model={:?}",
+                    requested_model,
+                    actual_model,
+                    metadata.server_model,
+                );
+            }
+        })
+        .boxed()
+}
+
 fn codex_headers(creds: &CodexCredentials, routing_cache_key: Option<&str>) -> CustomHeaders {
+    codex_headers_with_turn_state(creds, routing_cache_key, None)
+}
+
+fn codex_headers_with_turn_state(
+    creds: &CodexCredentials,
+    routing_cache_key: Option<&str>,
+    turn_state: Option<&str>,
+) -> CustomHeaders {
     let mut header_pairs: Vec<(HeaderName, HeaderValue)> = vec![
         (
             HeaderName::from_static("originator"),
@@ -1903,6 +2265,13 @@ fn codex_headers(creds: &CodexCredentials, routing_cache_key: Option<&str>) -> C
     {
         header_pairs.push((HeaderName::from_static("session-id"), value.clone()));
         header_pairs.push((HeaderName::from_static("thread-id"), value));
+    }
+    if let Some(turn_state) = turn_state
+        && !turn_state.is_empty()
+        && let Ok(mut value) = HeaderValue::from_str(turn_state)
+    {
+        value.set_sensitive(true);
+        header_pairs.push((HeaderName::from_static("x-codex-turn-state"), value));
     }
     CustomHeaders::new(header_pairs)
 }
@@ -1972,6 +2341,7 @@ async fn refresh_all_account_quotas(state: &WeakEntity<State>, cx: &mut AsyncApp
                     .manifest
                     .sessions
                     .iter()
+                    .filter(|session| !session.reauthentication_required)
                     .map(|session| session.session_id.clone())
                     .collect::<Vec<_>>(),
                 state.auth_generation,
@@ -2075,6 +2445,13 @@ async fn refresh_all_account_quotas(state: &WeakEntity<State>, cx: &mut AsyncApp
                     ));
                     credentials = refreshed;
                     result = fetch_quota(http_client.as_ref(), &credentials).await;
+                    if matches!(result, Err(QuotaFetchError::Unauthorized(_))) {
+                        log::warn!(
+                            "ChatGPT quota check rejected refreshed token for account {session_id}; marking reauthentication required"
+                        );
+                        reauthentication_required.push(session_id);
+                        continue;
+                    }
                 }
                 Err(RefreshError::Fatal(error)) => {
                     log::warn!(
@@ -2141,14 +2518,7 @@ async fn refresh_all_account_quotas(state: &WeakEntity<State>, cx: &mut AsyncApp
             }
         }
         for session_id in reauthentication_required {
-            if let Some(session) = state
-                .manifest
-                .sessions
-                .iter_mut()
-                .find(|session| session.session_id == session_id)
-            {
-                session.reauthentication_required = true;
-            }
+            state.mark_reauthentication_required(&session_id);
         }
         cx.notify();
         true
@@ -2436,14 +2806,107 @@ fn is_transport_error(error: &anyhow::Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
+fn is_authentication_error(err: &LanguageModelCompletionError) -> bool {
+    match err {
+        LanguageModelCompletionError::ProviderRejection {
+            status,
+            code,
+            message,
+            category,
+            ..
+        } => {
+            *category == ProviderErrorCategory::Authentication
+                || *status == Some(http_client::StatusCode::UNAUTHORIZED)
+                || code.as_deref() == Some("reauthentication_required")
+                || code.as_deref() == Some("token_revoked")
+                || code.as_deref() == Some("refresh_token_invalidated")
+                || message.contains("401")
+                || message.contains("unauthorized")
+                || message.contains("refresh_token_invalidated")
+                || message.contains("token_revoked")
+        }
+        LanguageModelCompletionError::Other(err) => {
+            let msg = err.to_string().to_lowercase();
+            msg.contains("401")
+                || msg.contains("unauthorized")
+                || msg.contains("refresh_token_invalidated")
+                || msg.contains("token_revoked")
+        }
+        _ => false,
+    }
+}
+
+fn map_refresh_error(
+    e: Arc<anyhow::Error>,
+    state: &WeakEntity<State>,
+    cx: &AsyncApp,
+) -> LanguageModelCompletionError {
+    let is_reauth = state
+        .read_with(cx, |s, _| {
+            s.active_session_id.as_deref().is_some_and(|active_id| {
+                s.manifest
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == active_id)
+                    .is_some_and(|session| session.reauthentication_required)
+            })
+        })
+        .unwrap_or(false);
+
+    let err_str = e.to_string().to_lowercase();
+    if is_reauth
+        || err_str.contains("401")
+        || err_str.contains("403")
+        || err_str.contains("unauthorized")
+        || err_str.contains("forbidden")
+        || err_str.contains("refresh_token_invalidated")
+        || err_str.contains("token_revoked")
+    {
+        LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::UNAUTHORIZED),
+            code: Some("reauthentication_required".to_string()),
+            message: format!(
+                "ChatGPT subscription session has expired or was revoked. Please sign in again: {e}"
+            ),
+            retry_after: None,
+            category: ProviderErrorCategory::Authentication,
+        }
+    } else {
+        LanguageModelCompletionError::Other(anyhow::anyhow!("{e}"))
+    }
+}
+
 async fn get_fresh_credentials(
     state: &WeakEntity<State>,
     http_client: &Arc<dyn HttpClient>,
     cx: &mut AsyncApp,
 ) -> Result<CodexCredentials, LanguageModelCompletionError> {
-    let (creds, existing_task) = state
-        .read_with(&*cx, |s, _| (s.credentials.clone(), s.refresh_task.clone()))
+    let (is_reauth, creds, existing_task) = state
+        .read_with(&*cx, |s, _| {
+            let is_reauth = s.active_session_id.as_deref().is_some_and(|active_id| {
+                s.manifest
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == active_id)
+                    .is_some_and(|session| session.reauthentication_required)
+            });
+            (is_reauth, s.credentials.clone(), s.refresh_task.clone())
+        })
         .map_err(LanguageModelCompletionError::Other)?;
+
+    if is_reauth {
+        return Err(LanguageModelCompletionError::ProviderRejection {
+            provider: PROVIDER_NAME,
+            status: Some(http_client::StatusCode::UNAUTHORIZED),
+            code: Some("reauthentication_required".to_string()),
+            message:
+                "ChatGPT subscription session has expired or was revoked. Please sign in again."
+                    .to_string(),
+            retry_after: None,
+            category: ProviderErrorCategory::Authentication,
+        });
+    }
 
     let creds = creds.ok_or(LanguageModelCompletionError::NoApiKey {
         provider: PROVIDER_NAME,
@@ -2457,7 +2920,7 @@ async fn get_fresh_credentials(
     if let Some(shared_task) = existing_task {
         return shared_task
             .await
-            .map_err(|e| LanguageModelCompletionError::Other(anyhow::anyhow!("{e}")));
+            .map_err(|e| map_refresh_error(e, state, cx));
     }
 
     // We are the first caller to notice expiry — spawn the refresh task.
@@ -2590,17 +3053,7 @@ async fn get_fresh_credentials(
                         state_clone
                             .update(cx, |s, cx| {
                                 s.refresh_task = None;
-                                s.credentials = None;
-                                if let Some(session) = s
-                                    .manifest
-                                    .sessions
-                                    .iter_mut()
-                                    .find(|session| session.session_id == session_id)
-                                {
-                                    session.reauthentication_required = true;
-                                }
-                                s.last_auth_error =
-                                    Some("Your session has expired. Please sign in again.".into());
+                                s.mark_reauthentication_required(&session_id);
                                 cx.notify();
                             })
                             .ok();
@@ -2646,7 +3099,7 @@ async fn get_fresh_credentials(
 
     shared_task
         .await
-        .map_err(|e| LanguageModelCompletionError::Other(anyhow::anyhow!("{e}")))
+        .map_err(|e| map_refresh_error(e, state, cx))
 }
 
 #[derive(Deserialize)]
@@ -2824,6 +3277,8 @@ async fn refresh_token(
         if status == http_client::StatusCode::BAD_REQUEST
             || status == http_client::StatusCode::UNAUTHORIZED
             || status == http_client::StatusCode::FORBIDDEN
+            || body.contains("refresh_token_invalidated")
+            || body.contains("token_revoked")
         {
             return Err(RefreshError::Fatal(err));
         }
@@ -3291,6 +3746,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_response_headers_capture_state_before_body_metadata() {
+        for length in [292, 312, 332, 356, 780, 868] {
+            let transport = CodexTransportState::default();
+            let prompt: Arc<str> = "turn".into();
+            let turn = transport.turn(Some("account"), 1, "model", Some(prompt.clone()));
+            let state = "s".repeat(length);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-turn-state",
+                HeaderValue::from_str(&state).expect("test state"),
+            );
+            headers.insert("openai-model", HeaderValue::from_static("other-model"));
+            let stream = observe_codex_response_metadata(
+                futures::stream::empty().boxed(),
+                headers,
+                "model",
+                turn.clone(),
+            );
+            assert_eq!(turn.value(), Some(state.as_str()));
+            drop(stream);
+            let mut replacement_headers = HeaderMap::new();
+            replacement_headers.insert(
+                "x-codex-turn-state",
+                HeaderValue::from_static("replacement"),
+            );
+            let _replacement_stream = observe_codex_response_metadata(
+                futures::stream::empty().boxed(),
+                replacement_headers,
+                "model",
+                turn.clone(),
+            );
+            let _missing_header_stream = observe_codex_response_metadata(
+                futures::stream::empty().boxed(),
+                HeaderMap::new(),
+                "model",
+                turn.clone(),
+            );
+            assert_eq!(turn.value(), Some(state.as_str()));
+        }
+    }
+
+    #[test]
+    fn codex_model_metadata_preserves_separate_server_and_buffering_signals() {
+        let mut headers = HeaderMap::new();
+        headers.insert("openai-model", HeaderValue::from_static("served-model"));
+        headers.insert("x-request-id", HeaderValue::from_static("request-id"));
+        headers.insert(
+            "x-codex-safety-buffering-enabled",
+            HeaderValue::from_static("false"),
+        );
+        headers.insert(
+            "x-codex-safety-buffering-faster-model",
+            HeaderValue::from_static("faster-model"),
+        );
+        assert_eq!(
+            CodexResponseMetadata::from_headers(&headers),
+            CodexResponseMetadata {
+                server_model: Some("served-model".into()),
+                request_id: Some("request-id".into()),
+                safety_buffering_enabled: Some(false),
+                faster_model: Some("faster-model".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_headers_can_inject_turn_state_without_logging_or_rewriting_it() {
+        let credentials = make_fresh_credentials();
+        for length in [292, 312, 332, 356, 780, 868] {
+            let state = "s".repeat(length);
+            let headers = codex_headers_with_turn_state(&credentials, None, Some(&state));
+            let header = headers
+                .iter()
+                .find(|(name, _)| name.as_str() == "x-codex-turn-state")
+                .map(|(_, value)| value)
+                .expect("turn state header");
+            assert_eq!(header.to_str().expect("text header"), state);
+            assert!(header.is_sensitive());
+        }
+    }
+
     #[gpui::test]
     async fn test_auto_compaction_streams_from_codex_responses_with_account_scope(
         cx: &mut TestAppContext,
@@ -3486,6 +4023,201 @@ mod tests {
                 "encrypted_content": "opaque-state",
             })])
         );
+    }
+
+    #[gpui::test]
+    async fn native_turn_state_survives_auth_retry_and_compaction(cx: &mut TestAppContext) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let token = "s".repeat(780);
+        let expected_token = token.clone();
+        let http_client = FakeHttpClient::create(move |request| {
+            let request_count = request_count.clone();
+            let token = expected_token.clone();
+            async move {
+                if request.uri().host() == Some("auth.openai.com") {
+                    assert!(request.headers().get("cookie").is_none());
+                    return Ok(http_client::Response::builder().status(200).body(
+                        http_client::AsyncBody::from(
+                            serde_json::json!({
+                                "access_token": "refreshed_access",
+                                "refresh_token": "refreshed_refresh",
+                                "expires_in": 3600,
+                            })
+                            .to_string(),
+                        ),
+                    )?);
+                }
+                assert_eq!(request.uri().host(), Some("chatgpt.com"));
+                let index = request_count.fetch_add(1, Ordering::SeqCst);
+                let state = request
+                    .headers()
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok());
+                let cookie = request
+                    .headers()
+                    .get("cookie")
+                    .and_then(|value| value.to_str().ok());
+                if matches!(index, 0 | 5) {
+                    assert_eq!(state, None);
+                } else {
+                    assert_eq!(state, Some(token.as_str()));
+                }
+                match index {
+                    0 => assert_eq!(cookie, None),
+                    1 => {
+                        assert_eq!(cookie, Some("__oailb=first-route"));
+                        return Ok(http_client::Response::builder()
+                            .status(401)
+                            .header(
+                                "set-cookie",
+                                "__oailb=retry-route; Path=/backend-api; Secure",
+                            )
+                            .body(http_client::AsyncBody::from("unauthorized"))?);
+                    }
+                    2..=5 => {
+                        assert_eq!(cookie, Some("__oailb=retry-route"));
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer refreshed_access")
+                        );
+                    }
+                    _ => panic!("unexpected inference request"),
+                }
+                let mut response = http_client::Response::builder().status(200);
+                if index == 0 {
+                    response = response.header("x-codex-turn-state", token).header(
+                        "set-cookie",
+                        "__oailb=first-route; Path=/backend-api; Secure",
+                    );
+                } else {
+                    response = response.header("x-codex-turn-state", "r".repeat(312));
+                }
+                if index == 3 {
+                    let mut body = String::new();
+                    smol::io::AsyncReadExt::read_to_string(&mut request.into_body(), &mut body)
+                        .await?;
+                    let body: serde_json::Value = serde_json::from_str(&body)?;
+                    assert_eq!(
+                        body["input"].as_array().and_then(|items| items.last()),
+                        Some(&serde_json::json!({"type": "compaction_trigger"}))
+                    );
+                }
+                Ok(response.body(http_client::AsyncBody::from(compaction_response_stream()))?)
+            }
+        });
+        let state = make_state(http_client, Some(make_fresh_credentials()), cx);
+        state.update(cx, |state, _| {
+            state.active_session_id = Some("session".to_string());
+        });
+        let model = cx.read(|cx| {
+            let model = ChatGptModel::fallback_models()
+                .into_iter()
+                .find(|model| model.id() == "gpt-5.5")
+                .expect("fallback gpt-5.5 model");
+            create_language_model(model, &state, cx)
+        });
+        let prompt_id: Arc<str> = "turn".into();
+        let request = LanguageModelRequest {
+            prompt_id: Some(prompt_id),
+            thread_id: Some("thread".to_string()),
+            messages: vec![language_model::LanguageModelRequestMessage {
+                role: language_model::Role::User,
+                content: vec![language_model::MessageContent::Text("Hello".into())],
+                cache: false,
+                reasoning_details: None,
+            }],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let events = model
+                .stream_completion(request.clone(), &cx.to_async())
+                .await
+                .expect("native completion")
+                .collect::<Vec<_>>()
+                .await;
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
+        }
+        model
+            .compact(request.clone(), &cx.to_async())
+            .await
+            .expect("native compaction");
+        let events = model
+            .stream_completion(request.clone(), &cx.to_async())
+            .await
+            .expect("post-compaction continuation")
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let new_turn = LanguageModelRequest {
+            prompt_id: Some(Arc::from("new-turn")),
+            ..request
+        };
+        let events = model
+            .stream_completion(new_turn, &cx.to_async())
+            .await
+            .expect("new turn")
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+    }
+
+    #[gpui::test]
+    async fn compaction_retry_replays_state_from_failed_stream(cx: &mut TestAppContext) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let http_client = FakeHttpClient::create(move |request| {
+            let index = request_count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let header = request
+                    .headers()
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok());
+                if index == 0 {
+                    assert_eq!(header, None);
+                    let error = serde_json::json!({
+                        "type": "error",
+                        "error": {"code": "internal_server_error", "message": "retryable error"},
+                    });
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .header("x-codex-turn-state", "s".repeat(780))
+                        .body(http_client::AsyncBody::from(format!("data: {error}\n\n")))?)
+                } else {
+                    assert_eq!(index, 1);
+                    assert_eq!(header, Some("s".repeat(780).as_str()));
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(compaction_response_stream()))?)
+                }
+            }
+        });
+        let state = make_state(http_client, Some(make_fresh_credentials()), cx);
+        state.update(cx, |state, _| {
+            state.active_session_id = Some("session".to_owned())
+        });
+        let model = cx.read(|cx| {
+            let model = ChatGptModel::fallback_models()
+                .into_iter()
+                .find(|model| model.id() == "gpt-5.5")
+                .expect("fallback gpt-5.5 model");
+            create_language_model(model, &state, cx)
+        });
+        model
+            .compact(
+                LanguageModelRequest {
+                    prompt_id: Some(Arc::from("turn")),
+                    ..Default::default()
+                },
+                &cx.to_async(),
+            )
+            .await
+            .expect("compaction retry");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     fn compaction_response_stream() -> String {
@@ -4205,10 +4937,7 @@ mod tests {
         let state = cx.new(|cx| State::new(http.clone(), creds_provider.clone(), cx));
 
         cx.read(|cx| {
-            assert_eq!(
-                state.read(cx).client_version,
-                UNGATED_MODEL_CATALOG_CLIENT_VERSION
-            );
+            assert_eq!(state.read(cx).client_version, MODEL_CATALOG_CLIENT_VERSION);
         });
 
         let load_task = cx
@@ -5153,6 +5882,7 @@ mod tests {
             model_fetch_task: None,
             quota_refresh_task: None,
             active_operations: Arc::new(BusyNotifier::new()),
+            transport: Arc::new(CodexTransportState::default()),
             manifest_load_state: ManifestLoadState::Loaded,
             client_version: "test".to_string(),
         })
@@ -5189,5 +5919,192 @@ mod tests {
             "expires_in": 3600
         })
         .to_string()
+    }
+
+    #[gpui::test]
+    async fn test_reauthentication_required_account_skips_refresh_and_returns_provider_rejection(
+        cx: &mut TestAppContext,
+    ) {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = request_count.clone();
+        let http_client = FakeHttpClient::create(move |_request| {
+            let count = request_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(http_client::Response::builder()
+                    .status(500)
+                    .body(http_client::AsyncBody::from("should not be called"))?)
+            }
+        });
+
+        let http: Arc<dyn HttpClient> = http_client;
+        let session_id = "reauth_session";
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_id.to_string()),
+            sessions: vec![AccountSessionMetadata {
+                session_id: session_id.to_string(),
+                email: None,
+                user_id: None,
+                display_name: None,
+                image_url: None,
+                last_used_at_ms: 0,
+                token_expires_at_ms: Some(0),
+                selected_workspace_account_id: None,
+                workspaces: Vec::new(),
+                quota: None,
+                quota_fetched_at_ms: None,
+                reauthentication_required: true,
+            }],
+        };
+
+        let state = cx.new(|_| State {
+            credentials_provider: creds_provider.clone(),
+            http_client: http.clone(),
+            active_session_id: Some(session_id.to_string()),
+            manifest: manifest.clone(),
+            credentials: Some(make_expired_credentials()),
+            sign_in_task: None,
+            sign_in_abort_handle: None,
+            sign_out_task: None,
+            refresh_task: None,
+            load_task: None,
+            auth_generation: 0,
+            account_mutation_seq: 0,
+            account_mutation_in_progress: false,
+            last_auth_error: None,
+            models: ChatGptModel::fallback_models(),
+            model_fetch_task: None,
+            quota_refresh_task: None,
+            active_operations: Arc::new(BusyNotifier::new()),
+            transport: Arc::new(CodexTransportState::default()),
+            manifest_load_state: ManifestLoadState::Loaded,
+            client_version: "test".to_string(),
+        });
+
+        let weak_state = cx.read(|_cx| state.downgrade());
+        let http_clone = http.clone();
+        let result = cx
+            .spawn(async move |mut cx| {
+                get_fresh_credentials(&weak_state, &http_clone, &mut cx).await
+            })
+            .await;
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            0,
+            "must not attempt HTTP token refresh when reauthentication_required is true"
+        );
+        let err = result.expect_err("should return provider rejection");
+        match err {
+            LanguageModelCompletionError::ProviderRejection { code, status, .. } => {
+                assert_eq!(code.as_deref(), Some("reauthentication_required"));
+                assert_eq!(status, Some(http_client::StatusCode::UNAUTHORIZED));
+            }
+            other => panic!("expected ProviderRejection, got {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_switch_account_does_not_clear_reauthentication_required(cx: &mut TestAppContext) {
+        let http: Arc<dyn HttpClient> = FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(http_client::AsyncBody::default())?)
+        });
+        let creds_provider = Arc::new(FakeCredentialsProvider::new());
+        let session_a = "session_a";
+        let session_b = "session_b";
+        let creds_a = make_fresh_credentials();
+        let creds_b = make_fresh_credentials();
+
+        creds_provider.insert(
+            &account_credentials_key(session_a),
+            "Bearer",
+            serde_json::to_vec(&creds_a).unwrap(),
+        );
+        creds_provider.insert(
+            &account_credentials_key(session_b),
+            "Bearer",
+            serde_json::to_vec(&creds_b).unwrap(),
+        );
+
+        let manifest = AccountManifest {
+            version: 1,
+            active_session_id: Some(session_b.to_string()),
+            sessions: vec![
+                AccountSessionMetadata {
+                    session_id: session_a.to_string(),
+                    email: None,
+                    user_id: None,
+                    display_name: None,
+                    image_url: None,
+                    last_used_at_ms: 0,
+                    token_expires_at_ms: None,
+                    selected_workspace_account_id: None,
+                    workspaces: Vec::new(),
+                    quota: None,
+                    quota_fetched_at_ms: None,
+                    reauthentication_required: true,
+                },
+                AccountSessionMetadata {
+                    session_id: session_b.to_string(),
+                    email: None,
+                    user_id: None,
+                    display_name: None,
+                    image_url: None,
+                    last_used_at_ms: 0,
+                    token_expires_at_ms: None,
+                    selected_workspace_account_id: None,
+                    workspaces: Vec::new(),
+                    quota: None,
+                    quota_fetched_at_ms: None,
+                    reauthentication_required: false,
+                },
+            ],
+        };
+
+        let state = cx.new(|_| State {
+            credentials_provider: creds_provider.clone(),
+            http_client: http.clone(),
+            active_session_id: Some(session_b.to_string()),
+            manifest: manifest.clone(),
+            credentials: Some(creds_b),
+            sign_in_task: None,
+            sign_in_abort_handle: None,
+            sign_out_task: None,
+            refresh_task: None,
+            load_task: None,
+            auth_generation: 0,
+            account_mutation_seq: 0,
+            account_mutation_in_progress: false,
+            last_auth_error: None,
+            models: ChatGptModel::fallback_models(),
+            model_fetch_task: None,
+            quota_refresh_task: None,
+            active_operations: Arc::new(BusyNotifier::new()),
+            transport: Arc::new(CodexTransportState::default()),
+            manifest_load_state: ManifestLoadState::Loaded,
+            client_version: "test".to_string(),
+        });
+
+        let task = state.update(cx, |state, cx| state.switch_account(session_a.into(), cx));
+        task.await.expect("switching to session_a should succeed");
+        cx.run_until_parked();
+
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.active_session_id.as_deref(), Some(session_a));
+            let session = state
+                .manifest
+                .sessions
+                .iter()
+                .find(|s| s.session_id == session_a)
+                .expect("session_a should exist");
+            assert!(
+                session.reauthentication_required,
+                "reauthentication_required must remain true after switching to the account"
+            );
+        });
     }
 }

@@ -150,7 +150,23 @@ impl GoalController {
                         .is_none_or(|verification| verification.passed)
             })
             .count();
-        snapshot.failed_tasks = task_ids_in_state(&snapshot.task_ids, &by_task, TaskState::Failed);
+        snapshot.failed_tasks = snapshot
+            .task_ids
+            .iter()
+            .filter(|task_id| {
+                by_task.get(*task_id).is_some_and(|status| {
+                    matches!(
+                        status.state,
+                        TaskState::Failed
+                            | TaskState::TimedOut
+                            | TaskState::Orphaned
+                            | TaskState::Blocked
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshot.failed_tasks.sort();
         snapshot.cancelled_tasks =
             task_ids_in_state(&snapshot.task_ids, &by_task, TaskState::Cancelled);
         snapshot.total_tokens_used = snapshot
@@ -167,6 +183,13 @@ impl GoalController {
                 GoalStatus::Achieved
             }
             RunState::Completed => GoalStatus::Failed,
+            RunState::CompletedWithErrors => {
+                if snapshot.completed_tasks > 0 {
+                    GoalStatus::Active
+                } else {
+                    GoalStatus::Failed
+                }
+            }
             RunState::Failed => GoalStatus::Failed,
             RunState::Cancelled => GoalStatus::Cancelled,
             _ if snapshot.status == GoalStatus::Blocked => GoalStatus::Blocked,
@@ -230,6 +253,12 @@ impl GoalController {
 
     pub fn mark_achieved(&self) -> Result<GoalSnapshot> {
         let mut snapshot = self.snapshot.write();
+        let active_tasks = snapshot.total_tasks.saturating_sub(
+            snapshot.completed_tasks + snapshot.failed_tasks.len() + snapshot.cancelled_tasks.len(),
+        );
+        if active_tasks > 0 {
+            bail!("cannot complete parent goal while tasks are still queued, starting, or running");
+        }
         match snapshot.status {
             GoalStatus::Active | GoalStatus::Blocked => {
                 snapshot.status = GoalStatus::Achieved;

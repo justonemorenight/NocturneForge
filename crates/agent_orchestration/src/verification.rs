@@ -329,6 +329,8 @@ impl VerificationPolicy {
             ],
         ) {
             ErrorClass::ContextOverflow
+        } else if lower.contains("external_source_unreachable") {
+            ErrorClass::FatalError
         } else if is_provider_unavailable_error(&lower) {
             ErrorClass::ProviderUnavailable
         } else if lower.contains("tool call budget") && lower.contains("exceeded") {
@@ -395,9 +397,14 @@ fn is_provider_unavailable_error(error: &str) -> bool {
             "provider unavailable",
             "no api key",
             "unauthorized",
+            "401",
+            "forbidden",
+            "403",
             "token_revoked",
             "refresh_token_invalidated",
             "session has ended",
+            "reauthentication_required",
+            "re-authenticate",
         ],
     ) || (error.contains("not configured") && contains_any(error, &["provider", "model"]))
 }
@@ -735,7 +742,10 @@ impl VerificationRunner {
         let mut builder = GlobSetBuilder::new();
         let mut pattern_count = 0;
         for pattern in scope
-            .split([',', '\n'])
+            // Task scopes are serialized by the orchestration UI as a
+            // semicolon-separated list. Accept all supported separators so a
+            // scope survives the round trip without becoming one invalid glob.
+            .split([',', '\n', ';'])
             .flat_map(|entry| {
                 let entry = entry.trim();
                 if entry.split_whitespace().count() > 1 {
@@ -1054,6 +1064,17 @@ mod tests {
                 .as_deref()
                 .is_some_and(|f| f.contains("scope"))
         );
+    }
+
+    #[test]
+    fn semicolon_separated_scopes_accept_each_declared_path() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope = Some("internal/services/host_runtime_service.go;internal/api".to_string());
+
+        let output = claim_json("", r#""internal/services/host_runtime_service.go:42""#);
+        assert!(runner.verify(&task, &output).passed);
     }
 
     #[test]

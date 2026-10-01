@@ -252,6 +252,23 @@ async fn load_user_overrides(
 
 #[cfg(test)]
 mod tests {
+    use super::builtin_guidance;
+
+    #[test]
+    fn orchestration_control_tools_have_builtin_guidance() {
+        for tool_name in [
+            "list_orchestration_agents",
+            "send_message_to_agent",
+            "wait_for_agents",
+            "update_orchestration_goal",
+        ] {
+            assert!(
+                builtin_guidance(tool_name).is_some_and(|guidance| !guidance.trim().is_empty()),
+                "missing built-in guidance for {tool_name}"
+            );
+        }
+    }
+
     /// Extraction utility for the contract/guidance tier split: dumps each
     /// built-in tool's current model-facing documentation into
     /// `src/tool_guidance/<tool>.hbs`, where the files become embedded

@@ -25,7 +25,7 @@ use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -214,6 +214,13 @@ impl RunHandle {
 
     pub fn goal_snapshot(&self) -> GoalSnapshot {
         self.goal.observe(self.state(), &self.task_statuses())
+    }
+
+    /// Returns the controller that owns this run's goal. The parent thread
+    /// adopts this handle so goal updates, task IDs, and persisted run state
+    /// remain on one identity across worker turns and resume.
+    pub fn goal_controller(&self) -> GoalController {
+        self.goal.clone()
     }
 
     pub fn record_goal_blocker(
@@ -886,6 +893,14 @@ impl RunHandle {
         Ok(true)
     }
 
+    pub fn authoritative_run(&self) -> crate::state::OrchestrationRunRecord {
+        self.snapshot().authoritative_run(None)
+    }
+
+    pub fn authoritative_tasks(&self) -> Vec<crate::state::OrchestrationTaskRecord> {
+        self.snapshot().authoritative_tasks(None)
+    }
+
     pub fn snapshot(&self) -> PersistedRun {
         let statuses = self.task_registry.all_statuses();
         let mut attempts = Vec::new();
@@ -910,6 +925,21 @@ impl RunHandle {
         .with_context_checkpoints(self.context_checkpoints.snapshot())
         .with_agent_residency(self.residency.snapshot())
         .with_goal(self.goal_snapshot())
+    }
+
+    pub fn historical_session_ids(&self) -> collections::HashSet<acp::SessionId> {
+        let statuses = self.task_registry.all_statuses();
+        let mut stale = collections::HashSet::default();
+        for status in statuses {
+            for attempt in self.task_registry.attempts_for(&status.task_id) {
+                if let Some(session_id) = attempt.session_id {
+                    if status.active_session_id.as_ref() != Some(&session_id) {
+                        stale.insert(session_id);
+                    }
+                }
+            }
+        }
+        stale
     }
 
     /// Returns the sequence number of the last event emitted, used as the
@@ -953,12 +983,43 @@ impl OrchestrationRuntime {
         RunHandle,
         futures::channel::oneshot::Receiver<Result<RunState>>,
     )> {
+        Self::start_with_disposition_and_sessions(
+            plan,
+            policy,
+            disposition,
+            HashMap::default(),
+            executor,
+            config,
+        )
+    }
+
+    /// Creates a run whose tasks may resume from already-existing worker sessions.
+    pub fn start_with_disposition_and_sessions(
+        plan: OrchestrationPlan,
+        policy: AgentExecutionPolicy,
+        disposition: RuntimeLaunchDisposition,
+        initial_session_ids: HashMap<TaskId, acp::SessionId>,
+        executor: Rc<dyn TaskExecutor>,
+        config: RuntimeConfig,
+    ) -> Result<(
+        RunHandle,
+        futures::channel::oneshot::Receiver<Result<RunState>>,
+    )> {
         if !config.enabled {
             anyhow::bail!("orchestration runtime is disabled");
         }
         let plan_graph = PlanGraph::new(plan.clone()).context("invalid plan graph")?;
         let run_id = RunId::new();
         let task_registry = TaskRegistry::new();
+        for (task_id, session_id) in initial_session_ids {
+            anyhow::ensure!(
+                plan_graph.task(&task_id).is_some(),
+                "initial worker session references unknown task '{task_id}'"
+            );
+            let mut status = TaskStatus::new(task_id);
+            status.active_session_id = Some(session_id);
+            task_registry.restore_status(status);
+        }
         let artifact_store = ArtifactStore::new();
         let cancellation_tree = Arc::new(CancellationTree::new());
         let event_stream = RuntimeEventStream::new();
@@ -984,7 +1045,7 @@ impl OrchestrationRuntime {
             run_id.clone(),
             initial_state,
             plan.clone(),
-            Vec::new(),
+            task_registry.all_statuses(),
             Some(&agent_control_plane.snapshot()),
             0,
         ));

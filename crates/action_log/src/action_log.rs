@@ -129,9 +129,24 @@ impl ActionLog {
         base_text: String,
         cx: &mut Context<Self>,
     ) {
+        self.restore_pending_file_change(buffer, Some(base_text), cx);
+    }
+
+    pub fn restore_pending_file_change(
+        &mut self,
+        buffer: Entity<Buffer>,
+        base_text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let tracked = self.track_buffer_internal(buffer.clone(), false, cx);
-        tracked.diff_base = Rope::from(base_text);
-        tracked.status = TrackedBufferStatus::Modified;
+        tracked.diff_base = Rope::from(base_text.clone().unwrap_or_default());
+        tracked.status = if base_text.is_some() {
+            TrackedBufferStatus::Modified
+        } else {
+            TrackedBufferStatus::Created {
+                existing_file_content: None,
+            }
+        };
         tracked.version = buffer.read(cx).version();
         tracked.schedule_diff_update(ChangeAuthor::Agent, cx);
     }

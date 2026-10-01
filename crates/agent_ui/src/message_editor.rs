@@ -221,8 +221,7 @@ const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
 const MAX_COMPACT_PASTE_BYTES: usize = 1024 * 1024;
 
 fn insert_pasted_text_crease(
-    anchor: text::Anchor,
-    content_len: usize,
+    anchors: Range<text::Anchor>,
     pasted_text: PastedText,
     editor: Entity<Editor>,
     message_editor: WeakEntity<MessageEditor>,
@@ -231,8 +230,15 @@ fn insert_pasted_text_crease(
 ) -> Option<CreaseId> {
     editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let start = snapshot.anchor_in_excerpt(anchor)?.bias_right(&snapshot);
-        let end = snapshot.anchor_before(start.to_offset(&snapshot) + content_len);
+        let start = snapshot
+            .anchor_in_excerpt(anchors.start)?
+            .bias_right(&snapshot);
+        let end = snapshot
+            .anchor_in_excerpt(anchors.end)?
+            .bias_left(&snapshot);
+        if start.to_offset(&snapshot) >= end.to_offset(&snapshot) {
+            return None;
+        }
         let label = pasted_text.label();
         let paste_id = pasted_text.id;
 
@@ -1109,32 +1115,44 @@ impl MessageEditor {
             return false;
         }
 
-        let content_len = content.len();
-        let text_anchor = self.editor.update(cx, |editor, cx| {
+        let inserted_text = self.editor.update(cx, |editor, cx| {
             let buffer = editor.buffer().read(cx);
             let snapshot = buffer.snapshot(cx);
             let buffer_snapshot = snapshot.as_singleton()?;
-            let text_anchor = snapshot
+            let start_anchor = snapshot
                 .anchor_to_buffer_anchor(editor.selections.newest_anchor().start)?
                 .0
                 .bias_left(&buffer_snapshot);
             editor.insert(&content, window, cx);
-            Some(text_anchor)
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let end_anchor = snapshot
+                .anchor_to_buffer_anchor(editor.selections.newest_anchor().head())?
+                .0;
+            let start_offset = snapshot
+                .anchor_in_excerpt(start_anchor)?
+                .to_offset(&snapshot);
+            let end_offset = snapshot.anchor_in_excerpt(end_anchor)?.to_offset(&snapshot);
+            if start_offset >= end_offset {
+                return None;
+            }
+            let inserted_content = snapshot
+                .text_for_range(start_offset..end_offset)
+                .collect::<String>();
+            Some((start_anchor..end_anchor, inserted_content))
         });
-        let Some(text_anchor) = text_anchor else {
-            return false;
+        let Some((anchors, inserted_content)) = inserted_text else {
+            return true;
         };
 
         let pasted_text = PastedText {
             id: self.next_pasted_text_id,
-            line_count: pasted_text_line_count(&content),
-            byte_count: content_len,
+            line_count: pasted_text_line_count(&inserted_content),
+            byte_count: inserted_content.len(),
             preview_editor: None,
         };
         self.next_pasted_text_id = self.next_pasted_text_id.wrapping_add(1);
         let Some(crease_id) = insert_pasted_text_crease(
-            text_anchor,
-            content_len,
+            anchors,
             pasted_text.clone(),
             self.editor.clone(),
             cx.weak_entity(),
@@ -6106,6 +6124,36 @@ mod tests {
         });
 
         (message_editor, editor, cx)
+    }
+
+    #[gpui::test]
+    async fn test_compact_paste_uses_inserted_range(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, editor, mut cx) = setup_paste_test_message_editor(json!({}), cx).await;
+        let pasted_code = "type HostAppInfo struct {\r\n        AppCode string `json:\"appCode\"`\r\n        AppType string `json:\"appType\"`\r\n        AuthType string `json:\"authType\"`\r\n        BasePath string `json:\"basePath\"`\r\n        BuildID string `json:\"buildId\"`\r\n        CDNURL *string `json:\"cdnUrl\"`\r\n        URL *string `json:\"url\"`\r\n        CLIVersion *string `json:\"cliVersion\"`\r\n    }";
+
+        editor.update_in(&mut cx, |editor, window, cx| {
+            editor.set_text("prefix suffix", window, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(7)..MultiBufferOffset(13)]);
+            });
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string(pasted_code.into()));
+        message_editor.update_in(&mut cx, |message_editor, window, cx| {
+            message_editor.paste(&Paste, window, cx);
+        });
+
+        let actual = editor.update(&mut cx, |editor, cx| editor.text(cx));
+        assert!(actual.starts_with("prefix type HostAppInfo struct {\n"));
+        assert!(actual.contains("CLIVersion *string `json:\"cliVersion\"`"));
+        assert!(!actual.contains('\r'));
+        message_editor.update(&mut cx, |message_editor, cx| {
+            assert_eq!(message_editor.pasted_texts.len(), 1);
+            assert_eq!(
+                message_editor.pasted_text_content(0, cx),
+                Some(actual[7..].to_string())
+            );
+        });
     }
 
     fn paste_external_paths(

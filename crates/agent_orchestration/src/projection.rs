@@ -22,6 +22,8 @@ pub struct RunActivityProjection {
     pub agents: Vec<ActivityAgentProjection>,
     pub last_event_seq: u64,
     pub resync_required: bool,
+    #[serde(default)]
+    pub stale_session_ids: collections::HashSet<agent_client_protocol::schema::v1::SessionId>,
 }
 
 impl RunActivityProjection {
@@ -75,7 +77,97 @@ impl RunActivityProjection {
             agents,
             last_event_seq,
             resync_required: false,
+            stale_session_ids: collections::HashSet::default(),
         }
+    }
+
+    pub fn authoritative_run(
+        &self,
+        root_thread_id: Option<String>,
+    ) -> crate::state::OrchestrationRunRecord {
+        let task_ids = self
+            .plan
+            .tasks
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>();
+        let active_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state.is_active())
+            .count();
+        let completed_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state == TaskState::Completed)
+            .count();
+        let failed_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    TaskState::Failed | TaskState::TimedOut | TaskState::Orphaned
+                )
+            })
+            .count();
+        let cancelled_count = self
+            .task_statuses
+            .iter()
+            .filter(|s| s.state == TaskState::Cancelled)
+            .count();
+        let finished_at = if self.state.is_terminal() {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+        crate::state::OrchestrationRunRecord {
+            run_id: self.run_id.clone(),
+            root_thread_id,
+            state: self.state,
+            task_ids,
+            active_count,
+            completed_count,
+            failed_count,
+            cancelled_count,
+            created_at: chrono::Utc::now(),
+            finished_at,
+        }
+    }
+
+    pub fn authoritative_tasks(
+        &self,
+        parent_thread_id: Option<String>,
+    ) -> Vec<crate::state::OrchestrationTaskRecord> {
+        self.plan
+            .tasks
+            .iter()
+            .map(|task| {
+                let status = self.task_statuses.iter().find(|s| s.task_id == task.id);
+                let state = status.map_or(TaskState::Pending, |s| s.state);
+                let attempt = status.map_or(0, |s| s.current_attempt);
+                let child_thread_id =
+                    status.and_then(|s| s.active_session_id.as_ref().map(|id| id.0.to_string()));
+                let error = status.and_then(|s| s.latest_error.clone());
+
+                crate::state::OrchestrationTaskRecord {
+                    task_id: task.id.clone(),
+                    run_id: self.run_id.clone(),
+                    parent_thread_id: parent_thread_id.clone(),
+                    label: task.label.clone(),
+                    state,
+                    attempt,
+                    child_thread_id,
+                    error,
+                    started_at: chrono::Utc::now(),
+                    finished_at: if state.is_terminal() {
+                        Some(chrono::Utc::now())
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect()
     }
 
     pub fn apply(&mut self, envelope: &SequencedRuntimeEvent) {
@@ -100,7 +192,11 @@ impl RunActivityProjection {
                 self.state = RunState::Running;
             }
             RuntimeEvent::RunPaused { .. } => self.state = RunState::Paused,
-            RuntimeEvent::RunCompleted { .. } => self.state = RunState::Completed,
+            RuntimeEvent::RunCompleted { .. } => {
+                if self.state != RunState::CompletedWithErrors {
+                    self.state = RunState::Completed;
+                }
+            }
             RuntimeEvent::RunFailed { .. } => self.state = RunState::Failed,
             RuntimeEvent::RunCancelled { .. } => self.state = RunState::Cancelled,
             RuntimeEvent::RunStateChanged { state, .. } => self.state = *state,
@@ -156,15 +252,24 @@ impl RunActivityProjection {
                 session_id,
                 attempt,
                 ..
-            } => self.update_status(task_id, updated_at, |status| {
-                status.state = TaskState::Running;
-                status.phase = Some("running".to_string());
-                status.active_session_id = session_id.clone();
-                status.current_attempt = *attempt;
-                status.total_attempts = status.total_attempts.max(*attempt);
-                status.wait_reason = None;
-                status.latest_error = None;
-            }),
+            } => {
+                if let Some(existing) = self.task_statuses.iter().find(|s| &s.task_id == task_id) {
+                    if let Some(old_session) = &existing.active_session_id {
+                        if Some(old_session) != session_id.as_ref() {
+                            self.stale_session_ids.insert(old_session.clone());
+                        }
+                    }
+                }
+                self.update_status(task_id, updated_at, |status| {
+                    status.state = TaskState::Running;
+                    status.phase = Some("running".to_string());
+                    status.active_session_id = session_id.clone();
+                    status.current_attempt = *attempt;
+                    status.total_attempts = status.total_attempts.max(*attempt);
+                    status.wait_reason = None;
+                    status.latest_error = None;
+                });
+            }
             RuntimeEvent::TaskPhaseChanged { task_id, phase, .. } => {
                 self.update_status(task_id, updated_at, |status| {
                     status.phase = Some(phase.clone());

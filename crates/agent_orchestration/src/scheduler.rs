@@ -15,6 +15,7 @@ use crate::residency::AgentResidencyManager;
 use crate::state::{RunState, TaskState};
 use crate::task_mutation::TaskMutationGateway;
 use crate::task_registry::TaskRegistry;
+use crate::verification::ErrorClass;
 use crate::verification::{
     FailureScope, TaskExecutionFailure, VerificationPolicy, VerificationResult,
 };
@@ -189,10 +190,11 @@ impl Scheduler {
         }
 
         Self {
-            task_mutations: TaskMutationGateway::new(
+            task_mutations: TaskMutationGateway::new_with_control_plane(
                 run_id.clone(),
                 task_registry.clone(),
                 event_stream.clone(),
+                agent_control_plane.clone(),
             ),
             run_id,
             plan_graph,
@@ -318,6 +320,34 @@ impl Scheduler {
                         });
                     }
                     continue;
+                }
+
+                let has_blocked = self
+                    .task_registry
+                    .all_statuses()
+                    .iter()
+                    .any(|s| s.state == TaskState::Blocked);
+                if !completed.is_empty()
+                    && (!failed.is_empty() || !cancelled.is_empty() || has_blocked)
+                {
+                    if !matches!(
+                        self.control.transition(RunState::CompletedWithErrors),
+                        Ok(true)
+                    ) {
+                        return Ok(self.control.state());
+                    }
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    let total_tokens = self.task_registry.total_tokens_used();
+                    self.event_stream.emit(RuntimeEvent::RunStateChanged {
+                        run_id: self.run_id.clone(),
+                        state: RunState::CompletedWithErrors,
+                    });
+                    self.event_stream.emit(RuntimeEvent::RunCompleted {
+                        run_id: self.run_id.clone(),
+                        total_tokens_used: total_tokens,
+                        duration_ms,
+                    });
+                    return Ok(RunState::CompletedWithErrors);
                 }
 
                 if !matches!(self.control.transition(RunState::Failed), Ok(true)) {
@@ -1436,7 +1466,19 @@ impl Scheduler {
                         Some(_) | None => fallback_candidate.is_none() && retry_allowed,
                     };
                     let fallback_model = fallback_candidate.filter(|_| !retry_same_route);
-                    let should_retry = fallback_model.is_some() || retry_same_route;
+                    let is_permanent_auth = error_class == ErrorClass::ProviderUnavailable
+                        || error_str.contains("401")
+                        || error_str.contains("403")
+                        || error_str.contains("unauthorized")
+                        || error_str.contains("forbidden")
+                        || error_str.contains("external_source_unreachable")
+                        || error_str.contains("refresh_token_invalidated")
+                        || error_str.contains("reauthentication_required");
+                    let should_retry = if is_permanent_auth {
+                        false
+                    } else {
+                        fallback_model.is_some() || retry_same_route
+                    };
 
                     self.task_mutations.fail_attempt_with_usage_in_context(
                         &task_id,

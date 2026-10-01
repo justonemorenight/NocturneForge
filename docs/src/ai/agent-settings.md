@@ -68,7 +68,7 @@ existing settings:
         "9router/gemini-3.8-flash-high",
         "9router/opus-4.6",
         "9router/deepseek-v4.1-flash",
-        "x_ai_subscribed/grok-4.6"
+        "x_ai_subscribed/grok-4.7"
       ],
       "explorer": {
         "intent": "fast",

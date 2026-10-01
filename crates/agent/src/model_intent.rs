@@ -596,13 +596,13 @@ mod tests {
     #[test]
     fn allowed_models_supports_provider_aliases_and_prefix_matching() {
         let candidates = vec![
-            candidate("x_ai_subscribed", "grok-4.6", ModelTier::Balanced, &[]),
+            candidate("x_ai_subscribed", "grok-4.7", ModelTier::Balanced, &[]),
             candidate("anthropic", "claude-3-5-haiku-latest", ModelTier::Fast, &[]),
         ];
 
         let settings = NativeSubagentRolesSettings::from(NativeSubagentRolesContent {
             allowed_models: Some(vec![
-                "supergrok/grok-4.6".to_string(),
+                "supergrok/grok-4.7".to_string(),
                 "anthropic/claude-3-5-haiku".to_string(),
             ]),
             ..Default::default()
@@ -611,9 +611,9 @@ mod tests {
         // "supergrok" matches "x_ai_subscribed" provider
         let worker =
             resolve_role_model_selection(SubagentRole::CodingWorker, &settings, &candidates, None)
-                .expect("coding worker should resolve to supergrok/grok-4.6");
+                .expect("coding worker should resolve to supergrok/grok-4.7");
         assert_eq!(worker.provider.0, "x_ai_subscribed");
-        assert_eq!(worker.model, "grok-4.6");
+        assert_eq!(worker.model, "grok-4.7");
 
         // "claude-3-5-haiku" matches prefix of "claude-3-5-haiku-latest"
         let explorer =
@@ -627,7 +627,7 @@ mod tests {
     fn allowed_models_matches_spaced_names() {
         let candidates = vec![
             candidate("google", "gemini-3.8-flash", ModelTier::Fast, &[]),
-            candidate("x_ai_subscribed", "grok-4.6", ModelTier::Balanced, &[]),
+            candidate("x_ai_subscribed", "grok-4.7", ModelTier::Balanced, &[]),
             candidate("deepseek", "deepseek-v4.1", ModelTier::Balanced, &[]),
             candidate("openai-subscribed", "gpt-5.6-luna", ModelTier::Strong, &[]),
         ];
@@ -635,7 +635,7 @@ mod tests {
         let settings = NativeSubagentRolesSettings::from(NativeSubagentRolesContent {
             allowed_models: Some(vec![
                 "gemini 3.8 flash".to_string(),
-                "grok 4.6".to_string(),
+                "grok 4.7".to_string(),
                 "deepseek v4.1".to_string(),
                 "gpt-5.6-luna".to_string(),
             ]),
@@ -677,7 +677,7 @@ mod tests {
                 &[],
             ),
             candidate("openai-subscribed", "gpt-5.6-luna", ModelTier::Fast, &[]),
-            candidate("x_ai_subscribed", "grok-4.6", ModelTier::Balanced, &[]),
+            candidate("x_ai_subscribed", "grok-4.7", ModelTier::Balanced, &[]),
         ];
 
         // Test 1: Full identifier paths
@@ -687,7 +687,7 @@ mod tests {
                 "9Router Provider/ag/claude-opus-4-6-thinking".to_string(),
                 "9Router Provider/cmc/deepseek/deepseek-v4.1-flash".to_string(),
                 "openai-subscribed/gpt-5.6-luna".to_string(),
-                "x_ai_subscribed/grok-4.6".to_string(),
+                "x_ai_subscribed/grok-4.7".to_string(),
             ]),
             ..Default::default()
         });
@@ -708,7 +708,7 @@ mod tests {
                 "9router/opus 4.6".to_string(),
                 "9router/deepseek v4.1 flash".to_string(),
                 "chatgpt/gpt-5.6-luna".to_string(),
-                "supergrok/grok-4.6".to_string(),
+                "supergrok/grok-4.7".to_string(),
             ]),
             flow_reader: Some(NativeSubagentRoleContent {
                 intent: Some(NativeSubagentModelIntent::Balanced),
@@ -732,16 +732,16 @@ mod tests {
         assert_eq!(strong.provider.0, "9Router Provider");
         assert_eq!(strong.model, "ag/claude-opus-4-6-thinking");
 
-        // Balanced intent resolves to grok-4.6
+        // Balanced intent resolves to grok-4.7
         let balanced = resolve_role_model_selection(
             SubagentRole::FlowReader,
             &settings_shorthand,
             &candidates,
             None,
         )
-        .expect("should resolve grok-4.6");
+        .expect("should resolve grok-4.7");
         assert_eq!(balanced.provider.0, "x_ai_subscribed");
-        assert_eq!(balanced.model, "grok-4.6");
+        assert_eq!(balanced.model, "grok-4.7");
     }
 
     #[test]

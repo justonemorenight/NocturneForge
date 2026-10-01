@@ -243,6 +243,7 @@ struct SubagentRuntimeExecutor {
     >,
     active_deliveries: ActiveDeliveries,
     maximum_pending_deliveries: usize,
+    session_info: Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
 }
 
 #[derive(Debug)]
@@ -369,6 +370,7 @@ impl SubagentRuntimeExecutor {
             >,
         >,
         maximum_pending_deliveries: usize,
+        session_info: Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
     ) -> Self {
         Self {
             environment,
@@ -377,6 +379,7 @@ impl SubagentRuntimeExecutor {
             roles_map,
             active_deliveries: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             maximum_pending_deliveries,
+            session_info,
         }
     }
 }
@@ -390,20 +393,24 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
         let app = self.app.clone();
         let event_stream = self.event_stream.clone();
         let reporter = context.reporter.clone();
-        let execution_prompt =
-            task_execution_prompt_with_dependencies(&context.task, &context.dependency_inputs);
+        let execution_prompt = if context.existing_session_id.is_some() {
+            context.task.description.clone()
+        } else {
+            task_execution_prompt_with_dependencies(&context.task, &context.dependency_inputs)
+        };
         let task = context.task;
         let role = self.roles_map.read().get(&task.id).cloned().flatten();
         let existing_session = context.existing_session_id;
         let active_deliveries = self.active_deliveries.clone();
         let maximum_pending_deliveries = self.maximum_pending_deliveries;
+        let session_info = self.session_info.clone();
 
         Box::pin(async move {
             if context.cancellation_token.is_cancelled() || event_stream.was_cancelled_by_user() {
                 anyhow::bail!("task execution cancelled");
             }
 
-            let subagent = app.update(|cx| {
+            let (subagent, message_start_index) = app.update(|cx| {
                 let subagent = if let Some(session_id) = existing_session {
                     env.resume_subagent(session_id, cx)
                 } else {
@@ -421,10 +428,26 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                     )
                 }?;
                 event_stream.subagent_spawned(subagent.id());
-                anyhow::Ok(subagent)
+                let message_start_index = subagent.num_entries(cx);
+                anyhow::Ok((subagent, message_start_index))
             })?;
 
             let session_id = subagent.id();
+            if let Some(session_info) = &session_info {
+                let info = SubagentSessionInfo {
+                    session_id: session_id.clone(),
+                    message_start_index,
+                    message_end_index: None,
+                };
+                session_info.lock().replace(info.clone());
+                event_stream.update_fields_with_meta(
+                    acp::ToolCallUpdateFields::new(),
+                    Some(acp::Meta::from_iter([(
+                        SUBAGENT_SESSION_INFO_META_KEY.into(),
+                        serde_json::json!(info),
+                    )])),
+                );
+            }
             let steering_session = SteeringSession::register(
                 session_id.clone(),
                 active_deliveries,
@@ -450,8 +473,35 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                 .await;
             reporter.report_tool_call_finished();
 
+            if session_info.is_some() {
+                telemetry::event!(
+                    "Subagent Completed",
+                    subagent_session = session_id.to_string(),
+                    status = if send_result.is_ok() {
+                        "completed"
+                    } else {
+                        "error"
+                    },
+                );
+            }
+
             let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
             let tokens_used = cumulative_token_delta(usage_before, usage_after);
+            if let Some(session_info) = &session_info {
+                let info = app.update(|cx| SubagentSessionInfo {
+                    session_id: session_id.clone(),
+                    message_start_index,
+                    message_end_index: Some(subagent.num_entries(cx).saturating_sub(1)),
+                });
+                session_info.lock().replace(info.clone());
+                event_stream.update_fields_with_meta(
+                    acp::ToolCallUpdateFields::new(),
+                    Some(acp::Meta::from_iter([(
+                        SUBAGENT_SESSION_INFO_META_KEY.into(),
+                        serde_json::json!(info),
+                    )])),
+                );
+            }
             let output = match send_result {
                 Ok(output) => output,
                 Err(error) => {
@@ -716,9 +766,10 @@ pub struct SpawnAgentToolInput {
     /// single-task fields above are ignored.
     #[serde(default)]
     pub tasks: Option<Vec<SpawnAgentTask>>,
-    /// For batch tasks, return after the orchestration run starts so it can be
-    /// coordinated with list_orchestration_agents, send_message_to_agent, and
-    /// wait_for_agents. Invalid without tasks.
+    /// For batch tasks, return after the orchestration run starts instead of
+    /// waiting for worker completion. Approved orchestration runs are
+    /// asynchronous even when this is false; the runtime parks and wakes the
+    /// parent automatically. Invalid without tasks.
     #[serde(default)]
     pub background: bool,
     /// Target worker agent: "native", "omp", "opencode", or a configured agent name.
@@ -925,8 +976,29 @@ fn validate_task_worker_fields(task: &SpawnAgentTask) -> Result<()> {
             "agent_type is only valid for Native workers and cannot be combined with agent"
         );
     }
+    if target.is_native() {
+        validate_requested_native_tools(task)?;
+    }
     if let Some(workspace) = &task.workspace {
         let policy = workspace.to_policy()?;
+        if target.is_native()
+            && policy.read_only
+            && !matches!(
+                task.agent_type,
+                Some(SubagentRole::Explorer | SubagentRole::FlowReader)
+            )
+        {
+            anyhow::bail!(
+                "Native read-only workspace requires agent_type `explorer` or `flow-reader`"
+            );
+        }
+        if target.is_native()
+            && policy.isolation == agent_orchestration::WorkspaceIsolation::DedicatedWorktree
+        {
+            anyhow::bail!(
+                "Native workers cannot use isolated_worktree; use shared_parent or read_only"
+            );
+        }
         if target.is_acp()
             && policy.isolation == agent_orchestration::WorkspaceIsolation::SharedParent
             && !policy.read_only
@@ -934,6 +1006,156 @@ fn validate_task_worker_fields(task: &SpawnAgentTask) -> Result<()> {
             anyhow::bail!(
                 "ACP workers cannot write in the shared parent workspace; use shared_read_only or isolated_worktree"
             );
+        }
+    }
+    check_external_source_preflight(task)?;
+    Ok(())
+}
+
+fn validate_requested_native_tools(task: &SpawnAgentTask) -> Result<()> {
+    let Some(role) = task.agent_type else {
+        return Ok(());
+    };
+    let Some(tools) = task.tools.as_ref() else {
+        return Ok(());
+    };
+    if let Some(tool) = tools.iter().find(|tool| !role.allows_tool(tool)) {
+        anyhow::bail!(
+            "Native role `{}` cannot use tool `{tool}`; choose a compatible role or omit the tools allowlist",
+            role.identifier()
+        );
+    }
+    Ok(())
+}
+
+fn validate_requested_tools_are_available(
+    tasks: &[(String, SpawnAgentTask)],
+    parent: &Thread,
+    cx: &App,
+) -> Result<()> {
+    let available_tools = parent.enabled_tools(cx);
+    for (_, task) in tasks {
+        let target = agent_orchestration::WorkerTarget::from_identifier(
+            task.agent.as_deref().unwrap_or("native"),
+        );
+        if !target.is_native() {
+            continue;
+        }
+        if let Some(tool) = task.tools.as_ref().and_then(|tools| {
+            tools.iter().find(|tool| {
+                !available_tools
+                    .keys()
+                    .any(|available| available.as_ref() == tool.as_str())
+            })
+        }) {
+            anyhow::bail!(
+                "Native worker requested unavailable tool `{tool}`; choose a tool enabled for the parent thread"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn check_external_source_preflight(task: &SpawnAgentTask) -> Result<()> {
+    let mut texts = vec![task.message.as_str(), task.label.as_str()];
+    if let Some(obj) = task.objective.as_deref() {
+        texts.push(obj);
+    }
+
+    for text in texts {
+        for word in text.split_whitespace() {
+            let candidate = word.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '/' && c != ':' && c != '.' && c != '-'
+            });
+            if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                if let Ok(url) = url::Url::parse(candidate) {
+                    if let Some(host) = url.host_str() {
+                        if host.contains("gitlab")
+                            || url.path().contains("/merge_requests/")
+                            || url.path().contains("/-/")
+                        {
+                            validate_external_source_reachability(
+                                candidate,
+                                host,
+                                url.port().unwrap_or(if url.scheme() == "https" {
+                                    443
+                                } else {
+                                    80
+                                }),
+                                task,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_external_source_reachability(
+    url_str: &str,
+    host: &str,
+    port: u16,
+    task: &SpawnAgentTask,
+) -> Result<()> {
+    use std::net::ToSocketAddrs;
+
+    let addrs = match (host, port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(err) => {
+            anyhow::bail!("external_source_unreachable: host '{host}' DNS lookup failed: {err}");
+        }
+    };
+    if addrs.is_empty() {
+        anyhow::bail!("external_source_unreachable: host '{host}' resolved to no addresses");
+    }
+
+    for addr in &addrs {
+        let ip = addr.ip();
+        let is_private = match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                ipv4.is_loopback()
+                    || ipv4.is_private()
+                    || ipv4.octets()[0] == 10
+                    || (ipv4.octets()[0] == 172 && (16..=31).contains(&ipv4.octets()[1]))
+                    || (ipv4.octets()[0] == 192 && ipv4.octets()[1] == 168)
+            }
+            std::net::IpAddr::V6(ipv6) => ipv6.is_loopback(),
+        };
+
+        if is_private {
+            // Respect actual network policy: private alone does not prove unreachable.
+            if let Some(tools) = &task.tools {
+                let has_network_tool = tools
+                    .iter()
+                    .any(|t| t == "terminal" || t == "fetch" || t == "http");
+                if !has_network_tool {
+                    anyhow::bail!(
+                        "external_source_unreachable: external source '{url_str}' resolves to private IP {ip}, but task tools do not allow network access"
+                    );
+                }
+            } else if let Some(role) = task.agent_type {
+                if matches!(role, SubagentRole::Explorer | SubagentRole::FlowReader) {
+                    anyhow::bail!(
+                        "external_source_unreachable: external source '{url_str}' resolves to private IP {ip}, but native role '{:?}' has no network tools",
+                        role
+                    );
+                }
+            }
+
+            // Test TCP reachability with a fast timeout (250ms)
+            match std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_millis(250))
+            {
+                Ok(_) => {
+                    // Host is reachable on current network connection
+                }
+                Err(err) => {
+                    anyhow::bail!(
+                        "external_source_unreachable: external source '{url_str}' on private IP {ip} is inaccessible: {err}"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -979,17 +1201,9 @@ fn normalize_native_task_fields(task: &mut SpawnAgentTask) -> Result<()> {
     Ok(())
 }
 
-fn native_single_task_requires_orchestration(input: &SpawnAgentToolInput) -> bool {
-    input.session_id.is_none()
-        && input
-            .agent
-            .as_deref()
-            .is_none_or(|agent| agent.trim().is_empty() || agent.eq_ignore_ascii_case("native"))
-        && (input.workspace.is_some() || input.model.is_some())
-}
-
 fn native_single_task_as_batch(input: &SpawnAgentToolInput) -> SpawnAgentTask {
     SpawnAgentTask {
+        id: Some("delegated-task".to_string()),
         label: input.label.clone(),
         message: input.message.clone(),
         agent_type: input.agent_type,
@@ -1090,7 +1304,8 @@ impl From<SpawnAgentToolOutput> for LanguageModelToolResultContent {
                     "run_id": run_id,
                     "status": "running",
                     "agents": agents,
-                    "next": "Use wait_for_agents, list_orchestration_agents, or send_message_to_agent",
+                    "parent_lifecycle": "End the turn after any immediate coordination. The runtime will park the parent and resume it with terminal worker results; do not poll.",
+                    "control_tools": "Use list_orchestration_agents, send_message_to_agent, or wait_for_agents only for an explicit checkpoint or focused steering.",
                 }))
                 .unwrap_or_else(|e| format!("Failed to serialize spawn_agent output: {e}"))
                 .into()
@@ -1167,6 +1382,7 @@ impl SpawnAgentTool {
             event_stream,
             Arc::new(parking_lot::RwLock::new(roles_map)),
             runtime_config.control_plane.max_messages_per_agent,
+            None,
         ));
         let mut host_registry = agent_orchestration::WorkerHostRegistry::new();
         for target in persisted
@@ -1257,14 +1473,8 @@ fn persist_snapshot_if_current(
     let Some(parent) = thread.upgrade() else {
         return;
     };
-    let run_id = snapshot.run_id.clone();
     parent.update(cx, |parent, cx| {
-        if parent
-            .orchestration_run()
-            .is_some_and(|run| run.run_id() == &run_id)
-        {
-            parent.set_persisted_orchestration_run(Some(snapshot), cx);
-        }
+        parent.set_persisted_orchestration_run(Some(snapshot), cx);
     });
 }
 
@@ -1328,15 +1538,56 @@ struct BatchRunCompletion {
     background: bool,
     disposition: agent_orchestration::RuntimeLaunchDisposition,
     strategy: agent_settings::AgentExecutionStrategy,
+    single_task: bool,
+    session_info: Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
     thread: gpui::WeakEntity<Thread>,
     event_stream: ToolCallEventStream,
 }
 
 impl BatchRunCompletion {
+    fn single_task_error(
+        single_task: bool,
+        session_info: &Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
+        event_stream: &ToolCallEventStream,
+        session_id: Option<acp::SessionId>,
+        error: String,
+    ) -> SpawnAgentToolOutput {
+        let session_info = session_info
+            .as_ref()
+            .and_then(|session_info| session_info.lock().take());
+        let session_id = session_id.or_else(|| {
+            session_info
+                .as_ref()
+                .map(|session_info| session_info.session_id.clone())
+        });
+        if single_task {
+            event_stream.update_fields_with_meta(
+                acp::ToolCallUpdateFields::new().content(vec![error.clone().into()]),
+                session_info.as_ref().map(|session_info| {
+                    acp::Meta::from_iter([(
+                        SUBAGENT_SESSION_INFO_META_KEY.into(),
+                        serde_json::json!(session_info),
+                    )])
+                }),
+            );
+        }
+        SpawnAgentToolOutput::Error {
+            session_id,
+            error,
+            session_info,
+        }
+    }
+
     async fn finish(
         self,
         cx: &mut gpui::AsyncApp,
     ) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
+        if self.disposition == agent_orchestration::RuntimeLaunchDisposition::AwaitApproval {
+            let output = background_run_output(&self.run_handle, self.disposition, self.strategy);
+            let snapshot = self.run_handle.snapshot();
+            cx.update(|cx| persist_snapshot_if_current(&self.thread, snapshot, cx));
+            return Ok(output);
+        }
         if self.background {
             let output = background_run_output(&self.run_handle, self.disposition, self.strategy);
             persist_background_completion(self.run_handle, self.completion, self.thread, cx);
@@ -1356,31 +1607,83 @@ impl BatchRunCompletion {
         {
             self.run_handle
                 .cancel(agent_orchestration::CancellationReason::UserRequested);
-            return Err(SpawnAgentToolOutput::Error {
-                session_id: None,
-                error: "parallel orchestration cancelled".to_string(),
-                session_info: None,
-            });
+            return Err(Self::single_task_error(
+                self.single_task,
+                &self.session_info,
+                &self.event_stream,
+                None,
+                "parallel orchestration cancelled".to_string(),
+            ));
         }
         match completion {
             Err(error) => {
-                return Err(SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: error.to_string(),
-                    session_info: None,
-                });
+                return Err(Self::single_task_error(
+                    self.single_task,
+                    &self.session_info,
+                    &self.event_stream,
+                    None,
+                    error.to_string(),
+                ));
             }
             Ok(Err(error)) => {
-                return Err(SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: error.to_string(),
-                    session_info: None,
-                });
+                return Err(Self::single_task_error(
+                    self.single_task,
+                    &self.session_info,
+                    &self.event_stream,
+                    None,
+                    error.to_string(),
+                ));
             }
             Ok(Ok(_)) => {}
         }
 
-        let batch = collect_batch_results(&self.run_handle, self.pending)?;
+        let batch = match collect_batch_results(&self.run_handle, self.pending) {
+            Ok(batch) => batch,
+            Err(SpawnAgentToolOutput::Error {
+                session_id, error, ..
+            }) if self.single_task => {
+                return Err(Self::single_task_error(
+                    self.single_task,
+                    &self.session_info,
+                    &self.event_stream,
+                    session_id,
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if self.single_task {
+            let Some(result) = batch.into_iter().next() else {
+                return Err(Self::single_task_error(
+                    self.single_task,
+                    &self.session_info,
+                    &self.event_stream,
+                    None,
+                    "single subagent task completed without a worker result".to_string(),
+                ));
+            };
+            let session_info = self
+                .session_info
+                .as_ref()
+                .and_then(|session_info| session_info.lock().take())
+                .unwrap_or(SubagentSessionInfo {
+                    session_id: result.session_id.clone(),
+                    message_start_index: 0,
+                    message_end_index: None,
+                });
+            self.event_stream.update_fields_with_meta(
+                acp::ToolCallUpdateFields::new().content(vec![result.output.clone().into()]),
+                Some(acp::Meta::from_iter([(
+                    SUBAGENT_SESSION_INFO_META_KEY.into(),
+                    serde_json::json!(&session_info),
+                )])),
+            );
+            return Ok(SpawnAgentToolOutput::Success {
+                session_id: result.session_id,
+                output: result.output,
+                session_info,
+            });
+        }
         let raw_output =
             serde_json::to_value(&batch).map_err(|error| SpawnAgentToolOutput::Error {
                 session_id: None,
@@ -1429,15 +1732,14 @@ fn collect_batch_results(
             last_session_id = status.active_session_id;
         }
     }
+    // Best-effort policy: retain successful results after another failure
+    if !batch.is_empty() {
+        return Ok(batch);
+    }
     if let Some(error) = last_error {
-        let completed_summary = batch
-            .iter()
-            .map(|result| result.task_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
         return Err(SpawnAgentToolOutput::Error {
             session_id: last_session_id,
-            error: format!("{error}; completed: [{completed_summary}]"),
+            error,
             session_info: None,
         });
     }
@@ -1588,6 +1890,7 @@ fn orchestration_executor(
     inputs: OrchestrationExecutorInputs,
     plan: &agent_orchestration::OrchestrationPlan,
     config: &agent_orchestration::RuntimeConfig,
+    session_info: Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
     cx: &mut gpui::AsyncApp,
 ) -> Rc<dyn agent_orchestration::TaskExecutor> {
     let OrchestrationExecutorInputs {
@@ -1602,6 +1905,7 @@ fn orchestration_executor(
         event_stream,
         Arc::new(parking_lot::RwLock::new(roles)),
         config.control_plane.max_messages_per_agent,
+        session_info,
     ));
     let mut host_registry = agent_orchestration::WorkerHostRegistry::new();
     for target in plan
@@ -1662,33 +1966,27 @@ async fn run_batch_tasks(
     thread: gpui::WeakEntity<Thread>,
     tasks: Vec<SpawnAgentTask>,
     background: bool,
+    single_task: bool,
+    initial_session_id: Option<acp::SessionId>,
     event_stream: ToolCallEventStream,
     cx: &mut gpui::AsyncApp,
 ) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
-    let active_run_id = cx.update(|cx| {
-        thread.upgrade().and_then(|thread| {
-            thread
-                .read(cx)
-                .orchestration_run()
-                .filter(|run| !run.state().is_terminal())
-                .map(|run| run.run_id().to_string())
-        })
-    });
-    if let Some(run_id) = active_run_id {
-        return Err(SpawnAgentToolOutput::Error {
-            session_id: None,
-            error: format!(
-                "orchestration run '{run_id}' is still active; wait for it or cancel it before starting another batch"
-            ),
-            session_info: None,
-        });
-    }
     let PreparedBatch {
         pending,
         prompt,
         roles,
         mut plan,
     } = prepare_batch(tasks)?;
+
+    cx.update(|cx| {
+        thread
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("parent thread no longer exists"))
+            .and_then(|parent| {
+                validate_requested_tools_are_available(&pending, parent.read(cx), cx)
+            })
+    })
+    .map_err(batch_error)?;
 
     cx.update(|cx| {
         if let Some(parent) = thread.upgrade() {
@@ -1720,8 +2018,14 @@ async fn run_batch_tasks(
         pending.len(),
         autonomy,
     );
+    // An approved orchestration run is event-driven: do not keep the parent
+    // model turn blocked while workers execute. The runtime parks the parent
+    // and resumes it once the run reaches a terminal state.
+    let background =
+        background || policy.strategy == agent_settings::AgentExecutionStrategy::Orchestrate;
 
     let (runtime_config, enable_acp_delegation) = orchestration_runtime_config(cx);
+    let session_info = single_task.then(|| Arc::new(parking_lot::Mutex::new(None)));
     let executor = orchestration_executor(
         OrchestrationExecutorInputs {
             environment,
@@ -1731,14 +2035,26 @@ async fn run_batch_tasks(
         },
         &plan,
         &runtime_config,
+        session_info.clone(),
         cx,
     );
 
+    let initial_session_ids = initial_session_id
+        .map(|session_id| {
+            [(
+                agent_orchestration::TaskId::new("delegated-task"),
+                session_id,
+            )]
+            .into_iter()
+            .collect()
+        })
+        .unwrap_or_default();
     let (run_handle, completion_rx) =
-        agent_orchestration::OrchestrationRuntime::start_with_disposition(
+        agent_orchestration::OrchestrationRuntime::start_with_disposition_and_sessions(
             plan,
             policy,
             disposition,
+            initial_session_ids,
             executor,
             runtime_config,
         )
@@ -1748,6 +2064,11 @@ async fn run_batch_tasks(
         if let Some(parent) = thread.upgrade() {
             parent.update(cx, |parent, cx| {
                 parent.set_orchestration_run(run_handle.clone(), cx);
+                if background
+                    && disposition == agent_orchestration::RuntimeLaunchDisposition::Approved
+                {
+                    parent.mark_orchestration_waiting_for_workers(run_handle.run_id().clone(), cx);
+                }
             });
         }
     });
@@ -1770,6 +2091,8 @@ async fn run_batch_tasks(
         background,
         disposition,
         strategy: policy.strategy,
+        single_task,
+        session_info,
         thread,
         event_stream,
     }
@@ -1893,157 +2216,61 @@ impl AgentTool for SpawnAgentTool {
                     self.thread.clone(),
                     tasks,
                     input.background,
+                    false,
+                    None,
                     event_stream,
                     cx,
                 )
                 .await;
             }
-
-            if native_single_task_requires_orchestration(&input) {
-                return run_batch_tasks(
-                    self.environment.clone(),
-                    self.thread.clone(),
-                    vec![native_single_task_as_batch(&input)],
-                    input.background,
-                    event_stream,
-                    cx,
-                )
-                .await;
-            }
-
-            let mut native_task = native_single_task_as_batch(&input);
-            normalize_native_task_fields(&mut native_task).map_err(batch_error)?;
-            input.agent_type = native_task.agent_type;
-            input.mode = native_task.mode;
 
             let is_native = input
                 .agent
                 .as_deref()
-                .map(|a| a.trim().is_empty() || a.eq_ignore_ascii_case("native"))
+                .map(|agent| agent.trim().is_empty() || agent.eq_ignore_ascii_case("native"))
                 .unwrap_or(true);
             if !is_native {
                 return Err(SpawnAgentToolOutput::Error {
                     session_id: None,
-                    error: "explicit ACP delegation is not available on the legacy single-task path; use the tasks array so the orchestration runtime can enforce worker lifecycle and isolation"
+                    error: "single-task spawn only supports native workers; use the tasks array for ACP delegation"
                         .to_string(),
                     session_info: None,
                 });
             }
-            if input.workspace.is_some() {
-                return Err(SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: "workspace policy requires the orchestration tasks array".to_string(),
-                    session_info: None,
-                });
+            let mut native_task = native_single_task_as_batch(&input);
+            if input.session_id.is_some() {
+                // A resumed session keeps its original role, mode, and tool filter.
+                native_task.agent_type = None;
+                native_task.tools = None;
+                native_task.mode = None;
             }
-            if input.model.is_some() {
-                return Err(SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: "model override requires the orchestration tasks array".to_string(),
-                    session_info: None,
-                });
-            }
-
-            let subagent_prompt = if input.session_id.is_none() {
-                let task = agent_orchestration::OrchestrationTask::new(
-                    "delegated-task",
-                    input.label.clone(),
-                    input.message.clone(),
-                );
-                task_execution_prompt(&task)
-            } else {
-                input.message.clone()
-            };
-
-            let (subagent, mut session_info) = cx.update(|cx| {
-                let subagent = if let Some(session_id) = input.session_id {
-                    // A resumed session keeps the tool filter it was created
-                    // with; `tools` is intentionally ignored here.
-                    self.environment.resume_subagent(session_id, cx)
-                } else {
-                    let tool_filter = input
-                        .tools
-                        .map(|tools| tools.into_iter().map(SharedString::from).collect());
-                    self.environment
-                        .create_subagent(
-                            input.label,
-                            input.agent_type,
-                            None,
-                            None,
-                            tool_filter,
+            normalize_native_task_fields(&mut native_task).map_err(batch_error)?;
+            validate_task_worker_fields(&native_task).map_err(batch_error)?;
+            cx.update(|cx| {
+                self.thread
+                    .upgrade()
+                    .map(|parent| {
+                        validate_requested_tools_are_available(
+                            &[("direct".to_string(), native_task.clone())],
+                            parent.read(cx),
                             cx,
                         )
-                };
-                let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: err.to_string(),
-                    session_info: None,
-                })?;
-                let session_info = SubagentSessionInfo {
-                    session_id: subagent.id(),
-                    message_start_index: subagent.num_entries(cx),
-                    message_end_index: None,
-                };
+                    })
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("parent thread no longer exists")))
+            })
+            .map_err(batch_error)?;
+            return run_batch_tasks(
+                self.environment.clone(),
+                self.thread.clone(),
+                vec![native_task],
+                false,
+                true,
+                input.session_id,
+                event_stream,
+                cx,
+            )
+            .await;
 
-                event_stream.subagent_spawned(subagent.id());
-                event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new(),
-                    Some(acp::Meta::from_iter([(
-                        SUBAGENT_SESSION_INFO_META_KEY.into(),
-                        serde_json::json!(&session_info),
-                    )])),
-                );
-
-                Ok((subagent, session_info))
-            })?;
-
-            let send_result = subagent.send(subagent_prompt, cx).await;
-
-            let status = if send_result.is_ok() {
-                "completed"
-            } else {
-                "error"
-            };
-            telemetry::event!(
-                "Subagent Completed",
-                subagent_session = session_info.session_id.to_string(),
-                status,
-            );
-
-            session_info.message_end_index =
-                cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
-
-            let meta = Some(acp::Meta::from_iter([(
-                SUBAGENT_SESSION_INFO_META_KEY.into(),
-                serde_json::json!(&session_info),
-            )]));
-
-            let (output, result) = match send_result {
-                Ok(output) => (
-                    output.clone(),
-                    Ok(SpawnAgentToolOutput::Success {
-                        session_id: session_info.session_id.clone(),
-                        session_info,
-                        output,
-                    }),
-                ),
-                Err(e) => {
-                    let error = e.to_string();
-                    (
-                        error.clone(),
-                        Err(SpawnAgentToolOutput::Error {
-                            session_id: Some(session_info.session_id.clone()),
-                            error,
-                            session_info: Some(session_info),
-                        }),
-                    )
-                }
-            };
-            event_stream.update_fields_with_meta(
-                acp::ToolCallUpdateFields::new().content(vec![output.into()]),
-                meta,
-            );
-            result
         })
     }
 
@@ -2255,6 +2482,32 @@ mod tests {
     }
 
     #[test]
+    fn background_batch_output_directs_parent_to_runtime_wake() {
+        let output = SpawnAgentToolOutput::BatchStarted {
+            run_id: "run-1".to_string(),
+            agents: vec!["/root/worker".to_string()],
+        };
+        let LanguageModelToolResultContent::Text(content) = output.into() else {
+            panic!("background batch output should be serialized as text");
+        };
+        let content: serde_json::Value =
+            serde_json::from_str(&content).expect("background output should be valid JSON");
+
+        assert_eq!(content["status"], "running");
+        assert!(
+            content["parent_lifecycle"]
+                .as_str()
+                .is_some_and(|message| message.contains("runtime will park the parent"))
+        );
+        assert!(
+            content["control_tools"]
+                .as_str()
+                .is_some_and(|message| message.contains("explicit checkpoint"))
+        );
+        assert!(content.get("next").is_none());
+    }
+
+    #[test]
     fn prepared_batch_preserves_dependencies_and_worker_policy() {
         let input: SpawnAgentToolInput = serde_json::from_value(json!({
             "label": "ignored",
@@ -2455,6 +2708,69 @@ mod tests {
     }
 
     #[test]
+    fn single_and_batch_spawns_keep_the_same_launch_policy() {
+        for (configured_strategy, resolved_strategy, autonomy) in [
+            (
+                agent_settings::AgentExecutionStrategy::Direct,
+                None,
+                agent_settings::AgentAutonomy::Autonomous,
+            ),
+            (
+                agent_settings::AgentExecutionStrategy::Auto,
+                Some(agent_settings::AgentExecutionStrategy::Direct),
+                agent_settings::AgentAutonomy::Autonomous,
+            ),
+            (
+                agent_settings::AgentExecutionStrategy::Auto,
+                Some(agent_settings::AgentExecutionStrategy::Orchestrate),
+                agent_settings::AgentAutonomy::Autonomous,
+            ),
+            (
+                agent_settings::AgentExecutionStrategy::Plan,
+                None,
+                agent_settings::AgentAutonomy::Autonomous,
+            ),
+            (
+                agent_settings::AgentExecutionStrategy::Orchestrate,
+                None,
+                agent_settings::AgentAutonomy::Manual,
+            ),
+            (
+                agent_settings::AgentExecutionStrategy::Orchestrate,
+                None,
+                agent_settings::AgentAutonomy::Autonomous,
+            ),
+        ] {
+            let resolved = resolved_strategy.map(|strategy| {
+                agent_orchestration::ResolvedTurnPolicy::automatic(
+                    agent_orchestration::AutoPolicyDecision {
+                        strategy,
+                        confidence: 0.9,
+                        reason: "test turn policy".to_string(),
+                        heuristics: collections::HashMap::default(),
+                    },
+                )
+            });
+            let single = batch_launch_policy(
+                configured_strategy,
+                resolved.as_ref(),
+                "delegate one task",
+                1,
+                autonomy,
+            );
+            let batch = batch_launch_policy(
+                configured_strategy,
+                resolved.as_ref(),
+                "delegate one task",
+                3,
+                autonomy,
+            );
+
+            assert_eq!(single, batch);
+        }
+    }
+
+    #[test]
     fn legacy_token_budget_input_is_ignored_and_not_exposed_in_schema() {
         let task: SpawnAgentTask = serde_json::from_value(serde_json::json!({
             "label": "Legacy task",
@@ -2577,14 +2893,14 @@ mod tests {
             "agent": "native",
             "mode": "ask",
             "workspace": "read_only",
-            "tools": ["read_file", "terminal"]
+            "tools": ["read_file", "search_web"]
         }))
         .expect("deserialize single task");
 
-        assert!(native_single_task_requires_orchestration(&input));
         let prepared = prepare_batch(vec![native_single_task_as_batch(&input)])
             .expect("prepare lifted Native task");
         let task = &prepared.plan.tasks[0];
+        assert_eq!(task.id.as_str(), "delegated-task");
         assert_eq!(task.native_role.as_deref(), Some("explorer"));
         assert!(task.mode.is_none());
         assert!(task.workspace_policy.read_only);
@@ -2603,6 +2919,33 @@ mod tests {
                 .expect_err("ACP shared writes must fail closed")
                 .to_string()
                 .contains("cannot write in the shared parent workspace")
+        );
+    }
+
+    #[test]
+    fn rejects_native_role_tool_and_workspace_mismatches() {
+        let explorer_terminal = SpawnAgentTask {
+            agent_type: Some(SubagentRole::Explorer),
+            tools: Some(vec!["read_file".to_string(), "terminal".to_string()]),
+            ..Default::default()
+        };
+        assert!(
+            validate_task_worker_fields(&explorer_terminal)
+                .expect_err("read-only Explorer must not receive terminal")
+                .to_string()
+                .contains("cannot use tool `terminal`")
+        );
+
+        let coding_worker_read_only = SpawnAgentTask {
+            agent_type: Some(SubagentRole::CodingWorker),
+            workspace: Some(WorkspacePolicyInput::Simple("read_only".to_string())),
+            ..Default::default()
+        };
+        assert!(
+            validate_task_worker_fields(&coding_worker_read_only)
+                .expect_err("CodingWorker cannot run in read-only workspace")
+                .to_string()
+                .contains("requires agent_type `explorer` or `flow-reader`")
         );
     }
 
@@ -2710,5 +3053,24 @@ mod tests {
         let result = verify_task_output(&task, &output);
         assert!(!result.passed);
         assert_eq!(result.citations_valid, Some(false));
+    }
+
+    #[test]
+    fn preflight_detects_inaccessible_gitlab_private_ip() {
+        let task = SpawnAgentTask {
+            agent: Some("native".to_string()),
+            agent_type: Some(SubagentRole::Explorer),
+            label: "Inspect GitLab MR".to_string(),
+            message: "Review https://gitlab.vinsmartfuture.tech/repo/-/merge_requests/36"
+                .to_string(),
+            objective: Some("Inspect MR".to_string()),
+            tools: Some(vec!["read_file".to_string(), "grep".to_string()]),
+            ..Default::default()
+        };
+
+        let result = check_external_source_preflight(&task);
+        if let Err(err) = result {
+            assert!(err.to_string().contains("external_source_unreachable"));
+        }
     }
 }

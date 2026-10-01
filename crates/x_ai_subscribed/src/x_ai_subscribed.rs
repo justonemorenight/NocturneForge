@@ -1316,19 +1316,19 @@ impl State {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SuperGrokModel {
-    Grok46,
+    Grok47,
     Grok45,
     GrokBuild01,
 }
 
 impl SuperGrokModel {
     pub fn all() -> Vec<Self> {
-        vec![Self::Grok46, Self::Grok45, Self::GrokBuild01]
+        vec![Self::Grok47, Self::Grok45, Self::GrokBuild01]
     }
 
     fn x_ai_model(&self) -> Option<x_ai::Model> {
         match self {
-            Self::Grok46 => Some(x_ai::Model::Grok46),
+            Self::Grok47 => Some(x_ai::Model::Grok47),
             Self::Grok45 => Some(x_ai::Model::Grok45),
             // grok-build-0.1 is SuperGrok-only; it is not in the BYOK catalog.
             Self::GrokBuild01 => None,
@@ -1337,7 +1337,7 @@ impl SuperGrokModel {
 
     pub fn id(&self) -> &str {
         match self {
-            Self::Grok46 => "grok-4.6",
+            Self::Grok47 => "grok-4.7",
             Self::Grok45 => "grok-4.5",
             Self::GrokBuild01 => "grok-build-0.1",
         }
@@ -1345,7 +1345,7 @@ impl SuperGrokModel {
 
     pub fn display_name(&self) -> &str {
         match self {
-            Self::Grok46 => "Grok 4.6",
+            Self::Grok47 => "Grok 4.7",
             Self::Grok45 => "Grok 4.5",
             Self::GrokBuild01 => "Grok Build 0.1",
         }
@@ -1423,7 +1423,7 @@ struct SuperGrokLanguageModel {
 }
 
 fn advertised_reasoning_efforts(model: &SuperGrokModel) -> &'static [ReasoningEffort] {
-    // xAI rejects `reasoning_effort: "none"` on grok-4.5/4.6. Compact and title
+    // xAI rejects `reasoning_effort: "none"` on grok-4.5/4.7. Compact and title
     // requests disable thinking, so we omit the field instead of sending none.
     match model.x_ai_model() {
         Some(x_ai::Model::Grok45) => &[
@@ -1431,7 +1431,7 @@ fn advertised_reasoning_efforts(model: &SuperGrokModel) -> &'static [ReasoningEf
             ReasoningEffort::Medium,
             ReasoningEffort::High,
         ],
-        Some(x_ai::Model::Grok46) => &[
+        Some(x_ai::Model::Grok47) => &[
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
@@ -1443,7 +1443,7 @@ fn advertised_reasoning_efforts(model: &SuperGrokModel) -> &'static [ReasoningEf
 
 fn default_thinking_reasoning_effort(model: &SuperGrokModel) -> Option<ReasoningEffort> {
     match model.x_ai_model() {
-        Some(x_ai::Model::Grok45 | x_ai::Model::Grok46) => Some(ReasoningEffort::High),
+        Some(x_ai::Model::Grok45 | x_ai::Model::Grok47) => Some(ReasoningEffort::High),
         _ => None,
     }
 }
@@ -3567,8 +3567,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn grok_46_supports_xhigh_and_defaults_to_high() {
-        let effort_levels = supported_thinking_effort_levels(&SuperGrokModel::Grok46);
+    fn grok_47_supports_xhigh_and_defaults_to_high() {
+        let effort_levels = supported_thinking_effort_levels(&SuperGrokModel::Grok47);
         let values = effort_levels
             .iter()
             .map(|level| level.value.as_ref())
@@ -3585,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_46_request_uses_selected_reasoning_effort() {
+    fn grok_47_request_uses_selected_reasoning_effort() {
         let request = LanguageModelRequest {
             thinking_allowed: true,
             thinking_effort: Some("xhigh".to_string()),
@@ -3593,13 +3593,13 @@ mod tests {
         };
 
         assert_eq!(
-            reasoning_effort_for_request(&request, &SuperGrokModel::Grok46),
+            reasoning_effort_for_request(&request, &SuperGrokModel::Grok47),
             Some(ReasoningEffort::XHigh)
         );
     }
 
     #[test]
-    fn grok_46_omits_reasoning_effort_when_thinking_is_disabled() {
+    fn grok_47_omits_reasoning_effort_when_thinking_is_disabled() {
         let request = LanguageModelRequest {
             thinking_allowed: false,
             thinking_effort: Some("medium".to_string()),
@@ -3607,7 +3607,7 @@ mod tests {
         };
 
         assert_eq!(
-            reasoning_effort_for_request(&request, &SuperGrokModel::Grok46),
+            reasoning_effort_for_request(&request, &SuperGrokModel::Grok47),
             None
         );
     }
@@ -3644,8 +3644,8 @@ mod tests {
     }
 
     #[test]
-    fn grok_46_and_45_omit_max_output_tokens() {
-        assert_eq!(SuperGrokModel::Grok46.max_output_tokens(), None);
+    fn grok_47_and_45_omit_max_output_tokens() {
+        assert_eq!(SuperGrokModel::Grok47.max_output_tokens(), None);
         assert_eq!(SuperGrokModel::Grok45.max_output_tokens(), None);
         assert_eq!(
             SuperGrokModel::GrokBuild01.max_output_tokens(),
@@ -4685,7 +4685,7 @@ mod tests {
         };
 
         // 1. Preferred active account ("session-2") must come first
-        let eligible = state.eligible_accounts("grok-4.6");
+        let eligible = state.eligible_accounts("grok-4.7");
         assert_eq!(eligible.len(), 3);
         assert_eq!(eligible[0].session_id, "session-2");
         assert_eq!(eligible[1].session_id, "session-1");
@@ -4699,7 +4699,7 @@ mod tests {
                 scope: AccountExclusionScope::Account,
             },
         );
-        let eligible = state.eligible_accounts("grok-4.6");
+        let eligible = state.eligible_accounts("grok-4.7");
         assert_eq!(eligible.len(), 2);
         assert_eq!(eligible[0].session_id, "session-1");
         assert_eq!(eligible[1].session_id, "session-3");
@@ -4711,13 +4711,13 @@ mod tests {
                 scope: AccountExclusionScope::Account,
             },
         );
-        let eligible = state.eligible_accounts("grok-4.6");
+        let eligible = state.eligible_accounts("grok-4.7");
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].session_id, "session-3");
 
         // 4. Rate limit on session-2 expires -> session-2 becomes preferred active again
         state.manifest.sessions[1].clean_expired_exclusions(now + 70_000);
-        let eligible = state.eligible_accounts("grok-4.6");
+        let eligible = state.eligible_accounts("grok-4.7");
         assert_eq!(eligible.len(), 2);
         assert_eq!(eligible[0].session_id, "session-2");
         assert_eq!(eligible[1].session_id, "session-3");
@@ -4729,13 +4729,13 @@ mod tests {
             provider: PROVIDER_NAME,
             status: Some(http_client::StatusCode::FORBIDDEN),
             code: Some("forbidden".to_string()),
-            message: "The model grok-4.6 is restricted on your plan".to_string(),
+            message: "The model grok-4.7 is restricted on your plan".to_string(),
             retry_after: None,
             category: ProviderErrorCategory::Permission,
         };
         assert_eq!(
-            classify_forbidden_scope(&error_model, "grok-4.6"),
-            AccountExclusionScope::Model("grok-4.6".to_string())
+            classify_forbidden_scope(&error_model, "grok-4.7"),
+            AccountExclusionScope::Model("grok-4.7".to_string())
         );
 
         let error_account = LanguageModelCompletionError::ProviderRejection {
@@ -4747,7 +4747,7 @@ mod tests {
             category: ProviderErrorCategory::Permission,
         };
         assert_eq!(
-            classify_forbidden_scope(&error_account, "grok-4.6"),
+            classify_forbidden_scope(&error_account, "grok-4.7"),
             AccountExclusionScope::Account
         );
 
@@ -4761,16 +4761,16 @@ mod tests {
 
         // Model-specific exclusion
         session.add_exclusion(AccountExclusion::Forbidden {
-            scope: AccountExclusionScope::Model("grok-4.6".to_string()),
+            scope: AccountExclusionScope::Model("grok-4.7".to_string()),
         });
-        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(session.is_excluded_for("grok-4.7", now_ms()));
         assert!(!session.is_excluded_for("grok-build-0.1", now_ms()));
 
         // Account-wide exclusion
         session.add_exclusion(AccountExclusion::Forbidden {
             scope: AccountExclusionScope::Account,
         });
-        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(session.is_excluded_for("grok-4.7", now_ms()));
         assert!(session.is_excluded_for("grok-build-0.1", now_ms()));
     }
 
@@ -4789,9 +4789,9 @@ mod tests {
             category: ProviderErrorCategory::RateLimit,
         };
         let (retry_at, scope) =
-            state.calculate_rate_limit_retry("session-1", "grok-4.6", &err_retry_after);
+            state.calculate_rate_limit_retry("session-1", "grok-4.7", &err_retry_after);
         assert!((retry_at as i64 - (now + 15_000) as i64).abs() < 500);
-        assert_eq!(scope, AccountExclusionScope::Model("grok-4.6".to_string()));
+        assert_eq!(scope, AccountExclusionScope::Model("grok-4.7".to_string()));
 
         // 2. Quota exhausted (used_percent >= QUOTA_EXHAUSTION_THRESHOLD_PERCENT)
         let reset_timestamp = (now / 1000 + 3600) as i64;
@@ -4818,21 +4818,21 @@ mod tests {
             category: ProviderErrorCategory::RateLimit,
         };
         let (retry_at, scope) =
-            state.calculate_rate_limit_retry("session-exhausted", "grok-4.6", &err_no_header);
+            state.calculate_rate_limit_retry("session-exhausted", "grok-4.7", &err_no_header);
         assert_eq!(retry_at, (reset_timestamp as u64) * 1000);
         assert_eq!(scope, AccountExclusionScope::Account);
 
         // 3. Fallback exponential backoff ladder: 30s -> 60s -> 300s
         let (retry_1, _) =
-            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.7", &err_no_header);
         assert!((retry_1 as i64 - (now + 30_000) as i64).abs() < 500);
 
         let (retry_2, _) =
-            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.7", &err_no_header);
         assert!((retry_2 as i64 - (now + 60_000) as i64).abs() < 500);
 
         let (retry_3, _) =
-            state.calculate_rate_limit_retry("session-fallback", "grok-4.6", &err_no_header);
+            state.calculate_rate_limit_retry("session-fallback", "grok-4.7", &err_no_header);
         assert!((retry_3 as i64 - (now + 300_000) as i64).abs() < 500);
     }
 
@@ -4964,7 +4964,7 @@ mod tests {
             quota_refresh_task: None,
         });
 
-        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok47, &state, cx));
         let request = LanguageModelRequest {
             messages: vec![language_model::LanguageModelRequestMessage {
                 role: language_model::Role::User,
@@ -5121,7 +5121,7 @@ mod tests {
             quota_refresh_task: None,
         });
 
-        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok47, &state, cx));
         let request = LanguageModelRequest {
             messages: vec![language_model::LanguageModelRequestMessage {
                 role: language_model::Role::User,
@@ -5272,7 +5272,7 @@ mod tests {
             quota_refresh_task: None,
         });
 
-        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok46, &state, cx));
+        let model = cx.read(|cx| create_language_model(SuperGrokModel::Grok47, &state, cx));
         let request = LanguageModelRequest {
             messages: vec![language_model::LanguageModelRequestMessage {
                 role: language_model::Role::User,
@@ -5299,8 +5299,8 @@ mod tests {
         cx.read(|cx| {
             let state = state.read(cx);
             assert_eq!(state.active_session_id.as_deref(), Some("session-a"));
-            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
-            assert!(!state.manifest.sessions[1].is_excluded_for("grok-4.6", now_ms()));
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.7", now_ms()));
+            assert!(!state.manifest.sessions[1].is_excluded_for("grok-4.7", now_ms()));
         });
     }
 
@@ -5370,7 +5370,7 @@ mod tests {
 
         cx.read(|cx| {
             let state = state.read(cx);
-            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.7", now_ms()));
         });
 
         let weak_state = cx.read(|_cx| state.downgrade());
@@ -5383,7 +5383,7 @@ mod tests {
 
         cx.read(|cx| {
             let state = state.read(cx);
-            assert!(!state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            assert!(!state.manifest.sessions[0].is_excluded_for("grok-4.7", now_ms()));
             assert_eq!(
                 state.manifest.sessions[0]
                     .quota
@@ -5404,11 +5404,11 @@ mod tests {
             ..Default::default()
         };
         session.add_exclusion(AccountExclusion::ReauthenticationRequired);
-        assert!(session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(session.is_excluded_for("grok-4.7", now_ms()));
 
         session.clear_reauthentication_required();
         assert!(!session.reauthentication_required);
-        assert!(!session.is_excluded_for("grok-4.6", now_ms()));
+        assert!(!session.is_excluded_for("grok-4.7", now_ms()));
     }
 
     #[gpui::test]
@@ -5489,7 +5489,7 @@ mod tests {
             assert_eq!(state.active_session_id.as_deref(), Some("session-b"));
             // Reauth requirement must NOT be cleared by switch_account!
             assert!(state.manifest.sessions[1].reauthentication_required);
-            assert!(state.manifest.sessions[1].is_excluded_for("grok-4.6", now_ms()));
+            assert!(state.manifest.sessions[1].is_excluded_for("grok-4.7", now_ms()));
         });
     }
 
@@ -5594,8 +5594,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(session.is_excluded_for("grok-4.6", now));
-        assert!(!session.is_eligible_for("grok-4.6", now));
+        assert!(session.is_excluded_for("grok-4.7", now));
+        assert!(!session.is_eligible_for("grok-4.7", now));
     }
 
     #[test]
@@ -5615,7 +5615,7 @@ mod tests {
             ..Default::default()
         };
         // Under 100.0% threshold, 99.5% used is still eligible to consume the last 0.5%!
-        assert!(session_99_5.is_eligible_for("grok-4.6", now));
+        assert!(session_99_5.is_eligible_for("grok-4.7", now));
 
         let session_100 = AccountSessionMetadata {
             session_id: "session-fully-exhausted".to_string(),
@@ -5631,8 +5631,8 @@ mod tests {
             ..Default::default()
         };
         // At 100.0%, it is immediately excluded!
-        assert!(session_100.is_excluded_for("grok-4.6", now));
-        assert!(!session_100.is_eligible_for("grok-4.6", now));
+        assert!(session_100.is_excluded_for("grok-4.7", now));
+        assert!(!session_100.is_eligible_for("grok-4.7", now));
     }
 
     #[test]
@@ -5651,13 +5651,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(session.is_eligible_for("grok-4.6", now));
+        assert!(session.is_eligible_for("grok-4.7", now));
         session.add_exclusion(AccountExclusion::RateLimited {
             retry_at_ms: now + 300_000,
             scope: AccountExclusionScope::Account,
         });
-        assert!(!session.is_eligible_for("grok-4.6", now));
-        assert!(session.is_eligible_for("grok-4.6", now + 300_001));
+        assert!(!session.is_eligible_for("grok-4.7", now));
+        assert!(session.is_eligible_for("grok-4.7", now + 300_001));
     }
 
     #[gpui::test]
@@ -5867,7 +5867,7 @@ mod tests {
         // Model-scoped 429 Retry-After cooldown (5 minutes)
         session_a.add_exclusion(AccountExclusion::RateLimited {
             retry_at_ms: now_ms() + 300_000,
-            scope: AccountExclusionScope::Model("grok-4.6".to_string()),
+            scope: AccountExclusionScope::Model("grok-4.7".to_string()),
         });
 
         let manifest = AccountManifest {
@@ -5908,7 +5908,7 @@ mod tests {
         // Model-level rate limit must still be preserved after quota refresh!
         cx.read(|cx| {
             let state = state.read(cx);
-            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.6", now_ms()));
+            assert!(state.manifest.sessions[0].is_excluded_for("grok-4.7", now_ms()));
             // But it is not excluded for other models!
             assert!(!state.manifest.sessions[0].is_excluded_for("grok-build-0.1", now_ms()));
         });

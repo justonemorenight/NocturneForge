@@ -108,10 +108,35 @@ pub struct DbThread {
     pub discovered_tools: Vec<SharedString>,
     #[serde(default)]
     pub orchestration_run: Option<agent_orchestration::PersistedRun>,
+    /// All native orchestration snapshots. `orchestration_run` remains as a
+    /// compatibility field for versions that only know about a single run.
+    #[serde(default)]
+    pub orchestration_runs: Vec<agent_orchestration::PersistedRun>,
     #[serde(default)]
     pub orchestration_goal: Option<agent_orchestration::GoalSnapshot>,
+    /// Whether the native parent was parked waiting for orchestration workers.
+    /// Older thread blobs default to false.
+    #[serde(default)]
+    pub orchestration_waiting_for_workers: bool,
+    /// Run IDs whose completion still needs to be delivered to the parent.
+    #[serde(default)]
+    pub orchestration_waiting_run_ids: Vec<agent_orchestration::RunId>,
     #[serde(default)]
     pub pending_edits: Vec<DbPendingEdit>,
+}
+
+impl DbThread {
+    pub fn all_orchestration_runs(&self) -> Vec<agent_orchestration::PersistedRun> {
+        let mut runs = self.orchestration_runs.clone();
+        if let Some(latest_run) = &self.orchestration_run {
+            if let Some(existing) = runs.iter_mut().find(|run| run.run_id == latest_run.run_id) {
+                *existing = latest_run.clone();
+            } else {
+                runs.push(latest_run.clone());
+            }
+        }
+        runs
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +230,10 @@ impl SharedThread {
             tool_filter: None,
             discovered_tools: Vec::new(),
             orchestration_run: None,
+            orchestration_runs: Vec::new(),
             orchestration_goal: None,
+            orchestration_waiting_for_workers: false,
+            orchestration_waiting_run_ids: Vec::new(),
             pending_edits: Vec::new(),
         }
     }
@@ -428,7 +456,10 @@ impl DbThread {
             thinking_enabled: false,
             thinking_effort: None,
             orchestration_run: None,
+            orchestration_runs: Vec::new(),
             orchestration_goal: None,
+            orchestration_waiting_for_workers: false,
+            orchestration_waiting_run_ids: Vec::new(),
             pending_edits: Vec::new(),
             draft_prompt: None,
             ui_scroll_position: None,
@@ -915,7 +946,10 @@ mod tests {
             tool_filter: None,
             discovered_tools: Vec::new(),
             orchestration_run: None,
+            orchestration_runs: Vec::new(),
             orchestration_goal: None,
+            orchestration_waiting_for_workers: false,
+            orchestration_waiting_run_ids: Vec::new(),
             pending_edits: Vec::new(),
         }
     }
@@ -1321,8 +1355,30 @@ mod tests {
             vec![],
             vec![],
         );
+        let additional_run = agent_orchestration::PersistedRun::new(
+            agent_orchestration::RunId::new(),
+            agent_orchestration::OrchestrationPlan::new(
+                "Additional Plan",
+                vec![agent_orchestration::OrchestrationTask::new(
+                    "t1",
+                    "Additional Task",
+                    "desc 2",
+                )],
+            ),
+            agent_orchestration::RunState::Running,
+            agent_settings::AgentExecutionPolicy::default(),
+            vec![agent_orchestration::TaskStatus::new(
+                agent_orchestration::TaskId::new("t1"),
+            )],
+            vec![],
+            vec![],
+            vec![],
+        );
 
-        thread.orchestration_run = Some(persisted_run.clone());
+        thread.orchestration_run = Some(additional_run.clone());
+        thread.orchestration_runs = vec![persisted_run.clone(), additional_run.clone()];
+        thread.orchestration_waiting_for_workers = true;
+        thread.orchestration_waiting_run_ids = vec![additional_run.run_id.clone()];
 
         database
             .save_thread(thread_id.clone(), thread, PathList::default())
@@ -1337,11 +1393,33 @@ mod tests {
 
         let loaded_run = loaded
             .orchestration_run
+            .as_ref()
             .expect("orchestration_run should be restored");
-        assert_eq!(loaded_run.run_id, persisted_run.run_id);
-        assert_eq!(loaded_run.state, agent_orchestration::RunState::Completed);
-        assert_eq!(loaded_run.plan.title, "Orch Plan");
+        assert_eq!(loaded_run.run_id, additional_run.run_id);
+        assert_eq!(loaded_run.state, agent_orchestration::RunState::Running);
+        assert_eq!(loaded_run.plan.title, "Additional Plan");
         assert_eq!(loaded_run.task_statuses.len(), 1);
+        let loaded_runs = loaded.all_orchestration_runs();
+        assert_eq!(loaded_runs.len(), 2);
+        assert_eq!(
+            loaded_runs
+                .first()
+                .expect("first run should be restored")
+                .run_id,
+            persisted_run.run_id
+        );
+        assert_eq!(
+            loaded_runs
+                .last()
+                .expect("latest run should be restored")
+                .run_id,
+            additional_run.run_id
+        );
+        assert!(loaded.orchestration_waiting_for_workers);
+        assert_eq!(
+            loaded.orchestration_waiting_run_ids,
+            vec![additional_run.run_id]
+        );
     }
 
     #[gpui::test]

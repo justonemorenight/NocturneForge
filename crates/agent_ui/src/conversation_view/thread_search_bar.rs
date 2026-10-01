@@ -1028,34 +1028,28 @@ fn collect_markdowns(
         AgentThreadEntry::ToolCall(tool_call) => {
             out.push(tool_call.label.clone());
             if entry_view_state.is_tool_call_expanded(&tool_call.id) {
-                out.extend(
-                    tool_call
-                        .content
-                        .iter()
-                        .filter_map(|content| match content {
-                            ToolCallContent::ContentBlock(
-                                ContentBlock::Markdown { markdown }
-                                | ContentBlock::Unsupported { markdown, .. },
-                            ) => Some(markdown.clone()),
-                            ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
-                                markdown: Some(markdown),
-                                ..
-                            }) => Some(markdown.clone()),
-                            ToolCallContent::ContentBlock(
-                                ContentBlock::Empty
-                                | ContentBlock::EmbeddedResource { markdown: None, .. }
-                                | ContentBlock::ResourceLink { .. }
-                                | ContentBlock::Image { .. },
-                            )
-                            | ToolCallContent::Diff(_)
-                            | ToolCallContent::Terminal(_)
-                            | ToolCallContent::PendingTerminal(_) => None,
-                        }),
-                );
+                out.extend(tool_call.content_for_display().iter().filter_map(
+                    |content| match content {
+                        ToolCallContent::ContentBlock(
+                            ContentBlock::Markdown { markdown }
+                            | ContentBlock::Unsupported { markdown, .. },
+                        ) => Some(markdown.clone()),
+                        ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
+                            markdown: Some(markdown),
+                            ..
+                        }) => Some(markdown.clone()),
+                        ToolCallContent::ContentBlock(
+                            ContentBlock::Empty
+                            | ContentBlock::EmbeddedResource { markdown: None, .. }
+                            | ContentBlock::ResourceLink { .. }
+                            | ContentBlock::Image { .. },
+                        )
+                        | ToolCallContent::Diff(_)
+                        | ToolCallContent::Terminal(_)
+                        | ToolCallContent::PendingTerminal(_) => None,
+                    },
+                ));
             }
-        }
-        AgentThreadEntry::CompletedPlan(entries) => {
-            out.extend(entries.iter().map(|e| e.content.clone()))
         }
         AgentThreadEntry::ContextCompaction(compaction) => out.extend(
             compaction

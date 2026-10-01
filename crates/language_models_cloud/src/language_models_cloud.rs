@@ -332,7 +332,7 @@ impl<TP: CloudLlmTokenProvider + 'static> CloudLanguageModel<TP> {
         cx: &AsyncApp,
     ) -> BoxFuture<'static, Result<CompactionResult, LanguageModelCompletionError>> {
         let thread_id = request.thread_id.clone();
-        let prompt_id = request.prompt_id.clone();
+        let prompt_id = request.prompt_id.as_deref().map(str::to_owned);
         let app_version = self.app_version.clone();
         let mut request = match into_anthropic(
             request,
@@ -504,7 +504,7 @@ impl<TP: CloudLlmTokenProvider + 'static> CloudLanguageModel<TP> {
         cx: &AsyncApp,
     ) -> BoxFuture<'static, Result<CompactionResult, LanguageModelCompletionError>> {
         let thread_id = request.thread_id.clone();
-        let prompt_id = request.prompt_id.clone();
+        let prompt_id = request.prompt_id.as_deref().map(str::to_owned);
         let app_version = self.app_version.clone();
         let model_provider = self.model.provider;
         let provider_name = provider_name(&self.model.provider);
@@ -885,7 +885,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                 request.effective_max_output_tokens(self.max_output_tokens());
         }
         let thread_id = request.thread_id.clone();
-        let prompt_id = request.prompt_id.clone();
+        let prompt_id = request.prompt_id.as_deref().map(str::to_owned);
         let app_version = self.app_version.clone();
         let thinking_allowed = request.thinking_allowed;
         let enable_thinking = thinking_allowed && self.model.supports_thinking;

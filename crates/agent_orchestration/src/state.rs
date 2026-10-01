@@ -1,5 +1,5 @@
 use crate::budget::TaskBudgetState;
-use crate::ids::TaskId;
+use crate::ids::{RunId, TaskId};
 use crate::verification::VerificationResult;
 use crate::worker::{StructuredWaitReason, WorkerMetadata, WorkerTarget};
 use agent_client_protocol::schema::v1 as acp;
@@ -30,6 +30,8 @@ pub enum RunState {
     AwaitingApply,
     /// Run finished successfully with all tasks completed and verified.
     Completed,
+    /// Run finished with mixed results (some tasks completed and verified, others failed).
+    CompletedWithErrors,
     /// Run halted due to an unrecoverable failure or policy limit.
     Failed,
     /// Run was cancelled by user or system shutdown.
@@ -40,7 +42,10 @@ pub enum RunState {
 
 impl RunState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::CompletedWithErrors | Self::Failed | Self::Cancelled
+        )
     }
 
     pub fn is_active(&self) -> bool {
@@ -62,6 +67,7 @@ impl RunState {
             (Self::Running, Self::Repairing) => true,
             (Self::Running, Self::AwaitingApply) => true,
             (Self::Running, Self::Completed) => true,
+            (Self::Running, Self::CompletedWithErrors) => true,
             (Self::Running, Self::Failed) => true,
             (Self::Running, Self::Cancelled) => true,
             (Self::Running, Self::Interrupted) => true,
@@ -70,16 +76,19 @@ impl RunState {
             (Self::Verifying, Self::Repairing) => true,
             (Self::Verifying, Self::AwaitingApply) => true,
             (Self::Verifying, Self::Completed) => true,
+            (Self::Verifying, Self::CompletedWithErrors) => true,
             (Self::Verifying, Self::Failed) => true,
             (Self::Verifying, Self::Cancelled) => true,
             (Self::Repairing, Self::Running) => true,
             (Self::Repairing, Self::Verifying) => true,
             (Self::Repairing, Self::AwaitingApply) => true,
             (Self::Repairing, Self::Completed) => true,
+            (Self::Repairing, Self::CompletedWithErrors) => true,
             (Self::Repairing, Self::Failed) => true,
             (Self::Repairing, Self::Cancelled) => true,
             (Self::AwaitingApply, Self::Running) => true,
             (Self::AwaitingApply, Self::Completed) => true,
+            (Self::AwaitingApply, Self::CompletedWithErrors) => true,
             (Self::AwaitingApply, Self::Failed) => true,
             (Self::AwaitingApply, Self::Cancelled) => true,
             (Self::AwaitingApply, Self::Paused) => true,
@@ -102,6 +111,10 @@ pub enum TaskState {
     WaitingDependency,
     /// Blocked due to user decision or external dependency.
     Blocked,
+    /// In queue, ready for dispatch.
+    Queued,
+    /// Worker process or session starting up.
+    Starting,
     /// Actively running.
     Running,
     /// Verifying output against acceptance criteria.
@@ -120,19 +133,31 @@ pub enum TaskState {
     Failed,
     /// Cancelled before completion.
     Cancelled,
+    /// Task timed out during execution.
+    TimedOut,
+    /// Task process/session was orphaned (e.g. disconnected or terminated on restart).
+    Orphaned,
     /// Interrupted by process restart.
     Interrupted,
 }
 
 impl TaskState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Orphaned
+        )
     }
 
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Running | Self::Verifying | Self::Repairing | Self::Retrying
+            Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::Verifying
+                | Self::Repairing
+                | Self::Retrying
         )
     }
 
@@ -246,3 +271,36 @@ impl TaskStatus {
         }
     }
 }
+
+/// Authoritative snapshot of an orchestration run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationRunRecord {
+    pub run_id: RunId,
+    pub root_thread_id: Option<String>,
+    pub state: RunState,
+    pub task_ids: Vec<TaskId>,
+    pub active_count: usize,
+    pub completed_count: usize,
+    pub failed_count: usize,
+    pub cancelled_count: usize,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Authoritative snapshot of an individual task in an orchestration run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationTaskRecord {
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub parent_thread_id: Option<String>,
+    pub label: String,
+    pub state: TaskState,
+    pub attempt: u32,
+    pub child_thread_id: Option<String>,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+pub type AuthoritativeOrchestrationRun = OrchestrationRunRecord;
+pub type AuthoritativeOrchestrationTask = OrchestrationTaskRecord;

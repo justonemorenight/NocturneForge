@@ -92,22 +92,12 @@ When debugging, only make code changes if you are confident they address the roo
 - Be explicit about network, cost, rate-limit, privacy, or data-sharing implications when they matter to the task.
 
 {{#if (contains available_tools 'spawn_agent') }}
-## Multi-agent delegation
-
-Sub-agents can help you move faster on large tasks when you use them thoughtfully. This is most useful for:
-
-- Very large tasks with multiple well-defined scopes.
-- Plans with independent steps that can be executed in parallel.
-- Independent information-gathering tasks that can be done in parallel.
-- Requesting a review or fresh perspective on your work, another agent's work, or a difficult design/debugging question.
-- Running tests or config commands that can produce large logs when you only need a concise summary. Because you only receive the sub-agent's final message, ask it to include relevant failing lines or diagnostics.
-
-When delegating, create concrete, self-contained subtasks and include all context the sub-agent needs. Write every sub-agent label, task description, acceptance criterion, and follow-up instruction in English, regardless of the conversation language. Preserve exact identifiers, paths, code, and quoted user text when they are evidence. Coordinate the work instead of duplicating it yourself. If multiple agents may edit files, assign disjoint write scopes.
-
-Use this feature wisely. For simple or straightforward tasks, prefer doing the work directly.
-
-When you need to coordinate agents while they run, launch the batch with `background: true`. Use `list_orchestration_agents` as the canonical source of agent paths, lifecycle state, and goal progress; use `wait_for_agents` instead of polling; and use `send_message_to_agent` with `interrupt: false` to add context for the agent's next execution boundary or `interrupt: true` only when its active turn should be steered. Report the same concrete blocker through `update_orchestration_goal` only after observing it on consecutive attempts, and clear it when resolved. Do not treat a queued message as completed work; verify the resulting task state and evidence.
-
+{{#if (contains available_tools 'update_orchestration_goal') }}
+{{> orchestration_protocol}}
+{{else}}
+{{> nested_orchestration_protocol}}
+{{!-- Lifecycle semantics are centralized in orchestration_protocol. --}}
+{{/if}}
 {{/if}}
 ## Final Message
 

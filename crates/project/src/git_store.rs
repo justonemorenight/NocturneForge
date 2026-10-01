@@ -341,6 +341,12 @@ pub struct GitStoreCheckpoint {
     checkpoints_by_work_dir_abs_path: HashMap<Arc<Path>, GitRepositoryCheckpoint>,
 }
 
+impl GitStoreCheckpoint {
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints_by_work_dir_abs_path.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusEntry {
     pub repo_path: RepoPath,
@@ -1944,6 +1950,41 @@ impl GitStore {
                 .into_iter()
                 .all(|result| result))
         })
+    }
+
+    pub fn diff_checkpoints(
+        &self,
+        base: GitStoreCheckpoint,
+        mut target: GitStoreCheckpoint,
+        cx: &mut App,
+    ) -> Task<Result<Vec<(PathBuf, String)>>> {
+        let repositories_by_work_dir_abs_path = self
+            .repositories
+            .values()
+            .map(|repo| (repo.read(cx).snapshot.work_directory_abs_path.clone(), repo))
+            .collect::<HashMap<_, _>>();
+
+        let mut tasks = Vec::new();
+        for (work_dir_abs_path, base_checkpoint) in base.checkpoints_by_work_dir_abs_path {
+            let Some(target_checkpoint) = target
+                .checkpoints_by_work_dir_abs_path
+                .remove(&work_dir_abs_path)
+            else {
+                return Task::ready(Err(anyhow!("Git repository disappeared during ACP edit")));
+            };
+            let Some(repository) = repositories_by_work_dir_abs_path.get(&work_dir_abs_path) else {
+                return Task::ready(Err(anyhow!("Git repository unavailable during ACP edit")));
+            };
+            let task = repository.update(cx, |repository, _| {
+                repository.diff_checkpoints(base_checkpoint, target_checkpoint)
+            });
+            tasks.push(async move { Ok((work_dir_abs_path.to_path_buf(), task.await??)) });
+        }
+        if !target.checkpoints_by_work_dir_abs_path.is_empty() {
+            return Task::ready(Err(anyhow!("Git repository appeared during ACP edit")));
+        }
+        cx.background_executor()
+            .spawn(async move { future::try_join_all(tasks).await })
     }
 
     /// Blames a buffer.

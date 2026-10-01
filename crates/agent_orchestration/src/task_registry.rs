@@ -592,12 +592,17 @@ impl TaskRegistry {
             .collect()
     }
 
-    /// Set of failed task IDs.
+    /// Set of failed, timed-out, or orphaned task IDs.
     pub fn failed_tasks(&self) -> HashSet<TaskId> {
         let statuses = self.statuses.read();
         statuses
             .iter()
-            .filter(|(_, s)| s.state == TaskState::Failed)
+            .filter(|(_, s)| {
+                matches!(
+                    s.state,
+                    TaskState::Failed | TaskState::TimedOut | TaskState::Orphaned
+                )
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
