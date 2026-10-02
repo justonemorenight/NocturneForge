@@ -1,6 +1,6 @@
 use agent_client_protocol::schema::v1 as acp;
 use agent_orchestration::{
-    AgentMessageKind, AgentPath, GoalSnapshot, RunHandle, RunState, TaskState,
+    AgentMessageKind, AgentMessageReceipt, AgentPath, GoalSnapshot, RunHandle, RunState, TaskState,
 };
 use anyhow::Result;
 use gpui::{App, SharedString, Task, WeakEntity};
@@ -218,7 +218,8 @@ pub struct SendMessageToAgentInput {
     /// Canonical path or unambiguous agent name.
     pub recipient: String,
     pub message: String,
-    /// When true, interrupt the active worker at a safe turn boundary and run this follow-up.
+    /// When true, cancel the worker's current turn and restart it with this message.
+    /// When false, a running worker reads the message at its next tool boundary and keeps working.
     #[serde(default)]
     pub interrupt: bool,
 }
@@ -279,8 +280,7 @@ impl AgentTool for SendMessageToAgentTool {
                     error: error.to_string(),
                 })?;
             let recipient = run
-                .agent_control_plane()
-                .resolve(&AgentPath::root(), &input.recipient)
+                .resolve_message_recipient(&input.recipient)
                 .map_err(|error| OrchestrationControlOutput::Error {
                     error: error.to_string(),
                 })?;
@@ -299,8 +299,13 @@ impl AgentTool for SendMessageToAgentTool {
             } else {
                 AgentMessageKind::Message
             };
-            let message = run
-                .send_agent_message(AgentPath::root(), recipient.clone(), kind, input.message)
+            let (message, receipt) = run
+                .send_agent_message_with_receipt(
+                    AgentPath::root(),
+                    recipient.clone(),
+                    kind,
+                    input.message,
+                )
                 .await
                 .map_err(|error| OrchestrationControlOutput::Error {
                     error: error.to_string(),
@@ -309,13 +314,29 @@ impl AgentTool for SendMessageToAgentTool {
                 run_id: run.run_id().to_string(),
                 sequence: message.sequence,
                 recipient: recipient.to_string(),
-                delivery: if input.interrupt {
-                    "steered".to_string()
-                } else {
-                    "queued".to_string()
-                },
+                delivery: describe_message_receipt(receipt).to_string(),
             })
         })
+    }
+}
+
+pub(crate) fn describe_message_receipt(receipt: AgentMessageReceipt) -> &'static str {
+    match receipt {
+        AgentMessageReceipt::DeliveredToActiveTurn { interrupt: true } => {
+            "steered: the agent's current turn was interrupted to handle this message"
+        }
+        AgentMessageReceipt::DeliveredToActiveTurn { interrupt: false } => {
+            "delivered: the agent reads this at its next tool boundary without restarting its work"
+        }
+        AgentMessageReceipt::WokeParkedAgent => {
+            "woken: the agent was waiting for input and has resumed with this message"
+        }
+        AgentMessageReceipt::ResumedCompletedAgent => {
+            "scheduled: the completed agent continues with this message in the same orchestration run when execution is permitted"
+        }
+        AgentMessageReceipt::QueuedInMailbox => {
+            "queued: the agent reads this before completing verification or when its next attempt starts"
+        }
     }
 }
 
@@ -600,6 +621,22 @@ impl AgentTool for WaitForAgentsTool {
             if before.iter().any(agent_needs_attention) {
                 return Ok(success_output(&run, before));
             }
+            // Polling a background run keeps the parent turn open, spending
+            // input tokens on every check and tempting the parent to redo
+            // worker files. The runtime already parks the parent at end of
+            // turn and resumes it when the run finishes.
+            let resumes_automatically = thread
+                .read_with(cx, |thread, _cx| {
+                    thread.resumes_after_orchestration_run(run.run_id())
+                })
+                .map_err(|error| OrchestrationControlOutput::Error {
+                    error: error.to_string(),
+                })?;
+            if resumes_automatically {
+                thread.update(cx, |thread, _cx| thread.request_orchestration_park())
+                    .map_err(|error| OrchestrationControlOutput::Error { error: error.to_string() })?;
+                return Ok(success_output(&run, before));
+            }
 
             let default_wait_ms =
                 u64::try_from(config.default_wait.as_millis()).unwrap_or(u64::MAX);
@@ -703,7 +740,7 @@ fn persisted_run_summary(run: &agent_orchestration::PersistedRun) -> Orchestrati
                 phase: status.and_then(|status| status.phase.clone()),
                 current_attempt: status.map(|status| status.current_attempt),
                 total_attempts: status.map(|status| status.total_attempts),
-                tokens_used: status.map(|status| status.tokens_used),
+                tokens_used: status.map(agent_orchestration::TaskStatus::total_tokens_used),
                 model: status.and_then(|status| status.model.clone()),
                 current_tool: status.and_then(|status| status.current_tool.clone()),
                 session_id: status
@@ -944,7 +981,9 @@ fn selected_summaries(
                 phase: status.as_ref().and_then(|status| status.phase.clone()),
                 current_attempt: status.as_ref().map(|status| status.current_attempt),
                 total_attempts: status.as_ref().map(|status| status.total_attempts),
-                tokens_used: status.as_ref().map(|status| status.tokens_used),
+                tokens_used: status
+                    .as_ref()
+                    .map(agent_orchestration::TaskStatus::total_tokens_used),
                 model: status.as_ref().and_then(|status| status.model.clone()),
                 current_tool: status
                     .as_ref()

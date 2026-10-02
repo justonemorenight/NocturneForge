@@ -142,6 +142,11 @@ pub enum RuntimeEvent {
         tokens_used: u64,
         tool_calls_used: u64,
     },
+    TaskInFlightTokensUpdated {
+        run_id: RunId,
+        task_id: TaskId,
+        tokens_used: u64,
+    },
     TaskOutput {
         run_id: RunId,
         task_id: TaskId,
@@ -270,6 +275,7 @@ impl RuntimeEvent {
             | Self::TaskContextUpdated { run_id, .. }
             | Self::TaskModelAssigned { run_id, .. }
             | Self::TaskBudgetUpdated { run_id, .. }
+            | Self::TaskInFlightTokensUpdated { run_id, .. }
             | Self::TaskOutput { run_id, .. }
             | Self::TaskVerifying { run_id, .. }
             | Self::TaskVerificationResult { run_id, .. }

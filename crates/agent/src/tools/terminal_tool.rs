@@ -1328,6 +1328,15 @@ fn working_dir(cd: &str, project: &Entity<Project>, cx: &mut App) -> Result<Opti
             ),
         }
     } else {
+        let normalized = path_style.normalize(cd);
+        if let Some(project_path) = project.find_project_path(Path::new(&normalized), cx)
+            && project
+                .entry_for_path(&project_path, cx)
+                .is_some_and(|entry| entry.is_dir())
+            && let Some(directory) = project.absolute_path(&project_path, cx)
+        {
+            return Ok(Some(directory));
+        }
         if let Some(dir) = resolve_cd_in_worktrees(cd, path_style, &worktree_roots) {
             return Ok(Some(dir));
         }
@@ -1338,7 +1347,8 @@ fn working_dir(cd: &str, project: &Entity<Project>, cx: &mut App) -> Result<Opti
 
 /// Resolves a `cd` argument to an absolute worktree directory. `cd` may be a
 /// worktree's root name or an absolute path to a worktree or a subdirectory
-/// therein.
+/// therein. In a single-root project it may also be relative to that root,
+/// which is how the file tools already resolve paths.
 ///
 /// Absolute paths are classified with the project's [`PathStyle`] rather than
 /// the host's, so an absolute POSIX path resolves correctly on a Windows host
@@ -1359,26 +1369,124 @@ fn resolve_cd_in_worktrees(
     let cd_path = Path::new(&cd);
     let is_absolute = path_style.is_absolute(&cd);
 
-    worktree_roots.iter().find_map(|(root_name, abs_path)| {
-        let prefix = if is_absolute {
-            path_style.normalize(abs_path.to_str()?)
-        } else {
-            (*root_name).to_string()
-        };
-        let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
-        if subpath.is_empty() {
-            Some(abs_path.clone())
-        } else {
-            path_style
-                .join_path(abs_path, &*subpath.display(path_style))
-                .ok()
-        }
-    })
+    worktree_roots
+        .iter()
+        .find_map(|(root_name, abs_path)| {
+            let prefix = if is_absolute {
+                path_style.normalize(abs_path.to_str()?)
+            } else {
+                (*root_name).to_string()
+            };
+            let subpath = path_style.strip_prefix(cd_path, Path::new(&prefix))?;
+            if subpath.is_empty() {
+                Some(abs_path.clone())
+            } else {
+                path_style
+                    .join_path(abs_path, &*subpath.display(path_style))
+                    .ok()
+            }
+        })
+        .or_else(|| {
+            // Without this, `write_file("labs/x")` succeeds while
+            // `cd: "labs"` is rejected, and workers burn turns guessing.
+            let [(_, abs_path)] = worktree_roots else {
+                return None;
+            };
+            if is_absolute {
+                return None;
+            }
+            let root = PathBuf::from(path_style.normalize(abs_path.to_str()?));
+            let joined = path_style.join_path(&root, cd_path).ok()?;
+            path_style.strip_prefix(&joined, &root)?;
+            Some(joined)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn test_working_directory_matches_file_paths_in_multiple_roots(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use util::path;
+        crate::tests::init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/workspace"),
+            serde_json::json!({
+                "one": {"labs": {}}, "two": {"labs": {}, "unique": {}}
+            }),
+        )
+        .await;
+        let project = Project::test(
+            fs,
+            [
+                path!("/workspace/one").as_ref(),
+                path!("/workspace/two").as_ref(),
+            ],
+            cx,
+        )
+        .await;
+        for path in ["labs", "unique", "two/labs", "/workspace/one/labs"] {
+            cx.update(|cx| {
+                let project_path = project
+                    .read(cx)
+                    .find_project_path(Path::new(path), cx)
+                    .expect("file tools resolve the directory");
+                let file_directory = project
+                    .read(cx)
+                    .absolute_path(&project_path, cx)
+                    .expect("absolute file directory");
+                assert_eq!(
+                    working_dir(path, &project, cx).expect("terminal working directory"),
+                    Some(file_directory)
+                );
+            });
+        }
+        cx.update(|cx| {
+            assert_eq!(
+                working_dir("unique", &project, cx).expect("unique directory"),
+                Some(PathBuf::from(path!("/workspace/two/unique")))
+            );
+            assert!(working_dir(".", &project, cx).is_err());
+            assert!(working_dir("../outside", &project, cx).is_err());
+        });
+    }
+
+    #[test]
+    fn test_resolve_cd_relative_paths_and_multiple_roots() {
+        use util::paths::PathStyle::{Unix, Windows};
+        let roots = vec![
+            ("one", PathBuf::from("/workspace/one")),
+            ("two", PathBuf::from("/workspace/two")),
+        ];
+        assert_eq!(resolve_cd_in_worktrees("labs", Unix, &roots), None);
+        assert_eq!(
+            resolve_cd_in_worktrees("two/labs", Unix, &roots),
+            Some(PathBuf::from("/workspace/two/labs"))
+        );
+        assert_eq!(
+            resolve_cd_in_worktrees("/workspace/one/labs", Unix, &roots),
+            Some(PathBuf::from("/workspace/one/labs"))
+        );
+        let single = &roots[..1];
+        assert_eq!(
+            resolve_cd_in_worktrees("labs", Unix, single),
+            Some(PathBuf::from("/workspace/one/labs"))
+        );
+        assert_eq!(resolve_cd_in_worktrees("../outside", Unix, single), None);
+        let windows = vec![("one", PathBuf::from(r"C:\workspace\one"))];
+        assert_eq!(
+            resolve_cd_in_worktrees("labs/tests", Windows, &windows),
+            Some(PathBuf::from(r"C:\workspace\one\labs\tests"))
+        );
+        assert_eq!(
+            resolve_cd_in_worktrees(r"..\outside", Windows, &windows),
+            None
+        );
+    }
 
     #[test]
     fn test_resolve_cd_uses_project_path_style() {
@@ -1460,6 +1568,24 @@ mod tests {
             resolve_cd_in_worktrees("./worktree", Unix, &unix_roots),
             Some(PathBuf::from("/a/worktree")),
             "a leading `./` is normalized away"
+        );
+
+        // paths relative to the only root of a single-root project
+        let single_root: Vec<(&str, PathBuf)> = vec![("Studio", PathBuf::from("/a/Studio"))];
+        assert_eq!(
+            resolve_cd_in_worktrees("labs", Unix, &single_root),
+            Some(PathBuf::from("/a/Studio/labs")),
+            "a path relative to the only root resolves like the file tools resolve it"
+        );
+        assert_eq!(
+            resolve_cd_in_worktrees("labs/../../escape", Unix, &single_root),
+            None,
+            "a path relative to the only root that escapes it via `..` is rejected"
+        );
+        assert_eq!(
+            resolve_cd_in_worktrees("labs", Unix, &unix_roots),
+            None,
+            "a path without a root name stays ambiguous in a multi-root project"
         );
 
         // Windows paths

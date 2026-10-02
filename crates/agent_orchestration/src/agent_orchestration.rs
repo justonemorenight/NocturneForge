@@ -69,7 +69,9 @@ pub use residency::{
     AgentResidencyConfig, AgentResidencyLease, AgentResidencyManager, AgentResidencyRecord,
     AgentResidencySnapshot, AgentResidencyState,
 };
-pub use runtime::{OrchestrationRuntime, RunHandle, RuntimeConfig, RuntimeLaunchDisposition};
+pub use runtime::{
+    AgentMessageReceipt, OrchestrationRuntime, RunHandle, RuntimeConfig, RuntimeLaunchDisposition,
+};
 pub use scheduler::{RuntimeControl, Scheduler, SchedulerConfig};
 pub use state::{RunState, TaskAttempt, TaskState, TaskStatus};
 pub use task_mutation::TaskMutationGateway;
@@ -244,6 +246,462 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct FollowUpExecutor {
+        executions: async_channel::Sender<(TaskId, Option<acp::SessionId>, String)>,
+        release: async_channel::Receiver<()>,
+    }
+
+    impl TaskExecutor for FollowUpExecutor {
+        fn execute(
+            &self,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            let executions = self.executions.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                executions
+                    .send((
+                        context.task.id.clone(),
+                        context.existing_session_id.clone(),
+                        context.task.description,
+                    ))
+                    .await?;
+                if context.task.id.as_str() != "fast" {
+                    release.recv().await?;
+                }
+                Ok(
+                    TaskExecutionOutput::new(format!("result {}", context.attempt))
+                        .with_session_id(acp::SessionId::new(format!(
+                            "session-{}",
+                            context.task.id
+                        )))
+                        .with_tokens_used(10),
+                )
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn completed_worker_follow_up_keeps_run_session_and_budget(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (executions, observed) = async_channel::bounded(8);
+        let (release, released) = async_channel::bounded(2);
+        let fast = OrchestrationTask::new("fast", "Fast", "original task");
+        let plan = OrchestrationPlan::new(
+            "Main objective",
+            vec![fast, OrchestrationTask::new("slow", "Slow", "wait")],
+        );
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) = OrchestrationRuntime::start(
+            plan,
+            policy,
+            Rc::new(FollowUpExecutor {
+                executions,
+                release: released,
+            }),
+            config,
+        )
+        .expect("start run");
+        cx.run_until_parked();
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("fast"))
+                .expect("fast status")
+                .state,
+            TaskState::Completed
+        );
+        handle.pause();
+        let run_id = handle.run_id().clone();
+        let goal_run_id = handle.goal_snapshot().run_id;
+        let recipient = handle
+            .resolve_message_recipient("fast")
+            .expect("resolve completed worker");
+        assert!(
+            handle
+                .send_agent_message(
+                    AgentPath::root(),
+                    recipient.clone(),
+                    AgentMessageKind::FollowUp,
+                    " ".into()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("fast"))
+                .expect("fast status")
+                .state,
+            TaskState::Completed
+        );
+        let (_, receipt) = handle
+            .send_agent_message_with_receipt(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::FollowUp,
+                "check the extra case".into(),
+            )
+            .await
+            .expect("resume completed worker");
+        assert_eq!(receipt, AgentMessageReceipt::ResumedCompletedAgent);
+        let projection = handle.activity_projection();
+        let pending = projection
+            .task_statuses
+            .iter()
+            .find(|status| status.task_id.as_str() == "fast")
+            .expect("projected worker");
+        assert_eq!(pending.state, TaskState::Pending);
+        assert_eq!(
+            pending.latest_output, None,
+            "old completion must not remain visible as the pending result"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            handle.state(),
+            RunState::Paused,
+            "follow-up must respect an explicit pause"
+        );
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("fast"))
+                .expect("paused worker")
+                .total_attempts,
+            1
+        );
+        handle.resume();
+        cx.run_until_parked();
+        let executions = std::iter::from_fn(|| observed.try_recv().ok()).collect::<Vec<_>>();
+        let fast_executions = executions
+            .iter()
+            .filter(|(task, _, _)| task.as_str() == "fast")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fast_executions.len(),
+            2,
+            "follow-up must start before the slow sibling completes"
+        );
+        let (_, session, description) = fast_executions.last().expect("follow-up execution");
+        assert_eq!(session.as_ref(), Some(&acp::SessionId::new("session-fast")));
+        assert_eq!(description.matches("check the extra case").count(), 1);
+        assert_eq!(handle.run_id(), &run_id);
+        assert_eq!(handle.goal_snapshot().run_id, goal_run_id);
+        let status = handle
+            .task_status(&TaskId::new("fast"))
+            .expect("fast status");
+        assert_eq!(status.state, TaskState::Completed);
+        assert_eq!(status.total_attempts, 2);
+        assert_eq!(status.total_tokens_used(), 20);
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox"),
+            0
+        );
+        release.send(()).await.expect("release sibling");
+        assert_eq!(
+            completion
+                .await
+                .expect("completion receiver")
+                .expect("complete"),
+            RunState::Completed
+        );
+    }
+
+    #[gpui::test]
+    async fn completed_worker_follow_up_rejects_consumed_dependencies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (executions, _observed) = async_channel::bounded(8);
+        let (release, released) = async_channel::bounded(2);
+        let fast = OrchestrationTask::new("fast", "Fast", "original task");
+        let dependent = OrchestrationTask::new("dependent", "Dependent", "consume fast result")
+            .with_depends_on(vec![fast.id.clone()]);
+        let plan = OrchestrationPlan::new("Main objective", vec![fast, dependent]);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) = OrchestrationRuntime::start(
+            plan,
+            policy,
+            Rc::new(FollowUpExecutor {
+                executions,
+                release: released,
+            }),
+            config,
+        )
+        .expect("start run");
+        cx.run_until_parked();
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("dependent"))
+                .expect("dependent status")
+                .state,
+            TaskState::Running
+        );
+        let recipient = handle
+            .resolve_message_recipient("fast")
+            .expect("completed worker");
+        let error = handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::FollowUp,
+                "change the result".into(),
+            )
+            .await
+            .expect_err("must protect dependent result");
+        assert!(
+            error
+                .to_string()
+                .contains("has already started using its result")
+        );
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("fast"))
+                .expect("fast status")
+                .state,
+            TaskState::Completed
+        );
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox"),
+            0
+        );
+        release.send(()).await.expect("release dependent");
+        assert_eq!(
+            completion
+                .await
+                .expect("completion receiver")
+                .expect("complete"),
+            RunState::Completed
+        );
+    }
+
+    struct VerificationMailboxExecutor {
+        verifying: async_channel::Sender<String>,
+        verify_release: async_channel::Receiver<()>,
+        repairing: async_channel::Sender<String>,
+        repair_release: async_channel::Receiver<()>,
+        active_messages: async_channel::Sender<(String, bool)>,
+    }
+
+    impl TaskExecutor for VerificationMailboxExecutor {
+        fn execute(
+            &self,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            context.reporter.report_worker_started(
+                Some(acp::SessionId::new("verification-session")),
+                WorkerMetadata::new(WorkerTarget::Native),
+            );
+            Box::pin(async {
+                Ok(TaskExecutionOutput::new("initial output")
+                    .with_session_id(acp::SessionId::new("verification-session"))
+                    .with_tokens_used(10))
+            })
+        }
+
+        fn verify(
+            &self,
+            _task: &OrchestrationTask,
+            output: &TaskExecutionOutput,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<VerificationResult>> {
+            let verifying = self.verifying.clone();
+            let release = self.verify_release.clone();
+            let output = output.output.clone();
+            Box::pin(async move {
+                verifying.send(output).await?;
+                release.recv().await?;
+                Ok(VerificationResult::pass())
+            })
+        }
+
+        fn repair(
+            &self,
+            _task: &OrchestrationTask,
+            feedback: &str,
+            context: TaskExecutionContext,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<TaskExecutionOutput>> {
+            let repairing = self.repairing.clone();
+            let release = self.repair_release.clone();
+            let feedback = feedback.to_string();
+            Box::pin(async move {
+                assert_eq!(
+                    context.existing_session_id,
+                    Some(acp::SessionId::new("verification-session"))
+                );
+                repairing.send(feedback.clone()).await?;
+                release.recv().await?;
+                Ok(TaskExecutionOutput::new(feedback)
+                    .with_session_id(acp::SessionId::new("verification-session"))
+                    .with_tokens_used(5))
+            })
+        }
+
+        fn deliver_message(
+            &self,
+            _task: &OrchestrationTask,
+            _session_id: acp::SessionId,
+            message: String,
+            interrupt: bool,
+        ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+            let messages = self.active_messages.clone();
+            Box::pin(async move {
+                messages.send((message, interrupt)).await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn verification_messages_are_consumed_before_completion(cx: &mut gpui::TestAppContext) {
+        let (verifying, verification_started) = async_channel::bounded(4);
+        let (verify_release, verify_released) = async_channel::bounded(4);
+        let (repairing, repair_started) = async_channel::bounded(4);
+        let (repair_release, repair_released) = async_channel::bounded(4);
+        let (active_messages, delivered) = async_channel::bounded(4);
+        let mut task = OrchestrationTask::new("worker", "Worker", "task");
+        task.acceptance_criteria = vec!["verified output".into()];
+        task.repair_on_failure = false;
+        task.max_repair_cycles = Some(0);
+        let policy = AgentExecutionPolicy {
+            strategy: AgentExecutionStrategy::Orchestrate,
+            autonomy: AgentAutonomy::Autonomous,
+        };
+        let mut config = RuntimeConfig::default();
+        config.foreground_executor = Some(cx.foreground_executor().clone());
+        config.scheduler.background_executor = Some(cx.background_executor.clone());
+        let (handle, completion) = OrchestrationRuntime::start(
+            OrchestrationPlan::new("Follow-ups", vec![task]),
+            policy,
+            Rc::new(VerificationMailboxExecutor {
+                verifying,
+                verify_release: verify_released,
+                repairing,
+                repair_release: repair_released,
+                active_messages,
+            }),
+            config,
+        )
+        .expect("start run");
+        cx.run_until_parked();
+        assert_eq!(
+            verification_started.try_recv().expect("first verify"),
+            "initial output"
+        );
+        let recipient = handle.resolve_message_recipient("worker").expect("worker");
+        for body in ["first follow-up", "second follow-up"] {
+            let (_, receipt) = handle
+                .send_agent_message_with_receipt(
+                    AgentPath::root(),
+                    recipient.clone(),
+                    AgentMessageKind::Message,
+                    body.into(),
+                )
+                .await
+                .expect("queue during verify");
+            assert_eq!(receipt, AgentMessageReceipt::QueuedInMailbox);
+        }
+        verify_release.send(()).await.expect("release verify");
+        cx.run_until_parked();
+        let feedback = repair_started.try_recv().expect("follow-up turn");
+        assert_eq!(feedback.matches("first follow-up").count(), 1);
+        assert_eq!(feedback.matches("second follow-up").count(), 1);
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("worker"))
+                .expect("worker status")
+                .state,
+            TaskState::Repairing
+        );
+        let (_, receipt) = handle
+            .send_agent_message_with_receipt(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::Message,
+                "message during repair".into(),
+            )
+            .await
+            .expect("deliver during repair");
+        assert_eq!(
+            receipt,
+            AgentMessageReceipt::DeliveredToActiveTurn { interrupt: false }
+        );
+        assert_eq!(
+            delivered.try_recv().expect("active delivery"),
+            ("message during repair".into(), false)
+        );
+        repair_release.send(()).await.expect("release repair");
+        cx.run_until_parked();
+        verification_started
+            .try_recv()
+            .expect("verify follow-up output");
+        assert_eq!(
+            handle
+                .task_status(&TaskId::new("worker"))
+                .expect("worker status")
+                .state,
+            TaskState::Verifying
+        );
+        handle
+            .send_agent_message(
+                AgentPath::root(),
+                recipient.clone(),
+                AgentMessageKind::FollowUp,
+                "third follow-up".into(),
+            )
+            .await
+            .expect("queue during re-verification");
+        verify_release
+            .send(())
+            .await
+            .expect("release second verify");
+        cx.run_until_parked();
+        let feedback = repair_started.try_recv().expect("second follow-up turn");
+        assert_eq!(feedback.matches("third follow-up").count(), 1);
+        assert!(!feedback.contains("first follow-up"));
+        repair_release
+            .send(())
+            .await
+            .expect("release second repair");
+        cx.run_until_parked();
+        verification_started.try_recv().expect("final verify");
+        verify_release.send(()).await.expect("release final verify");
+        assert_eq!(
+            completion
+                .await
+                .expect("completion receiver")
+                .expect("complete"),
+            RunState::Completed
+        );
+        let status = handle
+            .task_status(&TaskId::new("worker"))
+            .expect("worker status");
+        assert_eq!(status.total_attempts, 1);
+        assert_eq!(status.total_tokens_used(), 20);
+        assert_eq!(
+            handle
+                .agent_control_plane()
+                .mailbox_depth(&recipient)
+                .expect("mailbox"),
+            0
+        );
     }
 
     #[test]

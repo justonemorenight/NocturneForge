@@ -1277,15 +1277,37 @@ fn resolve_path(
             let parent_path = path
                 .parent()
                 .ok_or_else(|| "Can't create file: incorrect path".to_string())?;
+            if path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err("Can't create file: path must not contain `..`".to_string());
+            }
 
-            let parent_project_path = project.find_project_path(&parent_path, cx);
+            // Saving creates missing directories, so a new file only needs its
+            // nearest existing ancestor to be a project directory. Requiring the
+            // immediate parent made workers stop to run `mkdir` first.
+            let mut ancestor = parent_path;
+            let mut missing_directories = Vec::new();
+            let (ancestor_project_path, ancestor_entry) = loop {
+                if let Some(project_path) = project.find_project_path(ancestor, cx)
+                    && let Some(entry) = project.entry_for_path(&project_path, cx)
+                {
+                    break (project_path, entry);
+                }
+                let directory_name = ancestor
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        "Can't create file: parent directory is not in the project".to_string()
+                    })?;
+                missing_directories.push(directory_name);
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    "Can't create file: parent directory is not in the project".to_string()
+                })?;
+            };
 
-            let parent_entry = parent_project_path
-                .as_ref()
-                .and_then(|path| project.entry_for_path(path, cx))
-                .ok_or_else(|| "Can't create file: parent directory doesn't exist")?;
-
-            if !parent_entry.is_dir() {
+            if !ancestor_entry.is_dir() {
                 return Err("Can't create file: parent is not a directory".to_string());
             }
 
@@ -1295,12 +1317,16 @@ fn resolve_path(
                 .and_then(|file_name| RelPath::from_unix_str(file_name).ok())
                 .ok_or_else(|| "Can't create file: invalid filename".to_string())?;
 
-            let new_file_path = parent_project_path.map(|parent| ProjectPath {
-                path: parent.path.join(file_name).into(),
-                ..parent
-            });
-
-            new_file_path.ok_or_else(|| "Can't create file".to_string())
+            let mut new_file_path = ancestor_project_path.path.clone();
+            for directory_name in missing_directories.iter().rev() {
+                let directory = RelPath::from_unix_str(directory_name)
+                    .map_err(|_| "Can't create file: invalid directory name".to_string())?;
+                new_file_path = new_file_path.join(directory).into();
+            }
+            Ok(ProjectPath {
+                path: new_file_path.join(file_name).into(),
+                ..ancestor_project_path
+            })
         }
     }
 }

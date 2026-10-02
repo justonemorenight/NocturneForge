@@ -3,7 +3,7 @@ use crate::execution_limiter::{AgentExecutionLimiter, AgentExecutionLimiterConfi
 use crate::ids::{RunId, TaskId};
 use crate::plan_graph::OrchestrationPlan;
 use crate::worker::WorkerTarget;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use collections::HashMap;
 use parking_lot::{Mutex, RwLock};
@@ -648,6 +648,51 @@ impl AgentControlPlane {
         drop(state);
         self.emit(|run_id| RuntimeEvent::AgentUnregistered { run_id, path });
         true
+    }
+
+    pub fn reopen_task(&self, task_id: &TaskId) -> Result<()> {
+        let mut state = self.inner.state.write();
+        let path = state
+            .task_paths
+            .get(task_id)
+            .context("task has no agent identity")?
+            .clone();
+        let identity = state
+            .identities
+            .get(&path)
+            .context("agent identity is missing")?
+            .clone();
+        if self.is_open_locked(&state, &path) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            identity
+                .parent
+                .as_ref()
+                .is_some_and(|parent| self.is_open_locked(&state, parent)),
+            "cannot reopen an agent whose parent is closed"
+        );
+        anyhow::ensure!(
+            state
+                .edges
+                .values()
+                .filter(|edge| edge.state == AgentEdgeState::Open)
+                .count()
+                + 1
+                < self.inner.config.max_registered_agents,
+            "agent registry reached its limit of {} entries",
+            self.inner.config.max_registered_agents
+        );
+        let edge = state
+            .edges
+            .get_mut(&path)
+            .context("agent relationship is missing")?;
+        edge.state = AgentEdgeState::Open;
+        edge.closed_at = None;
+        edge.close_reason = None;
+        drop(state);
+        self.emit(|run_id| RuntimeEvent::AgentRegistered { run_id, identity });
+        Ok(())
     }
 
     fn is_open_locked(&self, state: &AgentControlPlaneState, path: &AgentPath) -> bool {

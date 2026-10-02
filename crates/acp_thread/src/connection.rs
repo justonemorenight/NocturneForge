@@ -803,9 +803,7 @@ mod test_support {
             *self.next_prompt_updates.lock() = updates;
         }
 
-        pub fn defer_next_prompt_response(
-            &self,
-        ) -> oneshot::Sender<Result<acp::PromptResponse>> {
+        pub fn defer_next_prompt_response(&self) -> oneshot::Sender<Result<acp::PromptResponse>> {
             let (sender, receiver) = oneshot::channel();
             assert!(self.next_prompt_response.lock().replace(receiver).is_none());
             sender

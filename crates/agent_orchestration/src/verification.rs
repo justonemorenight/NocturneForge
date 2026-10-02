@@ -599,25 +599,35 @@ struct VerificationAssessment {
     citations: Vec<String>,
     citations_valid: Option<bool>,
     scope_valid: bool,
+    scope_failure_details: Option<String>,
 }
 
 impl VerificationAssessment {
-    fn failure_feedback(&self) -> Option<&'static str> {
+    fn failure_feedback(&self) -> Option<String> {
         if self.criteria_verdicts.iter().any(|(_, passed)| !passed) {
-            Some("One or more acceptance criteria lack a passing claim with concrete evidence")
+            Some(
+                "One or more acceptance criteria lack a passing claim with concrete evidence"
+                    .to_string(),
+            )
         } else if !self.expected_output_valid {
-            Some("The expected output contract was not satisfied")
+            Some("The expected output contract was not satisfied".to_string())
         } else if self.citations_valid == Some(false) {
-            Some("Evidence required: provide valid file-and-line citations or source URLs")
+            Some(
+                "Evidence required: provide valid file-and-line citations or source URLs"
+                    .to_string(),
+            )
         } else if !self.scope_valid {
-            Some("Citations fall outside the task's declared scope")
+            Some(match &self.scope_failure_details {
+                Some(details) => format!("{SCOPE_FAILURE_FEEDBACK}. {details}"),
+                None => SCOPE_FAILURE_FEEDBACK.to_string(),
+            })
         } else {
             None
         }
     }
 
     fn into_result(self) -> VerificationResult {
-        let feedback = self.failure_feedback().map(String::from);
+        let feedback = self.failure_feedback();
         let passed = feedback.is_none();
         VerificationResult {
             passed,
@@ -712,6 +722,9 @@ impl VerificationRunner {
                     .all(|citation| is_file_line_citation(citation) || is_web_citation(citation))
         });
         let scope_valid = self.scope_citations_valid(task, &effective_citations);
+        let scope_failure_details = (!scope_valid)
+            .then(|| scope_failure_details(task, &effective_citations))
+            .flatten();
         let expected_output_satisfied = claim.expected_output_satisfied;
         let expected_output_valid =
             task.expected_output.is_none() || expected_output_satisfied == Some(true);
@@ -724,6 +737,7 @@ impl VerificationRunner {
             citations: persisted_citations,
             citations_valid,
             scope_valid,
+            scope_failure_details,
         }
     }
 
@@ -739,40 +753,219 @@ impl VerificationRunner {
         if citations.is_empty() {
             return true;
         }
+        let Some(matcher) = ScopeMatcher::new(scope) else {
+            return false;
+        };
+        citations
+            .iter()
+            .any(|citation| citation_path(citation).is_some_and(|path| matcher.contains(path)))
+    }
+}
+
+const SCOPE_FAILURE_FEEDBACK: &str = "Citations fall outside the task's declared scope";
+const MAX_SCOPE_FEEDBACK_PATHS: usize = 8;
+
+/// Explains a scope failure so a repair can fix the claim instead of redoing
+/// the task.
+fn scope_failure_details(task: &OrchestrationTask, citations: &[String]) -> Option<String> {
+    let scope = task.scope.as_deref()?;
+    let declared = scope_entries(scope)
+        .into_iter()
+        .take(MAX_SCOPE_FEEDBACK_PATHS)
+        .collect::<Vec<_>>();
+    let cited = citations
+        .iter()
+        .take(MAX_SCOPE_FEEDBACK_PATHS)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    Some(format!(
+        "Declared scope paths: {}. Cited: {}. If the work is already done inside the declared scope, do not redo it; re-emit the verification claim with citations written exactly as the declared scope paths.",
+        if declared.is_empty() {
+            "(none recognized)".to_string()
+        } else {
+            declared.join(", ")
+        },
+        if cited.is_empty() {
+            "(none)".to_string()
+        } else {
+            cited.join(", ")
+        },
+    ))
+}
+
+/// Splits a task scope into normalized path or glob entries.
+fn scope_entries(scope: &str) -> Vec<String> {
+    scope
+        // Task scopes are serialized by the orchestration UI as a
+        // semicolon-separated list. Accept all supported separators so a
+        // scope survives the round trip without becoming one invalid glob.
+        .split([',', '\n', ';'])
+        .flat_map(|entry| {
+            let entry = entry.trim();
+            if entry.split_whitespace().count() > 1 {
+                entry
+                    .split_whitespace()
+                    .filter(|part| part.contains('/') || part.contains(['*', '?']))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![entry]
+            }
+        })
+        .map(|entry| {
+            entry.trim_matches(|character: char| {
+                character.is_ascii_punctuation()
+                    && !matches!(
+                        character,
+                        '/' | '*' | '?' | '[' | ']' | '(' | ')' | '.' | '-' | '_'
+                    )
+            })
+        })
+        .map(normalize_scope_path)
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn normalize_scope_path(path: &str) -> String {
+    let path = path.trim().replace('\\', "/");
+    let is_absolute = path.starts_with('/');
+    let components = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>();
+    let joined = components.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+fn is_absolute_scope_path(path: &str) -> bool {
+    path.starts_with('/')
+        || (path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && path.as_bytes().get(1..3) == Some(b":/"))
+}
+
+fn is_glob_entry(entry: &str) -> bool {
+    entry.contains(['*', '?'])
+}
+
+fn is_literal_component(component: &str) -> bool {
+    !component.contains(['*', '?', '[', ']', '{', '}'])
+}
+
+/// Matches cited paths against a task's declared scope.
+///
+/// Workers cite paths relative to whatever they treat as the root: the
+/// worktree (`Studio/labs/src/x.ts`), its contents (`labs/src/x.ts`), a nested
+/// repository (`src/x.ts`), or the filesystem. A relative citation that is not
+/// a direct match is accepted when it equals the tail of entries that all
+/// identify one scope entry, so a tail present under different declared paths
+/// stays ambiguous. Absolute citations must match an absolute scope entry;
+/// the verifier has no project root with which to resolve relative scopes.
+/// Tails keep at least two components and start with a literal component, so
+/// `src/**/*.rs` never degrades into `**/*.rs`.
+struct ScopeMatcher {
+    entries: Vec<ScopeEntryMatcher>,
+}
+
+struct ScopeEntryMatcher {
+    declared_path: String,
+    full: globset::GlobSet,
+    tails: Option<globset::GlobSet>,
+}
+
+impl ScopeMatcher {
+    fn new(scope: &str) -> Option<Self> {
+        let entries = scope_entries(scope)
+            .iter()
+            .filter_map(|entry| ScopeEntryMatcher::new(entry))
+            .collect::<Vec<_>>();
+        (!entries.is_empty()).then_some(Self { entries })
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        let path = normalize_scope_path(path);
+        if path.is_empty() {
+            return false;
+        }
+        let is_absolute = is_absolute_scope_path(&path);
+        if self.entries.iter().any(|entry| {
+            is_absolute_scope_path(&entry.declared_path) == is_absolute
+                && entry.full.is_match(&path)
+        }) {
+            return true;
+        }
+
+        if is_absolute {
+            return false;
+        }
+
+        let mut matched_paths = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .tails
+                    .as_ref()
+                    .is_some_and(|tails| tails.is_match(&path))
+            })
+            .map(|entry| entry.declared_path.as_str());
+        matched_paths
+            .next()
+            .is_some_and(|path| matched_paths.all(|other| other == path))
+    }
+}
+
+impl ScopeEntryMatcher {
+    fn new(entry: &str) -> Option<Self> {
+        let is_glob = is_glob_entry(entry);
+        let components = entry.trim_start_matches('/').split('/').collect::<Vec<_>>();
+
+        let full = Self::glob_set(std::iter::once(entry), is_glob)?;
+        let literal_prefix_len = if is_glob {
+            components
+                .iter()
+                .take_while(|component| is_literal_component(component))
+                .count()
+        } else {
+            components.len()
+        };
+        let tail_patterns = (1..components.len())
+            .filter(|start| {
+                *start <= literal_prefix_len
+                    && components.len() - start >= 2
+                    && (!is_glob || is_literal_component(components[*start]))
+            })
+            .map(|start| components[start..].join("/"))
+            .collect::<Vec<_>>();
+        let tails = Self::glob_set(tail_patterns.iter().map(String::as_str), is_glob);
+
+        Some(Self {
+            declared_path: entry.to_string(),
+            full,
+            tails,
+        })
+    }
+
+    /// Literal entries are escaped so path characters like `[id]` or
+    /// `(group)` in framework route directories are not read as glob syntax,
+    /// and they also match their descendants.
+    fn glob_set<'a>(
+        patterns: impl Iterator<Item = &'a str>,
+        is_glob: bool,
+    ) -> Option<globset::GlobSet> {
         let mut builder = GlobSetBuilder::new();
         let mut pattern_count = 0;
-        for pattern in scope
-            // Task scopes are serialized by the orchestration UI as a
-            // semicolon-separated list. Accept all supported separators so a
-            // scope survives the round trip without becoming one invalid glob.
-            .split([',', '\n', ';'])
-            .flat_map(|entry| {
-                let entry = entry.trim();
-                if entry.split_whitespace().count() > 1 {
-                    entry
-                        .split_whitespace()
-                        .filter(|part| part.contains('/') || part.contains(['*', '?']))
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![entry]
-                }
-            })
-            .map(|pattern| {
-                pattern.trim_matches(|character: char| {
-                    character.is_ascii_punctuation()
-                        && !matches!(character, '/' | '*' | '?' | '[' | ']' | '.' | '-' | '_')
-                })
-            })
-            .filter(|pattern| !pattern.is_empty())
-        {
-            let patterns = if pattern.contains(['*', '?', '[', ']']) {
+        for pattern in patterns {
+            let variants = if is_glob {
                 vec![pattern.to_string()]
             } else {
-                let normalized = pattern.trim_end_matches('/');
-                vec![normalized.to_string(), format!("{normalized}/**")]
+                let escaped = globset::escape(pattern);
+                vec![escaped.clone(), format!("{escaped}/**")]
             };
-            for pattern in patterns {
-                let Ok(glob) = globset::Glob::new(&pattern) else {
+            for variant in variants {
+                let Ok(glob) = globset::Glob::new(&variant) else {
                     continue;
                 };
                 builder.add(glob);
@@ -780,14 +973,9 @@ impl VerificationRunner {
             }
         }
         if pattern_count == 0 {
-            return false;
+            return None;
         }
-        let Ok(glob_set) = builder.build() else {
-            return false;
-        };
-        citations
-            .iter()
-            .any(|citation| citation_path(citation).is_some_and(|path| glob_set.is_match(path)))
+        builder.build().ok()
     }
 }
 
@@ -971,10 +1159,115 @@ mod tests {
         let result = runner.verify(&task, &output);
 
         assert!(!result.passed);
-        assert_eq!(
-            result.feedback.as_deref(),
-            Some("Citations fall outside the task's declared scope")
+        assert!(
+            result
+                .feedback
+                .as_deref()
+                .is_some_and(|feedback| feedback.starts_with(SCOPE_FAILURE_FEEDBACK)
+                    && feedback.contains("Declared scope paths: src/**"))
         );
+    }
+
+    #[test]
+    fn scope_accepts_citations_relative_to_nested_roots() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope = Some(
+            "Studio/labs/apps/web/src/lib/voice/voice-client.ts,Studio/labs/apps/web/src/lib/voice/voice-state.ts"
+                .to_string(),
+        );
+
+        for citation in [
+            "Studio/labs/apps/web/src/lib/voice/voice-state.ts:17",
+            "./Studio/labs/apps/web/src/lib/voice/voice-state.ts:17",
+            "labs/apps/web/src/lib/voice/voice-state.ts:17",
+            "apps/web/src/lib/voice/voice-client.ts:12",
+        ] {
+            let output = claim_json("", &format!("\"{citation}\""));
+            assert!(runner.verify(&task, &output).passed, "{citation}");
+        }
+
+        let mut absolute_task = task.clone();
+        absolute_task.scope = Some("/Users/someone/Desktop/Studio/labs/src".to_string());
+        let output = claim_json("", r#""/Users/someone/Desktop/Studio/labs/src/main.ts:4""#);
+        assert!(runner.verify(&absolute_task, &output).passed);
+
+        for citation in [
+            "voice-client.ts:12",
+            "apps/web/src/lib/voice/other.ts:1",
+            "/Users/someone/Desktop/Other/apps/web/src/lib/other.ts:3",
+            "/Users/someone/Desktop/Studio/labs/apps/web/src/lib/voice/voice-client.ts:3",
+        ] {
+            let output = claim_json("", &format!("\"{citation}\""));
+            assert!(!runner.verify(&task, &output).passed, "{citation}");
+        }
+    }
+
+    #[test]
+    fn scope_tail_shared_by_two_roots_is_ambiguous() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope = Some("first/apps/web/main.ts,second/apps/web/main.ts".to_string());
+
+        let ambiguous = claim_json("", r#""apps/web/main.ts:1""#);
+        assert!(!runner.verify(&task, &ambiguous).passed);
+
+        let anchored = claim_json("", r#""second/apps/web/main.ts:1""#);
+        assert!(runner.verify(&task, &anchored).passed);
+    }
+
+    #[test]
+    fn scope_rejects_absolute_citations_from_other_checkouts() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        for scope in [
+            "Studio/labs/src/main.rs",
+            "**/*.rs",
+            "/Users/someone/Desktop/Studio/labs/src/main.rs",
+        ] {
+            task.scope = Some(scope.to_string());
+            let output = claim_json("", r#""/tmp/another-checkout/Studio/labs/src/main.rs:10""#);
+            assert!(!runner.verify(&task, &output).passed, "{scope}");
+        }
+
+        task.scope = Some("Studio/labs/src/main.rs".to_string());
+        let output = claim_json("", r#""C:/another-checkout/Studio/labs/src/main.rs:10""#);
+        assert!(!runner.verify(&task, &output).passed);
+
+        task.scope = Some("C:/allowed/Studio/labs/src/main.rs".to_string());
+        let output = claim_json("", r#""C:/allowed/Studio/labs/src/main.rs:10""#);
+        assert!(runner.verify(&task, &output).passed);
+    }
+
+    #[test]
+    fn scope_tail_shared_by_nested_repositories_is_ambiguous() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope =
+            Some("Studio/first/apps/web/main.ts;Studio/second/apps/web/main.ts".to_string());
+        let ambiguous = claim_json("", r#""apps/web/main.ts:1""#);
+        assert!(!runner.verify(&task, &ambiguous).passed);
+        let anchored = claim_json("", r#""second/apps/web/main.ts:1""#);
+        assert!(runner.verify(&task, &anchored).passed);
+    }
+
+    #[test]
+    fn literal_scope_paths_keep_route_brackets_and_groups() {
+        let runner = VerificationRunner;
+        let mut task = task_with_criteria(&[]);
+        task.evidence_required = true;
+        task.scope =
+            Some("Studio/labs/apps/web/src/app/(studio)/projects/[projectId]/page.tsx".to_string());
+
+        let output = claim_json(
+            "",
+            r#""Studio/labs/apps/web/src/app/(studio)/projects/[projectId]/page.tsx:20""#,
+        );
+        assert!(runner.verify(&task, &output).passed);
     }
 
     #[test]

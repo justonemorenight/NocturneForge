@@ -216,6 +216,11 @@ pub struct TaskStatus {
     pub total_attempts: u32,
     #[serde(default)]
     pub tokens_used: u64,
+    /// Tokens spent so far by the executor call still in progress. Settled
+    /// usage only lands in `tokens_used` and `budget_state` when the call
+    /// returns, which left long-running workers reporting zero.
+    #[serde(default)]
+    pub in_flight_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_session_id: Option<acp::SessionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +254,14 @@ pub struct TaskStatus {
 }
 
 impl TaskStatus {
+    // Repairs settle into the budget before the attempt settles into
+    // `tokens_used`; both counters cover overlapping usage.
+    pub fn total_tokens_used(&self) -> u64 {
+        self.tokens_used
+            .max(self.budget_state.tokens_used)
+            .saturating_add(self.in_flight_tokens)
+    }
+
     pub fn new(task_id: TaskId) -> Self {
         Self {
             task_id,
@@ -256,6 +269,7 @@ impl TaskStatus {
             current_attempt: 0,
             total_attempts: 0,
             tokens_used: 0,
+            in_flight_tokens: 0,
             active_session_id: None,
             latest_output: None,
             latest_error: None,

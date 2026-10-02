@@ -4536,7 +4536,7 @@ impl ThreadView {
                         item.objective = task.objective.clone().map(SharedString::from);
                         item.current_tool = current_tool;
                         item.last_intent = wait_reason.or_else(|| item.last_intent.clone());
-                        item.tokens = Some(status.tokens_used)
+                        item.tokens = Some(status.total_tokens_used())
                             .filter(|tokens| *tokens > 0)
                             .or(item.tokens);
                         item.worktree_path = worktree_path;
@@ -4570,7 +4570,7 @@ impl ThreadView {
                         last_intent: wait_reason,
                         tool_count: None,
                         requests: None,
-                        tokens: Some(status.tokens_used).filter(|tokens| *tokens > 0),
+                        tokens: Some(status.total_tokens_used()).filter(|tokens| *tokens > 0),
                         worker,
                         mode,
                         scope: task.scope.clone().map(SharedString::from),
@@ -7393,9 +7393,7 @@ impl ThreadView {
                                 )
                             }),
                     )
-                    .child(
-                        self.render_message_editor_toolbar(window, cx),
-                    ),
+                    .child(self.render_message_editor_toolbar(window, cx)),
             )
             .into_any()
     }
@@ -10760,9 +10758,9 @@ impl ThreadView {
         let last_turn_tokens_label = last_turn_clock
             .is_some()
             .then(|| {
-                self.turn_fields
-                    .last_turn_tokens
-                    .map(|tokens| completion_stats.map_or(tokens, |stats| stats.output_tokens))
+                completion_stats
+                    .map(|stats| stats.output_tokens)
+                    .or(self.turn_fields.last_turn_tokens)
                     .filter(|&tokens| tokens > TOKEN_THRESHOLD)
                     .map(|tokens| {
                         Label::new(format!("{} tokens", crate::humanize_token_count(tokens)))
@@ -10877,30 +10875,46 @@ impl ThreadView {
             .into_any_element()
     }
 
-    fn completed_turn_stats(&self, cx: &App) -> Option<agent::TurnCompletionStats> {
+    fn completed_turn_stats(&self, cx: &App) -> Option<acp_thread::AcpTurnCompletionStats> {
         self.turn_fields.last_turn_duration?;
-        let stats = self.as_native_thread(cx)?.read(cx).turn_completion_stats();
-        stats.tokens_per_second()?;
-        Some(stats)
+        if let Some(thread) = self.as_native_thread(cx) {
+            let stats = thread.read(cx).turn_completion_stats();
+            stats.tokens_per_second()?;
+            Some(acp_thread::AcpTurnCompletionStats {
+                output_tokens: stats.output_tokens,
+                output_duration: stats.output_duration,
+                first_output_latency: stats.first_output_latency,
+                request_count: Some(stats.request_count),
+            })
+        } else {
+            self.thread.read(cx).turn_completion_stats()
+        }
     }
 
-    fn render_completion_rate(stats: agent::TurnCompletionStats) -> Option<impl IntoElement> {
+    fn render_completion_rate(
+        stats: acp_thread::AcpTurnCompletionStats,
+    ) -> Option<impl IntoElement> {
         let rate = stats.tokens_per_second()?;
         let mut tooltip = format!(
             concat!(
-                "Client-measured output rate, including request latency\n",
-                "{} output tokens / {:.2}s across {} model requests\n",
-                "Uses provider-reported output tokens, which may include reasoning and tool arguments.\n",
-                "Excludes time between requests, such as tool execution and approval waits.\n",
-                "Tool execution overlapping a model stream remains included.",
+                "Client-measured output rate\n",
+                "{} output tokens / {:.2}s from first to last output\n",
+                "Uses reported output tokens, which may include reasoning and tool arguments.\n",
+                "Excludes the wait before the first output; reasoning generation remains included.",
             ),
             stats.output_tokens,
-            stats.request_duration.as_secs_f64(),
-            stats.request_count,
+            stats.output_duration.as_secs_f64(),
         );
-        if let Some(latency) = stats.first_text_latency {
+        if let Some(count) = stats.request_count {
             tooltip.push_str(&format!(
-                "\nFirst text-producing request: {:.2}s to first text",
+                "\nSummed across {count} model requests; excludes waits between requests.\nTool execution overlapping output remains included."
+            ));
+        } else {
+            tooltip.push_str("\nACP turn rate: request boundaries are unavailable, so tool, approval and later request waits remain included.");
+        }
+        if let Some(latency) = stats.first_output_latency {
+            tooltip.push_str(&format!(
+                "\n{:.2}s to first output (including reasoning or tool arguments)",
                 latency.as_secs_f64(),
             ));
         }

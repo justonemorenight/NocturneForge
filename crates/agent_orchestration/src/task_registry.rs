@@ -178,6 +178,23 @@ impl TaskRegistry {
         true
     }
 
+    pub fn restart_completed_task(&self, task_id: &TaskId) -> bool {
+        let mut statuses = self.statuses.write();
+        let Some(status) = statuses.get_mut(task_id) else {
+            return false;
+        };
+        if status.state != TaskState::Completed {
+            return false;
+        }
+        Self::update_lifecycle(status, TaskState::Pending);
+        status.latest_output = None;
+        status.latest_verification = None;
+        status.latest_error = None;
+        status.wait_reason = None;
+        status.updated_at = Utc::now();
+        true
+    }
+
     fn replace_active_session(&self, status: &mut TaskStatus, session_id: Option<acp::SessionId>) {
         let mut tasks_by_session = self.tasks_by_session.write();
         if let Some(previous_session_id) = status.active_session_id.take() {
@@ -242,6 +259,7 @@ impl TaskRegistry {
             if let Some(tokens) = tokens_used {
                 status.tokens_used += tokens;
             }
+            status.in_flight_tokens = 0;
             status.latest_output = output;
             status.latest_verification = verification.clone();
             status.updated_at = Utc::now();
@@ -322,6 +340,7 @@ impl TaskRegistry {
 
         if let Some(status) = statuses.get_mut(task_id) {
             status.tokens_used = status.tokens_used.saturating_add(usage.tokens_used);
+            status.in_flight_tokens = 0;
             status.budget_state.tokens_used = status
                 .budget_state
                 .tokens_used
@@ -348,12 +367,23 @@ impl TaskRegistry {
     pub fn update_budget_usage(&self, task_id: &TaskId, tokens_used: u64, tool_calls: u64) {
         let mut statuses = self.statuses.write();
         if let Some(status) = statuses.get_mut(task_id) {
+            status.in_flight_tokens = 0;
             status.budget_state.tokens_used =
                 status.budget_state.tokens_used.saturating_add(tokens_used);
             status.budget_state.tool_calls_used = status
                 .budget_state
                 .tool_calls_used
                 .saturating_add(tool_calls);
+            status.updated_at = Utc::now();
+        }
+    }
+
+    /// Records usage of the executor call still in progress. It is replaced,
+    /// not accumulated, and cleared once the call's usage is settled.
+    pub fn set_in_flight_tokens(&self, task_id: &TaskId, tokens: u64) {
+        let mut statuses = self.statuses.write();
+        if let Some(status) = statuses.get_mut(task_id) {
+            status.in_flight_tokens = tokens;
             status.updated_at = Utc::now();
         }
     }

@@ -1248,8 +1248,21 @@ impl ToolCall {
             self.locations = locations;
         }
 
-        if let Some(raw_input) = raw_input {
-            self.raw_input_markdown = markdown_for_raw_output(&raw_input, &language_registry, cx);
+        if let Some(raw_input) = raw_input
+            && self.raw_input.as_ref() != Some(&raw_input)
+        {
+            match (
+                self.raw_input_markdown.as_ref(),
+                raw_output_text(&raw_input),
+            ) {
+                (Some(markdown), Some(text)) => update_markdown_in_place(markdown, &text, cx),
+                (_, Some(text)) => {
+                    self.raw_input_markdown = Some(cx.new(|cx| {
+                        Markdown::new(text.into(), Some(language_registry.clone()), None, cx)
+                    }));
+                }
+                (_, None) => self.raw_input_markdown = None,
+            }
             self.raw_input = Some(raw_input);
         }
 
@@ -2552,11 +2565,13 @@ impl ToolCallContent {
 
         let needs_update = match (&self, &new) {
             (Self::Diff(old_diff), acp::ToolCallContent::Diff(new_diff)) => {
-                old_diff.read(cx).needs_update(
-                    new_diff.old_text.as_deref().unwrap_or(""),
-                    &new_diff.new_text,
-                    cx,
-                )
+                let old_diff = old_diff.read(cx);
+                old_diff.file_path(cx).as_deref() != Some(new_diff.path.to_string_lossy().as_ref())
+                    || old_diff.needs_update(
+                        new_diff.old_text.as_deref().unwrap_or(""),
+                        &new_diff.new_text,
+                        cx,
+                    )
             }
             _ => true,
         };
@@ -2815,12 +2830,208 @@ pub fn refusal_fallback_model_from_meta(meta: &Option<acp::Meta>) -> Option<Shar
         .map(|s| SharedString::from(s.to_owned()))
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AcpTurnCompletionStats {
+    pub output_tokens: u64,
+    pub output_duration: Duration,
+    pub first_output_latency: Option<Duration>,
+    pub request_count: Option<u32>,
+}
+
+impl AcpTurnCompletionStats {
+    pub fn tokens_per_second(&self) -> Option<f64> {
+        (self.output_tokens > 1 && self.output_duration >= Duration::from_millis(250))
+            .then(|| self.output_tokens as f64 / self.output_duration.as_secs_f64())
+    }
+}
+
+#[derive(Default)]
+struct OutputTiming {
+    first: Option<Duration>,
+    last: Option<Duration>,
+}
+
+impl OutputTiming {
+    fn observe(&mut self, elapsed: Duration) {
+        self.first.get_or_insert(elapsed);
+        self.last = Some(elapsed);
+    }
+
+    fn duration(&self) -> Option<Duration> {
+        Some(self.last?.saturating_sub(self.first?))
+    }
+}
+
+#[derive(Default)]
+struct ClaudeCompletionRequest {
+    timing: OutputTiming,
+    output_tokens: Option<u64>,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct AcpCompletionTracker {
+    started_at: Option<Instant>,
+    timing: OutputTiming,
+    claude_requests: HashMap<String, ClaudeCompletionRequest>,
+    claude_message_id: Option<String>,
+}
+
+impl AcpCompletionTracker {
+    fn observe_update(&mut self, update: &acp::SessionUpdate, elapsed: Duration) {
+        let meta = match update {
+            acp::SessionUpdate::AgentMessageChunk(chunk)
+            | acp::SessionUpdate::AgentThoughtChunk(chunk) => &chunk.meta,
+            acp::SessionUpdate::ToolCall(tool) => &tool.meta,
+            acp::SessionUpdate::ToolCallUpdate(tool) => &tool.meta,
+            _ => return,
+        };
+        if meta
+            .as_ref()
+            .and_then(|meta| meta.get("claudeCode"))
+            .and_then(|meta| meta.get("parentToolUseId"))
+            .is_some_and(|value| !value.is_null())
+        {
+            return;
+        }
+        let has_output = match update {
+            acp::SessionUpdate::AgentMessageChunk(chunk)
+            | acp::SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+                acp::ContentBlock::Text(text) => !text.text.is_empty(),
+                _ => true,
+            },
+            acp::SessionUpdate::ToolCall(tool) => !tool.title.is_empty(),
+            acp::SessionUpdate::ToolCallUpdate(tool) => tool
+                .fields
+                .raw_input
+                .as_ref()
+                .is_some_and(|input| !input.is_null()),
+            _ => false,
+        };
+        if has_output {
+            self.timing.observe(elapsed);
+        }
+    }
+
+    fn observe_claude_message(&mut self, message: &serde_json::Value, elapsed: Duration) {
+        // Subagent output is absent from the main-loop usage returned by session/prompt.
+        if message.get("type").and_then(|value| value.as_str()) != Some("stream_event")
+            || message
+                .get("parent_tool_use_id")
+                .is_some_and(|value| !value.is_null())
+        {
+            return;
+        }
+        let Some(event) = message.get("event") else {
+            return;
+        };
+        match event.get("type").and_then(|value| value.as_str()) {
+            Some("message_start") => {
+                self.claude_message_id = event
+                    .pointer("/message/id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned);
+                if let Some(id) = &self.claude_message_id {
+                    let request = self.claude_requests.entry(id.clone()).or_default();
+                    request.output_tokens = event
+                        .pointer("/message/usage/output_tokens")
+                        .and_then(|value| value.as_u64());
+                }
+            }
+            Some("message_delta") => {
+                if let Some(request) = self
+                    .claude_message_id
+                    .as_ref()
+                    .and_then(|id| self.claude_requests.get_mut(id))
+                    && let Some(tokens) = event
+                        .pointer("/usage/output_tokens")
+                        .and_then(|value| value.as_u64())
+                {
+                    request.output_tokens = Some(request.output_tokens.unwrap_or(0).max(tokens));
+                }
+            }
+            Some("message_stop") => {
+                if let Some(id) = self.claude_message_id.take()
+                    && let Some(request) = self.claude_requests.get_mut(&id)
+                {
+                    request.finished = true;
+                }
+            }
+            Some("content_block_start" | "content_block_delta") => {
+                let content = event.get("delta").or_else(|| event.get("content_block"));
+                let has_output = content.is_some_and(|content| {
+                    ["text", "thinking", "partial_json", "name", "data"]
+                        .iter()
+                        .any(|key| {
+                            content
+                                .get(key)
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|value| !value.is_empty())
+                        })
+                });
+                if has_output {
+                    if let Some(request) = self
+                        .claude_message_id
+                        .as_ref()
+                        .and_then(|id| self.claude_requests.get_mut(id))
+                    {
+                        request.timing.observe(elapsed);
+                    }
+                    self.timing.observe(elapsed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&self, output_tokens: u64) -> Option<AcpTurnCompletionStats> {
+        let mut stats = AcpTurnCompletionStats {
+            output_tokens,
+            output_duration: self.timing.duration()?,
+            first_output_latency: self.timing.first,
+            request_count: None,
+        };
+        let requests = self
+            .claude_requests
+            .values()
+            .map(|request| {
+                request.finished.then_some(())?;
+                let tokens = request.output_tokens?;
+                let duration = if tokens == 0 {
+                    Duration::ZERO
+                } else {
+                    request.timing.duration()?
+                };
+                Some((tokens, duration))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(requests) = requests.filter(|requests| !requests.is_empty()) {
+            let (tokens, duration) =
+                requests
+                    .iter()
+                    .fold((0_u64, Duration::ZERO), |(tokens, duration), request| {
+                        (
+                            tokens.saturating_add(request.0),
+                            duration.saturating_add(request.1),
+                        )
+                    });
+            // A partial stream must not pair whole-turn usage with only some requests' timing.
+            if tokens == output_tokens {
+                stats.output_duration = duration;
+                stats.request_count = u32::try_from(requests.len()).ok();
+            }
+        }
+        Some(stats)
+    }
+}
+
 struct RunningTurn {
     id: u32,
     send_task: Task<()>,
     settled: oneshot::Receiver<()>,
     activity_generation: u64,
     saw_activity: bool,
+    completion: AcpCompletionTracker,
 }
 
 #[derive(Default)]
@@ -3104,6 +3315,7 @@ pub struct AcpThread {
     claude_review_task: Option<Task<Result<()>>>,
     claude_reviewed_tool_calls: HashSet<acp::ToolCallId>,
     token_usage: Option<TokenUsage>,
+    turn_completion_stats: Option<AcpTurnCompletionStats>,
     cost: Option<SessionCost>,
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
@@ -3379,6 +3591,7 @@ impl AcpThread {
             claude_reviewed_tool_calls: HashSet::default(),
             session_id,
             token_usage: None,
+            turn_completion_stats: None,
             cost: None,
             prompt_capabilities,
             available_commands: Vec::new(),
@@ -3628,6 +3841,24 @@ impl AcpThread {
         self.token_usage.as_ref()
     }
 
+    pub fn turn_completion_stats(&self) -> Option<AcpTurnCompletionStats> {
+        self.turn_completion_stats
+    }
+
+    pub fn observe_claude_completion_message(&mut self, message: &serde_json::Value, cx: &App) {
+        if self.connection.agent_id().as_ref() != CLAUDE_ACP_AGENT_ID {
+            return;
+        }
+        if let Some(turn) = self.running_turn.as_mut()
+            && let Some(started_at) = turn.completion.started_at
+        {
+            turn.completion.observe_claude_message(
+                message,
+                cx.background_executor().now().duration_since(started_at),
+            );
+        }
+    }
+
     pub fn cost(&self) -> Option<&SessionCost> {
         self.cost.as_ref()
     }
@@ -3719,6 +3950,12 @@ impl AcpThread {
         if let Some(turn) = self.running_turn.as_mut() {
             turn.activity_generation = turn.activity_generation.wrapping_add(1);
             turn.saw_activity = true;
+            if let Some(started_at) = turn.completion.started_at {
+                turn.completion.observe_update(
+                    &update,
+                    cx.background_executor().now().duration_since(started_at),
+                );
+            }
         }
 
         match update {
@@ -5663,6 +5900,7 @@ impl AcpThread {
             .as_ref()
             .map(|client_user_message_ids| client_user_message_ids.new_id());
         let request_id_to_clear = agent_file_change_report_request_id.clone();
+        let prompt_turn_id = self.turn_id + 1;
 
         self.run_turn(cx, async move |this, cx| {
             if capture_claude_review {
@@ -5717,6 +5955,13 @@ impl AcpThread {
 
             let prompt_task = this.update(cx, |this, cx| {
                 this.agent_file_change_report_request_id = agent_file_change_report_request_id;
+                if let Some(turn) = this
+                    .running_turn
+                    .as_mut()
+                    .filter(|turn| turn.id == prompt_turn_id)
+                {
+                    turn.completion.started_at = Some(cx.background_executor().now());
+                }
                 if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
                     prompt.prompt(client_id, request, cx)
                 } else {
@@ -5753,8 +5998,16 @@ impl AcpThread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        let prompt_turn_id = self.turn_id + 1;
         self.run_turn(cx, async move |this, cx| {
             this.update(cx, |this, cx| {
+                if let Some(turn) = this
+                    .running_turn
+                    .as_mut()
+                    .filter(|turn| turn.id == prompt_turn_id)
+                {
+                    turn.completion.started_at = Some(cx.background_executor().now());
+                }
                 this.connection
                     .retry(&this.session_id, cx)
                     .map(|retry| retry.run(cx))
@@ -5806,6 +6059,7 @@ impl AcpThread {
         };
 
         self.turn_id += 1;
+        self.turn_completion_stats = None;
         let turn_id = self.turn_id;
         let cancellation_generation = self.turn_cancellation_generation;
         let guard_cancellation_generation = defer_until_background_subagents_finish;
@@ -5842,6 +6096,7 @@ impl AcpThread {
             settled: settled_rx,
             activity_generation: 0,
             saw_activity: false,
+            completion: AcpCompletionTracker::default(),
         });
         self.start_claude_stalled_turn_watchdog(turn_id, cx);
         cx.emit(AcpThreadEvent::StatusChanged);
@@ -5870,6 +6125,14 @@ impl AcpThread {
                     // dropped-tx guard below so the panel exits its generating
                     // state even when the send_task is cancelled before tx.send().
                     if is_same_turn {
+                        if let Ok(Ok(response)) = &response
+                            && response.stop_reason != acp::StopReason::Cancelled
+                            && let Some(usage) = &response.usage
+                            && let Some(turn) = &this.running_turn
+                        {
+                            this.turn_completion_stats =
+                                turn.completion.finish(usage.output_tokens);
+                        }
                         this.running_turn.take();
                     }
 
@@ -7023,6 +7286,193 @@ mod tests {
     use util::{path, path_list::PathList};
 
     #[test]
+    fn completion_rate_claude_excludes_request_and_tool_waits() {
+        let mut tracker = AcpCompletionTracker::default();
+        let mut observe = |event, seconds| {
+            tracker.observe_claude_message(
+                &json!({
+                    "type": "stream_event", "parent_tool_use_id": null, "event": event,
+                }),
+                Duration::from_secs(seconds),
+            );
+        };
+        observe(
+            json!({"type": "message_start", "message": {"id": "one", "usage": {"output_tokens": 0}}}),
+            1,
+        );
+        observe(
+            json!({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "reasoning"}}),
+            5,
+        );
+        observe(
+            json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "answer"}}),
+            15,
+        );
+        for tokens in [50, 100, 100, 75] {
+            observe(
+                json!({"type": "message_delta", "usage": {"output_tokens": tokens}}),
+                16,
+            );
+        }
+        observe(json!({"type": "message_stop"}), 20);
+        observe(
+            json!({"type": "message_start", "message": {"id": "two", "usage": {"output_tokens": 0}}}),
+            55,
+        );
+        observe(
+            json!({"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Read"}}),
+            60,
+        );
+        observe(
+            json!({"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            70,
+        );
+        observe(
+            json!({"type": "message_delta", "usage": {"output_tokens": 200}}),
+            75,
+        );
+        observe(json!({"type": "message_stop"}), 80);
+        tracker.observe_claude_message(
+            &json!({
+                "type": "stream_event", "parent_tool_use_id": "Task",
+                "event": {"type": "content_block_delta", "delta": {"text": "subagent"}},
+            }),
+            Duration::from_secs(100),
+        );
+        let stats = tracker.finish(300).expect("usage and output timing");
+        assert_eq!(stats.request_count, Some(2));
+        assert_eq!(stats.output_duration, Duration::from_secs(20));
+        assert_eq!(stats.first_output_latency, Some(Duration::from_secs(5)));
+        assert_eq!(stats.tokens_per_second(), Some(15.0));
+
+        let stats = tracker.finish(350).expect("whole turn fallback");
+        assert_eq!(
+            stats.request_count, None,
+            "partial usage cannot masquerade as measured model requests"
+        );
+        assert_eq!(stats.output_duration, Duration::from_secs(65));
+    }
+
+    #[test]
+    fn completion_rate_acp_ignores_empty_chunks_and_tool_results() {
+        let mut tracker = AcpCompletionTracker::default();
+        let text = |text: &str| {
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::Text(
+                acp::TextContent::new(text),
+            )))
+        };
+        tracker.observe_update(&text(""), Duration::from_secs(1));
+        assert!(tracker.finish(100).is_none());
+        tracker.observe_update(&text("first"), Duration::from_secs(5));
+        assert!(
+            tracker
+                .finish(100)
+                .expect("one chunk")
+                .tokens_per_second()
+                .is_none()
+        );
+        tracker.observe_update(&text("last"), Duration::from_secs(15));
+        tracker.observe_update(
+            &acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                "tool",
+                acp::ToolCallUpdateFields::new()
+                    .status(acp::ToolCallStatus::Completed)
+                    .raw_output(json!({"text": "tool result"})),
+            )),
+            Duration::from_secs(60),
+        );
+        let stats = tracker.finish(100).expect("turn timing");
+        assert_eq!(stats.request_count, None);
+        assert_eq!(stats.output_duration, Duration::from_secs(10));
+        assert_eq!(stats.tokens_per_second(), Some(10.0));
+        assert!(
+            tracker
+                .finish(0)
+                .expect("zero tokens")
+                .tokens_per_second()
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn completion_rate_acp_reads_response_usage_without_beta_and_resets(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |request, thread, mut cx| {
+                async move {
+                    if request.prompt.iter().any(|content| {
+                        matches!(content, acp::ContentBlock::Text(text) if text.text == "cancel")
+                    }) {
+                        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled)
+                            .usage(acp::Usage::new(200, 100, 100)));
+                    }
+                    let executor = cx.background_executor().clone();
+                    executor.timer(Duration::from_secs(5)).await;
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.handle_session_update(
+                            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new("thinking")),
+                            )),
+                            cx,
+                        )
+                    })??;
+                    executor.timer(Duration::from_secs(2)).await;
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.handle_session_update(
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new("answer")),
+                            )),
+                            cx,
+                        )
+                    })??;
+                    executor.timer(Duration::from_secs(3)).await;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)
+                        .usage(acp::Usage::new(200, 100, 100)))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("session");
+        for _ in 0..2 {
+            let response = thread.update(cx, |thread, cx| thread.send_raw("hello", cx));
+            assert!(
+                thread
+                    .read_with(cx, |thread, _| thread.turn_completion_stats())
+                    .is_none(),
+                "a new turn must clear old timing"
+            );
+            response.await.expect("response");
+            thread.read_with(cx, |thread, _| {
+                let stats = thread
+                    .turn_completion_stats()
+                    .expect("response usage is read without beta");
+                assert_eq!(stats.output_tokens, 100);
+                assert_eq!(stats.first_output_latency, Some(Duration::from_secs(5)));
+                assert_eq!(stats.output_duration, Duration::from_secs(2));
+                assert_eq!(stats.tokens_per_second(), Some(50.0));
+            });
+        }
+        thread
+            .update(cx, |thread, cx| thread.send_raw("cancel", cx))
+            .await
+            .expect("cancelled response");
+        assert!(
+            thread
+                .read_with(cx, |thread, _| thread.turn_completion_stats())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn strips_a_trimmed_utf8_suffix_without_byte_indexing() {
         let suffix = "<verification>✓</verification>";
         assert_eq!(
@@ -7094,6 +7544,114 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[gpui::test]
+    fn test_tool_patch_reuses_raw_input_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let terminals = HashMap::default();
+            let mut call = ToolCall::from_acp(
+                acp::ToolCall::new("tool", "Read").raw_input(json!("input")),
+                ToolCallStatus::InProgress,
+                languages.clone(),
+                PathStyle::local(),
+                &terminals,
+                cx,
+            )
+            .expect("tool should convert");
+            let input = call.raw_input_markdown.clone().expect("input");
+            for text in ["input", "input appended", "replacement", ""] {
+                call.update_fields(
+                    acp::ToolCallUpdateFields::new().raw_input(json!(text)),
+                    None,
+                    languages.clone(),
+                    PathStyle::local(),
+                    &terminals,
+                    cx,
+                )
+                .expect("snapshot should update");
+                assert_eq!(call.raw_input_markdown.as_ref(), Some(&input));
+                assert_eq!(input.read(cx).source(), text);
+            }
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().raw_input(serde_json::Value::Null),
+                None,
+                languages,
+                PathStyle::local(),
+                &terminals,
+                cx,
+            )
+            .expect("null input should clear the view");
+            assert!(call.raw_input_markdown.is_none());
+            assert_eq!(call.raw_input, Some(serde_json::Value::Null));
+        });
+    }
+
+    #[gpui::test]
+    fn test_tool_patch_updates_changed_diff_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let terminals = HashMap::default();
+            let content = vec![
+                "output".into(),
+                acp::ToolCallContent::Diff(
+                    acp::Diff::new("first.rs", "new text").old_text("old text"),
+                ),
+            ];
+            let mut call = ToolCall::from_acp(
+                acp::ToolCall::new("tool", "Read").content(content.clone()),
+                ToolCallStatus::InProgress,
+                languages.clone(),
+                PathStyle::local(),
+                &terminals,
+                cx,
+            )
+            .expect("tool should convert");
+            let [
+                ToolCallContent::ContentBlock(block),
+                ToolCallContent::Diff(diff),
+            ] = call.content.as_slice()
+            else {
+                panic!("expected text and diff");
+            };
+            let output = block.markdown().expect("text output").clone();
+            let diff = diff.clone();
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().content(content),
+                None,
+                languages.clone(),
+                PathStyle::local(),
+                &terminals,
+                cx,
+            )
+            .expect("unchanged snapshot should reuse the views");
+            assert_eq!(call.diffs().next(), Some(&diff));
+            let Some(ToolCallContent::ContentBlock(block)) = call.content.first() else {
+                panic!("expected text output");
+            };
+            assert_eq!(block.markdown(), Some(&output));
+            call.update_fields(
+                acp::ToolCallUpdateFields::new().content(vec![
+                    "output".into(),
+                    acp::ToolCallContent::Diff(
+                        acp::Diff::new("second.rs", "new text").old_text("old text"),
+                    ),
+                ]),
+                None,
+                languages,
+                PathStyle::local(),
+                &terminals,
+                cx,
+            )
+            .expect("changed path should update");
+            let changed = call.diffs().next().expect("diff");
+            assert_ne!(changed, &diff);
+            assert_eq!(changed.read(cx).file_path(cx).as_deref(), Some("second.rs"));
+            assert_eq!(diff.read(cx).file_path(cx).as_deref(), Some("first.rs"));
+        });
     }
 
     #[gpui::test]

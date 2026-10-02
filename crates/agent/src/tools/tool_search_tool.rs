@@ -28,19 +28,35 @@ pub(crate) fn tool_search_relevance(
     normalized_description: &str,
     query: &str,
 ) -> Option<u8> {
-    if query.is_empty() {
-        Some(0)
-    } else if normalized_name == query {
-        Some(1)
-    } else if normalized_name.starts_with(query) {
-        Some(2)
-    } else if normalized_name.contains(query) {
-        Some(3)
-    } else if normalized_description.contains(query) {
-        Some(4)
-    } else {
-        None
+    fn relevance(name: &str, description: &str, query: &str) -> Option<u8> {
+        if name == query {
+            Some(1)
+        } else if name.starts_with(query) {
+            Some(2)
+        } else if name.contains(query) {
+            Some(3)
+        } else if description.contains(query) {
+            Some(4)
+        } else {
+            None
+        }
     }
+
+    let query = query.trim();
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    // A query can list several tools, so requiring the whole phrase would
+    // hide each individually available capability.
+    relevance(normalized_name, normalized_description, query)
+        .into_iter()
+        .chain(
+            query
+                .split_whitespace()
+                .filter_map(|term| relevance(normalized_name, normalized_description, term)),
+        )
+        .min()
 }
 
 /// Searches the optional tool catalog and enables matching tools for the next
@@ -148,5 +164,26 @@ mod tests {
         );
         assert_eq!(tool_search_relevance("other", "edit code", "edit"), Some(4));
         assert_eq!(tool_search_relevance("other", "read code", "edit"), None);
+    }
+
+    #[test]
+    fn relevance_finds_each_tool_in_a_multi_name_query() {
+        let query = "terminal spawn_agent edit_file write_file";
+        for name in ["terminal", "spawn_agent", "edit_file", "write_file"] {
+            assert_eq!(tool_search_relevance(name, "", query), Some(1));
+        }
+        assert_eq!(tool_search_relevance("read_file", "read code", query), None);
+        assert_eq!(
+            tool_search_relevance("other", "edit_file support", query),
+            Some(4)
+        );
+        assert_eq!(
+            tool_search_relevance("write_file", "write code", "  terminal\nwrite_file\t "),
+            Some(1)
+        );
+        assert_eq!(
+            tool_search_relevance("write_file", "write code", " \t\n "),
+            Some(0)
+        );
     }
 }

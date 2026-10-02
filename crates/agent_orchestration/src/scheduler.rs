@@ -71,8 +71,17 @@ impl RuntimeControl {
         }
         *state = next;
         drop(state);
-        let _notification_pending = self.notifications.try_send(());
+        self.notify();
         Ok(true)
+    }
+
+    pub fn notify(&self) {
+        match self.notifications.try_send(()) {
+            Ok(()) | Err(async_channel::TrySendError::Full(())) => {}
+            Err(async_channel::TrySendError::Closed(())) => {
+                log::warn!("orchestration scheduler notification channel closed");
+            }
+        }
     }
 
     pub async fn wait_until_runnable(&self) -> bool {
@@ -385,10 +394,21 @@ impl Scheduler {
                 });
             }
 
-            if let Some(task_id) = in_flight.next().await {
-                in_flight_task_ids.remove(&task_id);
-            } else {
+            if in_flight.is_empty() {
                 smol::future::yield_now().await;
+            } else {
+                let completion = in_flight.next();
+                let notification = self.control.notification_receiver.recv();
+                futures::pin_mut!(completion, notification);
+                match futures::future::select(completion, notification).await {
+                    futures::future::Either::Left((Some(task_id), _)) => {
+                        in_flight_task_ids.remove(&task_id);
+                    }
+                    futures::future::Either::Right((Err(error), _)) => {
+                        return Err(error.into());
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -985,21 +1005,6 @@ impl Scheduler {
                             || task.expected_output.is_some()
                             || task.evidence_required)
                     {
-                        self.task_mutations.transition_in_context(
-                            &task_id,
-                            TaskState::Verifying,
-                            "output verification started",
-                            &event_context,
-                        );
-                        self.event_stream.emit_in_context(
-                            RuntimeEvent::TaskVerifying {
-                                run_id: self.run_id.clone(),
-                                task_id: task_id.clone(),
-                                attempt,
-                            },
-                            &event_context,
-                        );
-
                         let mut verified_output = output;
                         let mut attempt_tokens = tokens;
                         let remaining_timeout = || {
@@ -1007,51 +1012,105 @@ impl Scheduler {
                                 std::time::Duration::from_secs(seconds).saturating_sub(elapsed())
                             })
                         };
-                        let mut verification = self
-                            .run_controlled(
-                                self.executor.verify(&task, &verified_output),
-                                &task_token,
-                                remaining_timeout(),
-                            )
-                            .await
-                            .unwrap_or_else(|error| {
-                                VerificationResult::fail(
-                                    format!("verification failed to run: {error}"),
-                                    crate::verification::ErrorClass::FatalError,
-                                )
-                            });
-                        if !task_token.is_cancelled() {
-                            if !self.task_registry.attempt_is_active(&task_id, attempt) {
-                                return;
-                            }
+                        let mut verification;
+                        loop {
+                            self.task_mutations.transition_in_context(
+                                &task_id,
+                                TaskState::Verifying,
+                                "output verification started",
+                                &event_context,
+                            );
                             self.event_stream.emit_in_context(
-                                RuntimeEvent::TaskVerificationResult {
+                                RuntimeEvent::TaskVerifying {
                                     run_id: self.run_id.clone(),
                                     task_id: task_id.clone(),
-                                    result: verification.clone(),
+                                    attempt,
                                 },
                                 &event_context,
                             );
-                        }
+                            verification = self
+                                .run_controlled(
+                                    self.executor.verify(&task, &verified_output),
+                                    &task_token,
+                                    remaining_timeout(),
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    VerificationResult::fail(
+                                        format!("verification failed to run: {error}"),
+                                        crate::verification::ErrorClass::FatalError,
+                                    )
+                                });
+                            if !task_token.is_cancelled() {
+                                if !self.task_registry.attempt_is_active(&task_id, attempt) {
+                                    return;
+                                }
+                                self.event_stream.emit_in_context(
+                                    RuntimeEvent::TaskVerificationResult {
+                                        run_id: self.run_id.clone(),
+                                        task_id: task_id.clone(),
+                                        result: verification.clone(),
+                                    },
+                                    &event_context,
+                                );
+                            }
 
-                        let should_repair = !task_token.is_cancelled()
-                            && !verification.passed
-                            && verification.repairable
-                            && task.repair_on_failure
-                            && self.config.verification_policy.allow_repair_tasks
-                            && repair_cycles_used < max_repair_cycles;
-                        if should_repair {
-                            repair_cycles_used += 1;
+                            let queued_messages = match self
+                                .agent_control_plane
+                                .mailbox_depth(&agent_identity.path)
+                            {
+                                Ok(depth) => depth > 0,
+                                Err(error) => {
+                                    verification = VerificationResult::fail(
+                                        error.to_string(),
+                                        ErrorClass::FatalError,
+                                    );
+                                    break;
+                                }
+                            };
+                            let should_repair = !task_token.is_cancelled()
+                                && !verification.passed
+                                && verification.repairable
+                                && task.repair_on_failure
+                                && self.config.verification_policy.allow_repair_tasks
+                                && repair_cycles_used < max_repair_cycles;
+                            if task_token.is_cancelled() || (!should_repair && !queued_messages) {
+                                break;
+                            }
+                            if should_repair {
+                                repair_cycles_used += 1;
+                            }
                             self.task_mutations.transition_in_context(
                                 &task_id,
                                 TaskState::Repairing,
                                 "verification requested repair",
                                 &event_context,
                             );
-                            let feedback = verification
-                                .feedback
-                                .clone()
-                                .unwrap_or_else(|| "Verification failed".into());
+                            let mut feedback = if verification.passed {
+                                "Verification passed. Incorporate the queued follow-up before declaring this task complete; continue from the existing work.".to_string()
+                            } else {
+                                verification
+                                    .feedback
+                                    .clone()
+                                    .unwrap_or_else(|| "Verification failed".into())
+                            };
+                            let messages =
+                                match self.agent_control_plane.drain(&agent_identity.path) {
+                                    Ok(messages) => messages,
+                                    Err(error) => {
+                                        verification = VerificationResult::fail(
+                                            error.to_string(),
+                                            ErrorClass::FatalError,
+                                        );
+                                        break;
+                                    }
+                                };
+                            for message in messages {
+                                feedback.push_str("\n\nMessage from ");
+                                feedback.push_str(message.author.as_str());
+                                feedback.push_str(":\n");
+                                feedback.push_str(&message.body);
+                            }
                             self.event_stream.emit_in_context(
                                 RuntimeEvent::TaskRepairing {
                                     run_id: self.run_id.clone(),
@@ -1060,7 +1119,8 @@ impl Scheduler {
                                 },
                                 &event_context,
                             );
-                            let mut repair_context = context;
+                            let mut repair_context = context.clone();
+                            let usage_before_repair = reporter.usage();
                             repair_context.existing_session_id = session_id.clone();
                             repair_context.previous_worker_metadata =
                                 verified_output.worker_metadata.clone();
@@ -1125,11 +1185,11 @@ impl Scheduler {
                                         repaired_output.tokens_used.unwrap_or(0).max(
                                             repaired_usage
                                                 .tokens_used
-                                                .saturating_sub(reporter_usage.tokens_used),
+                                                .saturating_sub(usage_before_repair.tokens_used),
                                         );
                                     let additional_tool_calls = repaired_usage
                                         .tool_calls
-                                        .saturating_sub(reporter_usage.tool_calls);
+                                        .saturating_sub(usage_before_repair.tool_calls);
                                     self.task_registry.update_budget_usage(
                                         &task_id,
                                         additional_tokens,
@@ -1150,37 +1210,7 @@ impl Scheduler {
                                             &event_context,
                                         );
                                     }
-                                    let repaired_verification = self
-                                        .run_controlled(
-                                            self.executor.verify(&task, &repaired_output),
-                                            &task_token,
-                                            remaining_timeout(),
-                                        )
-                                        .await
-                                        .unwrap_or_else(|error| {
-                                            VerificationResult::fail(
-                                                format!(
-                                                    "repaired output verification failed: {error}"
-                                                ),
-                                                crate::verification::ErrorClass::FatalError,
-                                            )
-                                        });
-                                    if !task_token.is_cancelled() {
-                                        if !self.task_registry.attempt_is_active(&task_id, attempt)
-                                        {
-                                            return;
-                                        }
-                                        verification = repaired_verification;
-                                        verified_output = repaired_output;
-                                        self.event_stream.emit_in_context(
-                                            RuntimeEvent::TaskVerificationResult {
-                                                run_id: self.run_id.clone(),
-                                                task_id: task_id.clone(),
-                                                result: verification.clone(),
-                                            },
-                                            &event_context,
-                                        );
-                                    }
+                                    verified_output = repaired_output;
                                 }
                                 Err(error) if !task_token.is_cancelled() => {
                                     verification = VerificationResult::fail(
@@ -1195,8 +1225,9 @@ impl Scheduler {
                                         },
                                         &event_context,
                                     );
+                                    break;
                                 }
-                                _ => {}
+                                _ => break,
                             }
                         }
 

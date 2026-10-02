@@ -3977,6 +3977,9 @@ impl SubagentHandle for NativeSubagentHandle {
                         parent_thread.register_running_subagent(thread.downgrade())
                     })
                     .context("parent thread was released before the subagent turn started")?;
+                // A boundary request belongs to the turn it was made for; the
+                // turn started here carries the messages it was waiting on.
+                thread.update(cx, |thread, _cx| thread.set_end_turn_at_next_boundary(false));
 
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
@@ -4110,6 +4113,12 @@ impl SubagentHandle for NativeSubagentHandle {
                 cx.update(|cx| acp_thread.update(cx, |acp_thread, cx| acp_thread.cancel(cx)));
             cancel.await;
         })
+    }
+
+    fn end_turn_at_next_boundary(&self, cx: &mut App) {
+        self.subagent_thread.update(cx, |thread, _cx| {
+            thread.set_end_turn_at_next_boundary(true);
+        });
     }
 }
 

@@ -90,53 +90,122 @@ fn apply_native_role_model_policies(
     }
 }
 
+/// Cache reads are excluded: every request re-reads the whole cached prefix,
+/// so counting them makes a long worker session look many times more
+/// expensive than it is and trips task token budgets early.
 fn cumulative_token_delta(
     before: Option<language_model::TokenUsage>,
     after: Option<language_model::TokenUsage>,
 ) -> u64 {
+    fn billable_tokens(usage: language_model::TokenUsage) -> u64 {
+        usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_creation_input_tokens)
+    }
     let before = before.unwrap_or_default();
     let Some(after) = after else {
         return 0;
     };
-    after.total_tokens().saturating_sub(before.total_tokens())
+    billable_tokens(after).saturating_sub(billable_tokens(before))
 }
 
-pub(crate) fn task_execution_prompt(task: &agent_orchestration::OrchestrationTask) -> String {
+const IN_FLIGHT_TOKEN_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Drives `work` to completion while publishing the subagent's usage so far,
+/// so live views do not show zero tokens until the worker finishes.
+async fn with_in_flight_token_reports<T>(
+    work: impl std::future::Future<Output = T>,
+    subagent: &Rc<dyn SubagentHandle>,
+    usage_before: Option<language_model::TokenUsage>,
+    reporter: &agent_orchestration::TaskExecutionReporter,
+    app: &gpui::AsyncApp,
+) -> T {
+    use futures::FutureExt as _;
+
+    let work = work.fuse();
+    futures::pin_mut!(work);
+    loop {
+        let timer = app
+            .background_executor()
+            .timer(IN_FLIGHT_TOKEN_REPORT_INTERVAL)
+            .fuse();
+        futures::pin_mut!(timer);
+        futures::select_biased! {
+            result = work => return result,
+            _ = timer => {
+                let usage_now = app.update(|cx| subagent.cumulative_token_usage(cx));
+                reporter.report_in_flight_tokens(cumulative_token_delta(usage_before, usage_now));
+            }
+        }
+    }
+}
+
+fn task_acceptance_criteria(task: &agent_orchestration::OrchestrationTask) -> String {
     let criteria = task
         .acceptance_criteria
         .iter()
         .map(|criterion| format!("- {criterion}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let criteria = if criteria.is_empty() {
+    if criteria.is_empty() {
         "- Complete the stated task within scope and support material claims with concrete evidence."
             .to_string()
     } else {
         criteria
-    };
-    let objective = task.objective.as_deref().unwrap_or(task.label.as_str());
-    let scope = task
-        .scope
+    }
+}
+
+fn task_scope(task: &agent_orchestration::OrchestrationTask) -> &str {
+    task.scope
         .as_deref()
-        .unwrap_or("Use only the minimum code, files, services, and tools needed for this task.");
-    let expected_output = task.expected_output.as_deref().unwrap_or(
-        "A concise, decision-ready result with findings or completed changes, evidence, and validation.",
-    );
+        .unwrap_or("Use only the minimum code, files, services, and tools needed for this task.")
+}
+
+fn task_verification_contract(task: &agent_orchestration::OrchestrationTask) -> String {
+    if task.acceptance_criteria.is_empty()
+        && task.expected_output.is_none()
+        && !task.evidence_required
+    {
+        return String::new();
+    }
     let citation_example = if task.scope.is_some() {
         "path/to/file.rs:123"
     } else {
         "https://source.example/article or path/to/file.rs:123"
     };
-    let verification_contract = if task.acceptance_criteria.is_empty()
-        && task.expected_output.is_none()
-        && !task.evidence_required
-    {
-        String::new()
+    let citation_rule = if task.scope.is_some() {
+        "\nWrite file citations exactly as the paths appear in the declared scope."
     } else {
-        format!(
-            "\n\n## Verification contract\nAt the end of your response, include a JSON verification claim between `{VERIFICATION_START}` and `{VERIFICATION_END}`. Use this exact shape:\n{{\"criteria\":[{{\"criterion\":\"copy each criterion exactly\",\"passed\":true,\"evidence\":\"specific evidence\"}}],\"expected_output_satisfied\":true,\"citations\":[\"{citation_example}\"]}}\nDo not claim a criterion passed without concrete evidence."
-        )
+        ""
     };
+    format!(
+        "\n\n## Verification contract\nAt the end of your response, include a JSON verification claim between `{VERIFICATION_START}` and `{VERIFICATION_END}`. Use this exact shape:\n{{\"criteria\":[{{\"criterion\":\"copy each criterion exactly\",\"passed\":true,\"evidence\":\"specific evidence\"}}],\"expected_output_satisfied\":true,\"citations\":[\"{citation_example}\"]}}\nDo not claim a criterion passed without concrete evidence.{citation_rule}"
+    )
+}
+
+/// The repair turn resumes the worker's own session, which already holds the
+/// full task, so only the verification feedback and the claim contract are
+/// sent. Resending the task makes workers redo completed work.
+fn task_repair_prompt(task: &agent_orchestration::OrchestrationTask, feedback: &str) -> String {
+    let objective = task.objective.as_deref().unwrap_or(task.label.as_str());
+    format!(
+        "# Worker continuation\n\nAddress the feedback for task `{}` before completing it:\n\n{feedback}\n\nThe full task is earlier in this conversation. Address only this feedback. Do not restart, redo, or revert completed work; if the feedback concerns only the verification claim, re-emit the claim without further changes.\n\n## Objective\n{objective}\n\n## Scope\n{}\n\n## Acceptance criteria\n{}{}",
+        task.label,
+        task_scope(task),
+        task_acceptance_criteria(task),
+        task_verification_contract(task),
+    )
+}
+
+pub(crate) fn task_execution_prompt(task: &agent_orchestration::OrchestrationTask) -> String {
+    let criteria = task_acceptance_criteria(task);
+    let objective = task.objective.as_deref().unwrap_or(task.label.as_str());
+    let scope = task_scope(task);
+    let expected_output = task.expected_output.as_deref().unwrap_or(
+        "A concise, decision-ready result with findings or completed changes, evidence, and validation.",
+    );
+    let verification_contract = task_verification_contract(task);
     let shared_context = task
         .shared_context
         .as_deref()
@@ -344,7 +413,10 @@ impl SteeringSession {
                         self.active_deliveries.write().remove(&self.session_id);
                         return Ok(AgentTurnBoundary::Complete(result));
                     }
-                    return Ok(AgentTurnBoundary::Continue(deferred_messages.join("\n\n")));
+                    return Ok(AgentTurnBoundary::Continue(format!(
+                        "Message from the orchestrating agent. Take it into account, then continue your task from where you stopped; do not redo completed work.\n\n{}",
+                        deferred_messages.join("\n\n")
+                    )));
                 }
                 futures::future::Either::Right((delivery, _)) => {
                     let delivery = delivery
@@ -358,6 +430,10 @@ impl SteeringSession {
                         self.drain_messages(&mut deferred_messages);
                         return Ok(AgentTurnBoundary::Continue(deferred_messages.join("\n\n")));
                     }
+                    // Without this the message waits until the worker has
+                    // finished and summarized, then forces a fresh turn to
+                    // reopen work it already considered done.
+                    app.update(|cx| subagent.end_turn_at_next_boundary(cx));
                 }
             }
         }
@@ -486,9 +562,14 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             reporter.report_worker_started(Some(session_id.clone()), worker_metadata);
             reporter.report_tool_call_started("subagent");
             let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
-            let send_result = steering_session
-                .send(subagent.clone(), execution_prompt, app.clone())
-                .await;
+            let send_result = with_in_flight_token_reports(
+                steering_session.send(subagent.clone(), execution_prompt, app.clone()),
+                &subagent,
+                usage_before,
+                &reporter,
+                &app,
+            )
+            .await;
             reporter.report_tool_call_finished();
 
             if session_info.is_some() {
@@ -608,10 +689,8 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
         let active_deliveries = self.active_deliveries.clone();
         let maximum_pending_deliveries = self.maximum_pending_deliveries;
         let task = task.clone();
-        let feedback = feedback.to_string();
         let session_id = context.existing_session_id;
-        let execution_prompt =
-            task_execution_prompt_with_dependencies(&task, &context.dependency_inputs);
+        let repair_message = task_repair_prompt(&task, feedback);
 
         Box::pin(async move {
             let Some(session_id) = session_id else {
@@ -622,10 +701,6 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                 let session_id = session_id.clone();
                 move |cx| env.resume_subagent(session_id, cx)
             })?;
-            let repair_message = format!(
-                "{}\n\nVerification feedback for task `{}`:\n\n{}\n\nPlease address the feedback and return a corrected result with a new structured verification claim.",
-                execution_prompt, task.label, feedback
-            );
             let steering_session = SteeringSession::register(
                 session_id.clone(),
                 active_deliveries,
@@ -633,9 +708,14 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
             )?;
             reporter.report_tool_call_started("subagent");
             let usage_before = app.update(|cx| subagent.cumulative_token_usage(cx));
-            let send_result = steering_session
-                .send(subagent.clone(), repair_message, app.clone())
-                .await;
+            let send_result = with_in_flight_token_reports(
+                steering_session.send(subagent.clone(), repair_message, app.clone()),
+                &subagent,
+                usage_before,
+                &reporter,
+                &app,
+            )
+            .await;
             reporter.report_tool_call_finished();
             let usage_after = app.update(|cx| subagent.cumulative_token_usage(cx));
             let tokens_used = cumulative_token_delta(usage_before, usage_after);
@@ -711,11 +791,9 @@ fn batch_launch_policy(
         {
             agent_orchestration::RuntimeLaunchDisposition::Approved
         }
-        agent_settings::AgentExecutionStrategy::Orchestrate
-            if configured_strategy == agent_settings::AgentExecutionStrategy::Auto =>
-        {
-            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
-        }
+        // Whether Auto routed here or the user picked Orchestrate, the approval
+        // policy the user chose decides the checkpoint; Autonomous promises no
+        // plan approval.
         agent_settings::AgentExecutionStrategy::Orchestrate => match autonomy {
             agent_settings::AgentAutonomy::Autonomous => {
                 agent_orchestration::RuntimeLaunchDisposition::Approved
@@ -741,7 +819,7 @@ fn batch_launch_policy(
 /// - You will receive only the agent's final message as output.
 /// - Successful calls return a session_id that you can use for follow-up messages.
 /// - Error results may also include a session_id if a session was already created.
-/// - Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output.
+/// - Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output. A session owned by an unfinished task of a live orchestration run gets the message through that run instead, and its output is reported by the run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
@@ -1248,14 +1326,7 @@ fn steer_running_session(
             session_info: None,
         }));
     }
-    let message_start_index = match environment.existing_subagent(session_id.clone(), cx) {
-        Ok(Some(subagent)) => subagent.num_entries(cx),
-        Ok(None) => 0,
-        Err(error) => {
-            log::warn!("failed to look up steered subagent '{session_id}': {error:#}");
-            0
-        }
-    };
+    let message_start_index = subagent_entry_count(environment, &session_id, cx);
     Some(Ok(SpawnAgentToolOutput::Success {
         session_id: session_id.clone(),
         output: "The agent is still running. Your message was queued and will be incorporated at its next reasoning boundary; the call that is driving this session will receive the agent's final output.".to_string(),
@@ -1265,6 +1336,96 @@ fn steer_running_session(
             message_end_index: None,
         },
     }))
+}
+
+fn subagent_entry_count(
+    environment: &dyn ThreadEnvironment,
+    session_id: &acp::SessionId,
+    cx: &mut App,
+) -> usize {
+    match environment.existing_subagent(session_id.clone(), cx) {
+        Ok(Some(subagent)) => subagent.num_entries(cx),
+        Ok(None) => 0,
+        Err(error) => {
+            log::warn!("failed to look up subagent '{session_id}': {error:#}");
+            0
+        }
+    }
+}
+
+/// Finds the live run whose task owns `session_id`. Follow-ups to
+/// such a worker must go through that run's mailbox: starting a separate
+/// single-task run would race the worker's own turn and move the parent goal
+/// onto the new run.
+fn live_run_recipient(
+    thread: &Thread,
+    session_id: &acp::SessionId,
+) -> Option<(
+    agent_orchestration::RunHandle,
+    agent_orchestration::AgentPath,
+    agent_orchestration::TaskState,
+)> {
+    thread
+        .orchestration_runs()
+        .iter()
+        .filter(|run| !run.state().is_terminal())
+        .find_map(|run| {
+            let status = run.task_status_by_session_id(session_id)?;
+            let identity = run
+                .agent_control_plane()
+                .identity_for_task(&status.task_id)?;
+            Some((run.clone(), identity.path, status.state))
+        })
+}
+
+async fn message_live_run_worker(
+    run: agent_orchestration::RunHandle,
+    recipient: agent_orchestration::AgentPath,
+    state: agent_orchestration::TaskState,
+    session_id: acp::SessionId,
+    message: String,
+    environment: Rc<dyn ThreadEnvironment>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
+    // A parked worker only resumes for a follow-up; a running one must keep
+    // its turn, so it gets a plain message read at its next tool boundary.
+    let kind = if matches!(
+        state,
+        agent_orchestration::TaskState::Parked | agent_orchestration::TaskState::Completed
+    ) {
+        agent_orchestration::AgentMessageKind::FollowUp
+    } else {
+        agent_orchestration::AgentMessageKind::Message
+    };
+    let (sent, receipt) = run
+        .send_agent_message_with_receipt(
+            agent_orchestration::AgentPath::root(),
+            recipient.clone(),
+            kind,
+            message,
+        )
+        .await
+        .map_err(|error| SpawnAgentToolOutput::Error {
+            session_id: Some(session_id.clone()),
+            error: error.to_string(),
+            session_info: None,
+        })?;
+    let message_start_index =
+        cx.update(|cx| subagent_entry_count(environment.as_ref(), &session_id, cx));
+    Ok(SpawnAgentToolOutput::Success {
+        session_id: session_id.clone(),
+        output: format!(
+            "Message {} for agent `{recipient}` in orchestration run `{}` was {}. This agent's final output is reported through that run; do not poll for it.",
+            sent.sequence,
+            run.run_id(),
+            super::orchestration_control_tools::describe_message_receipt(receipt),
+        ),
+        session_info: SubagentSessionInfo {
+            session_id,
+            message_start_index,
+            message_end_index: None,
+        },
+    })
 }
 
 fn validate_background_mode(input: &SpawnAgentToolInput) -> Result<(), SpawnAgentToolOutput> {
@@ -2390,6 +2551,38 @@ impl AgentTool for SpawnAgentTool {
                 });
             }
             if let Some(session_id) = input.session_id.clone() {
+                let live_recipient = cx.update(|cx| {
+                    self.thread
+                        .upgrade()
+                        .and_then(|parent| live_run_recipient(parent.read(cx), &session_id))
+                });
+                if let Some((run, recipient, state)) = live_recipient {
+                    let result = message_live_run_worker(
+                        run,
+                        recipient,
+                        state,
+                        session_id,
+                        input.message.clone(),
+                        self.environment.clone(),
+                        cx,
+                    )
+                    .await;
+                    if let Ok(SpawnAgentToolOutput::Success {
+                        output,
+                        session_info,
+                        ..
+                    }) = &result
+                    {
+                        event_stream.update_fields_with_meta(
+                            acp::ToolCallUpdateFields::new().content(vec![output.clone().into()]),
+                            Some(acp::Meta::from_iter([(
+                                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                                serde_json::json!(session_info),
+                            )])),
+                        );
+                    }
+                    return result;
+                }
                 let steered = cx.update(|cx| {
                     let deliveries = parent_subagent_deliveries(&self.thread, cx);
                     steer_running_session(
@@ -2528,7 +2721,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn cumulative_token_delta_uses_all_provider_reported_tokens() {
+    fn cumulative_token_delta_excludes_cache_reads() {
         let before = language_model::TokenUsage {
             input_tokens: 40_000,
             output_tokens: 1_000,
@@ -2542,8 +2735,8 @@ mod tests {
             cache_read_input_tokens: 200_000,
         };
 
-        assert_eq!(cumulative_token_delta(Some(before), Some(after)), 176_500);
-        assert_eq!(cumulative_token_delta(None, Some(after)), 299_500);
+        assert_eq!(cumulative_token_delta(Some(before), Some(after)), 56_500);
+        assert_eq!(cumulative_token_delta(None, Some(after)), 99_500);
         assert_eq!(cumulative_token_delta(Some(after), None), 0);
     }
 
@@ -2951,7 +3144,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_orchestration_route_keeps_the_approval_checkpoint() {
+    fn auto_orchestration_route_follows_the_approval_policy() {
         let decision = agent_orchestration::AutoPolicyDecision {
             strategy: agent_settings::AgentExecutionStrategy::Orchestrate,
             confidence: 0.9,
@@ -2959,22 +3152,34 @@ mod tests {
             heuristics: collections::HashMap::default(),
         };
         let resolved_turn_policy = agent_orchestration::ResolvedTurnPolicy::automatic(decision);
-        let (policy, disposition) = batch_launch_policy(
-            agent_settings::AgentExecutionStrategy::Auto,
-            Some(&resolved_turn_policy),
-            "A batch",
-            4,
-            agent_settings::AgentAutonomy::Autonomous,
-        );
+        for (autonomy, expected) in [
+            (
+                agent_settings::AgentAutonomy::Autonomous,
+                agent_orchestration::RuntimeLaunchDisposition::Approved,
+            ),
+            (
+                agent_settings::AgentAutonomy::Supervised,
+                agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
+            ),
+            (
+                agent_settings::AgentAutonomy::Manual,
+                agent_orchestration::RuntimeLaunchDisposition::AwaitApproval,
+            ),
+        ] {
+            let (policy, disposition) = batch_launch_policy(
+                agent_settings::AgentExecutionStrategy::Auto,
+                Some(&resolved_turn_policy),
+                "A batch",
+                4,
+                autonomy,
+            );
 
-        assert_eq!(
-            policy.strategy,
-            agent_settings::AgentExecutionStrategy::Orchestrate
-        );
-        assert_eq!(
-            disposition,
-            agent_orchestration::RuntimeLaunchDisposition::AwaitApproval
-        );
+            assert_eq!(
+                policy.strategy,
+                agent_settings::AgentExecutionStrategy::Orchestrate
+            );
+            assert_eq!(disposition, expected, "autonomy {autonomy:?}");
+        }
     }
 
     #[test]

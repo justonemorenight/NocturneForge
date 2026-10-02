@@ -77,12 +77,19 @@ use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
+const TOOL_INPUT_INTERRUPTED_MESSAGE: &str = "Tool call did not run: the response stream ended before its input was complete. This was not a user cancellation; issue the call again if it is still needed.";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 2;
 const DEFAULT_MAX_PARENT_ORCHESTRATION_CONTINUATIONS: usize = 8;
+
+#[derive(Clone, Copy)]
+enum PendingMessageEndReason {
+    Cancelled,
+    StreamEnded,
+}
 
 /// A role used by native subagents.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1062,6 +1069,10 @@ pub trait SubagentHandle {
     /// Cancels the active subagent turn and resolves after the underlying
     /// provider request has settled.
     fn cancel(&self, cx: &AsyncApp) -> Task<()>;
+    /// Ends the active turn after its current tool results instead of letting
+    /// it run to completion, so a pending message is read without cancelling
+    /// in-flight work. The next `send` clears the request.
+    fn end_turn_at_next_boundary(&self, _cx: &mut App) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1622,6 +1633,8 @@ pub struct TurnCompletionStats {
     pub output_tokens: u64,
     pub request_count: u32,
     pub request_duration: Duration,
+    pub output_duration: Duration,
+    pub first_output_latency: Option<Duration>,
     pub first_text_latency: Option<Duration>,
     incomplete: bool,
 }
@@ -1630,11 +1643,11 @@ impl TurnCompletionStats {
     pub fn tokens_per_second(&self) -> Option<f64> {
         if self.incomplete
             || self.output_tokens == 0
-            || self.request_duration < Duration::from_millis(250)
+            || self.output_duration < Duration::from_millis(250)
         {
             return None;
         }
-        Some(self.output_tokens as f64 / self.request_duration.as_secs_f64())
+        Some(self.output_tokens as f64 / self.output_duration.as_secs_f64())
     }
 
     fn record_request(&mut self, request: CompletionRequestStats, duration: Duration) {
@@ -1645,6 +1658,16 @@ impl TurnCompletionStats {
         self.output_tokens = self.output_tokens.saturating_add(output_tokens);
         self.request_count = self.request_count.saturating_add(1);
         self.request_duration = self.request_duration.saturating_add(duration);
+        match (request.first_output_latency, request.last_output_at) {
+            (Some(first), Some(last)) => {
+                self.output_duration = self
+                    .output_duration
+                    .saturating_add(last.saturating_sub(first));
+                self.first_output_latency.get_or_insert(first);
+            }
+            _ if output_tokens > 0 => self.incomplete = true,
+            _ => {}
+        }
         if self.first_text_latency.is_none() {
             self.first_text_latency = request.first_text_latency;
         }
@@ -1654,11 +1677,31 @@ impl TurnCompletionStats {
 #[derive(Default)]
 struct CompletionRequestStats {
     output_tokens: Option<u64>,
+    first_output_latency: Option<Duration>,
+    last_output_at: Option<Duration>,
     first_text_latency: Option<Duration>,
 }
 
 impl CompletionRequestStats {
     fn observe(&mut self, event: &LanguageModelCompletionEvent, elapsed: Duration) {
+        let has_output = match event {
+            LanguageModelCompletionEvent::Text(text)
+            | LanguageModelCompletionEvent::Thinking { text, .. } => !text.is_empty(),
+            LanguageModelCompletionEvent::RedactedThinking { data } => !data.is_empty(),
+            LanguageModelCompletionEvent::ToolUse(tool) => {
+                !tool.name.is_empty() || !tool.raw_input.is_empty()
+            }
+            LanguageModelCompletionEvent::ToolUseJsonParseError {
+                tool_name,
+                raw_input,
+                ..
+            } => !tool_name.is_empty() || !raw_input.is_empty(),
+            _ => false,
+        };
+        if has_output {
+            self.first_output_latency.get_or_insert(elapsed);
+            self.last_output_at = Some(elapsed);
+        }
         match event {
             LanguageModelCompletionEvent::UsageUpdate(usage) => {
                 self.output_tokens = Some(self.output_tokens.unwrap_or(0).max(usage.output_tokens));
@@ -1691,6 +1734,7 @@ pub struct Thread {
     /// running to completion. The UI sets this to deliver a "steering" queued
     /// message mid-task; by default queued messages wait for the turn to finish.
     end_turn_at_next_boundary: bool,
+    orchestration_park_requested: bool,
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
@@ -1889,6 +1933,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            orchestration_park_requested: false,
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
@@ -2228,15 +2273,17 @@ impl Thread {
         );
     }
 
-    /// A canceled tool result carries only the model-facing `TOOL_CANCELED_MESSAGE`
-    /// sentinel (inserted exactly when a tool had no real result). It's never
-    /// meaningful to the user, so we detect it to skip replaying the tool call.
+    /// A canceled tool result carries only a model-facing sentinel
+    /// (`TOOL_CANCELED_MESSAGE` or `TOOL_INPUT_INTERRUPTED_MESSAGE`, inserted
+    /// exactly when a tool had no real result). It's never meaningful to the
+    /// user, so we detect it to skip replaying the tool call.
     fn is_canceled_tool_result(tool_result: &LanguageModelToolResult) -> bool {
         tool_result.is_error
             && matches!(
                 tool_result.content.as_slice(),
                 [LanguageModelToolResultContent::Text(text)]
                     if text.as_ref() == TOOL_CANCELED_MESSAGE
+                        || text.as_ref() == TOOL_INPUT_INTERRUPTED_MESSAGE
             )
     }
 
@@ -2374,6 +2421,7 @@ impl Thread {
             user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
+            orchestration_park_requested: false,
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
@@ -3201,7 +3249,16 @@ impl Thread {
         let run_id = run.run_id().clone();
         let subscription = run.subscribe_live();
         let event_run = run.clone();
-        self.orchestration_goal = Some(run.goal_controller());
+        // A follow-up run started while another run is still live must not take
+        // over the parent goal; the live run's goal stays authoritative until it
+        // reaches a terminal state.
+        let another_run_is_live = self
+            .orchestration_runs
+            .iter()
+            .any(|existing| existing.run_id() != &run_id && !existing.state().is_terminal());
+        if !another_run_is_live {
+            self.orchestration_goal = Some(run.goal_controller());
+        }
         self.upsert_persisted_orchestration_run(run.snapshot());
         if let Some(existing) = self
             .orchestration_runs
@@ -3292,7 +3349,23 @@ impl Thread {
             self.orchestration_waiting_run_ids.push(run_id);
         }
         self.orchestration_waiting_for_workers = !self.orchestration_waiting_run_ids.is_empty();
+        if self.running_turn.is_some() {
+            self.request_orchestration_park();
+        }
         cx.notify();
+    }
+
+    pub(crate) fn request_orchestration_park(&mut self) {
+        self.orchestration_park_requested = true;
+    }
+
+    /// Whether the runtime will resume this thread on its own once `run_id`
+    /// reaches a terminal state.
+    pub(crate) fn resumes_after_orchestration_run(
+        &self,
+        run_id: &agent_orchestration::RunId,
+    ) -> bool {
+        self.orchestration_waiting_run_ids.contains(run_id)
     }
 
     pub fn approve_orchestration_run(&mut self, cx: &mut Context<Self>) -> Result<bool> {
@@ -3604,7 +3677,7 @@ impl Thread {
         }
 
         let Some(running_turn) = self.running_turn.take() else {
-            self.flush_pending_message(cx);
+            self.flush_pending_message(PendingMessageEndReason::Cancelled, cx);
             return Task::ready(());
         };
 
@@ -3614,7 +3687,7 @@ impl Thread {
         cx.spawn(async move |this, cx| {
             turn_task.await;
             this.update(cx, |this, cx| {
-                this.flush_pending_message(cx);
+                this.flush_pending_message(PendingMessageEndReason::Cancelled, cx);
             })
             .ok();
         })
@@ -4004,7 +4077,7 @@ impl Thread {
         // Flush any pending message and cancel an in-flight turn before we
         // start, mirroring `run_turn` so a stray completion can't race with the
         // compaction we're about to perform.
-        self.flush_pending_message(cx);
+        self.flush_pending_message(PendingMessageEndReason::Cancelled, cx);
         self.cancel(cx).detach();
         self.turn_completion_stats = TurnCompletionStats::default();
 
@@ -4136,7 +4209,7 @@ impl Thread {
         // Flush the old pending message synchronously before cancelling,
         // to avoid a race where the detached cancel task might flush the NEW
         // turn's pending message instead of the old one.
-        self.flush_pending_message(cx);
+        self.flush_pending_message(PendingMessageEndReason::Cancelled, cx);
         self.cancel(cx).detach();
         self.turn_completion_stats = TurnCompletionStats::default();
 
@@ -4163,7 +4236,9 @@ impl Thread {
                     return;
                 }
 
-                _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
+                _ = this.update(cx, |this, cx| {
+                    this.flush_pending_message(PendingMessageEndReason::StreamEnded, cx)
+                });
 
                 match turn_result {
                     Ok(()) => {
@@ -4314,7 +4389,7 @@ impl Thread {
             });
 
             // Usage may include hidden reasoning, whose generation starts before visible deltas.
-            let request_started_at = Instant::now();
+            let request_started_at = cx.background_executor().now();
             let mut request_stats = CompletionRequestStats::default();
             let mut stream_finished = false;
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
@@ -4382,7 +4457,12 @@ impl Thread {
                         log::trace!("Received completion event: {:?}", event);
                         match event {
                             Ok(event) => {
-                                request_stats.observe(&event, request_started_at.elapsed());
+                                request_stats.observe(
+                                    &event,
+                                    cx.background_executor()
+                                        .now()
+                                        .duration_since(request_started_at),
+                                );
                                 match this.handle_completion_event(
                                     event,
                                     event_stream,
@@ -4423,7 +4503,10 @@ impl Thread {
                 }
             }
 
-            let request_duration = request_started_at.elapsed();
+            let request_duration = cx
+                .background_executor()
+                .now()
+                .duration_since(request_started_at);
             this.update(cx, |this, cx| {
                 if *cancellation_rx.borrow() {
                     return;
@@ -4510,7 +4593,7 @@ impl Thread {
                 return Err(CompletionError::Refusal.into());
             }
 
-            let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
+            let mut end_turn = tool_results.is_empty() && early_tool_results.is_empty();
             if error.is_none() && !cancelled && end_turn {
                 if let Some(capture) = cache_capture {
                     capture.confirm(
@@ -4526,8 +4609,19 @@ impl Thread {
                 Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
             }
 
+            if error.is_none() && !cancelled {
+                end_turn |= this.update(cx, |thread, _cx| {
+                    std::mem::take(&mut thread.orchestration_park_requested)
+                })?;
+            }
+
             this.update(cx, |this, cx| {
-                this.flush_pending_message(cx);
+                let reason = if cancelled {
+                    PendingMessageEndReason::Cancelled
+                } else {
+                    PendingMessageEndReason::StreamEnded
+                };
+                this.flush_pending_message(reason, cx);
                 if this.title.is_none() {
                     this.generate_title(cx);
                 }
@@ -5223,7 +5317,14 @@ impl Thread {
         };
         let delay = crate::jitter_retry_delay(delay);
 
-        log::debug!("Retry attempt {attempt} with delay {delay:?}");
+        // Retried errors are otherwise invisible in the log, which hides the cause
+        // of interrupted turns such as tool calls cut off mid-stream.
+        log::warn!(
+            "Completion from {}/{} failed, retry attempt {attempt}/{} in {delay:?}: {error:?}",
+            model.provider_id(),
+            model.id().0,
+            strategy.max_attempts()
+        );
 
         Ok(acp_thread::RetryStatus {
             last_error: error.to_string().into(),
@@ -5242,7 +5343,7 @@ impl Thread {
         &mut self,
         event: LanguageModelCompletionEvent,
         event_stream: &ThreadEventStream,
-        cancellation_rx: watch::Receiver<bool>,
+        mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
     ) -> Result<Option<Task<(usize, LanguageModelToolResult)>>> {
         log::trace!("Handling streamed completion event: {:?}", event);
@@ -5250,7 +5351,12 @@ impl Thread {
 
         match event {
             StartMessage { .. } => {
-                self.flush_pending_message(cx);
+                let reason = if *cancellation_rx.borrow() {
+                    PendingMessageEndReason::Cancelled
+                } else {
+                    PendingMessageEndReason::StreamEnded
+                };
+                self.flush_pending_message(reason, cx);
                 self.pending_message = Some(AgentMessage::default());
             }
             Text(new_text) => self.handle_text_event(new_text, event_stream),
@@ -5901,7 +6007,7 @@ impl Thread {
         self.pending_message.get_or_insert_default()
     }
 
-    fn flush_pending_message(&mut self, cx: &mut Context<Self>) {
+    fn flush_pending_message(&mut self, reason: PendingMessageEndReason, cx: &mut Context<Self>) {
         let Some(mut message) = self.pending_message.take() else {
             return;
         };
@@ -5916,15 +6022,27 @@ impl Thread {
             };
 
             if !message.tool_results.contains_key(&tool_use.id) {
+                let result_message = match reason {
+                    PendingMessageEndReason::Cancelled => TOOL_CANCELED_MESSAGE,
+                    PendingMessageEndReason::StreamEnded if tool_use.is_input_complete => {
+                        TOOL_CANCELED_MESSAGE
+                    }
+                    PendingMessageEndReason::StreamEnded => {
+                        log::warn!(
+                            "Tool call {} ({}) did not run because its input stream ended early",
+                            tool_use.name,
+                            tool_use.id
+                        );
+                        TOOL_INPUT_INTERRUPTED_MESSAGE
+                    }
+                };
                 message.tool_results.insert(
                     tool_use.id.clone(),
                     LanguageModelToolResult {
                         tool_use_id: tool_use.id.clone(),
                         tool_name: tool_use.name.clone(),
                         is_error: true,
-                        content: vec![LanguageModelToolResultContent::Text(
-                            TOOL_CANCELED_MESSAGE.into(),
-                        )],
+                        content: vec![LanguageModelToolResultContent::Text(result_message.into())],
                         output: None,
                     },
                 );
@@ -9909,28 +10027,40 @@ mod tests {
     fn completion_rate_weights_requests_and_deduplicates_usage() {
         let mut stats = TurnCompletionStats::default();
         let mut first_request = CompletionRequestStats::default();
+        first_request.observe(
+            &LanguageModelCompletionEvent::Text("first".into()),
+            Duration::from_secs(5),
+        );
+        first_request.observe(
+            &LanguageModelCompletionEvent::Text("last".into()),
+            Duration::from_secs(7),
+        );
         for output_tokens in [50, 100, 100, 75] {
             first_request.observe(
                 &LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
                     output_tokens,
                     ..Default::default()
                 }),
-                Duration::from_secs(1),
+                Duration::from_secs(9),
             );
         }
-        stats.record_request(first_request, Duration::from_secs(2));
+        stats.record_request(first_request, Duration::from_secs(10));
         stats.record_request(
             CompletionRequestStats {
                 output_tokens: Some(900),
-                first_text_latency: Some(Duration::from_secs(3)),
+                first_output_latency: Some(Duration::from_secs(10)),
+                last_output_at: Some(Duration::from_secs(28)),
+                first_text_latency: Some(Duration::from_secs(12)),
             },
-            Duration::from_secs(30),
+            Duration::from_secs(40),
         );
         assert_eq!(stats.output_tokens, 1_000);
         assert_eq!(stats.request_count, 2);
-        assert_eq!(stats.request_duration, Duration::from_secs(32));
-        assert_eq!(stats.tokens_per_second(), Some(31.25));
-        assert_eq!(stats.first_text_latency, Some(Duration::from_secs(3)));
+        assert_eq!(stats.request_duration, Duration::from_secs(50));
+        assert_eq!(stats.output_duration, Duration::from_secs(20));
+        assert_eq!(stats.tokens_per_second(), Some(50.0));
+        assert_eq!(stats.first_output_latency, Some(Duration::from_secs(5)));
+        assert_eq!(stats.first_text_latency, Some(Duration::from_secs(5)));
     }
 
     #[test]
@@ -9940,47 +10070,79 @@ mod tests {
         stats.record_request(
             CompletionRequestStats {
                 output_tokens: Some(20),
+                first_output_latency: Some(Duration::ZERO),
+                last_output_at: Some(Duration::from_millis(100)),
                 ..Default::default()
             },
-            Duration::from_millis(100),
+            Duration::from_secs(5),
         );
         assert_eq!(stats.tokens_per_second(), None);
         stats.record_request(
             CompletionRequestStats {
                 output_tokens: Some(80),
+                first_output_latency: Some(Duration::ZERO),
+                last_output_at: Some(Duration::from_millis(900)),
                 ..Default::default()
             },
-            Duration::from_millis(900),
+            Duration::from_secs(10),
         );
         assert_eq!(stats.tokens_per_second(), Some(100.0));
         stats.record_request(CompletionRequestStats::default(), Duration::from_secs(2));
         assert_eq!(stats.tokens_per_second(), None);
+
+        let mut stats = TurnCompletionStats::default();
+        stats.record_request(
+            CompletionRequestStats {
+                output_tokens: Some(100),
+                ..Default::default()
+            },
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            stats.tokens_per_second(),
+            None,
+            "usage without streamed output cannot establish generation time"
+        );
     }
 
     #[test]
-    fn completion_rate_keeps_first_visible_text_latency_separate() {
+    fn completion_rate_includes_thinking_and_tool_arguments() {
         let mut request = CompletionRequestStats::default();
+        request.observe(
+            &LanguageModelCompletionEvent::Text(String::new()),
+            Duration::from_secs(1),
+        );
+        request.observe(
+            &LanguageModelCompletionEvent::Thinking {
+                text: String::new(),
+                signature: Some("signature".into()),
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(request.first_output_latency, None);
         request.observe(
             &LanguageModelCompletionEvent::Thinking {
                 text: "reasoning".into(),
                 signature: None,
             },
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         );
-        request.observe(
-            &LanguageModelCompletionEvent::Text(String::new()),
-            Duration::from_secs(2),
-        );
-        assert_eq!(request.first_text_latency, None);
         request.observe(
             &LanguageModelCompletionEvent::Text("answer".into()),
             Duration::from_secs(4),
         );
         request.observe(
-            &LanguageModelCompletionEvent::Text("continues".into()),
-            Duration::from_secs(5),
+            &LanguageModelCompletionEvent::ToolUseJsonParseError {
+                id: LanguageModelToolUseId::from("tool"),
+                tool_name: "read_file".into(),
+                raw_input: "{invalid".into(),
+                json_parse_error: "invalid JSON".into(),
+            },
+            Duration::from_secs(8),
         );
+        assert_eq!(request.first_output_latency, Some(Duration::from_secs(3)));
         assert_eq!(request.first_text_latency, Some(Duration::from_secs(4)));
+        assert_eq!(request.last_output_at, Some(Duration::from_secs(8)));
     }
 
     #[gpui::test]
@@ -10013,14 +10175,25 @@ mod tests {
                     }),
                 );
             }
-            model.send_completion_stream_text_chunk(&request, "hello back");
+            cx.executor().advance_clock(Duration::from_secs(5));
+            model.send_completion_stream_text_chunk(&request, "hello ");
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(2));
+            model.send_completion_stream_text_chunk(&request, "back");
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(3));
             model.end_completion_stream(&request);
             cx.run_until_parked();
             thread.read_with(cx, |thread, _| {
                 let stats = thread.turn_completion_stats();
                 assert_eq!(stats.output_tokens, expected_tokens);
                 assert_eq!(stats.request_count, 1);
-                assert!(stats.first_text_latency.is_some());
+                assert_eq!(stats.first_output_latency, Some(Duration::from_secs(5)));
+                assert_eq!(stats.output_duration, Duration::from_secs(2));
+                assert_eq!(
+                    stats.tokens_per_second(),
+                    Some(expected_tokens as f64 / 2.0)
+                );
                 assert!(!stats.incomplete);
             });
         }
@@ -10047,6 +10220,7 @@ mod tests {
                 ..Default::default()
             }),
         );
+        model.send_completion_stream_text_chunk(&request, "replacement");
         model.end_completion_stream(&request);
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {

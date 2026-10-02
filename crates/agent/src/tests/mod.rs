@@ -2482,6 +2482,109 @@ async fn test_cancellation(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_incomplete_tool_input_cancel_preserves_user_cancellation(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    cx.run_until_parked();
+    let fake_model = model.as_fake();
+    let events = thread
+        .update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId("test-profile".into()), cx);
+            thread.set_title("Test".into(), cx);
+            thread.add_tool(EchoTool);
+            thread.send(ClientUserMessageId::new(), ["Echo a message"], cx)
+        })
+        .expect("start turn");
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _cx| assert!(thread.has_tool(EchoTool::NAME)));
+    let tool_use = LanguageModelToolUse {
+        id: "incomplete-echo".into(),
+        name: EchoTool::NAME.into(),
+        raw_input: r#"{"text":"#.into(),
+        input: language_model::LanguageModelToolUseInput::Json(json!({})),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use.clone()));
+    cx.run_until_parked();
+
+    thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+    assert_eq!(
+        stop_events(events.collect().await),
+        vec![acp::StopReason::Cancelled]
+    );
+    thread.read_with(cx, |thread, _cx| {
+        let message = thread
+            .last_received_or_pending_message()
+            .expect("cancelled tool message");
+        let message = message.as_agent_message().expect("agent message");
+        let result = message
+            .tool_results
+            .get(&tool_use.id)
+            .expect("cancelled tool result");
+        assert!(result.is_error);
+        assert_eq!(result.text_contents(), "Tool canceled by user");
+    });
+}
+
+#[gpui::test]
+async fn test_incomplete_tool_input_stream_error_preserves_interruption(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    cx.run_until_parked();
+    let fake_model = model.as_fake();
+    let events = thread
+        .update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId("test-profile".into()), cx);
+            thread.set_title("Test".into(), cx);
+            thread.add_tool(EchoTool);
+            thread.send(ClientUserMessageId::new(), ["Echo a message"], cx)
+        })
+        .expect("start turn");
+    cx.run_until_parked();
+    thread.read_with(cx, |thread, _cx| assert!(thread.has_tool(EchoTool::NAME)));
+    let tool_use = LanguageModelToolUse {
+        id: "incomplete-echo".into(),
+        name: EchoTool::NAME.into(),
+        raw_input: r#"{"text":"#.into(),
+        input: language_model::LanguageModelToolUseInput::Json(json!({})),
+        is_input_complete: false,
+        thought_signature: None,
+    };
+    fake_model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(tool_use.clone()));
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::from_http_status(
+        LanguageModelProviderName::new("test"),
+        http_client::StatusCode::INTERNAL_SERVER_ERROR,
+        "Interrupted stream".to_string(),
+        None,
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _cx| {
+        let message = thread
+            .last_received_or_pending_message()
+            .expect("interrupted tool message");
+        let message = message.as_agent_message().expect("agent message");
+        let result = message
+            .tool_results
+            .get(&tool_use.id)
+            .expect("interrupted tool result");
+        assert!(result.is_error);
+        assert_eq!(
+            result.text_contents(),
+            "Tool call did not run: the response stream ended before its input was complete. This was not a user cancellation; issue the call again if it is still needed."
+        );
+    });
+    thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+    assert_eq!(
+        stop_events(events.collect().await),
+        vec![acp::StopReason::Cancelled]
+    );
+}
+
+#[gpui::test]
 async fn test_terminal_tool_cancellation_captures_output(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     always_allow_tools(cx);
@@ -5632,6 +5735,258 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
     assert!(markdown.contains("Status: Completed"), "{markdown}");
     assert!(markdown.contains("subagent task response"), "{markdown}");
+    assert!(
+        markdown.ends_with("## Assistant\n\nResponse\n\n"),
+        "{markdown}"
+    );
+    assert_eq!(latest_worker_output(&thread, cx), "subagent task response");
+    assert_eq!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle
+    );
+}
+
+#[gpui::test]
+async fn test_background_worker_steering_and_live_tokens(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+        thread.set_execution_policy(
+            agent_settings::AgentExecutionStrategy::Orchestrate,
+            agent_settings::AgentAutonomy::Autonomous,
+            cx,
+        );
+        assert!(thread.remove_tool(UpdateOrchestrationGoalTool::NAME));
+    });
+    cx.run_until_parked();
+
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_tool_input = SpawnAgentToolInput {
+        background: true,
+        tasks: Some(
+            serde_json::from_value(json!([{
+                "id": "worker", "label": "label", "message": "subagent task prompt"
+            }]))
+            .expect("batch tasks"),
+        ),
+        ..Default::default()
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: language_model::LanguageModelToolUseInput::Json(
+            serde_json::to_value(&subagent_tool_input).unwrap(),
+        ),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        subagent_tool_use,
+    ));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .expect("subagent thread should be running")
+            .clone()
+    });
+
+    let subagent_thread = agent.read_with(cx, |agent, _cx| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .expect("subagent session should exist")
+            .acp_thread
+            .upgrade()
+            .expect("subagent thread should be alive")
+    });
+
+    assert!(
+        thread.read_with(cx, |thread, _cx| thread.is_turn_complete()),
+        "background launch must park the parent at the tool boundary"
+    );
+    assert!(
+        model
+            .pending_completions()
+            .iter()
+            .all(|request| request.thread_id.as_deref() != Some(session_id.to_string().as_str())),
+        "parent must not issue polling completions"
+    );
+    send.await.expect("parent launch turn ended");
+    let run = thread.read_with(cx, |thread, _cx| {
+        thread
+            .orchestration_runs()
+            .last()
+            .expect("worker run")
+            .clone()
+    });
+    let worker_id = agent_orchestration::TaskId::new("worker");
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 50_000,
+        },
+    ));
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    let live_status = run.task_status(&worker_id).expect("live status");
+    assert_eq!(live_status.state, agent_orchestration::TaskState::Running);
+    assert_eq!(
+        live_status.total_tokens_used(),
+        160,
+        "live tokens exclude cache reads"
+    );
+    assert_eq!(
+        live_status.budget_state.tokens_used, 0,
+        "temporary usage must not settle the budget"
+    );
+    let recipient = run
+        .resolve_message_recipient("worker")
+        .expect("worker path");
+    for body in [
+        "also inspect the edge case",
+        "preserve the existing changes",
+    ] {
+        let (_, receipt) = run
+            .send_agent_message_with_receipt(
+                agent_orchestration::AgentPath::root(),
+                recipient.clone(),
+                agent_orchestration::AgentMessageKind::Message,
+                body.into(),
+            )
+            .await
+            .expect("deferred message");
+        assert_eq!(
+            receipt,
+            agent_orchestration::AgentMessageReceipt::DeliveredToActiveTurn { interrupt: false }
+        );
+    }
+    cx.run_until_parked();
+    let input = json!({"path": "a/b.md"});
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        LanguageModelToolUse {
+            id: "read_boundary".into(),
+            name: ReadFileTool::NAME.into(),
+            raw_input: input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(input),
+            is_input_complete: true,
+            thought_signature: None,
+        },
+    ));
+    model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::ToolUse));
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+    let follow_up = model
+        .pending_completions()
+        .into_iter()
+        .find(|request| {
+            request.thread_id.as_deref() == Some(subagent_session_id.to_string().as_str())
+        })
+        .expect("same worker continues");
+    let prompt = follow_up
+        .messages
+        .last()
+        .expect("follow-up prompt")
+        .string_contents();
+    assert_eq!(prompt.matches("also inspect the edge case").count(), 1);
+    assert_eq!(prompt.matches("preserve the existing changes").count(), 1);
+    assert!(prompt.contains("continue your task from where you stopped"));
+    assert_eq!(
+        run.task_status(&worker_id)
+            .expect("worker status")
+            .total_attempts,
+        1
+    );
+    model.send_last_completion_stream_text_chunk("subagent task response");
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+    assert_ne!(
+        acp_thread.read_with(cx, |thread, _| thread.status()),
+        ThreadStatus::Idle,
+        "the parent turn continues with the worker result"
+    );
+
+    let worker_history = subagent_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert_eq!(
+        worker_history.matches("also inspect the edge case").count(),
+        1
+    );
+    assert_eq!(
+        worker_history
+            .matches("preserve the existing changes")
+            .count(),
+        1
+    );
+    let final_status = run.task_status(&worker_id).expect("settled worker status");
+    assert_eq!(
+        final_status.total_tokens_used(),
+        160,
+        "settling must not count live usage twice"
+    );
+    assert_eq!(final_status.in_flight_tokens, 0);
+    assert_eq!(
+        run.agent_control_plane()
+            .mailbox_depth(&recipient)
+            .expect("mailbox"),
+        0
+    );
+    complete_parent_orchestration_goal(&thread, cx);
+    model.send_last_completion_stream_text_chunk("Response");
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+    let markdown = acp_thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+    assert!(markdown.contains("Status: Completed"), "{markdown}");
     assert!(
         markdown.ends_with("## Assistant\n\nResponse\n\n"),
         "{markdown}"

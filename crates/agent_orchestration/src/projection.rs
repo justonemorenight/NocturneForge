@@ -235,6 +235,7 @@ impl RunActivityProjection {
             }
             RuntimeEvent::TaskStateChanged {
                 task_id,
+                previous_state,
                 state,
                 attempt,
                 ..
@@ -243,6 +244,12 @@ impl RunActivityProjection {
                 status.current_attempt = *attempt;
                 status.total_attempts = status.total_attempts.max(*attempt);
                 status.phase = phase_for_state(*state).map(str::to_string);
+                if *state == TaskState::Pending && *previous_state == TaskState::Completed {
+                    status.latest_output = None;
+                    status.latest_verification = None;
+                    status.latest_error = None;
+                    status.wait_reason = None;
+                }
                 if *state != TaskState::Running {
                     status.current_tool = None;
                 }
@@ -306,9 +313,17 @@ impl RunActivityProjection {
                 tool_calls_used,
                 ..
             } => self.update_status(task_id, updated_at, |status| {
+                status.in_flight_tokens = 0;
                 status.tokens_used = status.tokens_used.max(*tokens_used);
                 status.budget_state.tokens_used = *tokens_used;
                 status.budget_state.tool_calls_used = *tool_calls_used;
+            }),
+            RuntimeEvent::TaskInFlightTokensUpdated {
+                task_id,
+                tokens_used,
+                ..
+            } => self.update_status(task_id, updated_at, |status| {
+                status.in_flight_tokens = *tokens_used;
             }),
             RuntimeEvent::TaskOutput {
                 task_id,
@@ -594,6 +609,56 @@ mod tests {
                 OrchestrationTask::new("task-2", "Task two", "Use result")
                     .with_depends_on(vec![TaskId::new("task-1")]),
             ],
+        }
+    }
+
+    #[test]
+    fn in_flight_usage_does_not_settle_or_double_count_tokens() {
+        let run_id = RunId::from_string("run-test");
+        let task_id = TaskId::new("task-1");
+        let mut status = TaskStatus::new(task_id.clone());
+        status.tokens_used = 100;
+        status.budget_state.tokens_used = 100;
+        status.in_flight_tokens = 25;
+        let mut projection = RunActivityProjection::from_snapshot(
+            run_id.clone(),
+            RunState::Running,
+            plan(),
+            vec![status],
+            None,
+            0,
+        );
+
+        projection.apply(&envelope(
+            &run_id,
+            1,
+            RuntimeEvent::TaskInFlightTokensUpdated {
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+                tokens_used: 30,
+            },
+        ));
+        for status in &projection.task_statuses {
+            assert_eq!(status.total_tokens_used(), 130);
+            assert_eq!(status.tokens_used, 100);
+            assert_eq!(status.budget_state.tokens_used, 100);
+        }
+        assert_eq!(projection.task_statuses.len(), 1);
+
+        projection.apply(&envelope(
+            &run_id,
+            2,
+            RuntimeEvent::TaskBudgetUpdated {
+                run_id: run_id.clone(),
+                task_id,
+                tokens_used: 130,
+                tool_calls_used: 1,
+            },
+        ));
+        for status in &projection.task_statuses {
+            assert_eq!(status.total_tokens_used(), 130);
+            assert_eq!(status.in_flight_tokens, 0);
+            assert_eq!(status.budget_state.tokens_used, 130);
         }
     }
 
