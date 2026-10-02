@@ -34,6 +34,10 @@ use crate::{
 const RESPONSE_MESSAGE_PHASE_COMMENTARY: &str = "commentary";
 const RESPONSE_MESSAGE_PHASE_FINAL_ANSWER: &str = "final_answer";
 
+fn temperature_for_model(model_id: &str, temperature: Option<f32>) -> Option<f32> {
+    temperature.filter(|_| model_id != "gpt-6.1-sol")
+}
+
 /// Translates the request's `Speed` into the corresponding OpenAI service tier.
 /// Only `Fast` produces a value; `Standard` leaves the field unset so that the
 /// project's default tier applies.
@@ -198,7 +202,7 @@ pub fn into_open_ai(
             None
         },
         stop: request.stop,
-        temperature: request.temperature.or(Some(1.0)),
+        temperature: temperature_for_model(model_id, request.temperature.or(Some(1.0))),
         max_completion_tokens: match max_tokens_parameter {
             ChatCompletionMaxTokensParameter::MaxCompletionTokens => max_output_tokens,
             ChatCompletionMaxTokensParameter::MaxTokens => None,
@@ -467,7 +471,7 @@ pub fn into_open_ai_response_with_account_scope(
         store: Some(false),
         include,
         stream,
-        temperature,
+        temperature: temperature_for_model(model_id, temperature),
         top_p: None,
         max_output_tokens,
         parallel_tool_calls: if tools.is_empty() {
@@ -1920,6 +1924,51 @@ mod tests {
     use crate::{
         ChoiceDelta, FunctionChunk, ResponseMessageDelta, ResponseStreamEvent, ToolCallChunk,
     };
+
+    #[test]
+    fn gpt_6_1_sol_payload_omits_temperature() -> Result<()> {
+        for temperature in [None, Some(0.25)] {
+            for model_id in ["gpt-6.1-sol", "gpt-5.6-sol"] {
+                let request = LanguageModelRequest {
+                    temperature,
+                    thinking_allowed: true,
+                    ..Default::default()
+                };
+                let chat = into_open_ai(
+                    request.clone(),
+                    model_id,
+                    true,
+                    true,
+                    Some(128_000),
+                    ChatCompletionMaxTokensParameter::MaxCompletionTokens,
+                    Some(ReasoningEffort::Medium),
+                    false,
+                )?;
+                let response = into_open_ai_response(
+                    request,
+                    model_id,
+                    true,
+                    true,
+                    Some(128_000),
+                    Some(ReasoningEffort::Medium),
+                    false,
+                    &OPEN_AI_PROVIDER_ID,
+                )?;
+                let chat_payload = serde_json::to_value(&chat)?;
+                let response_payload = serde_json::to_value(&response)?;
+                if model_id == "gpt-6.1-sol" {
+                    assert!(chat_payload.get("temperature").is_none());
+                    assert!(response_payload.get("temperature").is_none());
+                    assert_eq!(response_payload["reasoning"]["effort"], "medium");
+                    assert_eq!(response_payload["max_output_tokens"], 128_000);
+                } else {
+                    assert_eq!(chat.temperature, temperature.or(Some(1.0)));
+                    assert_eq!(response.temperature, temperature);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn prompt_cache_key_respects_override_fallback_and_capability() -> Result<()> {
