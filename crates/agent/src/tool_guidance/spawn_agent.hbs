@@ -38,5 +38,5 @@ Spawn a sub-agent for a well-scoped task.
 - You will receive only the agent's final message as output.
 - Successful calls return a session_id that you can use for follow-up messages.
 - Error results may also include a session_id if a session was already created.
-- Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output.
+- Resuming (via `session_id`) a session that is still running steers it instead: your message is incorporated at that agent's next reasoning boundary, and this call returns immediately with an acknowledgment rather than the agent's output. The running call that is driving the session still receives its final output. A session owned by an unfinished task of a live orchestration run gets the message through that run instead, and its output is reported by the run.
 --}}

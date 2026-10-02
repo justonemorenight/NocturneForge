@@ -369,6 +369,20 @@ pub async fn sensitive_settings_kind(
     None
 }
 
+fn missing_project_path_error(project: &Project, path: &Path, cx: &App) -> anyhow::Error {
+    let path_style = project.path_style(cx);
+    let is_relative = !path_style.is_absolute(&path.to_string_lossy());
+    let visible_worktrees = project.visible_worktrees(cx).collect::<Vec<_>>();
+    if is_relative && let [worktree] = visible_worktrees.as_slice() {
+        return anyhow!(
+            "Path {} does not exist yet. Relative paths resolve against the project root `{}`; check the spelling, or create the missing directories first.",
+            path.display(),
+            worktree.read(cx).root_name_str()
+        );
+    }
+    anyhow!("Path {} is not in the project", path.display())
+}
+
 /// Resolves a path within the project, checking for symlink escapes.
 ///
 /// This is the primary entry point for agent tools that need to resolve a
@@ -397,7 +411,7 @@ pub fn resolve_project_path(
     let path = path.as_ref();
     let project_path = project
         .find_project_path(path, cx)
-        .ok_or_else(|| anyhow!("Path {} is not in the project", path.display()))?;
+        .ok_or_else(|| missing_project_path_error(project, path, cx))?;
 
     let worktree = project
         .worktree_for_id(project_path.worktree_id, cx)

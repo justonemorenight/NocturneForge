@@ -99,6 +99,8 @@ pub enum Model {
     FivePointSixTerra,
     #[serde(rename = "gpt-5.6-luna")]
     FivePointSixLuna,
+    #[serde(rename = "gpt-6.1-sol")]
+    SixPointOneSol,
     #[serde(rename = "custom")]
     Custom {
         name: String,
@@ -148,6 +150,7 @@ impl Model {
             "gpt-5.6-sol" => Ok(Self::FivePointSixSol),
             "gpt-5.6-terra" => Ok(Self::FivePointSixTerra),
             "gpt-5.6-luna" => Ok(Self::FivePointSixLuna),
+            "gpt-6.1-sol" => Ok(Self::SixPointOneSol),
             invalid_id => anyhow::bail!("invalid model id '{invalid_id}'"),
         }
     }
@@ -172,6 +175,7 @@ impl Model {
             Self::FivePointSixSol => "gpt-5.6-sol",
             Self::FivePointSixTerra => "gpt-5.6-terra",
             Self::FivePointSixLuna => "gpt-5.6-luna",
+            Self::SixPointOneSol => "gpt-6.1-sol",
             Self::Custom { name, .. } => name,
         }
     }
@@ -196,6 +200,7 @@ impl Model {
             Self::FivePointSixSol => "GPT-5.6 Sol",
             Self::FivePointSixTerra => "GPT-5.6 Terra",
             Self::FivePointSixLuna => "GPT-5.6 Luna",
+            Self::SixPointOneSol => "GPT-6.1 Sol",
             Self::Custom { display_name, .. } => display_name.as_deref().unwrap_or(&self.id()),
         }
     }
@@ -220,6 +225,7 @@ impl Model {
             Self::FivePointSixSol => 1_050_000,
             Self::FivePointSixTerra => 1_050_000,
             Self::FivePointSixLuna => 1_050_000,
+            Self::SixPointOneSol => 1_050_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
@@ -247,6 +253,7 @@ impl Model {
             Self::FivePointSixSol => Some(128_000),
             Self::FivePointSixTerra => Some(128_000),
             Self::FivePointSixLuna => Some(128_000),
+            Self::SixPointOneSol => Some(128_000),
         }
     }
 
@@ -270,7 +277,8 @@ impl Model {
             | Self::FivePointFive
             | Self::FivePointFivePro
             | Self::FivePointSixTerra
-            | Self::FivePointSixLuna => Some(ReasoningEffort::Medium),
+            | Self::FivePointSixLuna
+            | Self::SixPointOneSol => Some(ReasoningEffort::Medium),
             _ => None,
         }
     }
@@ -325,6 +333,13 @@ impl Model {
                 ReasoningEffort::XHigh,
                 ReasoningEffort::Max,
             ],
+            Self::SixPointOneSol => &[
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+            ],
             Self::FivePointTwo
             | Self::FivePointFour
             | Self::FivePointFive
@@ -371,6 +386,7 @@ impl Model {
             | Self::FivePointSixSol
             | Self::FivePointSixTerra
             | Self::FivePointSixLuna
+            | Self::SixPointOneSol
             | Self::FiveNano => true,
             Self::O3 | Model::Custom { .. } => false,
         }
@@ -401,7 +417,8 @@ impl Model {
             | Self::FivePointFivePro
             | Self::FivePointSixSol
             | Self::FivePointSixTerra
-            | Self::FivePointSixLuna => true,
+            | Self::FivePointSixLuna
+            | Self::SixPointOneSol => true,
             Self::Four
             | Self::FourOmniMini
             | Self::O3
@@ -431,7 +448,8 @@ impl Model {
             | Self::FivePointFive
             | Self::FivePointSixSol
             | Self::FivePointSixTerra
-            | Self::FivePointSixLuna => true,
+            | Self::FivePointSixLuna
+            | Self::SixPointOneSol => true,
             Self::Four
             | Self::FiveNano
             | Self::FivePointFourNano
@@ -464,6 +482,33 @@ mod tests {
     };
 
     use super::{Model, ReasoningEffort, RequestError, StatusCode};
+
+    #[test]
+    fn gpt_6_1_sol_model_contract() -> anyhow::Result<()> {
+        let model = Model::from_id("gpt-6.1-sol")?;
+        assert_eq!(model, Model::SixPointOneSol);
+        assert_eq!(serde_json::to_string(&model)?, "\"gpt-6.1-sol\"");
+        assert_eq!(serde_json::from_str::<Model>("\"gpt-6.1-sol\"")?, model);
+        assert_eq!(model.display_name(), "GPT-6.1 Sol");
+        assert_eq!(model.max_token_count(), 1_050_000);
+        assert_eq!(model.max_output_tokens(), Some(128_000));
+        assert_eq!(model.reasoning_effort(), Some(ReasoningEffort::Medium));
+        assert_eq!(
+            model.supported_reasoning_efforts(),
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+            ]
+        );
+        assert!(model.uses_responses_api());
+        assert!(model.supports_parallel_tool_calls());
+        assert!(model.supports_compaction());
+        assert!(model.supports_configuration_update());
+        Ok(())
+    }
 
     #[test]
     fn gpt_5_1_uses_none_reasoning_by_default() {

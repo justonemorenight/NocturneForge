@@ -21,7 +21,7 @@ use project::agent_server_store::{
 };
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -52,6 +52,14 @@ const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const CODEX_ACP_AGENT_ID: &str = "codex-acp";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone, Debug, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[notification(method = "_claude/sdkMessage")]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSdkMessageNotification {
+    session_id: acp::SessionId,
+    message: serde_json::Value,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
@@ -899,6 +907,10 @@ fn connect_client_future(
         )
         .on_receive_notification(
             on_notification!(handle_complete_elicitation),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_claude_sdk_message),
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
@@ -1850,10 +1862,17 @@ impl AcpConnection {
     }
 
     fn session_meta(&self, cx: &App) -> Task<Option<acp::Meta>> {
-        let Some(config_dir) = self.claude_config_dir.clone() else {
+        if self.id.as_ref() != CLAUDE_AGENT_ID {
             return Task::ready(None);
+        }
+        let Some(config_dir) = self.claude_config_dir.clone() else {
+            return Task::ready(Some(claude_code_completion_meta(None)));
         };
-        cx.background_spawn(async move { claude_code_session_meta(&config_dir) })
+        cx.background_spawn(async move {
+            Some(claude_code_completion_meta(claude_code_session_meta(
+                &config_dir,
+            )))
+        })
     }
 }
 
@@ -1962,6 +1981,20 @@ fn load_json_file<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Optio
             None
         }
     }
+}
+
+fn claude_code_completion_meta(plugin_meta: Option<acp::Meta>) -> acp::Meta {
+    let mut meta = plugin_meta.unwrap_or_default();
+    let claude = meta
+        .entry("claudeCode".to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(claude) = claude.as_object_mut() {
+        claude.insert(
+            "emitRawSDKMessages".into(),
+            serde_json::json!([{ "type": "stream_event" }]),
+        );
+    }
+    meta
 }
 
 fn claude_code_session_meta(config_dir: &std::path::Path) -> Option<acp::Meta> {
@@ -2465,8 +2498,16 @@ impl AgentConnection for AcpConnection {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
+        let completion_dispatch =
+            (self.id.as_ref() == CLAUDE_AGENT_ID).then(|| self.dispatch_tx.clone());
         cx.foreground_executor().spawn(async move {
             let result = conn.send_request(params).block_task().await;
+            // The response can arrive before queued stream notifications reach the thread.
+            if result.is_ok()
+                && let Some(dispatch_tx) = completion_dispatch
+            {
+                drain_foreground_queue(&dispatch_tx).await?;
+            }
 
             let mut suppress_abort_err = false;
 
@@ -3217,6 +3258,42 @@ mod tests {
     use super::*;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};
     use settings::Settings as _;
+
+    #[test]
+    fn completion_rate_claude_metadata_preserves_plugins_and_requests_stream_events() {
+        let plugins = serde_json::json!({"plugins": [{"type": "local", "path": "/plugin"}]});
+        let meta = claude_code_completion_meta(Some(acp::Meta::from_iter([(
+            "claudeCode".into(),
+            serde_json::json!({"options": plugins}),
+        )])));
+        assert_eq!(
+            meta.get("claudeCode")
+                .and_then(|value| value.get("options")),
+            Some(&plugins)
+        );
+        assert_eq!(
+            meta.get("claudeCode")
+                .and_then(|value| value.get("emitRawSDKMessages")),
+            Some(&serde_json::json!([{ "type": "stream_event" }]))
+        );
+        assert!(claude_code_completion_meta(None).contains_key("claudeCode"));
+    }
+
+    #[test]
+    fn completion_rate_claude_notification_parses_wire_contract() {
+        use agent_client_protocol::JsonRpcMessage as _;
+        let notification = ClaudeSdkMessageNotification::parse_message("_claude/sdkMessage", &serde_json::json!({
+            "sessionId": "session", "message": {"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "message_stop"}},
+        })).expect("Claude extension notification");
+        assert_eq!(notification.session_id, acp::SessionId::new("session"));
+        assert_eq!(
+            notification.message.pointer("/event/type"),
+            Some(&serde_json::json!("message_stop"))
+        );
+        assert!(!ClaudeSdkMessageNotification::matches_method(
+            "session/update"
+        ));
+    }
 
     #[test]
     fn worker_write_paths_reject_escape_and_protected_metadata() -> Result<()> {
@@ -6209,6 +6286,25 @@ fn handle_read_text_file(
         respond_result(responder, result.map(acp::ReadTextFileResponse::new));
     })
     .detach();
+}
+
+fn handle_claude_sdk_message(
+    notification: ClaudeSdkMessageNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = ctx
+        .sessions
+        .borrow()
+        .get(&notification.session_id)
+        .map(|session| session.thread.clone());
+    if let Some(thread) = thread {
+        thread
+            .update(cx, |thread, cx| {
+                thread.observe_claude_completion_message(&notification.message, cx);
+            })
+            .log_err();
+    }
 }
 
 fn handle_session_notification(

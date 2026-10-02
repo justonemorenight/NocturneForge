@@ -216,6 +216,14 @@ impl TaskMutationGateway {
         restarted
     }
 
+    pub fn restart_completed_task(&self, task_id: &TaskId) -> bool {
+        let mut restarted = false;
+        self.commit(task_id, "completed task received a follow-up", None, || {
+            restarted = self.registry.restart_completed_task(task_id);
+        });
+        restarted
+    }
+
     pub fn mark_applied(&self, task_id: &TaskId) -> bool {
         let mut applied = false;
         self.commit(task_id, "changes applied", None, || {

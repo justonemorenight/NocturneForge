@@ -262,6 +262,23 @@ impl TaskExecutionReporter {
         self.emit_budget_update();
     }
 
+    /// Publishes usage of the executor call still in progress for live views.
+    /// It is not charged to the budget; the executor's final usage is.
+    pub fn report_in_flight_tokens(&self, tokens: u64) {
+        if !self.is_current() {
+            return;
+        }
+        let Some(task_registry) = &self.task_registry else {
+            return;
+        };
+        task_registry.set_in_flight_tokens(&self.task_id, tokens);
+        self.emit(RuntimeEvent::TaskInFlightTokensUpdated {
+            run_id: self.run_id.clone(),
+            task_id: self.task_id.clone(),
+            tokens_used: tokens,
+        });
+    }
+
     pub fn set_phase(&self, phase: &str) {
         if !self.is_current() {
             return;

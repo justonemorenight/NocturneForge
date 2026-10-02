@@ -125,8 +125,27 @@ pub struct RunHandle {
     patch_operations: Arc<Mutex<HashSet<TaskId>>>,
 }
 
+/// Where a message sent through [`RunHandle::send_agent_message_with_receipt`]
+/// ended up, so callers can report delivery truthfully instead of assuming it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMessageReceipt {
+    /// Handed to the worker's live turn. Interrupting messages restart the
+    /// turn immediately; others are read at the worker's next tool boundary.
+    DeliveredToActiveTurn {
+        interrupt: bool,
+    },
+    /// The worker was parked waiting for input and has been restarted.
+    WokeParkedAgent,
+    ResumedCompletedAgent,
+    /// Held in the mailbox and consumed when the worker's next attempt starts.
+    QueuedInMailbox,
+}
+
 enum AgentMessageDelivery {
     Queued,
+    Reopen {
+        task_id: TaskId,
+    },
     Wake {
         task_id: TaskId,
     },
@@ -252,12 +271,59 @@ impl RunHandle {
         kind: AgentMessageKind,
         body: String,
     ) -> Result<AgentMessage> {
+        self.send_agent_message_with_receipt(author, recipient, kind, body)
+            .await
+            .map(|(message, _receipt)| message)
+    }
+
+    pub async fn send_agent_message_with_receipt(
+        &self,
+        author: AgentPath,
+        recipient: AgentPath,
+        kind: AgentMessageKind,
+        body: String,
+    ) -> Result<(AgentMessage, AgentMessageReceipt)> {
         let delivery = self.agent_message_delivery(&recipient, kind)?;
-        let message = self
+        if let AgentMessageDelivery::Reopen { task_id } = &delivery {
+            self.agent_control_plane.reopen_task(task_id)?;
+        }
+        let message = match self
             .agent_control_plane
-            .send(&author, &recipient, kind, body)?;
+            .send(&author, &recipient, kind, body)
+        {
+            Ok(message) => message,
+            Err(error) => {
+                if let AgentMessageDelivery::Reopen { task_id } = &delivery {
+                    self.agent_control_plane
+                        .close_task(task_id, "follow-up rejected");
+                }
+                return Err(error);
+            }
+        };
         match delivery {
-            AgentMessageDelivery::Queued => Ok(message),
+            AgentMessageDelivery::Queued => Ok((message, AgentMessageReceipt::QueuedInMailbox)),
+            AgentMessageDelivery::Reopen { task_id } => {
+                if !self.task_mutations.restart_completed_task(&task_id) {
+                    let error = self.reject_agent_message(
+                        &recipient,
+                        &message,
+                        anyhow::anyhow!("agent '{recipient}' changed state before it could resume"),
+                    );
+                    self.agent_control_plane
+                        .close_task(&task_id, "follow-up rejected");
+                    return Err(error);
+                }
+                if !self.control.is_user_paused()
+                    && matches!(
+                        self.control.state(),
+                        RunState::Paused | RunState::AwaitingApply
+                    )
+                {
+                    self.resume();
+                }
+                self.control.notify();
+                Ok((message, AgentMessageReceipt::ResumedCompletedAgent))
+            }
             AgentMessageDelivery::Wake { task_id } => {
                 let result = self.restart_task(&task_id).and_then(|restarted| {
                     anyhow::ensure!(
@@ -267,7 +333,7 @@ impl RunHandle {
                     Ok(())
                 });
                 match result {
-                    Ok(()) => Ok(message),
+                    Ok(()) => Ok((message, AgentMessageReceipt::WokeParkedAgent)),
                     Err(error) => Err(self.reject_agent_message(&recipient, &message, error)),
                 }
             }
@@ -285,7 +351,10 @@ impl RunHandle {
                 }
                 self.agent_control_plane
                     .acknowledge_delivery(&recipient, message.sequence)?;
-                Ok(message)
+                Ok((
+                    message,
+                    AgentMessageReceipt::DeliveredToActiveTurn { interrupt },
+                ))
             }
         }
     }
@@ -312,15 +381,45 @@ impl RunHandle {
             .task_registry
             .status(&task_id)
             .with_context(|| format!("recipient agent '{recipient}' has no registered task"))?;
+        if status.state == TaskState::Completed {
+            anyhow::ensure!(
+                !self.state().is_terminal(),
+                "cannot resume a worker in a terminal run"
+            );
+            let task = self
+                .plan_graph
+                .task(&task_id)
+                .context("worker task is missing")?;
+            anyhow::ensure!(
+                task.workspace_policy.isolation
+                    != crate::worker::WorkspaceIsolation::DedicatedWorktree,
+                "worker '{recipient}' has finalized an isolated patch; create an explicit follow-up task"
+            );
+            for dependent in self.plan_graph.blocked_by_failure(&task_id) {
+                anyhow::ensure!(
+                    self.task_registry
+                        .status(&dependent)
+                        .is_some_and(|status| status.total_attempts == 0
+                            && matches!(
+                                status.state,
+                                TaskState::Pending
+                                    | TaskState::WaitingDependency
+                                    | TaskState::Blocked
+                            )),
+                    "cannot resume '{recipient}': dependent task '{dependent}' has already started using its result"
+                );
+            }
+            return Ok(AgentMessageDelivery::Reopen { task_id });
+        }
         if status.state.is_terminal() {
             anyhow::bail!("cannot message terminal agent '{recipient}'; start a new task instead");
         }
-        if matches!(status.state, TaskState::Verifying | TaskState::Repairing) {
-            anyhow::bail!(
-                "cannot message agent '{recipient}' while its output is being verified or repaired"
-            );
+        if status.state == TaskState::Verifying {
+            return Ok(AgentMessageDelivery::Queued);
         }
-        if status.state == TaskState::Running {
+        // A repair turn runs in the worker's own session with a live turn owner,
+        // so it accepts messages exactly like a running worker.
+        if matches!(status.state, TaskState::Running | TaskState::Repairing) {
             let session_id = status.active_session_id.with_context(|| {
                 format!(
                     "agent '{recipient}' is running but has not published an addressable session yet"
@@ -363,6 +462,33 @@ impl RunHandle {
                 "failed to remove rejected message {} from '{recipient}': {rollback_error}",
                 message.sequence
             )),
+        }
+    }
+
+    pub fn resolve_message_recipient(&self, reference: &str) -> Result<AgentPath> {
+        if let Ok(path) = self
+            .agent_control_plane
+            .resolve(&AgentPath::root(), reference)
+        {
+            return Ok(path);
+        }
+        let reference = reference.trim();
+        let matches = self
+            .task_statuses()
+            .into_iter()
+            .filter(|status| status.state == TaskState::Completed)
+            .filter_map(|status| self.agent_control_plane.identity_for_task(&status.task_id))
+            .filter(|identity| {
+                identity.path.as_str() == reference || identity.path.name() == reference
+            })
+            .map(|identity| identity.path)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [path] => Ok(path.clone()),
+            [] => anyhow::bail!("agent reference '{reference}' was not found"),
+            _ => {
+                anyhow::bail!("agent reference '{reference}' is ambiguous; use its canonical path")
+            }
         }
     }
 
@@ -541,6 +667,7 @@ impl RunHandle {
         if self.control.state() == RunState::Paused {
             self.resume();
         }
+        self.control.notify();
         Ok(true)
     }
 
@@ -696,7 +823,7 @@ impl RunHandle {
         }
 
         // 2. Prepare pre-apply snapshot for safe rollback
-        let pre_apply = worktree
+        let mut pre_apply = worktree
             .prepare_parent_apply(&worktree.repo_path, allowed_subpaths)
             .await?;
 
@@ -726,6 +853,14 @@ impl RunHandle {
                 });
             }
             anyhow::bail!("worker patch was not applied and its worktree was retained: {error}");
+        }
+        if let Err(error) = pre_apply.capture_post_apply_state().await {
+            let error = format!("{error:#}");
+            let rollback_result = match pre_apply.rollback().await {
+                Ok(()) => "rollback succeeded".to_string(),
+                Err(rollback_error) => format!("rollback failed: {rollback_error:#}"),
+            };
+            anyhow::bail!("failed to capture post-apply state; {rollback_result}: {error}");
         }
 
         // 4. Tier 3: Parent post-apply verification

@@ -314,6 +314,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpt_6_1_sol_thinking_effort_picker() {
+        let levels = supported_thinking_effort_levels(&open_ai::Model::SixPointOneSol);
+        assert_eq!(
+            levels
+                .iter()
+                .map(|level| level.value.as_ref())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            levels
+                .iter()
+                .find(|level| level.is_default)
+                .map(|level| level.value.as_ref()),
+            Some("medium")
+        );
+    }
+
+    #[test]
     fn supported_thinking_effort_levels_hide_none() {
         let effort_levels = supported_thinking_effort_levels(&open_ai::Model::FivePointTwo);
         let values = effort_levels
@@ -504,6 +523,7 @@ impl LanguageModel for OpenAiLanguageModel {
             | Model::FivePointSixSol
             | Model::FivePointSixTerra
             | Model::FivePointSixLuna
+            | Model::SixPointOneSol
             | Model::O3 => true,
             Model::Four => false,
             Model::Custom {

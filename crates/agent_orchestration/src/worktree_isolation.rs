@@ -46,16 +46,69 @@ pub struct ParentPreApplySnapshot {
     pub pre_existing_paths: HashSet<String>,
     index_path: PathBuf,
     index_contents: Option<Vec<u8>>,
+    post_apply_file_contents: Option<Vec<(String, Option<Vec<u8>>)>>,
+    post_apply_index_contents: Option<Vec<u8>>,
 }
 
 impl ParentPreApplySnapshot {
-    /// Reverts the parent checkout to its exact pre-apply state:
-    /// - Files that existed before apply are restored from `baseline_commit`.
-    /// - Files newly introduced by the patch are removed.
-    /// - The parent git index is restored byte-for-byte, preserving staged work.
+    /// Records the exact parent state immediately after applying this operation.
+    pub async fn capture_post_apply_state(&mut self) -> Result<()> {
+        self.post_apply_file_contents = Some(
+            self.modified_files
+                .iter()
+                .map(|file| {
+                    let path = self.parent_repo.join(file);
+                    let contents = match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.file_type().is_file() => Some(fs::read(&path)?),
+                        Ok(_) => None,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(error),
+                    };
+                    Ok((file.clone(), contents))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        self.post_apply_index_contents = match fs::read(&self.index_path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("failed to read post-apply git index"),
+        };
+        Ok(())
+    }
+
+    /// Reverts the parent checkout only when it still matches this operation's
+    /// post-apply state. This avoids overwriting changes made concurrently.
     pub async fn rollback(&self) -> Result<()> {
         if self.modified_files.is_empty() {
             return Ok(());
+        }
+        let Some(post_apply_files) = &self.post_apply_file_contents else {
+            bail!("cannot rollback without a post-apply snapshot");
+        };
+        for (file, expected_contents) in post_apply_files {
+            let path = self.parent_repo.join(file);
+            let actual_contents = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => Some(fs::read(&path)?),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if &actual_contents != expected_contents {
+                bail!(
+                    "parent file changed after apply; refusing to rollback '{}'; inspect the checkout manually",
+                    file
+                );
+            }
+        }
+        let current_index = match fs::read(&self.index_path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("failed to read current git index"),
+        };
+        if current_index != self.post_apply_index_contents {
+            bail!(
+                "parent git index changed after apply; refusing to rollback; inspect the checkout manually"
+            );
         }
 
         for file in &self.modified_files {
@@ -794,6 +847,8 @@ impl IsolatedWorktree {
             pre_existing_paths,
             index_path,
             index_contents,
+            post_apply_file_contents: None,
+            post_apply_index_contents: None,
         })
     }
 
@@ -1002,6 +1057,11 @@ impl WorktreeManager {
         let _index_cleanup = SnapshotIndex(index.clone());
         async {
             self.snapshot_git(&index, &["read-tree", head]).await?;
+            if let Some(paths) = allowed_subpaths
+                && paths.is_empty()
+            {
+                return Ok(head.to_string());
+            }
             let mut arguments = vec!["add", "--all", "--"];
             if let Some(paths) = allowed_subpaths {
                 for path in paths {
@@ -1503,12 +1563,13 @@ mod tests {
                 )?;
 
                 // Capture snapshot
-                let pre_apply = worker.prepare_parent_apply(&parent, None).await?;
+                let mut pre_apply = worker.prepare_parent_apply(&parent, None).await?;
                 assert!(pre_apply.pre_existing_paths.contains("existing.txt"));
                 assert!(!pre_apply.pre_existing_paths.contains("brand_new.txt"));
 
                 // Apply to parent
                 worker.apply_to_parent(&parent, None).await?;
+                pre_apply.capture_post_apply_state().await?;
                 assert_eq!(
                     fs::read_to_string(parent.join("existing.txt"))?,
                     "modified by worker\n"
@@ -1518,7 +1579,16 @@ mod tests {
                     "created by worker\n"
                 );
 
-                // Rollback parent checkout
+                // A concurrent edit must prevent rollback from overwriting user data.
+                fs::write(parent.join("existing.txt"), "edited concurrently\n")?;
+                assert!(pre_apply.rollback().await.is_err());
+                assert_eq!(
+                    fs::read_to_string(parent.join("existing.txt"))?,
+                    "edited concurrently\n"
+                );
+
+                // Restore the post-apply state and verify that rollback still works.
+                fs::write(parent.join("existing.txt"), "modified by worker\n")?;
                 pre_apply.rollback().await?;
                 assert_eq!(
                     fs::read_to_string(parent.join("existing.txt"))?,

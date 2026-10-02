@@ -1355,6 +1355,9 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        // The adapter retains the content view, which retains this window state.
+        // Break that cycle before destroying the renderer and native window.
+        drop(this.accesskit_adapter.take());
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();

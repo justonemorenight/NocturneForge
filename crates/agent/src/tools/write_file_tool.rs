@@ -493,6 +493,53 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_write_creates_missing_parent_directories(cx: &mut TestAppContext) {
+        let (write_tool, _project, _action_log, fs, _thread) = setup_test(cx, json!({})).await;
+        for input_path in ["root/new/deep/file.txt", "another/deep/file.txt"] {
+            let result = cx
+                .update(|cx| {
+                    write_tool.clone().run(
+                        ToolInput::resolved(WriteFileToolInput {
+                            path: input_path.into(),
+                            content: "saved content".into(),
+                        }),
+                        ToolCallEventStream::test().0,
+                        cx,
+                    )
+                })
+                .await
+                .expect("write succeeds");
+            assert!(matches!(result, EditSessionOutput::Success { .. }));
+            let relative = input_path.strip_prefix("root/").unwrap_or(input_path);
+            assert_eq!(
+                fs.load(&PathBuf::from(path!("/root")).join(relative))
+                    .await
+                    .expect("file saved"),
+                "saved content"
+            );
+        }
+        let result = cx
+            .update(|cx| {
+                write_tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/../outside/file.txt".into(),
+                        content: "outside".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(
+            fs.metadata(path!("/outside").as_ref())
+                .await
+                .expect("outside metadata")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
     async fn test_streaming_resolve_path_for_creating_file(cx: &mut TestAppContext) {
         let mode = EditSessionMode::Write;
 
@@ -515,9 +562,21 @@ mod tests {
         );
 
         let result = test_resolve_path(&mode, "root/dir/nonexistent_dir/new.txt", cx);
+        assert_resolved_path_eq(result.await, rel_path("dir/nonexistent_dir/new.txt"));
+
+        let result = test_resolve_path(&mode, "root/dir/a/b/new.txt", cx);
+        assert_resolved_path_eq(result.await, rel_path("dir/a/b/new.txt"));
+
+        let result = test_resolve_path(&mode, "root/dir/subdir/existing.txt/new.txt", cx);
         assert_eq!(
             result.await.unwrap_err(),
-            "Can't create file: parent directory doesn't exist"
+            "Can't create file: parent is not a directory"
+        );
+
+        let result = test_resolve_path(&mode, "root/dir/../../outside/new.txt", cx);
+        assert_eq!(
+            result.await.unwrap_err(),
+            "Can't create file: path must not contain `..`"
         );
     }
 
