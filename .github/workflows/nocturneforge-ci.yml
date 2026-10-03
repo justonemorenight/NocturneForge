@@ -88,6 +88,13 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Run ACP file review regressions
+        env:
+          ZED_HEADLESS: '1'
+          RUST_LOG: 'off'
+        run: cargo test -p acp_thread --lib
+        timeout-minutes: 30
+
       - name: Run agent library tests
         run: cargo test -p agent --lib
         timeout-minutes: 45
