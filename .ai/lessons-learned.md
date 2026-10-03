@@ -35,10 +35,10 @@
 ### Find colocated Zed tests and stubs before using paths
 
 - **Pattern:** Zed keeps many tests inside source modules and ACP stubs in `crates/acp_thread/src/connection.rs`; guessed filename globs may match nothing.
-- **Wrong:** Pass unverified globs such as `crates/git_ui/src/*tests*` or `crates/acp_thread/src/stub*` to a zsh command.
-- **Right:** Use `rg --files` to discover real paths, or search the crate directory with `rg -n`; quote any glob supplied through an `rg -g` option.
+- **Wrong:** Read guessed source/state filenames or pass unverified globs such as `crates/git_ui/src/*tests*` or `crates/acp_thread/src/stub*` to a zsh command.
+- **Right:** Use `rg --files` to discover source and state paths before reading them, or search the containing directory with `rg -n`; quote any glob supplied through an `rg -g` option.
 - **Rule:** zsh `NOMATCH` stops the command before `rg` runs.
-- **Seen:** 6x — 2026-09-30 through 2026-10-01; includes missing stub, rules, and relocated Metal source paths.
+- **Seen:** 11x — 2026-09-30 through 2026-10-03; includes missing stub, thread-history, adapter diff, and relocated Metal source paths.
 
 ### Move GPUI handles into their final callback
 

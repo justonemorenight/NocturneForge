@@ -3042,6 +3042,7 @@ struct AcpAutoCompactionState {
 }
 
 const CLAUDE_ACP_AGENT_ID: &str = "claude-acp";
+const CLAUDE_ACP_ADAPTER_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 const ACP_AUTO_COMPACTION_COMMAND: &str = "compact";
 const ACP_AUTO_COMPACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const ACP_AUTO_COMPACTION_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -5146,8 +5147,14 @@ impl AcpThread {
         Ok(())
     }
 
+    fn uses_claude_file_review(&self) -> bool {
+        // Custom agent IDs are settings keys; telemetry carries the adapter's handshake name.
+        self.connection.agent_id().as_ref() == CLAUDE_ACP_AGENT_ID
+            || self.connection.telemetry_id().as_ref() == CLAUDE_ACP_ADAPTER_NAME
+    }
+
     fn queue_claude_tool_review(&mut self, tool_call_id: &acp::ToolCallId, cx: &mut Context<Self>) {
-        if self.connection.agent_id().as_ref() != CLAUDE_ACP_AGENT_ID
+        if !self.uses_claude_file_review()
             || self
                 .claude_review_checkpoint
                 .as_ref()
@@ -5206,7 +5213,7 @@ impl AcpThread {
         tool_call_id: &acp::ToolCallId,
         cx: &mut Context<Self>,
     ) {
-        if self.connection.agent_id().as_ref() == CLAUDE_ACP_AGENT_ID
+        if self.uses_claude_file_review()
             && self
                 .claude_review_checkpoint
                 .as_ref()
@@ -5891,7 +5898,7 @@ impl AcpThread {
         }
         let git_store = self.project.read(cx).git_store().clone();
         let enable_checkpoints = AgentSettings::get_global(cx).enable_checkpoints;
-        let capture_claude_review = self.connection.agent_id().as_ref() == CLAUDE_ACP_AGENT_ID;
+        let capture_claude_review = self.uses_claude_file_review();
 
         self.set_draft_prompt(None, cx);
 
@@ -12408,6 +12415,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeAgentConnection {
         agent_id: Option<AgentId>,
+        telemetry_id: Option<SharedString>,
         auth_methods: Vec<acp::AuthMethod>,
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
@@ -12428,6 +12436,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 agent_id: None,
+                telemetry_id: None,
                 auth_methods: Vec::new(),
                 supports_truncate: true,
                 on_user_message: None,
@@ -12443,6 +12452,11 @@ mod tests {
 
         fn with_agent_id(mut self, agent_id: impl Into<AgentId>) -> Self {
             self.agent_id = Some(agent_id.into());
+            self
+        }
+
+        fn with_telemetry_id(mut self, telemetry_id: impl Into<SharedString>) -> Self {
+            self.telemetry_id = Some(telemetry_id.into());
             self
         }
 
@@ -12474,7 +12488,7 @@ mod tests {
         }
 
         fn telemetry_id(&self) -> SharedString {
-            "fake".into()
+            self.telemetry_id.clone().unwrap_or_else(|| "fake".into())
         }
 
         fn auth_methods(&self) -> &[acp::AuthMethod] {
@@ -14003,6 +14017,223 @@ mod tests {
             reviewable_checkpoint_file_changes(project, bulk_changes, cx)
         });
         assert!(reviewable.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_custom_claude_reviews_normalized_diffs_and_shell_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().expect("temporary Git repository");
+        let root = directory.path().canonicalize().expect("repository path");
+        let file_path = root.join("file.go");
+        let original = "package main\n\nfunc value() int {\n\treturn 1\n}\n";
+        let edited = "package main\n\nfunc value() int {\n\treturn 2\n}\n";
+        let shell_edited = "package main\n\nfunc value() int {\n\treturn 3\n}\n";
+        std::fs::write(&file_path, original).expect("initial file");
+        let git = async |arguments: &[&str]| {
+            let output = util::command::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(arguments)
+                .output()
+                .await
+                .expect("run Git in the test repository");
+            assert!(
+                output.status.success(),
+                "Git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]).await;
+        git(&["add", "file.go"]).await;
+        git(&[
+            "-c",
+            "user.name=ACP Review Test",
+            "-c",
+            "user.email=acp-review@example.invalid",
+            "commit",
+            "-m",
+            "Initial file",
+        ])
+        .await;
+
+        let project = Project::test(
+            project::RealFs::new(None, cx.executor()),
+            [root.as_path()],
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        assert_eq!(
+            project.read_with(cx, |project, cx| project.repositories(cx).len()),
+            1
+        );
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.agent.get_or_insert_default().enable_checkpoints = Some(false);
+                });
+            });
+        });
+
+        let turn_count = AtomicUsize::new(0);
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .with_agent_id("Claude ACP Local")
+                .with_telemetry_id("@agentclientprotocol/claude-agent-acp")
+                .on_user_message({
+                    let file_path = file_path.clone();
+                    move |_, thread, mut cx| {
+                        let file_path = file_path.clone();
+                        let turn = turn_count.fetch_add(1, SeqCst);
+                        async move {
+                            std::fs::write(
+                                &file_path,
+                                if turn == 0 { edited } else { shell_edited },
+                            )?;
+                            let call = if turn == 0 {
+                                acp::ToolCall::new("edit-1", "Edit file.go")
+                                    .name("Edit")
+                                    .kind(acp::ToolKind::Edit)
+                                    .content(vec![acp::ToolCallContent::Diff(
+                                        acp::Diff::new(file_path, edited.replace('\t', "  "))
+                                            .old_text(original.replace('\t', "  ")),
+                                    )])
+                            } else {
+                                acp::ToolCall::new("bash-1", "Modify file.go with a script")
+                                    .name("Bash")
+                                    .kind(acp::ToolKind::Execute)
+                            }
+                            .status(acp::ToolCallStatus::Completed);
+                            thread.update(&mut cx, |thread, cx| {
+                                thread.handle_session_update(acp::SessionUpdate::ToolCall(call), cx)
+                            })??;
+                            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                        }
+                        .boxed_local()
+                    }
+                }),
+        );
+        let thread = cx
+            .update(|cx| connection.new_session(project, PathList::new(&[root.as_path()]), cx))
+            .await
+            .expect("custom Claude session");
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Edit the file", cx))
+            .await
+            .expect("first Claude turn");
+        cx.condition(&action_log, |action_log, cx| {
+            !action_log.pending_edits(cx).is_empty()
+        })
+        .await;
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(file_path.clone(), original.to_owned())]
+        );
+        action_log.update(cx, |action_log, cx| action_log.keep_all_edits(None, cx));
+        cx.condition(&action_log, |action_log, cx| {
+            action_log.pending_edits(cx).is_empty()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("accepted file"),
+            edited
+        );
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.send_raw("Modify it through Bash", cx)
+            })
+            .await
+            .expect("second Claude turn");
+        cx.condition(&action_log, |action_log, cx| {
+            !action_log.pending_edits(cx).is_empty()
+        })
+        .await;
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(file_path.clone(), edited.to_owned())]
+        );
+        action_log
+            .update(cx, |action_log, cx| action_log.reject_all_edits(None, cx))
+            .await;
+        cx.condition(&action_log, |action_log, cx| {
+            action_log.pending_edits(cx).is_empty()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("rejected file"),
+            edited
+        );
+        assert!(
+            action_log
+                .read_with(cx, |action_log, cx| action_log.pending_edits(cx))
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_custom_non_claude_agent_keeps_standard_diff_review(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({".git": {}, "file.txt": "before"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/test"))], cx).await;
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .with_agent_id("Claude ACP Local")
+                .with_telemetry_id("other-adapter")
+                .on_user_message(move |_, thread, mut cx| {
+                    let fs = fs.clone();
+                    async move {
+                        fs.insert_file(path!("/test/file.txt"), "after".into())
+                            .await;
+                        thread.update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::ToolCall(
+                                    acp::ToolCall::new("edit-1", "Edit file.txt")
+                                        .name("Edit")
+                                        .kind(acp::ToolKind::Edit)
+                                        .status(acp::ToolCallStatus::Completed)
+                                        .content(vec![acp::ToolCallContent::Diff(
+                                            acp::Diff::new("file.txt", "after").old_text("before"),
+                                        )]),
+                                ),
+                                cx,
+                            )
+                        })??;
+                        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    }
+                    .boxed_local()
+                }),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("non-Claude custom session");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Edit the file", cx))
+            .await
+            .expect("non-Claude turn");
+        cx.run_until_parked();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        assert_eq!(
+            action_log.read_with(cx, |action_log, cx| action_log.pending_edits(cx)),
+            vec![(PathBuf::from(path!("/test/file.txt")), "before".to_owned())]
+        );
     }
 
     #[gpui::test]
