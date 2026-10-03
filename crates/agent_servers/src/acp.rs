@@ -5555,7 +5555,14 @@ exit 7
         let session = sessions.get(&session_id).expect("loaded session");
         assert_eq!(session.thread.entity_id(), thread.entity_id());
         let options = session.config_options.as_ref().expect("loaded config");
-        assert_eq!(*options.config_options.borrow(), updated_options);
+        assert_eq!(
+            *options.config_options.borrow(),
+            vec![acp_v2::SessionConfigOption::boolean(
+                "web_search",
+                "Web Search",
+                true,
+            )]
+        );
     }
 
     #[gpui::test]
