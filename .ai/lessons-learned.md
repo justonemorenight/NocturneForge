@@ -63,3 +63,11 @@
 - **Right:** In test contexts use `cx.executor().advance_clock(...)`; `VisualTestContext` exposes `cx.background_executor.now()` as a field, while entity contexts use `cx.background_executor().now()`.
 - **Rule:** Rust E0599; use the GPUI executor clock for deterministic timeout tests.
 - **Seen:** 2x — cache icon and ACP reaper tests, 2026-10-01.
+
+### Cherry-pick conflicts can absorb unrelated fork code
+
+- **Pattern:** Porting upstream ACP and search changes with a distant merge base can place whole neighboring functions in a conflict, including telemetry and existing tests.
+- **Wrong:** Select an entire conflict side based only on the changed API name.
+- **Right:** Review the full diff against HEAD after resolution; preserve fork functions, deduplicate tests, and port only the actual upstream edits when conflict boundaries expand.
+- **Rule:** Three-way merge conflict boundaries are not the PR change scope.
+- **Seen:** 2x — ACP telemetry and Git/search ports, 2026-10-03.
