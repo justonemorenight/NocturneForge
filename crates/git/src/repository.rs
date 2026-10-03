@@ -4146,7 +4146,11 @@ mod tests {
             .unwrap();
 
             assert_eq!(object.is_binary, expected_binary);
-            assert_eq!(object.content, bytes);
+            if expected_binary {
+                assert!(object.text.is_empty());
+            } else {
+                assert_eq!(object.text, String::from_utf8(bytes).expect("text fixture"));
+            }
         }
     }
 
