@@ -78,6 +78,7 @@ members = [
     "crates/feature_flags",
     "crates/feature_flags_macros",
     "crates/feedback",
+    "crates/file_content",
     "crates/file_finder",
     "crates/file_icons",
     "crates/fs",
@@ -342,6 +343,7 @@ extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
+file_content = { path = "crates/file_content" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
 fs = { path = "crates/fs" }
@@ -520,7 +522,7 @@ accesskit = { version = "0.24.0", features = ["enumn"] }
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.21.0"
 accesskit_windows = "0.33.1"
-agent-client-protocol = { version = "=2.2.0", features = ["unstable"] }
+agent-client-protocol = { version = "=2.2.0", features = ["unstable", "unstable_protocol_v2"] }
 aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 any_vec = "0.14"
@@ -1026,6 +1028,7 @@ collections = { codegen-units = 1 }
 command_palette = { codegen-units = 1 }
 command_palette_hooks = { codegen-units = 1 }
 feature_flags = { codegen-units = 1 }
+file_content = { codegen-units = 1 }
 file_icons = { codegen-units = 1 }
 image_viewer = { codegen-units = 1 }
 edit_prediction_ui = { codegen-units = 1 }

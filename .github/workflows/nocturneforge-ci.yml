@@ -98,3 +98,24 @@ jobs:
       - name: Run agent library tests
         run: cargo test -p agent --lib
         timeout-minutes: 45
+
+      - name: Run ACP, picker, Git, and encoding regression tests
+        env:
+          ZED_HEADLESS: '1'
+          RUST_LOG: 'off'
+        run: cargo test -p acp_thread -p agent_servers -p agent_ui -p git -p file_content --lib
+        timeout-minutes: 45
+
+      - name: Run project search regression tests
+        env:
+          ZED_HEADLESS: '1'
+          RUST_LOG: 'off'
+        run: cargo test -p project --features test-support --test integration search
+        timeout-minutes: 45
+
+      - name: Run worktree streaming regression tests
+        env:
+          ZED_HEADLESS: '1'
+          RUST_LOG: 'off'
+        run: cargo test -p worktree --lib test_stream_utf8
+        timeout-minutes: 30

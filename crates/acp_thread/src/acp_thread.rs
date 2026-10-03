@@ -1,3 +1,4 @@
+pub mod config_options;
 mod connection;
 mod diff;
 mod mention;
@@ -5,7 +6,7 @@ pub mod session_client_state_store;
 mod terminal;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent_client_protocol::schema::{MaybeUndefined, v1 as acp};
+use agent_client_protocol::schema::{MaybeUndefined, v1 as acp, v2 as acp_v2};
 use agent_settings::{AgentSettings, AutoCompactThreshold};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
@@ -3419,7 +3420,7 @@ pub enum AcpThreadEvent {
     Refusal,
     AvailableCommandsUpdated(Vec<acp::AvailableCommand>),
     ModeUpdated(acp::SessionModeId),
-    ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
+    ConfigOptionsUpdated(Vec<acp_v2::SessionConfigOption>),
     WorkingDirectoriesUpdated,
 }
 
@@ -4071,7 +4072,9 @@ impl AcpThread {
             acp::SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate {
                 config_options,
                 ..
-            }) => cx.emit(AcpThreadEvent::ConfigOptionsUpdated(config_options)),
+            }) => cx.emit(AcpThreadEvent::ConfigOptionsUpdated(
+                config_options::from_v1(config_options).map_err(acp::Error::from)?,
+            )),
             acp::SessionUpdate::UsageUpdate(update) => {
                 let usage = self.token_usage.get_or_insert_with(Default::default);
                 usage.max_tokens = update.size;
