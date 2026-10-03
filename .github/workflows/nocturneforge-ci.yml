@@ -105,3 +105,10 @@ jobs:
           RUST_LOG: 'off'
         run: cargo test -p project --features test-support --test integration search
         timeout-minutes: 45
+
+      - name: Run worktree streaming regression tests
+        env:
+          ZED_HEADLESS: '1'
+          RUST_LOG: 'off'
+        run: cargo test -p worktree --lib test_stream_utf8
+        timeout-minutes: 30
