@@ -71,3 +71,11 @@
 - **Right:** Review the full diff against HEAD after resolution; preserve fork functions, deduplicate tests, and port only the actual upstream edits when conflict boundaries expand.
 - **Rule:** Three-way merge conflict boundaries are not the PR change scope.
 - **Seen:** 2x — ACP telemetry and Git/search ports, 2026-10-03.
+
+### Upstream ports can depend on manifest changes outside the PR
+
+- **Pattern:** Ported source imports depend on upstream's existing runtime dependencies or opt-in SDK schema features.
+- **Wrong:** Assume a successful cherry-pick or no-dependencies metadata check proves the fork exposes those imports.
+- **Right:** Compare imported crates and feature-gated modules against the fork's production dependency declarations; ACP's `unstable` feature does not include `unstable_protocol_v2`.
+- **Rule:** Rust E0432; dev-dependencies do not cover production code, and umbrella features need not include experimental schemas.
+- **Seen:** 2x — Project `encoding_rs` and ACP v2 schema imports, 2026-10-03.
