@@ -245,6 +245,8 @@ struct Session {
     /// Latest snapshot to persist. Overwritten in place on every save request;
     /// the single save worker drains it, coalescing bursts into one write.
     pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
+    last_streaming_save_key: Option<StreamingSaveKey>,
+    last_draft_prompt_revision: Option<usize>,
     save_wake: watch::Sender<()>,
     save_worker: Task<Result<()>>,
     scheduled_save: Task<()>,
@@ -259,6 +261,24 @@ impl Session {
             Some(acp_thread) => acp_thread.read(cx).draft_prompt().map(Vec::from),
             None => self.thread.read(cx).draft_prompt().map(Vec::from),
         }
+    }
+
+    fn draft_prompt_revision(&self, cx: &App) -> Option<usize> {
+        self.acp_thread
+            .upgrade()
+            .map(|acp_thread| acp_thread.read(cx).draft_prompt_revision())
+    }
+
+    fn can_skip_save_while_streaming(&self, cx: &App) -> bool {
+        // Streaming notifies the thread once per chunk, but `to_db` doesn't
+        // include the streaming message, so those notifies have nothing new to save.
+        let thread = self.thread.read(cx);
+        thread.can_skip_save_while_streaming()
+            && self
+                .last_streaming_save_key
+                .as_ref()
+                .is_some_and(|key| *key == thread.streaming_save_key())
+            && self.last_draft_prompt_revision == self.draft_prompt_revision(cx)
     }
 }
 
@@ -913,7 +933,15 @@ impl NativeAgent {
             }),
             cx.observe(&action_log, {
                 let thread_handle = thread_handle.clone();
-                move |this, _action_log, cx| this.schedule_thread_save(thread_handle.clone(), cx)
+                move |this, _action_log, cx| {
+                    let id = thread_handle.read(cx).id().clone();
+                    if let Some(session) = this.sessions.get_mut(&id) {
+                        // Pending edit baselines live outside Thread, so invalidate
+                        // the streaming key before the save is coalesced.
+                        session.last_streaming_save_key = None;
+                    }
+                    this.schedule_thread_save(thread_handle.clone(), cx);
+                }
             }),
             cx.observe_release(&acp_thread, {
                 let session_id = session_id.clone();
@@ -953,6 +981,8 @@ impl NativeAgent {
                 subagents: Vec::new(),
                 project_id,
                 pending_save,
+                last_streaming_save_key: None,
+                last_draft_prompt_revision: None,
                 save_wake,
                 save_worker,
                 _subscriptions: subscriptions,
@@ -1865,6 +1895,9 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        if session.can_skip_save_while_streaming(cx) {
+            return;
+        }
 
         let window_started_at = session.save_window_started_at.get_or_insert(now);
         let max_latency_remaining =
@@ -1904,6 +1937,9 @@ impl NativeAgent {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
+        if !capture_live_draft && session.can_skip_save_while_streaming(cx) {
+            return;
+        }
         let draft_prompt = if capture_live_draft {
             session
                 .acp_thread
@@ -1934,6 +1970,8 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        session.last_streaming_save_key = Some(session.thread.read(cx).streaming_save_key());
+        session.last_draft_prompt_revision = session.draft_prompt_revision(cx);
         *session.pending_save.lock() = Some(PendingThreadSave {
             folder_paths,
             db_thread,
@@ -4398,7 +4436,7 @@ mod internal_tests {
     use super::*;
     use crate::tests::release_dropped_entities;
     use acp_thread::{AgentConnection, AgentModelGroupName, AgentModelInfo, MentionUri};
-    use agent_settings::COMPACTION_PROMPT;
+    use agent_settings::{AgentAutonomy, AgentExecutionStrategy, COMPACTION_PROMPT};
     use fs::FakeFs;
     use gpui::TestAppContext;
     use indoc::formatdoc;
@@ -7766,6 +7804,356 @@ mod internal_tests {
             Some(third_draft),
             "the save worker must persist the latest snapshot of a burst"
         );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_chunks_do_not_save_thread(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        let saves_before_stream = turn.database.save_count();
+
+        for chunk in ["one ", "two ", "three"] {
+            turn.model.send_last_completion_stream_text_chunk(chunk);
+            flush_streaming_test_saves(cx);
+        }
+        assert_eq!(
+            turn.database.save_count(),
+            saves_before_stream,
+            "streamed chunks must not save the thread"
+        );
+
+        turn.model.end_last_completion_stream();
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        assert!(turn.database.save_count() > saves_before_stream);
+        assert_eq!(
+            turn.saved_markdown().await,
+            "## User\n\nhello\n\n## Assistant\n\none two three\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_completed_message_saved_while_next_message_streams(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+
+        turn.model
+            .send_last_completion_stream_event(LanguageModelCompletionEvent::StartMessage {
+                message_id: "first".into(),
+            });
+        turn.model
+            .send_last_completion_stream_text_chunk("first message");
+        turn.model
+            .send_last_completion_stream_event(LanguageModelCompletionEvent::StartMessage {
+                message_id: "second".into(),
+            });
+        turn.model
+            .send_last_completion_stream_text_chunk("second mess");
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_markdown().await,
+            "## User\n\nhello\n\n## Assistant\n\nfirst message\n",
+            "a completed message must be saved even while the next one streams"
+        );
+
+        turn.model.send_last_completion_stream_text_chunk("age");
+        turn.model.end_last_completion_stream();
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_markdown().await,
+            "## User\n\nhello\n\n## Assistant\n\nfirst message\n\n## Assistant\n\nsecond message\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cancelling_stream_saves_partial_message(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+
+        turn.model.send_last_completion_stream_text_chunk("partial");
+        flush_streaming_test_saves(cx);
+        turn.acp_thread
+            .update(cx, |thread, cx| thread.cancel(cx))
+            .await;
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_markdown().await,
+            "## User\n\nhello\n\n## Assistant\n\npartial\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_settings_changes_save_while_message_streams(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        turn.model.send_last_completion_stream_text_chunk("one ");
+        flush_streaming_test_saves(cx);
+
+        turn.thread.update(cx, |thread, cx| {
+            thread.set_thinking_effort(Some("high".into()), cx);
+        });
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_thread().await.thinking_effort.as_deref(),
+            Some("high")
+        );
+
+        turn.thread
+            .update(cx, |thread, cx| thread.set_title("Renamed".into(), cx));
+        flush_streaming_test_saves(cx);
+        assert_eq!(turn.saved_thread().await.title, "Renamed");
+
+        let draft = vec![acp::ContentBlock::Text(acp::TextContent::new(
+            "next prompt",
+        ))];
+        turn.acp_thread.update(cx, |acp_thread, cx| {
+            acp_thread.set_draft_prompt(Some(draft.clone()), cx);
+        });
+        // The thread view notifies the thread after a draft edit to request a save.
+        turn.thread.update(cx, |_, cx| cx.notify());
+        flush_streaming_test_saves(cx);
+        assert_eq!(turn.saved_thread().await.draft_prompt, Some(draft));
+
+        let saves_after_changes = turn.database.save_count();
+        turn.model.send_last_completion_stream_text_chunk("two");
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.database.save_count(),
+            saves_after_changes,
+            "streamed chunks after a saved change must not save the thread"
+        );
+
+        turn.model.end_last_completion_stream();
+        send.await.unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_token_usage_does_not_save_while_message_streams(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        turn.model.send_last_completion_stream_text_chunk("one ");
+        flush_streaming_test_saves(cx);
+        let saves_before_usage = turn.database.save_count();
+
+        // Some providers, like Google, report usage with every streamed chunk.
+        for output_tokens in [10, 20, 30] {
+            turn.model.send_last_completion_stream_event(
+                LanguageModelCompletionEvent::UsageUpdate(language_model::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens,
+                    ..Default::default()
+                }),
+            );
+            flush_streaming_test_saves(cx);
+        }
+        assert_eq!(turn.database.save_count(), saves_before_usage);
+
+        turn.model.end_last_completion_stream();
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        let expected_usage = language_model::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 30,
+            ..Default::default()
+        };
+        let saved_thread = turn.saved_thread().await;
+        assert_eq!(saved_thread.cumulative_token_usage, expected_usage);
+        assert_eq!(
+            saved_thread
+                .request_token_usage
+                .into_values()
+                .collect::<Vec<_>>(),
+            vec![expected_usage]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_token_usage_saved_when_message_ends_without_content(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        // A titled thread doesn't generate a title when the turn ends, which
+        // would otherwise save the thread.
+        turn.thread
+            .update(cx, |thread, cx| thread.set_title("Title".into(), cx));
+        turn.send_start_message_with_usage(100);
+        flush_streaming_test_saves(cx);
+
+        turn.model.end_last_completion_stream();
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_thread()
+                .await
+                .cumulative_token_usage
+                .input_tokens,
+            100
+        );
+    }
+
+    #[gpui::test]
+    async fn test_token_usage_saved_when_cancelled_before_content(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        // A titled thread doesn't generate a title when the turn ends, which
+        // would otherwise save the thread.
+        turn.thread
+            .update(cx, |thread, cx| thread.set_title("Title".into(), cx));
+        turn.send_start_message_with_usage(100);
+        flush_streaming_test_saves(cx);
+
+        turn.acp_thread
+            .update(cx, |thread, cx| thread.cancel(cx))
+            .await;
+        send.await.unwrap();
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_thread()
+                .await
+                .cumulative_token_usage
+                .input_tokens,
+            100
+        );
+    }
+
+    #[gpui::test]
+    async fn test_execution_policy_saved_while_message_streams(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        turn.model.send_last_completion_stream_text_chunk("one ");
+        flush_streaming_test_saves(cx);
+
+        turn.thread.update(cx, |thread, cx| {
+            thread.set_execution_policy(
+                AgentExecutionStrategy::Direct,
+                AgentAutonomy::default(),
+                cx,
+            );
+        });
+        flush_streaming_test_saves(cx);
+        assert_eq!(
+            turn.saved_thread().await.execution_strategy,
+            AgentExecutionStrategy::Direct
+        );
+        let saves_after_policy = turn.database.save_count();
+        turn.model.send_last_completion_stream_text_chunk("two");
+        flush_streaming_test_saves(cx);
+        assert_eq!(turn.database.save_count(), saves_after_policy);
+        turn.model.end_last_completion_stream();
+        send.await.expect("finish streaming turn");
+    }
+
+    #[gpui::test]
+    async fn test_pending_edits_saved_while_message_streams(cx: &mut TestAppContext) {
+        let (turn, send) = StreamingTurn::start(cx).await;
+        turn.model.send_last_completion_stream_text_chunk("one ");
+        flush_streaming_test_saves(cx);
+        let project = turn
+            .thread
+            .read_with(cx, |thread, _| thread.project.clone());
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.atomic_write(Path::new("/a/pending.rs").to_path_buf(), "original".into())
+            .await
+            .expect("create pending edit file");
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("test worktree")
+                .read(cx)
+                .id()
+        });
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(
+                    (worktree_id, Arc::<RelPath>::from(rel_path("pending.rs"))),
+                    cx,
+                )
+            })
+            .await
+            .expect("open pending edit buffer");
+        let action_log = turn
+            .thread
+            .read_with(cx, |thread, _| thread.action_log.clone());
+        action_log.update(cx, |action_log, cx| {
+            action_log.buffer_edited(buffer.clone(), cx)
+        });
+        buffer.update(cx, |buffer, cx| buffer.set_text("changed", cx));
+        flush_streaming_test_saves(cx);
+
+        let saved = turn.saved_thread().await;
+        let [edit] = saved.pending_edits.as_slice() else {
+            panic!("pending edit must be persisted while the response is streaming");
+        };
+        assert_eq!(edit.path, Path::new("/a/pending.rs"));
+        assert_eq!(edit.base_text, "original");
+        let saves_after_edit = turn.database.save_count();
+        turn.model.send_last_completion_stream_text_chunk("two");
+        flush_streaming_test_saves(cx);
+        assert_eq!(turn.database.save_count(), saves_after_edit);
+        turn.model.end_last_completion_stream();
+        send.await.expect("finish streaming turn");
+    }
+
+    fn flush_streaming_test_saves(cx: &mut TestAppContext) {
+        cx.run_until_parked();
+        cx.executor().advance_clock(THREAD_SAVE_MAX_LATENCY);
+        cx.run_until_parked();
+    }
+
+    struct StreamingTurn {
+        model: Arc<FakeLanguageModel>,
+        acp_thread: Entity<AcpThread>,
+        thread: Entity<Thread>,
+        session_id: acp::SessionId,
+        database: Arc<ThreadsDatabase>,
+    }
+
+    impl StreamingTurn {
+        async fn start(
+            cx: &mut TestAppContext,
+        ) -> (Self, Task<Result<Option<acp::PromptResponse>>>) {
+            init_test(cx);
+            let (_connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+            let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+            let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+            let model = Arc::new(FakeLanguageModel::default());
+            thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+            let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+
+            let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+            let send = cx.foreground_executor().spawn(send);
+            flush_streaming_test_saves(cx);
+
+            let turn = Self {
+                model,
+                acp_thread,
+                thread,
+                session_id,
+                database,
+            };
+            (turn, send)
+        }
+
+        async fn saved_thread(&self) -> DbThread {
+            self.database
+                .load_thread(self.session_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn saved_markdown(&self) -> String {
+            crate::thread::messages_to_markdown(&self.saved_thread().await.messages)
+        }
+
+        /// Providers like Anthropic report usage before streaming any content.
+        fn send_start_message_with_usage(&self, input_tokens: u64) {
+            self.model.send_last_completion_stream_event(
+                LanguageModelCompletionEvent::StartMessage {
+                    message_id: "message".into(),
+                },
+            );
+            self.model.send_last_completion_stream_event(
+                LanguageModelCompletionEvent::UsageUpdate(language_model::TokenUsage {
+                    input_tokens,
+                    ..Default::default()
+                }),
+            );
+        }
     }
 
     #[gpui::test]

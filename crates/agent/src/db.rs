@@ -510,6 +510,8 @@ pub(crate) struct ThreadsDatabase {
     /// hold a write in flight and interleave more save requests with it.
     #[cfg(test)]
     write_gate: Mutex<Option<Shared<futures::channel::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    save_count: std::sync::atomic::AtomicUsize,
 }
 
 struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>);
@@ -601,6 +603,8 @@ impl ThreadsDatabase {
             connection: Arc::new(Mutex::new(connection)),
             #[cfg(test)]
             write_gate: Mutex::new(None),
+            #[cfg(test)]
+            save_count: Default::default(),
         };
 
         Ok(db)
@@ -751,6 +755,9 @@ impl ThreadsDatabase {
         let connection = self.connection.clone();
         #[cfg(test)]
         let write_gate = self.write_gate.lock().clone();
+        #[cfg(test)]
+        self.save_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         self.executor.spawn(async move {
             #[cfg(test)]
@@ -759,6 +766,11 @@ impl ThreadsDatabase {
             }
             Self::save_thread_sync(&connection, id, thread, &folder_paths)
         })
+    }
+
+    #[cfg(test)]
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(test)]

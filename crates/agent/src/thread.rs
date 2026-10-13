@@ -1714,6 +1714,28 @@ impl CompletionRequestStats {
     }
 }
 
+/// The parts of `to_db` that are worth saving while a message streams. Token
+/// usage and scroll position are left out because they can change on every
+/// streamed chunk or scroll, and some fields never change after creation.
+#[derive(PartialEq)]
+pub(crate) struct StreamingSaveKey {
+    message_count: usize,
+    title: Option<SharedString>,
+    summary: Option<SharedString>,
+    model: Option<DbLanguageModel>,
+    profile_id: AgentProfileId,
+    execution_strategy: AgentExecutionStrategy,
+    autonomy: AgentAutonomy,
+    plan: Option<NativePlan>,
+    proposed_plan: Option<NativePlan>,
+    discovered_tools: HashSet<SharedString>,
+    speed: Option<Speed>,
+    thinking_enabled: bool,
+    thinking_effort: Option<String>,
+    sandboxed_terminal_temp_dir: Option<PathBuf>,
+    sandbox_grants: crate::db::DbSandboxGrants,
+}
+
 pub struct Thread {
     id: acp::SessionId,
     pub(crate) fork_origin: Option<crate::ForkOrigin>,
@@ -2570,6 +2592,8 @@ impl Thread {
         crate::sandboxing::sandbox_worktree_writable_paths(self.project.read(cx), cx)
     }
 
+    /// A field added here must also go in `StreamingSaveKey`, unless saving it
+    /// can wait until the response finishes streaming.
     pub fn to_db(&self, cx: &App) -> Task<DbThread> {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         let orchestration_runs = self.orchestration_snapshots();
@@ -2634,6 +2658,37 @@ impl Thread {
             thread.initial_project_snapshot = initial_project_snapshot;
             thread
         })
+    }
+
+    pub(crate) fn can_skip_save_while_streaming(&self) -> bool {
+        self.pending_message.is_some()
+            // Live orchestration state can mutate through shared run handles.
+            // Keep the existing saves until it has its own persistence revision.
+            && self.orchestration_runs.is_empty()
+            && self.persisted_orchestration_runs.is_empty()
+            && self.orchestration_goal.is_none()
+            && !self.orchestration_waiting_for_workers
+            && self.orchestration_waiting_run_ids.is_empty()
+    }
+
+    pub(crate) fn streaming_save_key(&self) -> StreamingSaveKey {
+        StreamingSaveKey {
+            message_count: self.messages.len(),
+            title: self.title.clone(),
+            summary: self.summary.clone(),
+            model: (&self.model).into(),
+            profile_id: self.profile_id.clone(),
+            execution_strategy: self.execution_strategy,
+            autonomy: self.autonomy,
+            plan: self.plan.clone(),
+            proposed_plan: self.proposed_plan.clone(),
+            discovered_tools: self.discovered_tools.clone(),
+            speed: self.speed,
+            thinking_enabled: self.thinking_enabled,
+            thinking_effort: self.thinking_effort.clone(),
+            sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
+            sandbox_grants: self.sandbox_grants.borrow().to_db(),
+        }
     }
 
     pub(crate) fn fork_requires_confirmation(&self) -> bool {
@@ -6013,6 +6068,9 @@ impl Thread {
         };
 
         if message.content.is_empty() {
+            // Saves are skipped while a message streams, so notify to save
+            // anything that changed meanwhile, like token usage.
+            cx.notify();
             return;
         }
 

@@ -2044,6 +2044,12 @@ impl ThreadView {
         !self.message_queue.is_empty()
     }
 
+    fn resync_entry(&mut self, entry_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.entry_view_state.update(cx, |state, cx| {
+            state.sync_entry(entry_index, &self.thread, window, cx);
+        });
+    }
+
     // events
 
     pub fn handle_entry_view_event(
@@ -4258,6 +4264,14 @@ impl ThreadView {
                         .as_ref()
                         .and_then(|view| view.read(cx).current_model_id(cx))
                         .map(Into::into)
+                })
+                .or_else(|| {
+                    tool_call
+                        .raw_input
+                        .as_ref()
+                        .and_then(|input| input.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|model| SharedString::from(model.to_owned()))
                 });
             let role = native_thread
                 .as_ref()
@@ -10064,6 +10078,33 @@ impl ThreadView {
         list(
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
+                let materialize_content = {
+                    let view_state = this.entry_view_state.read(cx);
+                    match this.thread.read(cx).entries().get(index) {
+                        Some(AgentThreadEntry::ToolCall(call))
+                            if view_state.is_tool_call_expanded(&call.id)
+                                || matches!(
+                                    call.status,
+                                    ToolCallStatus::WaitingForConfirmation { .. }
+                                ) =>
+                        {
+                            let views = view_state
+                                .entry(index)
+                                .and_then(|entry| entry.content_map());
+                            call.diffs()
+                                .map(|diff| diff.entity_id())
+                                .chain(call.terminals().map(|terminal| terminal.entity_id()))
+                                .any(|entity_id| {
+                                    views.is_none_or(|views| !views.contains_key(&entity_id))
+                                })
+                        }
+                        _ => false,
+                    }
+                };
+                // Programmatic expansion can bypass disclosure callbacks.
+                if materialize_content {
+                    this.resync_entry(index, window, cx);
+                }
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
@@ -12005,6 +12046,7 @@ impl ThreadView {
                 this.entry_view_state.update(cx, |state, _cx| {
                     state.toggle_tool_call_expansion(&id);
                 });
+                this.resync_entry(entry_ix, window, cx);
                 this.refresh_thread_search(window, cx);
                 cx.notify();
             }
@@ -12467,6 +12509,7 @@ impl ThreadView {
                         this.entry_view_state.update(cx, |state, _| {
                             state.toggle_tool_call_expansion(&tool_call_id);
                         });
+                        this.resync_entry(entry_ix, window, cx);
                         this.refresh_thread_search(window, cx);
                         cx.notify();
                     })),
@@ -13051,6 +13094,7 @@ impl ThreadView {
                                                                             );
                                                                     },
                                                                 );
+                                                                this.resync_entry(entry_ix, window, cx);
                                                                 this.refresh_thread_search(window, cx);
                                                                 cx.notify();
                                                             }
@@ -13229,10 +13273,11 @@ impl ThreadView {
                             Button::new(("view-full-tool-call", entry_ix), view_full_label)
                                 .style(ButtonStyle::Subtle)
                                 .label_size(LabelSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     this.entry_view_state.update(cx, |state, _| {
                                         state.expand_tool_call(tool_call_id.clone());
                                     });
+                                    this.resync_entry(entry_ix, window, cx);
                                     this.list_state.scroll_to(ListOffset {
                                         item_ix: entry_ix,
                                         offset_in_item: px(0.),
@@ -15310,6 +15355,7 @@ impl ThreadView {
                                                     state.toggle_tool_call_expansion(&tool_call_id);
                                                     state.is_tool_call_expanded(&tool_call_id)
                                                 });
+                                            this.resync_entry(entry_ix, window, cx);
                                             if let Some(streaming_thread) = &streaming_thread {
                                                 streaming_thread.update(cx, |thread, cx| {
                                                     thread.set_streaming_updates_visible(

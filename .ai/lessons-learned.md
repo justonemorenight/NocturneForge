@@ -54,7 +54,7 @@
 - **Wrong:** Enable runtime shaders for app/tests but omit them from the separate remote-server build.
 - **Right:** Keep remote-server compilation separate and select `gpui_platform/runtime_shaders` in both invocations; add `-p gpui_platform` with its empty defaults when selecting workspace features.
 - **Rule:** `xcrun` cannot find `metal`; GPUI `runtime_shaders`.
-- **Seen:** 2x — GPUI test build and remote release build, 2026-09-30.
+- **Seen:** 3x — GPUI test build and remote release build, 2026-09-30; remote release build, 2026-10-08.
 
 ### GPUI test clock APIs depend on the context type
 
@@ -62,7 +62,7 @@
 - **Wrong:** Copy `cx.advance_clock(...)` or `cx.background_executor()` from a different context type.
 - **Right:** In test contexts use `cx.executor().advance_clock(...)`; `VisualTestContext` exposes `cx.background_executor.now()` as a field, while entity contexts use `cx.background_executor().now()`.
 - **Rule:** Rust E0599; use the GPUI executor clock for deterministic timeout tests.
-- **Seen:** 2x — cache icon and ACP reaper tests, 2026-10-01.
+- **Seen:** 3x — cache icon and ACP reaper tests, 2026-10-01; upstream streaming-save tests, 2026-10-08.
 
 ### Cherry-pick conflicts can absorb unrelated fork code
 

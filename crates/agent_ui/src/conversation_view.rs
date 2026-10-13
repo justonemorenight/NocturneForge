@@ -1552,7 +1552,7 @@ impl ConversationView {
 
         entry_view_state.update(cx, |view_state, cx| {
             for ix in 0..count {
-                view_state.sync_entry(ix, &thread, window, cx);
+                view_state.sync_entry_initial(ix, &thread, window, cx);
             }
             list_state.splice_focusable(
                 0..0,
@@ -2515,7 +2515,6 @@ impl ConversationView {
             return;
         };
         if connected.threads.contains_key(&subagent_id)
-            || !connected.connection.supports_load_session()
             || self.pending_subagent_loads.contains(&subagent_id)
         {
             return;
@@ -2523,6 +2522,26 @@ impl ConversationView {
         let Some(parent_thread) = connected.threads.get(&parent_session_id) else {
             return;
         };
+        let live_subagent = parent_thread
+            .read(cx)
+            .thread
+            .read(cx)
+            .external_subagent(&subagent_id);
+        if let Some(subagent_thread) = live_subagent {
+            let conversation = connected.conversation.clone();
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(subagent_thread.clone(), cx);
+            });
+            let view = self.new_thread_view(subagent_thread, conversation, false, None, window, cx);
+            if let Some(connected) = self.as_connected_mut() {
+                connected.threads.insert(subagent_id, view);
+            }
+            cx.notify();
+            return;
+        }
+        if !connected.connection.supports_load_session() {
+            return;
+        }
         let work_dirs = parent_thread
             .read(cx)
             .thread

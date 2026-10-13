@@ -466,6 +466,7 @@ pub struct Markdown {
     /// container from the cache filtered at this width. Purely a hint — the
     /// per-width tag on `block_heights` is what enforces correctness.
     last_known_width: Option<Pixels>,
+    deferred: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -475,6 +476,8 @@ pub struct MarkdownOptions {
     pub render_mermaid_diagrams: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
+    /// Avoid retaining parsed off-screen thread content until it is laid out.
+    pub defer_parsing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -633,6 +636,7 @@ impl Markdown {
         } else {
             None
         };
+        let deferred = options.defer_parsing && !source.is_empty();
         let mut this = Self {
             source,
             source_buf: None,
@@ -665,8 +669,11 @@ impl Markdown {
             active_search_highlight: None,
             block_heights: HashMap::default(),
             last_known_width: None,
+            deferred,
         };
-        this.parse(cx);
+        if !deferred {
+            this.parse(cx);
+        }
         this
     }
 
@@ -1037,7 +1044,19 @@ impl Markdown {
         self.context_menu_capture_generation = 0;
     }
 
+    /// Start deferred parsing when a renderer or another consumer needs parsed events.
+    pub fn ensure_parsed(&mut self, cx: &mut Context<Self>) {
+        if self.deferred {
+            self.deferred = false;
+            self.parse(cx);
+        }
+    }
+
     fn parse(&mut self, cx: &mut Context<Self>) {
+        if self.deferred {
+            return;
+        }
+
         if self.source().is_empty() {
             self.should_reparse = false;
             self.pending_parse.take();
@@ -3289,6 +3308,9 @@ impl Element for MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        self.markdown
+            .update(cx, |markdown, cx| markdown.ensure_parsed(cx));
+
         let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
             let markdown = self.markdown.read(cx);
             (
@@ -5307,6 +5329,49 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             MarkdownElement::new(self.markdown.clone(), self.style.clone())
         }
+    }
+
+    #[gpui::test]
+    fn test_deferred_markdown_renders_latest_source_and_keeps_streaming(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                "Original source".into(),
+                None,
+                None,
+                MarkdownOptions {
+                    defer_parsing: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        markdown.update(cx, |markdown, cx| {
+            markdown.append(" with a streamed suffix", cx);
+            markdown.reset("Latest **é中🙂**".into(), cx);
+        });
+        cx.run_until_parked();
+        markdown.read_with(cx, |markdown, _| {
+            assert_eq!(markdown.source(), "Latest **é中🙂**");
+            assert!(markdown.parsed_markdown().events().is_empty());
+        });
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        MarkdownElement::rendered_text(markdown.clone(), cx, |_, _| MarkdownStyle::default());
+        cx.run_until_parked();
+        let rendered =
+            MarkdownElement::rendered_text(markdown.clone(), cx, |_, _| MarkdownStyle::default());
+        assert!(rendered.contains("Latest é中🙂"), "{rendered:?}");
+        assert!(!rendered.contains("Original source"), "{rendered:?}");
+
+        markdown.update(cx, |markdown, cx| {
+            markdown.append("\n\nAfter rendering", cx)
+        });
+        cx.run_until_parked();
+        let rendered =
+            MarkdownElement::rendered_text(markdown, cx, |_, _| MarkdownStyle::default());
+        assert!(rendered.contains("Latest é中🙂"), "{rendered:?}");
+        assert!(rendered.contains("After rendering"), "{rendered:?}");
     }
 
     #[gpui::test]

@@ -1,0 +1,77 @@
+--- a/dist/native-subagents.js
++++ b/dist/native-subagents.js
+@@ -20,6 +20,9 @@
+     identityByToolUse = new Map();
+     controlByToolUse = new Map();
+     childByParentToolUse = new Map();
++    // SendMessage has a new lifecycle tool id, while child output can retain the
++    // original Agent id. Stream aliases must not retarget old finish events.
++    childByStreamParentToolUse = new Map();
+     /**
+      * The child session of each tool call that went to a child session. A later
+      * update of that tool call can lose `parentToolUseId`, for example a progress
+@@ -43,6 +46,10 @@
+             if (child.parentToolUseId) {
+                 this.childByParentToolUse.set(child.parentToolUseId, child);
+             }
++            for (const toolUseId of child.streamParentToolUseIds ?? [child.parentToolUseId]) {
++                if (toolUseId)
++                    this.childByStreamParentToolUse.set(toolUseId, child);
++            }
+         }
+     }
+     async route(notification, deliver, forcedSessionId) {
+@@ -61,7 +68,7 @@
+                 this.identityByToolUse.set(toolCallId, mergeSubagentIdentity(this.identityByToolUse.get(toolCallId), identity));
+             }
+             const parentSessionId = claudeMeta?.parentToolUseId
+-                ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)?.sessionId
++                ? this.childByStreamParentToolUse.get(claudeMeta.parentToolUseId)?.sessionId
+                 : this.rootSessionId;
+             this.parentByToolUse.set(toolCallId, parentSessionId ?? this.rootSessionId);
+             const child = this.childByParentToolUse.get(toolCallId);
+@@ -100,7 +107,7 @@
+         if (owner)
+             return this.toChild(owner, notification, toolCallId);
+         if (this.enabled && claudeMeta?.parentToolUseId) {
+-            const child = this.childByParentToolUse.get(claudeMeta.parentToolUseId);
++            const child = this.childByStreamParentToolUse.get(claudeMeta.parentToolUseId);
+             if (!child || !child.announced) {
+                 this.buffer(claudeMeta.parentToolUseId, notification);
+                 return null;
+@@ -287,6 +294,7 @@
+         this.identityByToolUse.clear();
+         this.controlByToolUse.clear();
+         this.childByParentToolUse.clear();
++        this.childByStreamParentToolUse.clear();
+         this.taskFinishPromises.clear();
+         this.generationByTaskId.clear();
+         this.pending.clear();
+@@ -345,7 +353,14 @@
+             ...fields,
+         };
+         const toolUseId = child.parentToolUseId;
++        child.streamParentToolUseIds = [...new Set([
++            ...(previous?.streamParentToolUseIds ?? []),
++            previous?.parentToolUseId,
++            toolUseId,
++        ].filter((value) => typeof value === "string" && value.length > 0))];
+         this.children.set(taskId, child);
++        for (const streamToolUseId of child.streamParentToolUseIds)
++            this.childByStreamParentToolUse.set(streamToolUseId, child);
+         if (toolUseId) {
+             this.taskByToolUse.set(toolUseId, taskId);
+             this.childByParentToolUse.set(toolUseId, child);
+@@ -354,8 +369,10 @@
+         if (!announce)
+             return;
+         await announceNativeSubagent(child, this.publish);
+-        for (const pending of toolUseId ? this.takePending(toolUseId) : [])
+-            await deliver(pending);
++        for (const streamToolUseId of child.streamParentToolUseIds) {
++            for (const pending of this.takePending(streamToolUseId))
++                await deliver(pending);
++        }
+     }
+     nextChildSessionId(taskId, previous) {
+         if (!previous) {
