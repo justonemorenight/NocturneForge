@@ -118,6 +118,10 @@ pub fn init_test(cx: &mut TestAppContext) {
     });
 }
 
+pub fn init_thread_transcript_search(cx: &mut App) {
+    crate::thread_transcript_search::init(cx);
+}
+
 /// Returns the creation time assigned to a linked worktree's git metadata
 /// directory, mirroring `FakeGitRepository::worktree_created_at` (which uses
 /// the FakeFs directory mtime as a stand-in for the creation time).

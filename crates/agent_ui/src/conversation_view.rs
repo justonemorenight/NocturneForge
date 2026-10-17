@@ -2568,13 +2568,14 @@ impl ConversationView {
                 let Ok(subagent_thread) = result else {
                     return;
                 };
-                let Some(conversation) = this
-                    .as_connected()
-                    .map(|connected| connected.conversation.clone())
-                else {
+                let Some(connected) = this.as_connected() else {
                     return;
                 };
                 let subagent_session_id = subagent_thread.read(cx).session_id().clone();
+                if connected.threads.contains_key(&subagent_session_id) {
+                    return;
+                }
+                let conversation = connected.conversation.clone();
                 conversation.update(cx, |conversation, cx| {
                     conversation.register_thread(subagent_thread.clone(), cx);
                 });
@@ -4140,6 +4141,52 @@ pub(crate) mod tests {
     use crate::thread_metadata_store::ThreadMetadataStore;
 
     use super::*;
+
+    #[gpui::test]
+    async fn test_subagent_load_preserves_a_view_registered_while_loading(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) = setup_conversation_view(FakeAcpAgentServer::new(), cx).await;
+        let parent_session_id =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.session_id.clone());
+        let child_session_id = acp::SessionId::new("subagent-load-race");
+        let registered_view = conversation_view.update_in(cx, |view, window, cx| {
+            view.load_subagent_session(child_session_id.clone(), parent_session_id, window, cx);
+            let connected = view.as_connected().expect("connected conversation");
+            let connection = connected.connection.clone();
+            let conversation = connected.conversation.clone();
+            let thread = build_test_thread(
+                connection,
+                view.project.clone(),
+                "subagent-load-race",
+                child_session_id.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(thread.clone(), cx);
+            });
+            let thread_view = view.new_thread_view(thread, conversation, false, None, window, cx);
+            let entity_id = thread_view.entity_id();
+            view.as_connected_mut()
+                .expect("connected conversation")
+                .threads
+                .insert(child_session_id.clone(), thread_view);
+            entity_id
+        });
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, cx| {
+            let connected = view.as_connected().expect("connected conversation");
+            assert_eq!(connected.threads.len(), 2);
+            assert_eq!(
+                connected
+                    .threads
+                    .get(&child_session_id)
+                    .expect("subagent view")
+                    .entity_id(),
+                registered_view
+            );
+            assert_eq!(connected.conversation.read(cx).subscriptions.len(), 2);
+        });
+    }
 
     #[test]
     fn test_data_retention_error_maps_from_provider_error() {

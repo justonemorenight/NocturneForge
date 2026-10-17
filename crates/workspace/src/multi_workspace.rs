@@ -1046,12 +1046,9 @@ impl MultiWorkspace {
                 .map(|group| group.key.clone())
         });
 
-        // Now remove the group.
-        self.project_groups.retain(|group| group.key != *group_key);
-        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
-
         let excluded_workspaces = workspaces.clone();
-        self.remove(
+        let empty_group = workspaces.is_empty();
+        let removal = self.remove(
             workspaces,
             move |this, window, cx| {
                 if let Some(neighbor_key) = neighbor_key
@@ -1086,7 +1083,21 @@ impl MultiWorkspace {
             },
             window,
             cx,
-        )
+        );
+        let group_key = group_key.clone();
+        cx.spawn(async move |this, cx| {
+            let removed = removal.await?;
+            if !removed && !empty_group {
+                return Ok(false);
+            }
+            this.update(cx, |this, cx| {
+                this.project_groups.retain(|group| group.key != group_key);
+                this.serialize(cx);
+                cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+                cx.notify();
+            })?;
+            Ok(true)
+        })
     }
 
     /// Goes through sqlite: serialize -> close -> open new window

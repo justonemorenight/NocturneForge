@@ -1034,6 +1034,20 @@ mod tests {
             let count_after_focus_change = *pending_input_changed_count.borrow();
             assert!(count_after_focus_change > *count_after_pending_for_assertion.borrow());
         });
+        cx.update(|_, cx| cx.bind_keys([KeyBinding::new("ctrl-d h", TestAction, None)]));
+        let temporary_focus = cx.update(|window, cx| {
+            let handle = cx.focus_handle();
+            window.focus(&handle, cx);
+            handle
+        });
+        cx.simulate_keystrokes("ctrl-d");
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        cx.update(|_, _| drop(temporary_focus));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(window.focused(cx).is_none());
+            assert!(!window.has_pending_keystrokes());
+        });
     }
 
     #[crate::test]

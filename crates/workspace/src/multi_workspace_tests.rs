@@ -1130,3 +1130,80 @@ async fn test_remove_project_group_with_remote_neighbor_does_not_create_local_wo
         }
     });
 }
+
+#[gpui::test]
+async fn test_remove_project_group_waits_for_save_prompt(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "file.txt": "" }))
+        .await;
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| multi_workspace.open_sidebar(cx));
+    cx.run_until_parked();
+    let group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let item = cx.new(|cx| TestItem::new(cx).with_dirty(true));
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+    });
+
+    for (answer, expected_removed) in [("Cancel", false), ("Don't Save", true)] {
+        let removal = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove_project_group(&group_key, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert!(multi_workspace.project_group_keys().contains(&group_key));
+        });
+        cx.simulate_prompt_answer(answer);
+        cx.run_until_parked();
+        assert_eq!(
+            removal.await.expect("remove project group"),
+            expected_removed
+        );
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert_eq!(
+                multi_workspace.project_group_keys().contains(&group_key),
+                !expected_removed
+            );
+            if !expected_removed {
+                assert_eq!(multi_workspace.workspace(), &workspace);
+            }
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_remove_project_group_without_open_workspaces(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let group_key = ProjectGroupKey::new(
+        None,
+        PathList::new(&[PathBuf::from(path!("/closed-project"))]),
+    );
+    multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.test_add_project_group(ProjectGroup {
+            key: group_key.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+    });
+    let removed = multi_workspace
+        .update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove_project_group(&group_key, window, cx)
+        })
+        .await
+        .expect("remove closed project group");
+    assert!(removed);
+    assert!(!cx.has_pending_prompt());
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert!(!multi_workspace.project_group_keys().contains(&group_key));
+    });
+}

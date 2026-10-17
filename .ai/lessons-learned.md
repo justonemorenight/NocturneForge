@@ -38,7 +38,7 @@
 - **Wrong:** Read guessed source/state filenames or pass unverified globs such as `crates/git_ui/src/*tests*` or `crates/acp_thread/src/stub*` to a zsh command.
 - **Right:** Use `rg --files` to discover source and state paths before reading them, or search the containing directory with `rg -n`; quote any glob supplied through an `rg -g` option.
 - **Rule:** zsh `NOMATCH` stops the command before `rg` runs.
-- **Seen:** 11x — 2026-09-30 through 2026-10-03; includes missing stub, thread-history, adapter diff, and relocated Metal source paths.
+- **Seen:** 15x — 2026-09-30 through 2026-10-17; includes missing stub, thread-history, adapter diff, relocated Metal, fake-provider, and colocated item-test paths.
 
 ### Move GPUI handles into their final callback
 
@@ -79,3 +79,11 @@
 - **Right:** Compare imported crates and feature-gated modules against the fork's production dependency declarations; ACP's `unstable` feature does not include `unstable_protocol_v2`.
 - **Rule:** Rust E0432; dev-dependencies do not cover production code, and umbrella features need not include experimental schemas.
 - **Seen:** 2x — Project `encoding_rs` and ACP v2 schema imports, 2026-10-03.
+
+### Upstream test capability builders differ from the fork
+
+- **Pattern:** New upstream Agent UI tests use plain model fields and ACP v2 prompt capability objects.
+- **Wrong:** Copy `model.supports_images = true` or the v2 image builder into this fork's test setup.
+- **Right:** Use `FakeLanguageModel::set_supports_images` through `ConfiguredModel.model`, and the receiving editor's v1 `PromptCapabilities::image(true)` API.
+- **Rule:** Rust E0433 and mismatched model/capability APIs; inspect the receiving type before porting test helpers.
+- **Seen:** 2x — 2026-10-17, inline-prompt and message-editor paste regressions.

@@ -962,12 +962,12 @@ impl SyntaxSnapshot {
         self.layers = layers;
         self.interpolated_version = text.version.clone();
         self.parsed_version = text.version.clone();
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, debug_assertions))]
         self.check_invariants(text);
         Ok(())
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn check_invariants(&self, text: &BufferSnapshot) {
         let mut max_depth = 0;
         let mut prev_layer: Option<(Range<Anchor>, Option<LanguageId>)> = None;
@@ -981,24 +981,22 @@ impl SyntaxSnapshot {
                         match layer.range.start.cmp(&prev_range.start, text) {
                             Ordering::Less => panic!("layers out of order"),
                             Ordering::Equal => match layer.range.end.cmp(&prev_range.end, text) {
-                                Ordering::Less => panic!("layers out of order"),
+                                Ordering::Greater => panic!("layers out of order"),
                                 Ordering::Equal => {
                                     if layer.content.language_id() < prev_language_id {
                                         panic!("layers out of order")
                                     }
                                 }
-                                Ordering::Greater => {}
+                                Ordering::Less => {}
                             },
                             Ordering::Greater => {}
                         }
                     }
-                    prev_layer = Some((layer.range.clone(), layer.content.language_id()));
                 }
-                Ordering::Greater => {
-                    prev_layer = None;
-                }
+                Ordering::Greater => {}
             }
 
+            prev_layer = Some((layer.range.clone(), layer.content.language_id()));
             max_depth = layer.depth;
         }
     }
