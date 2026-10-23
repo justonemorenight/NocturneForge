@@ -297,10 +297,88 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
 #[serde(rename_all = "snake_case")]
 pub enum ExternalSubagentState {
     Running,
+    RequiresAction,
+    Unknown,
     Completed,
     Failed,
     Cancelled,
     Disconnected,
+}
+
+// A patch must distinguish an omitted field from an explicit null.
+fn deserialize_external_patch<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSubagentPatch {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub title: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<Option<ExternalSubagentWorkState>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub capabilities: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ExternalSubagentWorkState {
+    Running,
+    RequiresAction,
+    Idle {
+        stop_reason: Option<serde_json::Value>,
+        error: Option<serde_json::Value>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSessionMessage {
+    pub message_id: acp::MessageId,
+    pub sender_session_id: Option<acp::SessionId>,
+    pub recipient_session_id: Option<acp::SessionId>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content: Option<Option<Vec<acp::ContentBlock>>>,
+    #[serde(
+        rename = "_meta",
+        default,
+        deserialize_with = "deserialize_external_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub meta: Option<Option<acp::Meta>>,
 }
 
 #[derive(Debug)]
@@ -861,6 +939,35 @@ pub struct ContextCompactionUpdate {
 }
 
 impl AgentThreadEntry {
+    pub fn has_pending_markdown_render(&self, cx: &App) -> bool {
+        let pending = |markdown: &Entity<Markdown>| markdown.read(cx).has_pending_render();
+        let block_pending = |block: &ContentBlock| block.markdown().is_some_and(pending);
+        match self {
+            Self::UserMessage(message) => block_pending(&message.content),
+            Self::AssistantMessage(message) => message.chunks.iter().any(|chunk| {
+                let (AssistantMessageChunk::Message { block, .. }
+                | AssistantMessageChunk::Thought { block, .. }) = chunk;
+                block_pending(block)
+            }),
+            Self::ToolCall(call) => {
+                pending(&call.label)
+                    || call.raw_input_markdown.as_ref().is_some_and(pending)
+                    || call
+                        .content_for_display()
+                        .iter()
+                        .any(|content| match content {
+                            ToolCallContent::ContentBlock(block) => block_pending(block),
+                            _ => false,
+                        })
+            }
+            Self::ContextCompaction(compaction) => {
+                compaction.error.as_ref().is_some_and(pending)
+                    || compaction.summary.iter().any(block_pending)
+            }
+            Self::Elicitation(_) => false,
+        }
+    }
+
     pub fn is_indented(&self) -> bool {
         match self {
             Self::UserMessage(message) => message.indented,
@@ -3338,6 +3445,10 @@ pub struct AcpThread {
     subagent_sessions_by_tool: HashMap<acp::ToolCallId, Vec<acp::SessionId>>,
     external_subagents: HashMap<acp::SessionId, Entity<AcpThread>>,
     external_subagent_state: Option<ExternalSubagentState>,
+    external_subagent_resumable: bool,
+    external_subagent_cancel_allowed: bool,
+    external_subagent_error: Option<String>,
+    external_session_messages: HashMap<acp::MessageId, ExternalSessionMessage>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     pending_terminal_references_logged: HashSet<acp::TerminalId>,
     had_error: bool,
@@ -3619,6 +3730,10 @@ impl AcpThread {
             subagent_sessions_by_tool: HashMap::default(),
             external_subagents: HashMap::default(),
             external_subagent_state: None,
+            external_subagent_resumable: false,
+            external_subagent_cancel_allowed: false,
+            external_subagent_error: None,
+            external_session_messages: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             pending_terminal_references_logged: HashSet::default(),
             had_error: false,
@@ -3823,7 +3938,14 @@ impl AcpThread {
 
     pub fn status(&self) -> ThreadStatus {
         if self.running_turn.is_some()
-            || self.external_subagent_state == Some(ExternalSubagentState::Running)
+            || matches!(
+                self.external_subagent_state,
+                Some(
+                    ExternalSubagentState::Running
+                        | ExternalSubagentState::RequiresAction
+                        | ExternalSubagentState::Unknown
+                )
+            )
         {
             ThreadStatus::Generating
         } else {
@@ -3836,6 +3958,9 @@ impl AcpThread {
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
+        if self.external_subagent_state == Some(ExternalSubagentState::RequiresAction) {
+            return true;
+        }
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(_) => return false,
@@ -3971,9 +4096,10 @@ impl AcpThread {
         update: acp::SessionUpdate,
         cx: &mut Context<Self>,
     ) -> Result<(), acp::Error> {
-        if self
-            .external_subagent_state
-            .is_some_and(|state| state != ExternalSubagentState::Running)
+        if !self.external_subagent_resumable
+            && self
+                .external_subagent_state
+                .is_some_and(|state| state != ExternalSubagentState::Running)
         {
             return Ok(());
         }
@@ -4980,8 +5106,43 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
     }
 
+    pub fn register_subagent(
+        &mut self,
+        child: Entity<AcpThread>,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<AcpThread>> {
+        let session_id = child.read(cx).session_id().clone();
+        anyhow::ensure!(
+            session_id != self.session_id,
+            "A subagent cannot be its own parent"
+        );
+        anyhow::ensure!(
+            child.read(cx).parent_session_id() == Some(&self.session_id),
+            "Subagent belongs to another parent"
+        );
+        if let Some(existing) = self.external_subagents.get(&session_id) {
+            return Ok(existing.clone());
+        }
+        self.external_subagents
+            .insert(session_id.clone(), child.clone());
+        cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+        Ok(child)
+    }
+
+    pub fn subagents(&self) -> impl Iterator<Item = &Entity<AcpThread>> {
+        self.external_subagents.values()
+    }
+
     pub fn external_subagent(&self, session_id: &acp::SessionId) -> Option<Entity<AcpThread>> {
         self.external_subagents.get(session_id).cloned()
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        !self.external_subagent_resumable || self.external_subagent_cancel_allowed
+    }
+
+    pub fn activity_unknown(&self) -> bool {
+        self.external_subagent_state == Some(ExternalSubagentState::Unknown)
     }
 
     pub fn is_external_subagent(&self) -> bool {
@@ -5044,10 +5205,200 @@ impl AcpThread {
         )?;
         // These children already stream on this connection. Loading their ids
         // as independent CLI sessions would lose their live task ownership.
-        self.external_subagents
-            .insert(session_id.clone(), child.clone());
-        cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+        self.register_subagent(child, cx)
+    }
+
+    pub fn upsert_external_subagent(
+        &mut self,
+        session_id: acp::SessionId,
+        patch: ExternalSubagentPatch,
+        cx: &mut Context<Self>,
+    ) -> Result<Entity<AcpThread>> {
+        let existing = self.external_subagents.contains_key(&session_id);
+        let child = self.spawn_external_subagent(
+            session_id.clone(),
+            session_id.to_string(),
+            String::new(),
+            None,
+            cx,
+        )?;
+        let state_changed = patch.state.is_some();
+        let state = patch.state;
+        let mut error_message = None;
+        child.update(cx, |child, cx| {
+            child.external_subagent_resumable = true;
+            if !existing {
+                child.external_subagent_state = Some(ExternalSubagentState::Unknown);
+            }
+            if let Some(title) = &patch.title {
+                child.title = title.clone().map(Into::into);
+                cx.emit(AcpThreadEvent::TitleUpdated);
+            }
+            if let Some(capabilities) = &patch.capabilities {
+                child.external_subagent_cancel_allowed = capabilities
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.get("cancel"))
+                    .is_some_and(serde_json::Value::is_object);
+            }
+            if let Some(state) = state {
+                let previous = child.external_subagent_state;
+                let next = match state {
+                    Some(ExternalSubagentWorkState::Running) => ExternalSubagentState::Running,
+                    Some(ExternalSubagentWorkState::RequiresAction) => {
+                        ExternalSubagentState::RequiresAction
+                    }
+                    Some(ExternalSubagentWorkState::Idle { stop_reason, error }) => {
+                        match stop_reason.as_ref().and_then(serde_json::Value::as_str) {
+                            Some("cancelled") => ExternalSubagentState::Cancelled,
+                            Some("error") => {
+                                error_message = error
+                                    .as_ref()
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                ExternalSubagentState::Failed
+                            }
+                            _ => ExternalSubagentState::Completed,
+                        }
+                    }
+                    Some(ExternalSubagentWorkState::Unknown) | None => {
+                        ExternalSubagentState::Unknown
+                    }
+                };
+                child.external_subagent_state = Some(next);
+                child.had_error = next == ExternalSubagentState::Failed;
+                Self::flush_streaming_text(&mut child.streaming_text_buffer, cx);
+                if previous != Some(next) {
+                    cx.emit(AcpThreadEvent::StatusChanged);
+                    if matches!(
+                        next,
+                        ExternalSubagentState::Completed
+                            | ExternalSubagentState::Failed
+                            | ExternalSubagentState::Cancelled
+                    ) {
+                        cx.emit(AcpThreadEvent::Stopped(
+                            if next == ExternalSubagentState::Cancelled {
+                                acp::StopReason::Cancelled
+                            } else {
+                                acp::StopReason::EndTurn
+                            },
+                        ));
+                    }
+                }
+            }
+            let error_changed = state_changed && child.external_subagent_error != error_message;
+            if state_changed {
+                child.external_subagent_error = error_message.clone();
+            }
+            if let Some(error) = &error_message
+                && error_changed
+            {
+                child.push_assistant_content_block(
+                    acp::ContentBlock::Text(acp::TextContent::new(error.clone())),
+                    false,
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+        let state = child.read(cx).external_subagent_state;
+        let status = match state {
+            Some(ExternalSubagentState::Running | ExternalSubagentState::RequiresAction) => {
+                acp::ToolCallStatus::InProgress
+            }
+            Some(ExternalSubagentState::Failed | ExternalSubagentState::Disconnected) => {
+                acp::ToolCallStatus::Failed
+            }
+            Some(ExternalSubagentState::Completed | ExternalSubagentState::Cancelled) => {
+                acp::ToolCallStatus::Completed
+            }
+            _ => acp::ToolCallStatus::Pending,
+        };
+        let mut fields = acp::ToolCallUpdateFields::new().status(status);
+        if let Some(title) = patch.title {
+            fields.title = Some(title.unwrap_or_else(|| session_id.to_string()));
+        }
+        if let Some(description) = patch.description {
+            fields.raw_input =
+                Some(serde_json::json!({"message": description.unwrap_or_default()}));
+        }
+        self.handle_session_update(
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                Self::external_subagent_tool_id(&session_id),
+                fields,
+            )),
+            cx,
+        )?;
+        if state == Some(ExternalSubagentState::Cancelled)
+            && let Some((index, call)) =
+                self.tool_call_mut(&Self::external_subagent_tool_id(&session_id))
+        {
+            call.status = ToolCallStatus::Canceled;
+            cx.emit(AcpThreadEvent::EntryUpdated(index));
+        }
+        cx.notify();
         Ok(child)
+    }
+
+    pub fn upsert_external_session_message(
+        &mut self,
+        mut message: ExternalSessionMessage,
+        append: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.external_session_messages.get(&message.message_id);
+        if let Some(previous) = previous {
+            message.sender_session_id = message
+                .sender_session_id
+                .or_else(|| previous.sender_session_id.clone());
+            message.recipient_session_id = message
+                .recipient_session_id
+                .or_else(|| previous.recipient_session_id.clone());
+            if message.meta.is_none() {
+                message.meta = previous.meta.clone();
+            }
+        }
+        let mut content = previous
+            .and_then(|message| message.content.clone())
+            .flatten()
+            .unwrap_or_default();
+        if let Some(update) = message.content.take() {
+            if append {
+                content.extend(update.unwrap_or_default());
+            } else {
+                content = update.unwrap_or_default();
+            }
+        }
+        message.content = Some(Some(content.clone()));
+        self.external_session_messages
+            .insert(message.message_id.clone(), message.clone());
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        let languages = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let mut rendered = ContentBlock::new(
+            acp::ContentBlock::Text(acp::TextContent::new("")),
+            &languages,
+            path_style,
+            cx,
+        );
+        for block in &content {
+            rendered.append(block.clone(), &languages, path_style, cx);
+        }
+        if let Some((index, entry)) = self.entries.iter_mut().enumerate().find(|(_, entry)| {
+            matches!(entry, AgentThreadEntry::UserMessage(user) if user.protocol_id.as_ref() == Some(&message.message_id))
+        }) {
+            if let AgentThreadEntry::UserMessage(user) = entry {
+                user.content = rendered;
+                user.chunks = content;
+            }
+            cx.emit(AcpThreadEvent::EntryUpdated(index));
+        } else {
+            self.push_entry(AgentThreadEntry::UserMessage(UserMessage {
+                protocol_id: Some(message.message_id), client_id: None, is_optimistic: false,
+                content: rendered, chunks: content, checkpoint: None, indented: true,
+            }), cx);
+        }
+        cx.notify();
     }
 
     fn external_subagent_tool_id(session_id: &acp::SessionId) -> acp::ToolCallId {
@@ -5065,7 +5416,8 @@ impl AcpThread {
             .get(session_id)
             .with_context(|| format!("Unknown external subagent {session_id}"))?;
         let changed = child.update(cx, |child, cx| {
-            if child.external_subagent_state != Some(ExternalSubagentState::Running)
+            if child.external_subagent_resumable
+                || child.external_subagent_state != Some(ExternalSubagentState::Running)
                 || state == ExternalSubagentState::Running
             {
                 return false;
@@ -5090,7 +5442,10 @@ impl AcpThread {
         });
         if changed {
             let status = match state {
-                ExternalSubagentState::Running => acp::ToolCallStatus::InProgress,
+                ExternalSubagentState::Running | ExternalSubagentState::RequiresAction => {
+                    acp::ToolCallStatus::InProgress
+                }
+                ExternalSubagentState::Unknown => acp::ToolCallStatus::Completed,
                 ExternalSubagentState::Completed => acp::ToolCallStatus::Completed,
                 ExternalSubagentState::Failed | ExternalSubagentState::Disconnected => {
                     acp::ToolCallStatus::Failed
@@ -5163,7 +5518,10 @@ impl AcpThread {
         {
             let session_id = acp::SessionId::new(agent_id);
             let tool_id = Self::external_subagent_tool_id(&session_id);
-            if self.external_subagents.contains_key(&session_id)
+            if self
+                .external_subagents
+                .get(&session_id)
+                .is_some_and(|child| !child.read(cx).external_subagent_resumable)
                 && self.index_for_tool_call(&tool_id).is_some()
             {
                 fields_update.tool_call_id = tool_id;
@@ -6090,6 +6448,12 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        if self.is_external_subagent() {
+            return futures::future::ready(Err(anyhow::anyhow!(
+                "This subagent is owned by its parent agent and cannot accept prompts"
+            )))
+            .boxed();
+        }
         let block = ContentBlock::new_combined(
             message.clone(),
             self.project.read(cx).languages().clone(),
@@ -6205,13 +6569,19 @@ impl AcpThread {
     }
 
     pub fn can_retry(&self, cx: &App) -> bool {
-        self.connection.retry(&self.session_id, cx).is_some()
+        !self.is_external_subagent() && self.connection.retry(&self.session_id, cx).is_some()
     }
 
     pub fn retry(
         &mut self,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        if self.is_external_subagent() {
+            return futures::future::ready(Err(anyhow::anyhow!(
+                "This subagent is owned by its parent agent and cannot be retried"
+            )))
+            .boxed();
+        }
         let prompt_turn_id = self.turn_id + 1;
         self.run_turn(cx, async move |this, cx| {
             this.update(cx, |this, cx| {
@@ -6478,6 +6848,12 @@ impl AcpThread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if self.external_subagent_resumable {
+            if self.external_subagent_cancel_allowed {
+                self.connection.cancel(&self.session_id, cx);
+            }
+            return Task::ready(());
+        }
         self.cancel_inner(RequestPermissionOutcome::Cancelled, cx)
     }
 
@@ -6567,12 +6943,18 @@ impl AcpThread {
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
-                    let cancel = matches!(
-                        call.status,
-                        ToolCallStatus::Pending
-                            | ToolCallStatus::WaitingForConfirmation { .. }
-                            | ToolCallStatus::InProgress
-                    );
+                    let reported_child =
+                        self.external_subagents.iter().any(|(session_id, child)| {
+                            call.id == Self::external_subagent_tool_id(session_id)
+                                && child.read(cx).external_subagent_resumable
+                        });
+                    let cancel = !reported_child
+                        && matches!(
+                            call.status,
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::WaitingForConfirmation { .. }
+                                | ToolCallStatus::InProgress
+                        );
                     if cancel {
                         let previous_status =
                             mem::replace(&mut call.status, ToolCallStatus::Canceled);
@@ -8441,6 +8823,138 @@ mod tests {
             settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn external_subagent_rfd_state_snapshots_and_message_upserts(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let parent = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("parent");
+        let session_id = acp::SessionId::new("worker");
+        let patch =
+            |value| serde_json::from_value::<ExternalSubagentPatch>(value).expect("RFD patch");
+        let child = parent.update(cx, |parent, cx| parent.upsert_external_subagent(session_id.clone(), patch(json!({"title":"Initial", "description":"Purpose", "state":{"state":"running"}, "capabilities":{"cancel":{}}})), cx)).expect("child");
+        for value in [
+            json!({"state":{"state":"requires_action"}}),
+            json!({"description":"Updated purpose"}),
+        ] {
+            parent
+                .update(cx, |parent, cx| {
+                    parent.upsert_external_subagent(session_id.clone(), patch(value), cx)
+                })
+                .expect("patch");
+        }
+        assert!(child.read_with(cx, |thread, _| thread.is_waiting_for_confirmation()));
+        assert!(child.read_with(cx, |thread, _| thread.external_subagent_cancel_allowed));
+        parent
+            .update(cx, |parent, cx| {
+                parent.upsert_external_subagent(
+                    session_id.clone(),
+                    patch(json!({"title":null, "capabilities":null, "state":null})),
+                    cx,
+                )
+            })
+            .expect("clear");
+        child.read_with(cx, |thread, _| {
+            assert_eq!(thread.title(), None);
+            assert!(!thread.external_subagent_cancel_allowed);
+            assert_eq!(
+                thread.external_subagent_state,
+                Some(ExternalSubagentState::Unknown)
+            );
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+        for state in [
+            json!({"state":"running"}),
+            json!({"state":"unknown"}),
+            json!({"state":"idle", "stopReason":"cancelled"}),
+            json!({"state":"running"}),
+            json!({"state":"idle", "stopReason":"error", "error":{"code":-32603,"message":"Worker request failed"}}),
+        ] {
+            parent
+                .update(cx, |parent, cx| {
+                    parent.upsert_external_subagent(
+                        session_id.clone(),
+                        patch(json!({"state":state})),
+                        cx,
+                    )
+                })
+                .expect("state transition");
+        }
+        assert!(child.read_with(cx, |thread, _| thread.had_error()));
+        let transcript_before_repeat = child.read_with(cx, |thread, cx| {
+            thread
+                .entries
+                .iter()
+                .map(|entry| entry.to_markdown(cx))
+                .collect::<String>()
+        });
+        parent.update(cx, |parent, cx| parent.upsert_external_subagent(session_id.clone(), patch(json!({"state":{"state":"idle", "stopReason":"error", "error":{"code":-32603,"message":"Worker request failed"}}})), cx)).expect("repeat snapshot");
+        assert_eq!(
+            child.read_with(cx, |thread, cx| thread
+                .entries
+                .iter()
+                .map(|entry| entry.to_markdown(cx))
+                .collect::<String>()),
+            transcript_before_repeat
+        );
+        parent.read_with(cx, |parent, cx| {
+            let Some(AgentThreadEntry::ToolCall(call)) = parent.entries.first() else {
+                panic!("worker card")
+            };
+            assert_eq!(call.label.read(cx).source(), "worker");
+            assert_eq!(
+                call.raw_input
+                    .as_ref()
+                    .and_then(|input| input.get("message")),
+                Some(&json!("Updated purpose"))
+            );
+        });
+        child
+            .update(cx, |child, cx| {
+                child.handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                        acp::ContentBlock::Text(acp::TextContent::new("Result after idle")),
+                    )),
+                    cx,
+                )
+            })
+            .expect("late output retained");
+        let message =
+            |value| serde_json::from_value::<ExternalSessionMessage>(value).expect("message");
+        child.update(cx, |child, cx| {
+            child.upsert_external_session_message(message(json!({"messageId":"resume", "senderSessionId":"parent", "recipientSessionId":"worker", "content":[{"type":"text","text":"First"}], "_meta":{"label":"retained"}})), false, cx);
+            child.upsert_external_session_message(message(json!({"messageId":"resume", "content":[{"type":"text","text":"Replacement"}]})), false, cx);
+            child.upsert_external_session_message(message(json!({"messageId":"resume", "content":[{"type":"text","text":" appended"}]})), true, cx);
+            let stored = child.external_session_messages.get(&acp::MessageId::new("resume")).expect("stored");
+            assert_eq!(stored.sender_session_id, Some(acp::SessionId::new("parent")));
+            assert!(stored.meta.as_ref().and_then(Option::as_ref).is_some());
+            assert_eq!(child.entries.iter().filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(user) if user.protocol_id == Some(acp::MessageId::new("resume")))).count(), 1);
+            let user = child.entries.iter().find_map(|entry| match entry { AgentThreadEntry::UserMessage(user) => Some(user), _ => None }).expect("message entry");
+            assert_eq!(user.chunks.len(), 2);
+            assert_eq!(user.chunks.first(), Some(&acp::ContentBlock::Text(acp::TextContent::new("Replacement"))));
+            child.upsert_external_session_message(message(json!({"messageId":"resume", "senderSessionId":null})), false, cx);
+            assert_eq!(child.external_session_messages.get(&acp::MessageId::new("resume")).expect("stored").content.as_ref().and_then(Option::as_ref).expect("retained").len(), 2);
+            child.upsert_external_session_message(message(json!({"messageId":"resume", "content":null, "_meta":null})), false, cx);
+            assert!(child.external_session_messages.get(&acp::MessageId::new("resume")).expect("stored").content.as_ref().and_then(Option::as_ref).expect("cleared").is_empty());
+        });
+        parent.update(cx, |parent, cx| {
+            parent.upsert_external_subagent(session_id.clone(), patch(json!({"state":{"state":"running"}})), cx).expect("resume");
+            parent.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, cx);
+            assert!(matches!(parent.entries.first(), Some(AgentThreadEntry::ToolCall(call)) if matches!(call.status, ToolCallStatus::InProgress)));
+        });
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating,
+            "parent cancel does not invent a child cancellation"
+        );
     }
 
     #[gpui::test]
@@ -11578,6 +12092,58 @@ mod tests {
                 "}
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_register_subagent_deduplicates_and_keeps_children_alive(cx: &mut TestAppContext) {
+        init_test(cx);
+        let parent = new_test_thread(cx).await;
+        let create_child = |session: &str, parent_id: acp::SessionId, cx: &mut TestAppContext| {
+            let project = parent.read_with(cx, |thread, _| thread.project().clone());
+            let connection = parent.read_with(cx, |thread, _| thread.connection().clone());
+            cx.update(|cx| {
+                let action_log = cx.new(|_| ActionLog::new(project.clone()));
+                cx.new(|cx| {
+                    AcpThread::new(
+                        Some(parent_id),
+                        None,
+                        None,
+                        connection,
+                        project,
+                        action_log,
+                        acp::SessionId::new(session.to_string()),
+                        watch::Receiver::constant(acp::PromptCapabilities::new()),
+                        cx,
+                    )
+                })
+            })
+        };
+        let parent_id = parent.read_with(cx, |thread, _| thread.session_id().clone());
+        let first = create_child("child", parent_id.clone(), cx);
+        let weak_child = first.downgrade();
+        let duplicate = create_child("child", parent_id, cx);
+        let wrong_parent = create_child("wrong", acp::SessionId::new("another"), cx);
+        parent.update(cx, |parent, cx| {
+            assert_eq!(
+                parent
+                    .register_subagent(first.clone(), cx)
+                    .expect("register child"),
+                first
+            );
+            assert_eq!(
+                parent
+                    .register_subagent(duplicate, cx)
+                    .expect("deduplicate child"),
+                first
+            );
+            assert!(parent.register_subagent(wrong_parent, cx).is_err());
+            assert_eq!(parent.subagents().count(), 1);
+        });
+        drop(first);
+        assert!(weak_child.is_upgradable());
+        drop(parent);
+        cx.run_until_parked();
+        assert!(!weak_child.is_upgradable());
     }
 
     async fn new_test_thread(cx: &mut TestAppContext) -> Entity<AcpThread> {

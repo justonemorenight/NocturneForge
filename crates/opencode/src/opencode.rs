@@ -3,7 +3,9 @@ use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::B
 use http_client::{
     AsyncBody, CustomHeaders, HttpClient, Method, Request as HttpRequest, RequestBuilderExt,
 };
-use language_model_core::ReasoningEffort;
+use language_model_core::{
+    LanguageModelCompletionError, LanguageModelProviderName, ReasoningEffort,
+};
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
@@ -936,7 +938,9 @@ pub async fn stream_generate_content(
     api_key: &str,
     request: google_ai::GenerateContentRequest,
     extra_headers: &CustomHeaders,
-) -> Result<BoxStream<'static, Result<google_ai::GenerateContentResponse>>> {
+) -> Result<
+    BoxStream<'static, Result<google_ai::GenerateContentResponse, LanguageModelCompletionError>>,
+> {
     let api_key = api_key.trim();
 
     let model_id = &request.model.model_id;
@@ -962,14 +966,20 @@ pub async fn stream_generate_content(
                             match serde_json::from_str(line) {
                                 Ok(response) => Some(Ok(response)),
                                 Err(error) => {
-                                    Some(Err(anyhow!("Error parsing JSON: {error:?}\n{line:?}")))
+                                    Some(Err(LanguageModelCompletionError::DeserializeResponse {
+                                        provider: LanguageModelProviderName::new("OpenCode"),
+                                        error,
+                                    }))
                                 }
                             }
                         } else {
                             None
                         }
                     }
-                    Err(error) => Some(Err(anyhow!(error))),
+                    Err(error) => Some(Err(LanguageModelCompletionError::ApiReadResponseError {
+                        provider: LanguageModelProviderName::new("OpenCode"),
+                        error,
+                    })),
                 }
             })
             .boxed())

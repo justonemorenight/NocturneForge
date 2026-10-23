@@ -2,6 +2,7 @@ use std::{
     any::Any,
     fmt::Debug,
     ops::Not,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -367,7 +368,7 @@ impl ScrollbarStyle {
 #[derive(Clone)]
 pub struct Scrollbars<T: ScrollableHandle = ScrollHandle> {
     id: Option<ElementId>,
-    get_visibility: fn(&App) -> ShowScrollbar,
+    get_visibility: Rc<dyn Fn(&App) -> ShowScrollbar>,
     tracked_entity: Option<Option<EntityId>>,
     scrollable_handle: Handle<T>,
     visibility: Point<ReservedSpace>,
@@ -386,15 +387,22 @@ impl Scrollbars {
     }
 
     pub fn for_settings<S: ScrollbarVisibility + Default>() -> Scrollbars {
-        Scrollbars::new_with_setting(ScrollAxes::Both, |cx| S::default().visibility(cx))
+        Self::new_with_setting(ScrollAxes::Both, |cx| S::default().visibility(cx))
+    }
+
+    pub fn for_visibility(settings: impl ScrollbarVisibility) -> Scrollbars {
+        Self::new_with_setting(ScrollAxes::Both, move |cx| settings.visibility(cx))
     }
 }
 
 impl Scrollbars {
-    fn new_with_setting(show_along: ScrollAxes, get_visibility: fn(&App) -> ShowScrollbar) -> Self {
+    fn new_with_setting(
+        show_along: ScrollAxes,
+        get_visibility: impl Fn(&App) -> ShowScrollbar + 'static,
+    ) -> Self {
         Self {
             id: None,
-            get_visibility,
+            get_visibility: Rc::new(get_visibility),
             scrollable_handle: Handle::Untracked(ScrollHandle::new),
             tracked_entity: None,
             visibility: show_along.apply_to(Default::default(), ReservedSpace::Thumb),
@@ -623,7 +631,7 @@ struct ScrollbarState<T: ScrollableHandle = ScrollHandle> {
     manually_added: bool,
     scroll_handle: T,
     show_behavior: ShowBehavior,
-    get_visibility: fn(&App) -> ShowScrollbar,
+    get_visibility: Rc<dyn Fn(&App) -> ShowScrollbar>,
     visibility: Point<ReservedSpace>,
     track_color: Option<TrackColors>,
     show_state: VisibilityState,

@@ -89,6 +89,21 @@ const EXTERNAL_SUBAGENT_UPDATE_META_KEY: &str = "nocturne_external_subagent_upda
     rename_all_fields = "camelCase"
 )]
 enum ExternalSubagentUpdate {
+    SubagentUpdate {
+        session_id: acp::SessionId,
+        #[serde(flatten)]
+        patch: acp_thread::ExternalSubagentPatch,
+    },
+    SessionMessage {
+        #[serde(flatten)]
+        message: acp_thread::ExternalSessionMessage,
+    },
+    SessionMessageChunk {
+        message_id: acp::MessageId,
+        sender_session_id: Option<acp::SessionId>,
+        recipient_session_id: Option<acp::SessionId>,
+        content: acp::ContentBlock,
+    },
     SubagentSpawned {
         subagent_session_id: acp::SessionId,
         name: String,
@@ -108,7 +123,13 @@ impl SessionNotificationWithSubagents {
             .get("sessionUpdate")
             .and_then(serde_json::Value::as_str)
         {
-            Some("subagent_spawned" | "subagent_state_update") => {
+            Some(
+                "subagent_spawned"
+                | "subagent_state_update"
+                | "subagent_update"
+                | "session_message"
+                | "session_message_chunk",
+            ) => {
                 let event: ExternalSubagentUpdate = serde_json::from_value(self.update)?;
                 acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(
                     acp::Meta::from_iter([(
@@ -1830,13 +1851,7 @@ impl AcpConnection {
                             };
                             session.session_modes = modes;
                             session.config_options = config_options.clone();
-                            session.default_config_task = config_options.as_ref().map(|options| {
-                                connection_state.apply_default_config_options(
-                                    &session_id,
-                                    options,
-                                    cx,
-                                )
-                            });
+                            session.default_config_task = None;
                         }
                         connection_state.remove_pending_session(&session_id, thread.entity_id());
                         connection_state.drain_pending_notifications(&session_id, cx);
@@ -3445,6 +3460,116 @@ mod tests {
             update: serde_json::json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": "worker", "state": "invalid"}),
         }.into_notification().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn external_subagents_parse_rfd_patches_without_losing_nulls() -> Result<()> {
+        use agent_client_protocol::JsonRpcMessage as _;
+        for update in [
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"child", "title":"Worker", "state":{"state":"running"}}),
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"child", "title":null, "state":null, "capabilities":null}),
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"child", "description":"Purpose", "state":{"state":"requires_action"}, "capabilities":{"cancel":{}}}),
+            serde_json::json!({"sessionUpdate":"session_message", "messageId":"delegation", "senderSessionId":"parent", "recipientSessionId":"child", "content":[{"type":"text","text":"Inspect sources"}]}),
+            serde_json::json!({"sessionUpdate":"session_message", "messageId":"delegation", "content":null}),
+            serde_json::json!({"sessionUpdate":"session_message_chunk", "messageId":"delegation", "content":{"type":"text","text":"More"}}),
+        ] {
+            let notification = SessionNotificationWithSubagents::parse_message(
+                "session/update",
+                &serde_json::json!({"sessionId":"parent", "update":update}),
+            )?
+            .into_notification()?;
+            let acp::SessionUpdate::SessionInfoUpdate(info) = notification.update else {
+                panic!("extension envelope")
+            };
+            let event = info.meta.expect("metadata")[EXTERNAL_SUBAGENT_UPDATE_META_KEY].clone();
+            for (key, value) in update.as_object().expect("wire object") {
+                assert_eq!(
+                    event.get(key),
+                    Some(value),
+                    "field {key} must survive normalization"
+                );
+            }
+            if update["sessionUpdate"] == "subagent_update" && update.get("description").is_none() {
+                assert!(event.get("description").is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn external_subagents_rfd_wire_creates_one_resumable_child(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_feature_flags_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let parent = cx
+            .update(|cx| {
+                harness.connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new("/test")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("parent");
+        let ctx = ClientContext {
+            sessions: harness.connection.sessions.clone(),
+            session_list: Rc::new(RefCell::new(None)),
+            request_elicitations: harness.connection.request_elicitations.clone(),
+            session_notification_state: harness.connection.session_notification_state.clone(),
+            read_only: false,
+            terminal_sandbox_wrap: None,
+        };
+        let parent_id = parent.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_id = acp::SessionId::new("rfd-worker");
+        let mut async_cx = cx.to_async();
+        let mut send = |session_id, update| {
+            handle_session_notification_with_subagents(
+                SessionNotificationWithSubagents { session_id, update },
+                &mut async_cx,
+                &ctx,
+            )
+        };
+        send(
+            parent_id.clone(),
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"rfd-worker", "title":"Review", "state":{"state":"running"}}),
+        );
+        send(
+            child_id.clone(),
+            serde_json::json!({"sessionUpdate":"session_message", "messageId":"launch", "senderSessionId":parent_id, "recipientSessionId":"rfd-worker", "content":[{"type":"text","text":"Read one file"}]}),
+        );
+        send(
+            parent_id.clone(),
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"rfd-worker", "state":{"state":"idle", "stopReason":"end_turn"}}),
+        );
+        send(
+            child_id.clone(),
+            serde_json::json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":"Late result"}}),
+        );
+        send(
+            parent_id,
+            serde_json::json!({"sessionUpdate":"subagent_update", "sessionId":"rfd-worker", "state":{"state":"running"}}),
+        );
+        send(
+            child_id.clone(),
+            serde_json::json!({"sessionUpdate":"session_message", "messageId":"resume", "content":[{"type":"text","text":"Read another file"}]}),
+        );
+        let child = parent
+            .read_with(cx, |thread, _| thread.external_subagent(&child_id))
+            .expect("announced child");
+        assert_eq!(
+            child.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating
+        );
+        assert_eq!(child.read_with(cx, |thread, _| thread.entries().len()), 3);
+        assert_eq!(
+            parent.read_with(cx, |thread, _| thread.entries().len()),
+            1,
+            "reuse the same worker card"
+        );
+        assert!(harness.connection.sessions.borrow().contains_key(&child_id));
     }
 
     #[test]
@@ -7431,6 +7556,74 @@ fn handle_session_notification(
         let result = (|| -> Result<()> {
             let event: ExternalSubagentUpdate = serde_json::from_value(event.clone())?;
             match event {
+                ExternalSubagentUpdate::SubagentUpdate { session_id, patch } => {
+                    cx.update(|cx| -> Result<()> {
+                        if let Some(existing) = ctx.sessions.borrow().get(&session_id) {
+                            let owned = existing.thread.read_with(cx, |child, _| {
+                                child.parent_session_id() == Some(&notification.session_id)
+                            })?;
+                            anyhow::ensure!(
+                                owned,
+                                "Subagent {session_id} already belongs to another parent"
+                            );
+                        }
+                        let child = thread.update(cx, |thread, cx| {
+                            thread.upsert_external_subagent(session_id.clone(), patch, cx)
+                        })??;
+                        let connection = child
+                            .read(cx)
+                            .connection()
+                            .clone()
+                            .into_any()
+                            .downcast::<AcpConnection>()
+                            .map_err(|_| anyhow!("External subagent requires an ACP connection"))?;
+                        connection
+                            .session_notification_state
+                            .register_session(&session_id);
+                        if !ctx.sessions.borrow().contains_key(&session_id) {
+                            connection.register_session(
+                                session_id.clone(),
+                                &child,
+                                None,
+                                None,
+                                None,
+                                cx,
+                            );
+                        }
+                        Ok(())
+                    })?;
+                    if let Some(buffered) = ctx.session_notification_state.take_pending(&session_id)
+                    {
+                        for update in buffered {
+                            handle_session_notification(update, cx, ctx);
+                        }
+                    }
+                }
+                ExternalSubagentUpdate::SessionMessage { message } => {
+                    thread.update(cx, |thread, cx| {
+                        thread.upsert_external_session_message(message, false, cx)
+                    })?;
+                }
+                ExternalSubagentUpdate::SessionMessageChunk {
+                    message_id,
+                    sender_session_id,
+                    recipient_session_id,
+                    content,
+                } => {
+                    thread.update(cx, |thread, cx| {
+                        thread.upsert_external_session_message(
+                            acp_thread::ExternalSessionMessage {
+                                message_id,
+                                sender_session_id,
+                                recipient_session_id,
+                                content: Some(Some(vec![content])),
+                                meta: None,
+                            },
+                            true,
+                            cx,
+                        )
+                    })?;
+                }
                 ExternalSubagentUpdate::SubagentSpawned {
                     subagent_session_id,
                     name,

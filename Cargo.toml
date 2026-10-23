@@ -874,7 +874,7 @@ vte = { version = "0.15.0", features = ["ansi"] }
 walkdir = "2.5"
 wasm-encoder = "0.252"
 wasmparser = "0.252"
-wasmtime = { version = "48", default-features = false, features = [
+wasmtime = { version = "48.0.7", default-features = false, features = [
     "anyhow",
     "async",
     "demangle",
@@ -886,7 +886,7 @@ wasmtime = { version = "48", default-features = false, features = [
 ] }
 wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4"
-wasmtime-wasi = "48"
+wasmtime-wasi = "48.0.7"
 wax = "0.7"
 which = "6.0.0"
 web-time = "1.1.0"

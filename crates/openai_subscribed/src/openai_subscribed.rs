@@ -1488,6 +1488,10 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         self.model.supports_images()
     }
 
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        language_model::PromptCompactionStrategy::PreserveRequestPrefix
+    }
+
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
         true
     }
@@ -2171,12 +2175,12 @@ impl CodexResponseMetadata {
     }
 }
 
-fn observe_codex_response_metadata(
-    stream: futures::stream::BoxStream<'static, Result<StreamEvent>>,
+fn observe_codex_response_metadata<E: Send + 'static>(
+    stream: futures::stream::BoxStream<'static, Result<StreamEvent, E>>,
     headers: HeaderMap,
     requested_model: &str,
     turn_state: TurnState,
-) -> futures::stream::BoxStream<'static, Result<StreamEvent>> {
+) -> futures::stream::BoxStream<'static, Result<StreamEvent, E>> {
     let response_state = headers
         .get("x-codex-turn-state")
         .and_then(|value| value.to_str().ok());
@@ -3760,7 +3764,7 @@ mod tests {
             );
             headers.insert("openai-model", HeaderValue::from_static("other-model"));
             let stream = observe_codex_response_metadata(
-                futures::stream::empty().boxed(),
+                futures::stream::empty::<Result<StreamEvent, open_ai::RequestError>>().boxed(),
                 headers,
                 "model",
                 turn.clone(),
@@ -3773,13 +3777,13 @@ mod tests {
                 HeaderValue::from_static("replacement"),
             );
             let _replacement_stream = observe_codex_response_metadata(
-                futures::stream::empty().boxed(),
+                futures::stream::empty::<Result<StreamEvent, open_ai::RequestError>>().boxed(),
                 replacement_headers,
                 "model",
                 turn.clone(),
             );
             let _missing_header_stream = observe_codex_response_metadata(
-                futures::stream::empty().boxed(),
+                futures::stream::empty::<Result<StreamEvent, open_ai::RequestError>>().boxed(),
                 HeaderMap::new(),
                 "model",
                 turn.clone(),

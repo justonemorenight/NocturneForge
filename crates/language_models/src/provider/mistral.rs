@@ -311,6 +311,10 @@ impl LanguageModel for MistralLanguageModel {
         true
     }
 
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        language_model::PromptCompactionStrategy::PreserveRequestPrefix
+    }
+
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
         self.model.supports_tools()
     }

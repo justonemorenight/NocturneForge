@@ -64,6 +64,12 @@ struct CachedMermaidDiagram {
 }
 
 impl MermaidState {
+    pub(crate) fn has_pending_render(&self) -> bool {
+        self.cache
+            .values()
+            .any(|cached| cached.render_image.get().is_none())
+    }
+
     pub(crate) fn clear(&mut self) {
         self.cache.clear();
         self.order.clear();

@@ -227,8 +227,15 @@ impl OpenAiCompatibleLanguageModel {
         request: ResponseRequest,
         extra_headers: CustomHeaders,
         cx: &AsyncApp,
-    ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponsesStreamEvent>>>>
-    {
+    ) -> BoxFuture<
+        'static,
+        Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<ResponsesStreamEvent, open_ai::RequestError>,
+            >,
+        >,
+    > {
         let http_client = self.http_client.clone();
 
         let (api_key, api_url) = self.state.read_with(cx, |state, _cx| {
@@ -361,6 +368,10 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
     fn supports_images(&self) -> bool {
         self.model.capabilities.images
+    }
+
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        language_model::PromptCompactionStrategy::PreserveRequestPrefix
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {

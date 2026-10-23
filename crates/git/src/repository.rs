@@ -869,9 +869,14 @@ pub trait GitRepository: Send + Sync {
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    /// Restores `paths` in the working tree.
+    ///
+    /// With `Some(commit)`, both the index and the working tree are reset to the
+    /// commit's version, discarding staged and unstaged changes. With `None`, only
+    /// the working tree is restored from the index, so staged changes are kept.
     fn checkout_files(
         &self,
-        commit: String,
+        commit: Option<String>,
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>>;
@@ -1516,7 +1521,7 @@ impl GitRepository for RealGitRepository {
 
     fn checkout_files(
         &self,
-        commit: String,
+        commit: Option<String>,
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1528,9 +1533,7 @@ impl GitRepository for RealGitRepository {
             }
 
             let mut args = vec!["checkout"];
-            if !commit.is_empty() {
-                args.push(&commit);
-            }
+            args.extend(commit.as_deref());
             args.push("--");
 
             let output = git
@@ -6163,6 +6166,56 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+    #[gpui::test]
+    async fn test_checkout_files_from_index_keeps_staged_changes(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("checkout fixture");
+        git_init_repo(repo_dir.path());
+        let file_path = repo_dir.path().join("file.txt");
+        fs::write(&file_path, "head\n").expect("checkout fixture");
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "head"]);
+        fs::write(&file_path, "staged\n").expect("checkout fixture");
+        git_command(repo_dir.path(), ["add", "file.txt"]);
+        fs::write(&file_path, "unstaged\n").expect("checkout fixture");
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("checkout fixture");
+        let paths = vec![RepoPath::new("file.txt").expect("checkout fixture")];
+
+        repository
+            .checkout_files(None, paths.clone(), Arc::default())
+            .await
+            .expect("checkout fixture");
+        assert_eq!(
+            fs::read_to_string(&file_path).expect("checkout fixture"),
+            "staged\n"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", ":file.txt"]),
+            "staged"
+        );
+
+        repository
+            .checkout_files(Some("HEAD".into()), paths, Arc::default())
+            .await
+            .expect("checkout fixture");
+        assert_eq!(
+            fs::read_to_string(&file_path).expect("checkout fixture"),
+            "head\n"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", ":file.txt"]),
+            "head"
         );
     }
 }

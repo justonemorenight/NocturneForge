@@ -6128,54 +6128,11 @@ impl Thread {
         let model = self
             .model()
             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
-        let sandboxing_enabled = self.sandboxing_enabled(cx);
-        let tools = if let Some(turn) = self.running_turn.as_ref() {
-            turn.tools
-                .iter()
-                .map(|(tool_name, tool)| {
-                    log::trace!("Including tool: {}", tool_name);
-                    let mut description = tool.description().to_string();
-                    let mut schema = tool.input_schema();
-                    // TEMPORARY (sandboxing feature flag): with the flag off,
-                    // the fetch and create_directory descriptions/schemas must
-                    // not advertise sandbox-dependent behavior (host grants,
-                    // out-of-project creation via the `reason` field), since
-                    // the corresponding runtime paths are disabled. Restore
-                    // the pre-sandboxing model-facing surface here rather than
-                    // forking the tools; delete this when the flag is removed
-                    // again.
-                    if !sandboxing_enabled {
-                        if tool_name.as_ref() == FetchTool::NAME {
-                            description =
-                                "Fetches a URL and returns the content as Markdown.".to_string();
-                        } else if tool_name.as_ref() == CreateDirectoryTool::NAME {
-                            description = "Creates a new directory at the specified path within \
-                                the project. Returns confirmation that the directory was \
-                                created.\n\nThis tool creates a directory and all necessary \
-                                parent directories. It should be used whenever you need to \
-                                create new directories within the project.\nThe only supported \
-                                path outside the project is `~/.agents/skills` or a descendant, \
-                                for global agent skills."
-                                .to_string();
-                            if let Some(properties) = schema
-                                .get_mut("properties")
-                                .and_then(|value| value.as_object_mut())
-                            {
-                                properties.remove("reason");
-                            }
-                        }
-                    }
-                    LanguageModelRequestTool::function(
-                        tool_name.to_string(),
-                        description,
-                        schema,
-                        tool.supports_input_streaming(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let tools = self
+            .running_turn
+            .as_ref()
+            .map(|turn| self.build_request_tools(&turn.tools, cx))
+            .unwrap_or_default();
 
         log::debug!("Building completion request");
         log::debug!("Completion intent: {:?}", completion_intent);
@@ -6236,6 +6193,57 @@ impl Thread {
 
         log::debug!("Completion request built successfully");
         Ok(request)
+    }
+
+    fn build_request_tools(
+        &self,
+        tools: &BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
+        cx: &App,
+    ) -> Vec<LanguageModelRequestTool> {
+        let sandboxing_enabled = self.sandboxing_enabled(cx);
+        tools
+            .iter()
+            .map(|(tool_name, tool)| {
+                log::trace!("Including tool: {}", tool_name);
+                let mut description = tool.description().to_string();
+                let mut schema = tool.input_schema();
+                // TEMPORARY (sandboxing feature flag): with the flag off,
+                // the fetch and create_directory descriptions/schemas must
+                // not advertise sandbox-dependent behavior (host grants,
+                // out-of-project creation via the `reason` field), since
+                // the corresponding runtime paths are disabled. Restore
+                // the pre-sandboxing model-facing surface here rather than
+                // forking the tools; delete this when the flag is removed
+                // again.
+                if !sandboxing_enabled {
+                    if tool_name.as_ref() == FetchTool::NAME {
+                        description =
+                            "Fetches a URL and returns the content as Markdown.".to_string();
+                    } else if tool_name.as_ref() == CreateDirectoryTool::NAME {
+                        description = "Creates a new directory at the specified path within \
+                                the project. Returns confirmation that the directory was \
+                                created.\n\nThis tool creates a directory and all necessary \
+                                parent directories. It should be used whenever you need to \
+                                create new directories within the project.\nThe only supported \
+                                path outside the project is `~/.agents/skills` or a descendant, \
+                                for global agent skills."
+                            .to_string();
+                        if let Some(properties) = schema
+                            .get_mut("properties")
+                            .and_then(|value| value.as_object_mut())
+                        {
+                            properties.remove("reason");
+                        }
+                    }
+                }
+                LanguageModelRequestTool::function(
+                    tool_name.to_string(),
+                    description,
+                    schema,
+                    tool.supports_input_streaming(),
+                )
+            })
+            .collect::<Vec<_>>()
     }
 
     pub(crate) fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
@@ -7064,6 +7072,28 @@ impl Thread {
         model: &Arc<dyn LanguageModel>,
         cx: &App,
     ) -> LanguageModelRequest {
+        let uses_thread_model = self.model().is_some_and(|thread_model| {
+            thread_model.provider_id() == model.provider_id() && thread_model.id() == model.id()
+        });
+        let preserves_request_prefix = uses_thread_model
+            && model.prompt_compaction_strategy()
+                == language_model::PromptCompactionStrategy::PreserveRequestPrefix;
+        let enabled_tools = if preserves_request_prefix
+            && model.supports_tools()
+            && model.supports_tool_choice(language_model::LanguageModelToolChoice::None)
+        {
+            self.running_turn
+                .as_ref()
+                .map(|turn| turn.tools.clone())
+                .unwrap_or_else(|| self.enabled_tools(cx))
+        } else {
+            BTreeMap::new()
+        };
+        let available_tools = enabled_tools.keys().cloned().collect();
+        let tools = self.build_request_tools(&enabled_tools, cx);
+        // Changing tool choice invalidates Anthropic's cached messages, so providers opt in.
+        let tool_choice =
+            (!tools.is_empty()).then_some(language_model::LanguageModelToolChoice::None);
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.0.clone()),
@@ -7071,11 +7101,30 @@ impl Thread {
             temperature: AgentSettings::temperature_for_model(model, cx),
             messages: self.build_request_messages_for_history_until_with_retained_user_budget(
                 messages,
-                Vec::new(),
+                available_tools,
                 insertion_ix,
                 retained_user_byte_budget,
                 cx,
             ),
+            tools,
+            tool_choice,
+            prompt_cache_key: uses_thread_model.then(|| {
+                if self.subagent_context.as_ref().is_some_and(|context| {
+                    context.parent_provider_id.as_deref() != Some(model.provider_id().0.as_ref())
+                }) {
+                    self.id.to_string()
+                } else {
+                    self.prompt_cache_affinity()
+                }
+            }),
+            thinking_allowed: preserves_request_prefix
+                && (self.thinking_enabled
+                    || !model
+                        .supports_disabling_thinking_at_effort(self.thinking_effort.as_deref())),
+            thinking_effort: preserves_request_prefix
+                .then(|| self.thinking_effort.clone())
+                .flatten(),
+            speed: uses_thread_model.then(|| self.speed()).flatten(),
             ..Default::default()
         };
 
@@ -11855,6 +11904,87 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_summary_compaction_preserves_prefix_only_for_opted_in_same_model(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_tools(true);
+        model.set_supports_thinking(true);
+        let model: Arc<dyn LanguageModel> = model;
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.add_tool(ReplayImageTool);
+            let profile_id = thread.profile().clone();
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings
+                .profiles
+                .get_mut(&profile_id)
+                .expect("thread profile")
+                .tools
+                .insert(ReplayImageTool::NAME.into(), true);
+            AgentSettings::override_global(settings, cx);
+            thread.set_thinking_enabled(true, cx);
+            thread.set_thinking_effort(Some("high".to_string()), cx);
+            thread.set_speed(Speed::Fast, cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "old user"));
+            let request = thread.build_summary_compaction_request(
+                &thread.messages,
+                thread.messages.len(),
+                usize::MAX,
+                &model,
+                cx,
+            );
+            assert!(request.tools.is_empty());
+            assert!(!request.thinking_allowed);
+        });
+        let preserving = Arc::new(FakeLanguageModel::default());
+        preserving.set_supports_tools(true);
+        preserving.set_supports_thinking(true);
+        preserving.set_preserves_compaction_prefix(true);
+        let preserving: Arc<dyn LanguageModel> = preserving;
+        thread.update(cx, |thread, cx| {
+            thread.set_model(preserving.clone(), cx);
+            let request = thread.build_summary_compaction_request(
+                &thread.messages,
+                thread.messages.len(),
+                usize::MAX,
+                &preserving,
+                cx,
+            );
+            assert!(!request.tools.is_empty());
+            assert_eq!(
+                request.tool_choice,
+                Some(language_model::LanguageModelToolChoice::None)
+            );
+            assert!(request.thinking_allowed);
+            assert_eq!(request.thinking_effort.as_deref(), Some("high"));
+            assert_eq!(
+                request.prompt_cache_key.as_deref(),
+                Some(thread.prompt_cache_affinity().as_str())
+            );
+            let other: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+                "other",
+                "different",
+                "Different",
+                true,
+            ));
+            let request = thread.build_summary_compaction_request(
+                &thread.messages,
+                thread.messages.len(),
+                usize::MAX,
+                &other,
+                cx,
+            );
+            assert!(request.tools.is_empty());
+            assert!(request.prompt_cache_key.is_none());
+            assert!(request.speed.is_none());
+        });
+    }
+
+    #[gpui::test]
     async fn test_compaction_preserves_current_orchestration_guidance_and_tool_schema(
         cx: &mut TestAppContext,
     ) {
@@ -13838,6 +13968,21 @@ mod tests {
             Some(subagent_id.0.as_ref()),
             "cross-provider subagent must isolate prompt_cache_key to its own session ID"
         );
+        subagent_thread.read_with(cx, |thread, cx| {
+            let model = thread.model().expect("subagent model");
+            let summary = thread.build_summary_compaction_request(
+                &thread.messages,
+                thread.messages.len(),
+                usize::MAX,
+                &model,
+                cx,
+            );
+            assert_eq!(
+                summary.prompt_cache_key.as_deref(),
+                foreign_subagent_request.prompt_cache_key.as_deref(),
+                "compaction must retain cross-provider cache isolation"
+            );
+        });
         assert_eq!(
             subagent_thread.read_with(cx, |thread, _| thread.prompt_cache_affinity()),
             root_id.to_string(),

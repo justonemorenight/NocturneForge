@@ -40,6 +40,32 @@ pub enum SidebarSide {
     Right,
 }
 
+/// How tool calls are presented in agent conversations.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDisplay {
+    /// Preserve the existing tool cards and expansion preferences.
+    #[default]
+    Verbose,
+    /// Show individual calls as expandable summaries.
+    Compact,
+    /// Group consecutive calls of the same kind into expandable summaries.
+    Grouped,
+}
+
 /// How thinking blocks should be displayed by default in the agent panel.
 #[derive(
     Clone,
@@ -324,6 +350,7 @@ pub struct CacheKeepaliveSettings {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
+    pub threads_sidebar: Option<ThreadsSidebarSettingsContent>,
     /// Whether the Agent is enabled.
     ///
     /// Default: true
@@ -487,6 +514,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// How tool input and output are displayed in agent conversations.
+    /// Compact and grouped summaries start collapsed, independently of card expansion settings.
+    ///
+    /// Default: verbose
+    pub tool_call_display: Option<ToolCallDisplay>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
@@ -568,6 +600,10 @@ pub struct OrchestrationSettingsContent {
 impl AgentSettingsContent {
     pub fn set_dock(&mut self, dock: DockPosition) {
         self.dock = Some(dock);
+    }
+
+    pub fn set_threads_sidebar_group_by(&mut self, group_by: Option<ThreadsSidebarGroupBy>) {
+        self.threads_sidebar.get_or_insert_default().group_by = group_by;
     }
 
     pub fn set_sidebar_side(&mut self, position: SidebarDockPosition) {
@@ -1543,4 +1579,35 @@ mod tests {
             }]
         );
     }
+}
+
+/// How the threads sidebar groups threads.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadsSidebarGroupBy {
+    /// Show the threads of a repository and all of its git worktrees in one group.
+    #[default]
+    Project,
+    /// Show the threads of each git worktree under their own heading within the
+    /// repository's group.
+    Worktree,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct ThreadsSidebarSettingsContent {
+    pub group_by: Option<ThreadsSidebarGroupBy>,
 }

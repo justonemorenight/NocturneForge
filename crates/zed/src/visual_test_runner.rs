@@ -2122,7 +2122,7 @@ fn run_agent_thread_view_test(
         .content(tool_content),
     )]);
 
-    let stub_agent: Rc<dyn AgentServer> = Rc::new(StubAgentServer::new(connection));
+    let stub_agent: Rc<dyn AgentServer> = Rc::new(StubAgentServer::new(connection.clone()));
 
     // Create a window sized for the agent panel
     let window_size = size(px(500.0), px(900.0));
@@ -2258,6 +2258,92 @@ fn run_agent_thread_view_test(
         cx,
         update_baseline,
     )?;
+
+    connection.set_next_prompt_updates(Vec::new());
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.open_external_thread_with_server(stub_agent.clone(), window, cx);
+        });
+    })?;
+    cx.run_until_parked();
+    let display_view = cx
+        .read(|cx| panel.read(cx).active_thread_view_for_tests().cloned())
+        .context("Missing tool display fixture view")?;
+    let display_thread = cx
+        .read(|cx| {
+            display_view
+                .read(cx)
+                .active_thread()
+                .map(|view| view.read(cx).thread.clone())
+        })
+        .context("Missing tool display fixture thread")?;
+    let send = display_thread.update(cx, |thread, cx| {
+        thread.send(vec!["Inspect the project and run the checks.".into()], cx)
+    });
+    cx.background_executor.allow_parking();
+    let result = cx.foreground_executor.block_test(send);
+    cx.background_executor.forbid_parking();
+    result?;
+    cx.run_until_parked();
+
+    for (id, title, kind) in [
+        ("read-one", "Read /src/main.rs", acp::ToolKind::Read),
+        ("read-two", "Read /Cargo.toml", acp::ToolKind::Read),
+        ("command-one", "cargo test --locked", acp::ToolKind::Execute),
+        ("command-two", "rg -n 'fn main' src", acp::ToolKind::Execute),
+        ("command-three", "cargo fmt --check", acp::ToolKind::Execute),
+    ] {
+        display_thread.update(cx, |thread, cx| {
+            thread.handle_session_update(
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(id, title)
+                        .kind(kind)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                            "Finished successfully.",
+                        ))]),
+                ),
+                cx,
+            )
+        })?;
+    }
+    cx.run_until_parked();
+
+    // Render the conversation directly so this fixture does not depend on dock visibility.
+    let display_window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |_, _| display_view.clone(),
+        )
+    })?;
+    cx.run_until_parked();
+
+    let original_settings = cx.read(|cx| agent_settings::AgentSettings::get_global(cx).clone());
+    for (mode, name) in [
+        (settings::ToolCallDisplay::Verbose, "agent_tools_verbose"),
+        (settings::ToolCallDisplay::Compact, "agent_tools_compact"),
+        (settings::ToolCallDisplay::Grouped, "agent_tools_grouped"),
+    ] {
+        cx.update(|cx| {
+            agent_settings::AgentSettings::override_global(
+                agent_settings::AgentSettings {
+                    tool_call_display: mode,
+                    ..original_settings.clone()
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        run_visual_test(name, display_window.into(), cx, update_baseline)?;
+    }
+    cx.update(|cx| agent_settings::AgentSettings::override_global(original_settings, cx));
+
+    cx.update_window(display_window.into(), |_, window, _| window.remove_window())?;
 
     // Remove the worktree from the project to stop background scanning tasks
     // This prevents "root path could not be canonicalized" errors when we clean up

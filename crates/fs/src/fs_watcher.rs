@@ -3,7 +3,7 @@ use gpui::{BackgroundExecutor, Task};
 use notify::{Event, EventKind};
 use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     ops::DerefMut,
     path::Path,
     pin::Pin,
@@ -233,13 +233,6 @@ impl Watcher for FsWatcher {
         log::trace!("watcher add: {path:?}");
 
         let path: Arc<Path> = path.into();
-        if path_covered_by_recursive_registration(
-            &self.registrations.lock(),
-            SanitizedPath::new(&path),
-        ) {
-            log::trace!("path to watch is covered by an existing registration: {path:?}");
-            return Ok(());
-        }
 
         if self
             .pending_registrations
@@ -274,25 +267,6 @@ impl Watcher for FsWatcher {
         }
         Ok(())
     }
-}
-
-/// Whether a recursive registration on a strict ancestor of `path` already covers
-/// it. Both key spellings are probed so a folded registration still matches; only
-/// poll watches and native macOS/Windows watches are recursive.
-fn path_covered_by_recursive_registration(
-    registrations: &HashMap<WatchKey, FsWatcherRegistration>,
-    path: &SanitizedPath,
-) -> bool {
-    path.as_path().ancestors().skip(1).any(|ancestor| {
-        let ancestor = SanitizedPath::unchecked_new(ancestor);
-        [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
-            .iter()
-            .any(|key| {
-                registrations
-                    .get(key)
-                    .is_some_and(|registration| registration.os_watcher.is_recursive())
-            })
-    })
 }
 
 /// Detect whether a path requires polling instead of native file watching.
@@ -554,10 +528,8 @@ fn path_is_under(path: &SanitizedPath, root: &SanitizedPath, case_insensitive: b
 /// never be hit by a folded lookup (or vice versa); dispatch can therefore probe
 /// both forms of an event path without risking a cross-rule false match.
 ///
-/// NOTE: folding only normalizes case. macOS (APFS/HFS+) is also Unicode
-/// normalization-insensitive (NFC vs NFD); that normalization is intentionally
-/// centralized here so it can be added in one place later without touching the
-/// add/remove/dispatch call sites.
+/// Folded keys use path-component spelling so separators and `.` components
+/// agree with exact path equality. macOS also normalizes Unicode before folding.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum WatchKey {
     Exact(Arc<Path>),
@@ -570,7 +542,9 @@ impl WatchKey {
     }
 
     fn folded(path: &SanitizedPath) -> Self {
-        let lossy = path.as_path().to_string_lossy();
+        // Event ancestors omit trailing separators, even when registration paths include them.
+        let normalized_path = path.as_path().components().collect::<std::path::PathBuf>();
+        let lossy = normalized_path.to_string_lossy();
         // macOS (APFS/HFS+) compares names normalization-insensitively (NFC vs
         // NFD), and FSEvents can report NFD while a config/LSP supplies NFC, so
         // normalize before folding case. Windows (NTFS) and Linux are
@@ -851,10 +825,12 @@ pub struct WatcherRegistrationId(u32);
 struct WatcherRegistrationState {
     callback: Arc<dyn Fn(&notify::Event) + Send + Sync>,
     key: WatchKey,
-    path: Arc<SanitizedPath>,
+    covered_by: Option<WatchKey>,
 }
 
 struct PathRegistrationState {
+    path: Arc<SanitizedPath>,
+    covered_ids: HashSet<WatcherRegistrationId>,
     watcher_ids: Vec<WatcherRegistrationId>,
     has_os_watcher: bool,
 }
@@ -927,17 +903,27 @@ impl WatcherState {
     }
 
     fn remove_registration(&mut self, id: WatcherRegistrationId) -> Option<Arc<SanitizedPath>> {
-        let registration_state = self.watchers.remove(&id)?;
-        let path_state = self.paths.get_mut(&registration_state.key)?;
-        path_state.watcher_ids.retain(|&existing| existing != id);
-        if !path_state.watcher_ids.is_empty() {
-            return None;
+        let registration = self.watchers.remove(&id)?;
+        let mut released = None;
+        if let Some(path) = self.paths.get_mut(&registration.key) {
+            path.watcher_ids.retain(|existing| *existing != id);
+            if path.watcher_ids.is_empty() && path.covered_ids.is_empty() {
+                if path.has_os_watcher {
+                    released = Some(path.path.clone());
+                }
+                self.paths.remove(&registration.key);
+            }
         }
-
-        let was_actually_watched = path_state.has_os_watcher;
-        self.paths.remove(&registration_state.key);
-
-        was_actually_watched.then_some(registration_state.path)
+        if let Some(ancestor) = registration.covered_by {
+            if let Some(path) = self.paths.get_mut(&ancestor) {
+                path.covered_ids.remove(&id);
+                if path.watcher_ids.is_empty() && path.covered_ids.is_empty() {
+                    released = Some(path.path.clone());
+                    self.paths.remove(&ancestor);
+                }
+            }
+        }
+        released
     }
 }
 
@@ -1046,10 +1032,6 @@ impl OsWatcher {
         move |event| enqueue(&event_tx, event)
     }
 
-    pub(crate) fn is_recursive(&self) -> bool {
-        self.recursive
-    }
-
     #[must_use]
     fn add(
         &self,
@@ -1088,10 +1070,41 @@ impl OsWatcher {
         let id = state.last_registration;
         state.last_registration = WatcherRegistrationId(id.0 + 1);
 
+        let covered_by = if self.recursive
+            && state
+                .paths
+                .0
+                .get(&key)
+                .is_none_or(|path| !path.has_os_watcher)
+        {
+            watch_path
+                .as_path()
+                .ancestors()
+                .skip(1)
+                .find_map(|ancestor| {
+                    let ancestor = SanitizedPath::unchecked_new(ancestor);
+                    [WatchKey::exact(ancestor), WatchKey::folded(ancestor)]
+                        .into_iter()
+                        .find(|key| {
+                            state
+                                .paths
+                                .0
+                                .get(key)
+                                .is_some_and(|path| path.has_os_watcher)
+                        })
+                })
+        } else {
+            None
+        };
+        if let Some(ancestor) = covered_by.as_ref().and_then(|key| state.paths.get_mut(key)) {
+            // Retaining the recursive backend root keeps child subscriptions live without
+            // calling the backend under the state lock during teardown.
+            ancestor.covered_ids.insert(id);
+        }
         let registration_state = WatcherRegistrationState {
             callback: Arc::new(cb),
             key: key.clone(),
-            path: watch_path,
+            covered_by,
         };
         state.watchers.insert(id, registration_state);
         state
@@ -1099,6 +1112,8 @@ impl OsWatcher {
             .entry(key)
             .and_modify(|registration| registration.watcher_ids.push(id))
             .or_insert_with(|| PathRegistrationState {
+                path: watch_path,
+                covered_ids: HashSet::default(),
                 watcher_ids: vec![id],
                 has_os_watcher: !path_already_covered,
             });
@@ -1516,6 +1531,10 @@ mod tests {
             .expect("child watch registered");
 
         watcher.remove(parent_registration);
+        assert!(
+            backend.lock().unwatch_calls.is_empty(),
+            "child still depends on the recursive root"
+        );
         watcher.remove(child_registration);
 
         let backend = backend.lock();
@@ -1784,6 +1803,73 @@ mod tests {
             move |_: &notify::Event| *fired.lock() += 1
         };
         (fired, cb)
+    }
+
+    #[test]
+    fn equivalent_path_spellings_share_watch_delivery_and_lifetime() {
+        for case_insensitive in [false, true] {
+            for spelling in ["/repo/project/", "/repo//project", "/repo/./project"] {
+                let backend = Arc::new(Mutex::new(FakeWatchBackend::default()));
+                let watcher = test_os_watcher(OsWatcherKind::Native, Some(backend.clone()));
+                let (first_fired, first_callback) = fired_count();
+                let first = watcher
+                    .add(Path::new(spelling).into(), case_insensitive, first_callback)
+                    .expect("add alternate spelling")
+                    .expect("registered alternate spelling");
+                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
+                assert_eq!(
+                    *first_fired.lock(),
+                    1,
+                    "{spelling}, folded={case_insensitive}"
+                );
+
+                let (second_fired, second_callback) = fired_count();
+                let second = watcher
+                    .add(
+                        Path::new("/repo/project").into(),
+                        case_insensitive,
+                        second_callback,
+                    )
+                    .expect("add ordinary spelling")
+                    .expect("registered ordinary spelling");
+                assert_eq!(backend.lock().watch_calls.len(), 1);
+                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
+                assert_eq!(*first_fired.lock(), 2);
+                assert_eq!(*second_fired.lock(), 1);
+
+                watcher.remove(first);
+                assert!(backend.lock().unwatch_calls.is_empty());
+                watcher.dispatch(Ok(modify_event("/repo/project/file.txt")));
+                assert_eq!(*first_fired.lock(), 2);
+                assert_eq!(*second_fired.lock(), 2);
+                watcher.remove(second);
+                assert_eq!(backend.lock().unwatch_calls.len(), 1);
+                assert!(backend.lock().watched_paths.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn folded_keys_preserve_root_and_parent_component_identity() {
+        for path in ["/", "/repo/../project", "./project", "project"] {
+            let ordinary = Path::new(path);
+            let with_separator = PathBuf::from(format!("{path}/"));
+            assert_eq!(ordinary, with_separator);
+            assert_eq!(
+                WatchKey::folded(SanitizedPath::new(ordinary)),
+                WatchKey::folded(SanitizedPath::new(&with_separator)),
+            );
+        }
+        for (left, right) in [
+            ("/", ""),
+            ("/repo/../project", "/project"),
+            ("./project", "project"),
+        ] {
+            assert_ne!(
+                WatchKey::folded(SanitizedPath::new(Path::new(left))),
+                WatchKey::folded(SanitizedPath::new(Path::new(right))),
+            );
+        }
     }
 
     #[test]

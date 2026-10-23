@@ -6536,8 +6536,33 @@ fn panels_page() -> SettingsPage {
 }
 
 fn debugger_page() -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 6] {
+    fn general_section() -> [SettingsPageItem; 7] {
         [
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Threads Sidebar Group By",
+                description: "How to group threads in the Threads Sidebar.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.threads_sidebar.group_by"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .threads_sidebar
+                            .as_ref()?
+                            .group_by
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .set_threads_sidebar_group_by(value);
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Stepping Granularity",
@@ -6655,9 +6680,21 @@ fn debugger_page() -> SettingsPage {
 }
 
 fn terminal_page() -> SettingsPage {
-    fn environment_section() -> [SettingsPageItem; 5] {
+    fn environment_section() -> [SettingsPageItem; 6] {
         [
                 SettingsPageItem::SectionHeader("Environment"),
+                SettingsPageItem::SettingItem(SettingItem {
+                    files: USER,
+                    title: "Profiles",
+                    description: "Named terminal profiles shown in the terminal dropdown. The first profile is the default. Configure profiles in settings.json; other terminal controls edit the first profile.",
+                    field: Box::new(SettingField {
+                        organization_override: None,
+                        json_path: Some("terminal"),
+                        pick: |settings_content| settings_content.terminal.as_ref(),
+                        write: |_settings_content, _value, _| {},
+                    }.unimplemented()),
+                    metadata: None,
+                }),
                 SettingsPageItem::DynamicItem(DynamicItem {
                     discriminant: SettingItem {
                         files: USER | PROJECT,
@@ -8500,6 +8537,22 @@ fn ai_page(cx: &App) -> SettingsPage {
                             .agent
                             .get_or_insert_default()
                             .expand_terminal_card = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Tool Call Display",
+                description: "Show full tool cards (Verbose), expandable individual summaries (Compact), or consecutive tool groups with counts (Grouped). Compact and grouped summaries start collapsed. Permission requests remain visible.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.tool_call_display"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.tool_call_display.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().tool_call_display = value;
                     },
                 }),
                 metadata: None,

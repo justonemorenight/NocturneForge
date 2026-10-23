@@ -4577,6 +4577,14 @@ async fn test_noisy_dot_git_events_do_not_emit_git_repo_update(
         path!("/main_repo/.git/info/refs"),
         path!("/main_repo/.git/info/refs_lzOf51"),
         path!("/main_repo/.git/gc.pid"),
+        path!("/main_repo/.git/fsmonitor--daemon/cookies/1234-1"),
+        path!("/main_repo/.git/lfs/tmp/abc123"),
+        path!("/main_repo/.git/worktrees/feature/fsmonitor--daemon/cookies/1234-1"),
+        path!("/main_repo/.git/worktrees/feature/logs/HEAD"),
+        path!("/main_repo/.git/worktrees/feature/ORIG_HEAD"),
+        path!("/main_repo/.git/worktrees/feature/rebase-merge/done"),
+        path!("/main_repo/.git/worktrees/feature/index.new"),
+        path!("/main_repo/.git/worktrees/other/fsmonitor--daemon/cookies/5678-2"),
         // Linked-worktree specific skipped paths
         path!("/main_repo/.git/worktrees/feature/index.lock"),
     ];
@@ -6519,4 +6527,77 @@ fn set_file_scan_depth(cx: &mut TestAppContext, depth: Option<u32>) {
             });
         });
     });
+}
+
+#[gpui::test]
+async fn test_deleted_external_symlink_before_read_dir_cleans_up_watch(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.scan_symlinks =
+                    Some(settings::ScanSymlinksSetting::Always);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({})).await;
+    fs.insert_tree("/outside", json!({"data": {}})).await;
+    fs.create_symlink("/root/link".as_ref(), "/outside/data".into())
+        .await
+        .expect("symlink cleanup fixture");
+
+    fs.before_read_dir(
+        "/root/link",
+        Box::pin({
+            let fs = fs.clone();
+            async move {
+                let mut watched_paths = fs.registered_watch_paths();
+                watched_paths.sort();
+                assert_eq!(
+                    watched_paths,
+                    vec![PathBuf::from("/outside/data"), PathBuf::from("/root")]
+                );
+                // FakeFs cannot unlink symlinks; moving it out makes the pending read fail.
+                fs.rename(
+                    "/root/link".as_ref(),
+                    "/outside/link".as_ref(),
+                    Default::default(),
+                )
+                .await
+                .expect("symlink cleanup fixture");
+            }
+        }),
+    );
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .expect("symlink cleanup fixture");
+    cx.read(|cx| {
+        tree.read(cx)
+            .as_local()
+            .expect("symlink cleanup fixture")
+            .scan_complete()
+    })
+    .await;
+    tree.flush_fs_events(cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.entries(true, 0)
+                .map(|entry| entry.path.as_ref())
+                .collect::<Vec<_>>(),
+            vec![rel_path("")]
+        );
+    });
+    assert_eq!(fs.registered_watch_paths(), vec![PathBuf::from("/root")]);
 }

@@ -36,9 +36,9 @@
 
 - **Pattern:** Zed keeps many tests inside source modules and ACP stubs in `crates/acp_thread/src/connection.rs`; guessed filename globs may match nothing.
 - **Wrong:** Read guessed source/state filenames or pass unverified globs such as `crates/git_ui/src/*tests*` or `crates/acp_thread/src/stub*` to a zsh command.
-- **Right:** Use `rg --files` to discover source and state paths before reading them, or search the containing directory with `rg -n`; quote any glob supplied through an `rg -g` option.
+- **Right:** Use `rg --files` to discover source and state paths before reading them, or search the containing directory with `rg -n`; quote any glob supplied through an `rg -g` option. Check upstream diff paths against the fork too: newly introduced upstream files may not exist locally.
 - **Rule:** zsh `NOMATCH` stops the command before `rg` runs.
-- **Seen:** 15x — 2026-09-30 through 2026-10-17; includes missing stub, thread-history, adapter diff, relocated Metal, fake-provider, and colocated item-test paths.
+- **Seen:** 16x — 2026-09-30 through 2026-10-18; includes missing stub, thread-history, adapter diff, relocated Metal, fake-provider, colocated item-test, and upstream-only source paths.
 
 ### Move GPUI handles into their final callback
 
@@ -70,7 +70,7 @@
 - **Wrong:** Select an entire conflict side based only on the changed API name.
 - **Right:** Review the full diff against HEAD after resolution; preserve fork functions, deduplicate tests, and port only the actual upstream edits when conflict boundaries expand.
 - **Rule:** Three-way merge conflict boundaries are not the PR change scope.
-- **Seen:** 2x — ACP telemetry and Git/search ports, 2026-10-03.
+- **Seen:** 5x — ACP telemetry and Git/search ports, 2026-10-03; unrelated Node discovery, terminal hyperlink and Git merge-base tests in expanded upstream conflicts, 2026-10-23.
 
 ### Upstream ports can depend on manifest changes outside the PR
 
@@ -87,3 +87,17 @@
 - **Right:** Use `FakeLanguageModel::set_supports_images` through `ConfiguredModel.model`, and the receiving editor's v1 `PromptCapabilities::image(true)` API.
 - **Rule:** Rust E0433 and mismatched model/capability APIs; inspect the receiving type before porting test helpers.
 - **Seen:** 2x — 2026-10-17, inline-prompt and message-editor paste regressions.
+
+### Restored source timestamps can leave Cargo metadata stale
+
+- **Pattern:** Restoring backed-up source with preserved mtimes after experimental builds leaves Cargo treating older intermediate metadata as current.
+- **Wrong:** Use `copy2` to restore source and trust contradictory type errors from cached metadata.
+- **Right:** Restore file contents with fresh modification times, then rerun the targeted check; keep build artifacts on the external SSD.
+- **Seen:** Multiple provider/check failures during upstream ports, 2026-10-23.
+
+### Batch test targets before expensive release linking
+
+- **Pattern:** Separate Cargo test commands choose different feature graphs and repeatedly build shared dependencies; this repository's `release` profile also uses thin LTO with one codegen unit.
+- **Wrong:** Discover missing upstream test helpers only after linking several large release test binaries, then change the feature graph for each package.
+- **Right:** Check all selected test targets, including required integration-test features, before linking. Build their binaries with one feature graph and run focused filters against the discovered executables. Prefer the existing `release-fast` profile for iterative test builds; retain release source checks and external SSD target/temp paths.
+- **Seen:** Repeated GPUI, agent and terminal validation builds during the 2026-10-23 upstream port.

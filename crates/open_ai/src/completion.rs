@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use collections::HashMap;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use http_client::StatusCode;
 use language_model_core::{
     CompactedContext, CompactionUpdate, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -952,11 +952,13 @@ impl OpenAiEventMapper {
                     reasoning_details,
                 )));
             }
-            if let Some(reasoning) = delta.reasoning.clone() {
-                push_thinking_event(reasoning, &mut events);
-            }
-            if let Some(reasoning_content) = delta.reasoning_content.clone() {
-                push_thinking_event(reasoning_content, &mut events);
+            if let Some(reasoning) = delta
+                .reasoning
+                .as_ref()
+                .filter(|text| !text.is_empty())
+                .or(delta.reasoning_content.as_ref())
+            {
+                push_thinking_event(reasoning.clone(), &mut events);
             }
             if let Some(content) = delta.content.clone() {
                 if !content.is_empty() {
@@ -1162,15 +1164,15 @@ impl OpenAiResponseEventMapper {
         self
     }
 
-    pub fn map_stream(
+    pub fn map_stream<E: Into<LanguageModelCompletionError> + 'static>(
         mut self,
-        events: Pin<Box<dyn Send + Stream<Item = Result<ResponsesStreamEvent>>>>,
+        events: BoxStream<'static, Result<ResponsesStreamEvent, E>>,
     ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
+                Err(error) => vec![Err(error.into())],
             })
         })
     }
@@ -1253,7 +1255,8 @@ impl OpenAiResponseEventMapper {
                     events
                 }
             }
-            ResponsesStreamEvent::ReasoningDelta { delta, .. } => {
+            ResponsesStreamEvent::ReasoningDelta { delta, .. }
+            | ResponsesStreamEvent::ReasoningTextDelta { delta, .. } => {
                 if delta.is_empty() {
                     Vec::new()
                 } else {
@@ -1458,6 +1461,7 @@ impl OpenAiResponseEventMapper {
             | ResponsesStreamEvent::ContentPartAdded { .. }
             | ResponsesStreamEvent::ContentPartDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryTextDone { .. }
+            | ResponsesStreamEvent::ReasoningTextDone { .. }
             | ResponsesStreamEvent::ReasoningSummaryPartDone { .. }
             | ResponsesStreamEvent::ReasoningDone { .. }
             | ResponsesStreamEvent::Created { .. }
@@ -1895,7 +1899,12 @@ fn response_reasoning_input_item_from_output(
     ResponseReasoningInputItem {
         id: reasoning.id.clone(),
         summary,
-        content: reasoning.content.clone(),
+        content: reasoning
+            .content
+            .iter()
+            .filter(|part| !matches!(part, crate::responses::ReasoningContentPart::Other))
+            .cloned()
+            .collect(),
         encrypted_content,
         status: reasoning.status.clone(),
     }
@@ -2018,7 +2027,9 @@ mod tests {
     fn map_response_events(events: Vec<ResponsesStreamEvent>) -> Vec<LanguageModelCompletionEvent> {
         block_on(async {
             OpenAiResponseEventMapper::new(OPEN_AI_PROVIDER_ID)
-                .map_stream(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+                .map_stream(Box::pin(futures::stream::iter(
+                    events.into_iter().map(Ok::<_, crate::RequestError>),
+                )))
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
@@ -4575,10 +4586,9 @@ mod tests {
             Some("ENC"),
             Some("completed".into()),
         );
-        reasoning_item.content = vec![json!({
-            "type": "reasoning_text",
-            "text": "Internal reasoning text."
-        })];
+        reasoning_item.content = vec![crate::responses::ReasoningContentPart::ReasoningText {
+            text: "Internal reasoning text.".into(),
+        }];
 
         let events = vec![
             ResponsesStreamEvent::OutputItemDone {
@@ -4929,29 +4939,49 @@ mod tests {
 
     #[test]
     fn stream_maps_reasoning() {
-        let events = map_completion_events(vec![ResponseStreamEvent {
-            choices: vec![ChoiceDelta {
-                index: 0,
-                delta: Some(ResponseMessageDelta {
-                    role: None,
-                    content: None,
-                    reasoning: Some("thinking".into()),
-                    tool_calls: None,
-                    reasoning_content: None,
-                    reasoning_details: None,
-                }),
-                finish_reason: None,
-            }],
-            usage: None,
-        }]);
-
-        assert_eq!(
-            events,
-            vec![LanguageModelCompletionEvent::Thinking {
-                text: "thinking".into(),
-                signature: None,
-            }]
-        );
+        for (reasoning, reasoning_content, expected) in [
+            (Some("thinking"), None, Some("thinking")),
+            (None, Some("thinking"), Some("thinking")),
+            (Some("thinking"), Some("thinking"), Some("thinking")),
+            (Some("thinking"), Some("other"), Some("thinking")),
+            (Some(""), Some("thinking"), Some("thinking")),
+            (Some("thinking"), Some(""), Some("thinking")),
+            (None, None, None),
+            (Some(""), Some(""), None),
+        ] {
+            let events = map_completion_events(
+                (0..2)
+                    .map(|_| ResponseStreamEvent {
+                        choices: vec![ChoiceDelta {
+                            index: 0,
+                            delta: Some(ResponseMessageDelta {
+                                role: None,
+                                content: None,
+                                reasoning: reasoning.map(str::to_owned),
+                                reasoning_content: reasoning_content.map(str::to_owned),
+                                tool_calls: None,
+                                reasoning_details: None,
+                            }),
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                events,
+                expected
+                    .into_iter()
+                    .cycle()
+                    .take(2)
+                    .map(|text| LanguageModelCompletionEvent::Thinking {
+                        text: text.into(),
+                        signature: None
+                    })
+                    .collect::<Vec<_>>(),
+                "reasoning={reasoning:?}, reasoning_content={reasoning_content:?}"
+            );
+        }
     }
 
     #[test]

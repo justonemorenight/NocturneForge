@@ -475,7 +475,12 @@ impl OpenCodeLanguageModel {
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
-        Result<futures::stream::BoxStream<'static, Result<open_ai::responses::StreamEvent>>>,
+        Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<open_ai::responses::StreamEvent, open_ai::RequestError>,
+            >,
+        >,
     > {
         // Responses crate appends /responses to api_url, so we pass base + "/v1"
         let base_url = self.base_api_url(cx);
@@ -512,7 +517,12 @@ impl OpenCodeLanguageModel {
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
-        Result<futures::stream::BoxStream<'static, Result<google_ai::GenerateContentResponse>>>,
+        Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<google_ai::GenerateContentResponse, LanguageModelCompletionError>,
+            >,
+        >,
     > {
         let api_url = self.base_api_url(cx);
         let api_key = self.api_key(cx);

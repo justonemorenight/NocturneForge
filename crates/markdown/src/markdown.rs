@@ -768,7 +768,7 @@ impl Markdown {
     }
 
     pub fn scroll_to_heading_when_parsed(&mut self, slug: SharedString, cx: &mut Context<Self>) {
-        if self.pending_parse.is_some() || self.source().is_empty() {
+        if self.pending_parse.is_some() || self.deferred || self.source().is_empty() {
             self.pending_heading_scroll = Some(slug);
         } else {
             self.scroll_to_heading(&slug, cx);
@@ -827,7 +827,7 @@ impl Markdown {
         source_index: usize,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_parse.is_some() {
+        if self.pending_parse.is_some() || self.deferred {
             self.pending_autoscroll = Some(source_index);
         } else {
             self.autoscroll_request = Some(source_index);
@@ -859,7 +859,7 @@ impl Markdown {
 
     pub fn reset(&mut self, source: SharedString, cx: &mut Context<Self>) {
         if source.as_ref() == self.source() {
-            if self.pending_parse.is_none() {
+            if self.pending_parse.is_none() && !self.deferred {
                 if let Some(slug) = self.pending_heading_scroll.take() {
                     self.pending_autoscroll = None;
                     self.scroll_to_heading(&slug, cx);
@@ -1042,6 +1042,10 @@ impl Markdown {
         self.context_menu_selected_text = None;
         self.context_menu_selected_markdown = None;
         self.context_menu_capture_generation = 0;
+    }
+
+    pub fn has_pending_render(&self) -> bool {
+        self.pending_parse.is_some() || self.mermaid_state.has_pending_render()
     }
 
     /// Start deferred parsing when a renderer or another consumer needs parsed events.

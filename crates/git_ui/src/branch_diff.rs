@@ -2,7 +2,8 @@ use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ReviewDiff, render_send_review_to_agent_button,
+        self, CompareWithBranch, DeployBranchDiff, DiffFileBranch, ReviewDiff,
+        render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
@@ -70,6 +71,7 @@ impl Addon for BranchDiffAddon {
 impl BranchDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(Self::deploy_branch_diff);
+        workspace.register_action(Self::deploy_file_branch_diff);
         workspace.register_action(Self::compare_with_branch);
         workspace::register_serializable_item::<Self>(cx);
     }
@@ -116,6 +118,55 @@ impl BranchDiff {
                 anyhow::Ok(())
             })
             .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn deploy_file_branch_diff(
+        workspace: &mut Workspace,
+        _: &DiffFileBranch,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let project = workspace.project().clone();
+        let file = workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
+            .and_then(|path| {
+                project
+                    .read(cx)
+                    .git_store()
+                    .read(cx)
+                    .repository_and_path_for_project_path(&path, cx)
+            });
+        let Some((repository, repo_path)) = file else {
+            workspace.show_error("The active item is not a file in a git repository", cx);
+            return;
+        };
+        let default_branch = repository.update(cx, |repo, _| repo.default_branch(true));
+        let workspace = cx.entity();
+        let weak_workspace = workspace.downgrade();
+        window.spawn(cx, async move |cx| {
+            let base_ref = default_branch.await??.context("Could not determine default branch")?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+                    let item = item.read(cx);
+                    item.repo(cx).is_some_and(|repo| repo == repository)
+                        && item.diff.read(cx).path_filter() == Some(&repo_path)
+                        && matches!(item.diff_base(cx), DiffBase::Merge { base_ref: current } if current == &base_ref)
+                });
+                if let Some(existing) = existing {
+                    workspace.activate_item(&existing, true, true, window, cx);
+                    return;
+                }
+                let handle = cx.entity();
+                let item = cx.new(|cx| {
+                    let view = Self::new_with_base_ref(project, handle, base_ref, Some(repository), window, cx);
+                    view.diff.update(cx, |diff, _| diff.set_path_filter(Some(repo_path)));
+                    view
+                });
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            })?;
+            anyhow::Ok(())
+        }).detach_and_notify_err(weak_workspace, window, cx);
     }
 
     fn compare_with_branch(
@@ -184,7 +235,7 @@ impl BranchDiff {
     ) {
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
-            matches!(
+            item.diff.read(cx).path_filter().is_none() && matches!(
                 item.diff_base(cx),
                 DiffBase::Merge { base_ref: existing_base_ref } if existing_base_ref == &base_ref
             )
@@ -353,6 +404,9 @@ impl BranchDiff {
     }
 
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
+        if self.diff.read(cx).path_filter().is_some() {
+            return;
+        }
         let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return;
         };
@@ -451,7 +505,13 @@ impl Item for BranchDiff {
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
-            DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
+            DiffBase::Merge { base_ref } => {
+                if let Some(path) = self.diff.read(cx).path_filter() {
+                    format!("{} since {}", path.as_unix_str(), base_ref).into()
+                } else {
+                    format!("Changes since {}", base_ref).into()
+                }
+            }
             DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
         }
     }
@@ -507,8 +567,12 @@ impl Item for BranchDiff {
         };
         let repo = self.repo(cx);
         let project = self.project.clone();
+        let path_filter = self.diff.read(cx).path_filter().cloned();
         Task::ready(Some(cx.new(|cx| {
-            Self::new_with_base_ref(project, workspace, base_ref, repo, window, cx)
+            let item = Self::new_with_base_ref(project, workspace, base_ref, repo, window, cx);
+            item.diff
+                .update(cx, |diff, _| diff.set_path_filter(path_filter));
+            item
         })))
     }
 
@@ -648,6 +712,9 @@ impl SerializableItem for BranchDiff {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
+        if self.diff.read(cx).path_filter().is_some() {
+            return None;
+        }
         let workspace_id = workspace.database_id()?;
         let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return None;
@@ -752,7 +819,9 @@ impl Render for BranchDiffToolbar {
             .is_empty();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
-        let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let show_review_button = !is_multibuffer_empty
+            && is_ai_enabled
+            && branch_diff.read(cx).diff.read(cx).path_filter().is_none();
 
         h_flex()
             .my_neg_1()

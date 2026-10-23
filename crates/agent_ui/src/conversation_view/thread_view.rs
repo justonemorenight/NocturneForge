@@ -1,3 +1,7 @@
+use super::subagent_card::{SubagentCardState, SubagentStatus};
+use super::tool_call_groups::{
+    ActivityKind, ActivityStatus, ToolActivity, ToolCallGroups, compact_preview,
+};
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
@@ -6,6 +10,7 @@ use crate::{
     thread_transcript_search::ThreadSearchNavigation,
 };
 use agent_client_protocol::schema::{v1 as acp, v2 as acp_v2};
+use settings::{SettingsStore, ToolCallDisplay};
 use std::{cell::RefCell, ops::Range};
 
 use acp_thread::{
@@ -837,6 +842,29 @@ fn parse_cat_numbered_line(line: &str) -> Option<(u32, &str)> {
     Some((number.parse().ok()?, text))
 }
 
+#[derive(IntoElement)]
+struct CatNumberedCodeBlock {
+    markdown: Entity<Markdown>,
+    parsed: ParsedCatNumberedCode,
+    markdown_style: MarkdownStyle,
+    copy_button_id: String,
+}
+
+impl RenderOnce for CatNumberedCodeBlock {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        self.markdown
+            .update(cx, |markdown, cx| markdown.ensure_parsed(cx));
+        let language = self.markdown.read(cx).first_code_block_language();
+        render_cat_numbered_code_block(
+            self.parsed,
+            language,
+            self.markdown_style,
+            self.copy_button_id,
+            cx,
+        )
+    }
+}
+
 fn render_cat_numbered_code_block(
     parsed: ParsedCatNumberedCode,
     language: Option<Arc<Language>>,
@@ -1196,6 +1224,8 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+    expanded_compact_tool_calls: HashSet<acp::ToolCallId>,
+    expanded_tool_groups: HashSet<String>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -1681,6 +1711,11 @@ impl ThreadView {
                 matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(entry_ix)
             })
             .collect();
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            this.list_state
+                .remeasure_items(0..this.list_state.item_count());
+            cx.notify();
+        }));
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -1712,6 +1747,8 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_compact_tool_calls: HashSet::default(),
+            expanded_tool_groups: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -3447,6 +3484,22 @@ impl ThreadView {
         for index in 0..entry_count {
             self.sync_elicitation_state_for_entry(index, window, cx);
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn expand_tool_call_for_test(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_compact_tool_calls
+            .insert(tool_call_id.clone());
+        self.entry_view_state.update(cx, |state, _| {
+            state.expand_tool_call(tool_call_id);
+        });
+        self.list_state
+            .remeasure_items(0..self.list_state.item_count());
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -10064,7 +10117,59 @@ impl ThreadView {
         )
     }
 
+    fn tool_activity(call: &ToolCall) -> Option<ToolActivity> {
+        if call.subagent_session_info.is_some()
+            || matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. })
+        {
+            return None;
+        }
+        let kind = match call.kind {
+            acp::ToolKind::Execute => ActivityKind::Execute,
+            acp::ToolKind::Read => ActivityKind::Read,
+            acp::ToolKind::Search => ActivityKind::Search,
+            acp::ToolKind::Edit => ActivityKind::Edit,
+            acp::ToolKind::Delete => ActivityKind::Delete,
+            acp::ToolKind::Move => ActivityKind::Move,
+            acp::ToolKind::Fetch => ActivityKind::Fetch,
+            _ => return None,
+        };
+        let status = match call.status {
+            ToolCallStatus::Pending => ActivityStatus::Pending,
+            ToolCallStatus::InProgress => ActivityStatus::Running,
+            ToolCallStatus::Completed => ActivityStatus::Completed,
+            ToolCallStatus::Failed => ActivityStatus::Failed,
+            ToolCallStatus::Canceled => ActivityStatus::Canceled,
+            ToolCallStatus::Rejected => ActivityStatus::Rejected,
+            ToolCallStatus::WaitingForConfirmation { .. } => return None,
+        };
+        Some(ToolActivity {
+            id: call.id.to_string(),
+            kind,
+            status,
+            paths: call
+                .locations
+                .iter()
+                .map(|location| location.path.clone())
+                .collect(),
+        })
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        let display = if self.thread_search_visible {
+            ToolCallDisplay::Verbose
+        } else {
+            AgentSettings::get_global(cx).tool_call_display
+        };
+        let groups =
+            (display == ToolCallDisplay::Grouped).then(|| {
+                ToolCallGroups::new(self.thread.read(cx).entries().iter().map(
+                    |entry| match entry {
+                        AgentThreadEntry::ToolCall(call) => Self::tool_activity(call),
+                        _ => None,
+                    },
+                ))
+            });
+
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -10078,6 +10183,112 @@ impl ThreadView {
         list(
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
+                let summary = this.thread.read(cx).entries().get(index).and_then(|entry| {
+                    let AgentThreadEntry::ToolCall(call) = entry else {
+                        return None;
+                    };
+                    if display == ToolCallDisplay::Verbose {
+                        return None;
+                    }
+                    let activity = Self::tool_activity(call)?;
+                    if let Some(group) = groups.as_ref().and_then(|groups| groups.for_entry(index))
+                    {
+                        let expanded = this.expanded_tool_groups.contains(&group.first_id);
+                        if index != group.entries.start {
+                            return (!expanded).then(|| {
+                                (
+                                    String::new(),
+                                    group.first_id.clone(),
+                                    call.id.clone(),
+                                    false,
+                                    true,
+                                    ActivityStatus::Completed,
+                                )
+                            });
+                        }
+                        Some((
+                            group.label(),
+                            group.first_id.clone(),
+                            call.id.clone(),
+                            expanded,
+                            true,
+                            group.status(),
+                        ))
+                    } else {
+                        Some((
+                            compact_preview(call.label.read(cx).source()),
+                            call.id.to_string(),
+                            call.id.clone(),
+                            this.expanded_compact_tool_calls.contains(&call.id),
+                            false,
+                            activity.status,
+                        ))
+                    }
+                });
+                if let Some((label, key, tool_id, expanded, grouped, status)) = summary {
+                    if label.is_empty() {
+                        return Empty.into_any();
+                    }
+                    let header = h_flex()
+                        .id(("tool-summary", index))
+                        .mx_5()
+                        .my_1()
+                        .p_2()
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::Small),
+                        )
+                        .child(if status == ActivityStatus::Running {
+                            SpinnerLabel::new()
+                                .size(LabelSize::Small)
+                                .into_any_element()
+                        } else {
+                            Icon::new(match status {
+                                ActivityStatus::Completed => IconName::Check,
+                                ActivityStatus::Failed => IconName::Warning,
+                                ActivityStatus::Pending => IconName::Clock,
+                                ActivityStatus::Canceled | ActivityStatus::Rejected => {
+                                    IconName::Close
+                                }
+                                ActivityStatus::Running => IconName::ArrowRight,
+                            })
+                            .size(IconSize::Small)
+                            .into_any_element()
+                        })
+                        .child(Label::new(label).size(LabelSize::Small).truncate())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if grouped {
+                                if !this.expanded_tool_groups.remove(&key) {
+                                    this.expanded_tool_groups.insert(key.clone());
+                                }
+                            } else if !this.expanded_compact_tool_calls.remove(&tool_id) {
+                                this.expanded_compact_tool_calls.insert(tool_id.clone());
+                                this.entry_view_state
+                                    .update(cx, |state, _| state.expand_tool_call(tool_id.clone()));
+                            }
+                            this.list_state
+                                .remeasure_items(0..this.list_state.item_count());
+                            cx.notify();
+                        }));
+                    if !expanded {
+                        return centered_container(header.into_any_element()).into_any_element();
+                    }
+                    this.resync_entry(index, window, cx);
+                    let entries = this.thread.read(cx).entries();
+                    if let Some(entry) = entries.get(index) {
+                        let body = this.render_entry(index, entries.len(), entry, window, cx);
+                        return centered_container(
+                            v_flex().child(header).child(body).into_any_element(),
+                        )
+                        .into_any_element();
+                    }
+                }
                 let materialize_content = {
                     let view_state = this.entry_view_state.read(cx);
                     match this.thread.read(cx).entries().get(index) {
@@ -15014,16 +15225,16 @@ impl ThreadView {
             return None;
         }
 
-        let markdown = markdown.read(cx);
-        let parsed = parse_cat_numbered_markdown_code_block(markdown.source())?;
-        let language = markdown.first_code_block_language();
-        Some(render_cat_numbered_code_block(
-            parsed,
-            language,
-            markdown_style,
-            format!("copy-read-file-output-{entry_ix}-{context_ix}"),
-            cx,
-        ))
+        let parsed = parse_cat_numbered_markdown_code_block(markdown.read(cx).source())?;
+        Some(
+            CatNumberedCodeBlock {
+                markdown,
+                parsed,
+                markdown_style,
+                copy_button_id: format!("copy-read-file-output-{entry_ix}-{context_ix}"),
+            }
+            .into_any_element(),
+        )
     }
 
     fn render_image_output(
@@ -15132,47 +15343,21 @@ impl ThreadView {
         let files_changed = changed_buffers.len();
         let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
-        let is_running = matches!(
-            tool_call.status,
-            ToolCallStatus::Pending
-                | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation { .. }
-        );
-
-        let is_failed = matches!(
-            tool_call.status,
-            ToolCallStatus::Failed | ToolCallStatus::Rejected
-        );
-
-        let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
-            || tool_call.content_for_display().iter().any(|c| match c {
-                ToolCallContent::ContentBlock(block) => {
-                    block.text_content(cx) == Some("User canceled")
-                }
-                _ => false,
-            });
-
+        let card_state = SubagentCardState::from_tool_call(tool_call, cx);
+        let is_running = card_state.status == SubagentStatus::Running;
+        let can_stop = card_state.can_stop
+            && thread
+                .as_ref()
+                .is_none_or(|thread| thread.read(cx).can_cancel());
+        let is_failed = card_state.status == SubagentStatus::Failed;
+        let is_cancelled = card_state.status == SubagentStatus::Canceled;
         let thread_title = thread
             .as_ref()
-            .and_then(|t| t.read(cx).title())
-            .filter(|t| !t.is_empty());
-        let tool_call_label = tool_call.label.read(cx).source().to_string();
-        let has_tool_call_label = !tool_call_label.is_empty();
-
-        let has_title = thread_title.is_some() || has_tool_call_label;
-        let has_no_title_or_canceled = !has_title || is_failed || is_cancelled;
-
-        let title: SharedString = if let Some(thread_title) = thread_title {
-            thread_title
-        } else if !tool_call_label.is_empty() {
-            tool_call_label.into()
-        } else if is_cancelled {
-            "Subagent Canceled".into()
-        } else if is_failed {
-            "Subagent Failed".into()
-        } else {
-            "Spawning Agent…".into()
-        };
+            .and_then(|thread| thread.read(cx).title())
+            .filter(|title| !title.is_empty());
+        let has_title = thread_title.is_some() || card_state.label.is_some();
+        let has_no_title_or_canceled = !has_title || card_state.status.is_failed_or_canceled();
+        let title = card_state.title(thread_title);
 
         let activity_detail: Option<SharedString> = thread.as_ref().map(|thread| {
             let thread = thread.read(cx);
@@ -15193,7 +15378,11 @@ impl ThreadView {
                     SubagentRole::FlowReader => "Flow reader",
                     SubagentRole::CodingWorker => "Coding worker",
                 });
-            let status = AgentActivityStatus::from_tool_call_status(&tool_call.status).label();
+            let status = if thread.activity_unknown() {
+                "Activity unknown"
+            } else {
+                AgentActivityStatus::from_tool_call_status(&tool_call.status).label()
+            };
             match (model, role) {
                 (Some(model), Some(role)) => {
                     format!("{status} · {model} · {role} · {events} events").into()
@@ -15232,7 +15421,12 @@ impl ThreadView {
                         .size(IconSize::Small)
                         .color(Color::Error),
                 )
-                .tooltip(Tooltip::text("Subagent Failed"))
+                .tooltip(Tooltip::text(
+                    card_state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Subagent Failed".into()),
+                ))
                 .into_any_element()
         } else {
             Icon::new(IconName::Check)
@@ -15370,7 +15564,7 @@ impl ThreadView {
                                     }))
                             }),
                     )
-                    .when(is_running && subagent_session_id.is_some(), |buttons| {
+                    .when(can_stop && subagent_session_id.is_some(), |buttons| {
                         buttons.child(
                             IconButton::new(format!("stop-subagent-{}", entry_ix), IconName::Stop)
                                 .icon_size(IconSize::Small)
@@ -15507,19 +15701,8 @@ impl ThreadView {
 
         let entries = subagent_view.thread.read(cx).entries();
         let total_entries = entries.len();
-        let mut entry_range = if let Some(info) = tool_call.subagent_session_info.as_ref() {
-            info.message_start_index
-                ..info
-                    .message_end_index
-                    .map(|i| (i + 1).min(total_entries))
-                    .unwrap_or(total_entries)
-        } else {
-            0..total_entries
-        };
-        entry_range.start = entry_range
-            .end
-            .saturating_sub(MAX_PREVIEW_ENTRIES)
-            .max(entry_range.start);
+        let card_state = SubagentCardState::from_tool_call(tool_call, cx);
+        let entry_range = card_state.preview_range(total_entries, MAX_PREVIEW_ENTRIES);
         let start_ix = entry_range.start;
 
         let scroll_handle = self

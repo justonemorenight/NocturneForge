@@ -2661,7 +2661,7 @@ impl GitPanel {
             this.update_in(cx, |this, window, cx| {
                 let task = active_repository.update(cx, |repo, cx| {
                     repo.checkout_files(
-                        commit,
+                        (!commit.is_empty()).then_some(commit),
                         entries
                             .into_iter()
                             .map(|entries| entries.repo_path)

@@ -5,7 +5,39 @@ resuming a completed Claude Multi subagent. The affected adapter is
 `@agentclientprotocol/claude-agent-acp` 0.88.0, using Claude Agent SDK 0.3.293.
 The fix belongs in that external adapter, rather than in Zed's Rust UI.
 
-## Root cause
+## Native support for the current subagent protocol
+
+On 2026-10-15, Claude ACP 0.90.0 selected the current RFD wire format because
+NocturneForge advertises `clientCapabilities.subagents`. It emitted
+`subagent_update` and `session_message`, which the earlier fork rejected as
+unknown variants. All six workers kept running but their cards were absent.
+This is separate from the legacy AIR resume-routing bug below.
+
+The fork now handles `subagent_update`, `session_message`, and
+`session_message_chunk` directly in its ACP notification handler:
+
+- Announcements register a live child on the same connection. Its session and
+  card are reused across delegations; a different parent cannot claim it.
+- `running`, `requires_action`, `idle`, and `unknown` replace the current
+  activity snapshot. Idle is resumable, so later output is retained. Clearing
+  state does not assert successful completion or cancel pending requests.
+- Omitted title, description, capability and state fields retain their
+  previous values; explicit null clears them. Child cancellation requires an
+  advertised `cancel` object. Cancelling a parent does not invent a terminal
+  state for a background child.
+- Inter-session messages upsert by message ID. Content replacements, clearing,
+  streamed append, and sender/recipient identity are preserved without adding
+  a duplicate entry for the same ID. Error details from failed child work are
+  displayed in the child's transcript.
+
+The legacy AIR events remain supported for existing adapters. The saved
+JavaScript patch targets that older form; it is not required to receive the
+RFD events and should not be used to force current adapters onto AIR.
+
+A source change only takes effect after rebuilding and installing the fork.
+The running app is not replaced by a test build.
+
+## Root cause of the legacy AIR routing failure
 
 On the first run, the SDK associates both lifecycle and output with the
 original `Agent` tool-use ID. When `SendMessage` resumes the same agent,

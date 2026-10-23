@@ -125,6 +125,13 @@ impl Default for LanguageModelTextStream {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PromptCompactionStrategy {
+    #[default]
+    RebuildPrompt,
+    PreserveRequestPrefix,
+}
+
 pub trait LanguageModel: Send + Sync {
     fn id(&self) -> LanguageModelId;
     fn name(&self) -> LanguageModelName;
@@ -160,6 +167,10 @@ pub trait LanguageModel: Send + Sync {
     }
 
     fn telemetry_id(&self) -> String;
+
+    fn prompt_compaction_strategy(&self) -> PromptCompactionStrategy {
+        PromptCompactionStrategy::RebuildPrompt
+    }
 
     /// Identifies the authenticated routing scope for optional cache replay.
     /// Providers without an isolated replay path must leave this unsupported.

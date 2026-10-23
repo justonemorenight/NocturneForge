@@ -50,6 +50,8 @@ actions!(
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
+        /// Shows the active file relative to a branch merge base.
+        DiffFileBranch,
     ]
 );
 

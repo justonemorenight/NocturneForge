@@ -118,6 +118,8 @@ pub struct FakeLanguageModel {
     >,
     forbid_requests: AtomicBool,
     supports_thinking: AtomicBool,
+    preserves_compaction_prefix: AtomicBool,
+    supports_tools: AtomicBool,
     supports_disabling_thinking: AtomicBool,
     supports_disabling_thinking_by_effort: Mutex<HashMap<String, bool>>,
     supports_streaming_tools: AtomicBool,
@@ -141,6 +143,8 @@ impl Default for FakeLanguageModel {
             current_completion_txs: Mutex::new(Vec::new()),
             forbid_requests: AtomicBool::new(false),
             supports_thinking: AtomicBool::new(false),
+            preserves_compaction_prefix: AtomicBool::new(false),
+            supports_tools: AtomicBool::new(false),
             supports_disabling_thinking: AtomicBool::new(true),
             supports_disabling_thinking_by_effort: Mutex::new(HashMap::new()),
             supports_streaming_tools: AtomicBool::new(false),
@@ -170,6 +174,14 @@ impl FakeLanguageModel {
             supports_thinking: AtomicBool::new(supports_thinking),
             ..Default::default()
         }
+    }
+
+    pub fn set_preserves_compaction_prefix(&self, preserves: bool) {
+        self.preserves_compaction_prefix.store(preserves, SeqCst);
+    }
+
+    pub fn set_supports_tools(&self, supports: bool) {
+        self.supports_tools.store(supports, SeqCst);
     }
 
     pub fn allow_requests(&self) {
@@ -336,12 +348,20 @@ impl LanguageModel for FakeLanguageModel {
         self.provider_name.clone()
     }
 
+    fn prompt_compaction_strategy(&self) -> crate::PromptCompactionStrategy {
+        if self.preserves_compaction_prefix.load(SeqCst) {
+            crate::PromptCompactionStrategy::PreserveRequestPrefix
+        } else {
+            crate::PromptCompactionStrategy::RebuildPrompt
+        }
+    }
+
     fn supports_tools(&self) -> bool {
-        false
+        self.supports_tools.load(SeqCst)
     }
 
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
-        false
+        self.supports_tools.load(SeqCst)
     }
 
     fn supports_images(&self) -> bool {

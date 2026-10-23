@@ -353,30 +353,52 @@ impl GitRepository for FakeGitRepository {
 
     fn checkout_files(
         &self,
-        commit: String,
+        commit: Option<String>,
         paths: Vec<RepoPath>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
-        let repo_dir = self.repository_dir_path.clone();
-        let contents = self.with_state_async(false, move |state| {
-            Ok(paths
+        let workdir_path = self.repository_dir_path.clone();
+        let restored = self.with_state_async(true, move |state| {
+            if let Some(commit) = &commit {
+                let head_sha = state.refs.get("HEAD").map(String::as_str);
+                anyhow::ensure!(
+                    commit == "HEAD" || Some(commit.as_str()) == head_sha,
+                    "fake git repository can only check out files from HEAD, got {commit}"
+                );
+            }
+            let source = if commit.is_some() {
+                &state.head_contents
+            } else {
+                &state.index_contents
+            };
+            let restored = paths
                 .into_iter()
-                .filter_map(|path| {
-                    let content = if commit.is_empty() {
-                        state.index_contents.get(&path).cloned()
-                    } else {
-                        state.head_contents.get(&path).cloned()
-                    }?;
-                    Some((path, content))
+                .map(|path| {
+                    let content = source.get(&path).cloned().with_context(|| {
+                        format!(
+                            "pathspec '{}' did not match any file(s) known to git",
+                            path.as_unix_str()
+                        )
+                    })?;
+                    Ok((path, content))
                 })
-                .collect::<Vec<_>>())
+                .collect::<Result<Vec<_>>>()?;
+            if commit.is_some() {
+                for (path, content) in &restored {
+                    state.index_contents.insert(path.clone(), content.clone());
+                }
+            }
+            Ok(restored)
         });
         async move {
-            for (path, content) in contents.await? {
-                let file_path = repo_dir.join(path.as_std_path());
-                fs.save(&file_path, &content.as_str().into(), Default::default())
-                    .await?;
+            for (path, content) in restored.await? {
+                fs.save(
+                    &workdir_path.join(path.as_std_path()),
+                    &content.as_str().into(),
+                    Default::default(),
+                )
+                .await?;
             }
             Ok(())
         }
@@ -1230,7 +1252,7 @@ impl GitRepository for FakeGitRepository {
 
         let path_prefixes = path_prefixes.to_vec();
 
-        let workdir_path = self.dot_git_path.parent().unwrap().to_path_buf();
+        let workdir_path = self.repository_dir_path.clone();
         let worktree_files: HashMap<RepoPath, String> = self
             .fs
             .files()

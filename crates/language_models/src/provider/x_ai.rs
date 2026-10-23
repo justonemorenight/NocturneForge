@@ -367,6 +367,10 @@ impl LanguageModel for XAiLanguageModel {
         true
     }
 
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        language_model::PromptCompactionStrategy::PreserveRequestPrefix
+    }
+
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
         match choice {
             LanguageModelToolChoice::Auto

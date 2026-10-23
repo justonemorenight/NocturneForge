@@ -35,3 +35,6 @@ which.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 async-std.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

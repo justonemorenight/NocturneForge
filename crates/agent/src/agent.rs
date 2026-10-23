@@ -240,7 +240,6 @@ struct Session {
     thread: Entity<Thread>,
     /// The ACP thread that handles protocol communication
     acp_thread: WeakEntity<acp_thread::AcpThread>,
-    subagents: Vec<Entity<acp_thread::AcpThread>>,
     project_id: EntityId,
     /// Latest snapshot to persist. Overwritten in place on every save request;
     /// the single save worker drains it, coalescing bursts into one write.
@@ -978,7 +977,6 @@ impl NativeAgent {
             Session {
                 thread: thread_handle,
                 acp_thread: acp_thread.downgrade(),
-                subagents: Vec::new(),
                 project_id,
                 pending_save,
                 last_streaming_save_key: None,
@@ -3559,8 +3557,11 @@ impl NativeThreadEnvironment {
                     .sessions
                     .get_mut(parent_session_id)
                     .context("parent session not found")?;
-                parent_session.subagents.push(acp_thread.clone());
-                Ok(acp_thread)
+                let parent = parent_session
+                    .acp_thread
+                    .upgrade()
+                    .context("parent session was released")?;
+                parent.update(cx, |parent, cx| parent.register_subagent(acp_thread, cx))
             })?
     }
 

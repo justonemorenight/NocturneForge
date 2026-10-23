@@ -254,7 +254,12 @@ impl GoogleLanguageModel {
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
-        Result<futures::stream::BoxStream<'static, Result<GenerateContentResponse>>>,
+        Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<GenerateContentResponse, LanguageModelCompletionError>,
+            >,
+        >,
     > {
         let http_client = self.http_client.clone();
 

@@ -1037,6 +1037,7 @@ impl TerminalBuilder {
         let term = new_term(&config, terminal_bounds, events_tx, alternate_scroll);
 
         let terminal = Terminal {
+            profile_name: None,
             task: None,
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
@@ -1320,6 +1321,7 @@ impl TerminalBuilder {
 
             let no_task = task.is_none();
             let terminal = Terminal {
+                profile_name: None,
                 task,
                 terminal_type,
                 subprocess,
@@ -1529,6 +1531,7 @@ enum TerminalType {
 }
 
 pub struct Terminal {
+    pub profile_name: Option<String>,
     terminal_type: TerminalType,
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
@@ -1632,6 +1635,13 @@ const FIND_HYPERLINK_THROTTLE_PX: Pixels = px(5.0);
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 
 impl Terminal {
+    pub fn settings<'a>(&self, cx: &'a App) -> &'a TerminalSettings {
+        let settings = TerminalSettings::get_global(cx);
+        settings
+            .profile(self.profile_name.as_deref())
+            .unwrap_or(settings)
+    }
+
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
             PtyEvent::Event(event) => self.process_event(event, cx),
@@ -1814,7 +1824,7 @@ impl Terminal {
                 if let Some(txt) = selection_text(term) {
                     cx.write_to_clipboard(ClipboardItem::new_string(txt));
                     if !keep_selection.unwrap_or_else(|| {
-                        let settings = TerminalSettings::get_global(cx);
+                        let settings = self.settings(cx);
                         settings.keep_selection_on_copy
                     }) {
                         self.events.push_back(InternalEvent::SetSelection(None));
@@ -2394,7 +2404,10 @@ impl Terminal {
     ///Paste text into the terminal
     pub fn paste(&mut self, text: &str) {
         let paste_text = if self.last_content.mode.contains(Modes::BRACKETED_PASTE) {
-            format!("{}{}{}", "\x1b[200~", text.replace('\x1b', ""), "\x1b[201~")
+            // Line breaks are forwarded as they are, except `\r\n` (Windows clipboards),
+            // which programs would otherwise see as two line breaks.
+            let text = text.replace("\r\n", "\r").replace('\x1b', "");
+            format!("{}{}{}", "\x1b[200~", text, "\x1b[201~")
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
         };
@@ -2620,8 +2633,7 @@ impl Terminal {
 
         if e.button == MouseButton::Left
             && e.modifiers.secondary()
-            && (TerminalSettings::get_global(cx).open_links_in_mouse_mode
-                || !self.mouse_mode(e.modifiers.shift))
+            && (self.settings(cx).open_links_in_mouse_mode || !self.mouse_mode(e.modifiers.shift))
         {
             self.mouse_down_hyperlink = self.find_hyperlink_at_point(point);
 
@@ -2692,7 +2704,7 @@ impl Terminal {
     }
 
     pub fn mouse_up(&mut self, e: &MouseUpEvent, cx: &Context<Self>) {
-        let setting = TerminalSettings::get_global(cx);
+        let setting = self.settings(cx);
 
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
         if let Some(mouse_down_hyperlink) = self.mouse_down_hyperlink.take() {
@@ -3723,6 +3735,43 @@ mod tests {
             b"\nthree"
         );
         assert!(!previous_byte_was_cr);
+    }
+
+    #[gpui::test]
+    async fn test_paste_converts_line_endings_to_cr(cx: &mut TestAppContext) {
+        let terminal = init_ctrl_click_hyperlink_test(cx, b"");
+
+        terminal.update(cx, |terminal, _cx| {
+            terminal.paste("one\r\ntwo\nthree\r");
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"one\rtwo\rthree\r".to_vec()]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bracketed_paste_converts_only_crlf(cx: &mut TestAppContext) {
+        // `?2004h` enables bracketed paste mode.
+        let terminal = init_ctrl_click_hyperlink_test(cx, b"\x1b[?2004h");
+
+        terminal.update(cx, |terminal, _cx| {
+            assert!(terminal.last_content.mode.contains(Modes::BRACKETED_PASTE));
+
+            // `\r\n` from Windows clipboards becomes one line break; `\n` and `\r` are kept.
+            terminal.paste("one\r\ntwo\nthree\r");
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[200~one\rtwo\nthree\r\x1b[201~".to_vec()]
+            );
+
+            // ESC is removed, so the pasted text can't end the paste early.
+            terminal.paste("a\x1b[201~b");
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![b"\x1b[200~a[201~b\x1b[201~".to_vec()]
+            );
+        });
     }
 
     /// Regression test for the agent terminal failing with `Not a tty (os error

@@ -856,6 +856,14 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
         self.model.supports_streaming_tools
     }
 
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        use cloud_llm_client::LanguageModelProvider::*;
+        match self.model.provider {
+            OpenAi | XAi => language_model::PromptCompactionStrategy::PreserveRequestPrefix,
+            _ => language_model::PromptCompactionStrategy::RebuildPrompt,
+        }
+    }
+
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
         match choice {
             LanguageModelToolChoice::Auto

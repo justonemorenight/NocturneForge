@@ -28,7 +28,7 @@ use git::{
     BISECT_LOG, COMMIT_MESSAGE, DOT_GIT, FETCH_HEAD, FSMONITOR_DAEMON, GC_PID, GITIGNORE,
     HOOKS_DIR, INFO_DIR, LFS_DIR, LOGS_DIR, LOGS_REF_STASH, OBJECTS_DIR, ORIG_HEAD,
     REBASE_APPLY_DIR, REBASE_MERGE_DIR, REFS_DIR, REFTABLE_DIR, REPO_EXCLUDE, SEQUENCER_DIR,
-    status::GitSummary,
+    WORKTREES_DIR, status::GitSummary,
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
@@ -3736,6 +3736,15 @@ async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
     matches!(config_metadata, Ok(Some(_)))
 }
 
+fn path_in_linked_worktree_git_dir(path_in_git_dir: &Path) -> Option<&Path> {
+    let mut components = path_in_git_dir.components();
+    if components.next()?.as_os_str() != OsStr::new(WORKTREES_DIR) {
+        return None;
+    }
+    components.next()?;
+    Some(components.as_path())
+}
+
 async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
     let parent = abs_path.parent().unwrap_or_else(|| Path::new("/"));
     build_gitignore_with_root(abs_path, parent, fs).await
@@ -4888,20 +4897,26 @@ impl BackgroundScanner {
                 }
 
                 if let Some((dot_git_abs_path, path_in_git_dir)) = dot_git_paths {
+                    // A linked worktree's git dir (`<common dir>/worktrees/<name>`) has no
+                    // `config`, so `is_dot_git` resolves its events to the common dir.
+                    let path_for_skip_rules = path_in_linked_worktree_git_dir(&path_in_git_dir)
+                        .unwrap_or(&path_in_git_dir);
                     let is_ignored = skipped_file_names_in_dot_git.iter().any(|skipped| {
-                        path_in_git_dir
+                        path_for_skip_rules
                             .file_name()
                             .is_some_and(|file_name| file_name == OsStr::new(skipped))
-                    }) || (path_in_git_dir.starts_with(LOGS_DIR)
-                        && path_in_git_dir != Path::new(LOGS_REF_STASH))
-                        || (path_in_git_dir.starts_with(INFO_DIR)
-                            && path_in_git_dir != Path::new(REPO_EXCLUDE))
+                    }) || (path_for_skip_rules.starts_with(LOGS_DIR)
+                        && path_for_skip_rules != Path::new(LOGS_REF_STASH))
+                        || (path_for_skip_rules.starts_with(INFO_DIR)
+                            && path_for_skip_rules != Path::new(REPO_EXCLUDE))
                         || skipped_dirs_in_dot_git.iter().any(|skipped_git_subdir| {
-                            path_in_git_dir.starts_with(skipped_git_subdir)
+                            path_for_skip_rules.starts_with(skipped_git_subdir)
                         })
-                        || path_in_git_dir.extension().is_some_and(|ext| ext == "lock")
-                        || (path_in_git_dir.components().count() == 1
-                            && path_in_git_dir
+                        || path_for_skip_rules
+                            .extension()
+                            .is_some_and(|ext| ext == "lock")
+                        || (path_for_skip_rules.components().count() == 1
+                            && path_for_skip_rules
                                 .extension()
                                 .is_some_and(|ext| ext == "new" || ext == "tmp"));
                     let is_dot_git = path_in_git_dir == Path::new("")
@@ -5361,6 +5376,52 @@ impl BackgroundScanner {
         let mut root_canonical_path = None;
         let mut new_entries: Vec<Entry> = Vec::new();
         let mut new_jobs: Vec<Option<ScanJob>> = Vec::new();
+
+        // Watch before reading so a child created after enumeration still
+        // produces an event.
+        //
+        // For external entries, watch the canonical (resolved) path so OS-level
+        // FS events on the real filesystem location are observed. The same
+        // canonical path is stored in both `external_canonical_to_relative`
+        // (for translating canonical-path FS events back to worktree-relative
+        // paths) and `watched_dir_abs_paths_by_entry_id` (used by `remove_path`
+        // to know which abs path to unwatch), so both cleanup paths agree on
+        // the path the watcher was actually registered on.
+        let watched_abs_path: Option<Arc<Path>> = if job.is_external {
+            self.fs
+                .canonicalize(job.abs_path.as_ref())
+                .await
+                .ok()
+                .map(|canonical| {
+                    let canonical: Arc<Path> = canonical.into();
+                    self.watcher.add(&canonical).log_err();
+                    canonical
+                })
+        } else {
+            self.watcher.add(job.abs_path.as_ref()).log_err();
+            Some(job.abs_path.clone())
+        };
+
+        if let Some(watched_abs_path) = watched_abs_path {
+            // Deletion cleanup needs the canonical path even if enumeration fails.
+            let mut state = self.state.lock().await;
+            if job.is_external {
+                state
+                    .snapshot
+                    .external_canonical_to_relative
+                    .insert(watched_abs_path.clone(), job.path.clone());
+            }
+            if let Some(entry_id) = state
+                .snapshot
+                .entry_for_path(&job.path)
+                .map(|entry| entry.id)
+            {
+                state
+                    .watched_dir_abs_paths_by_entry_id
+                    .insert(entry_id, watched_abs_path);
+            }
+        }
+
         let mut child_paths = self
             .fs
             .read_dir(&job.abs_path)
@@ -5577,50 +5638,6 @@ impl BackgroundScanner {
         }
 
         state.populate_dir(job.path.clone(), new_entries, new_ignore);
-        // For external entries, watch the canonical (resolved) path so OS-level
-        // FS events on the real filesystem location are observed. The same
-        // canonical path is stored in both `external_canonical_to_relative`
-        // (for translating canonical-path FS events back to worktree-relative
-        // paths) and `watched_dir_abs_paths_by_entry_id` (used by `remove_path`
-        // to know which abs path to unwatch), so both cleanup paths agree on
-        // the path the watcher was actually registered on.
-        //
-        // `canonicalize` is an async filesystem operation that may suspend, so
-        // the lock must not be held across the await point below.
-        drop(state);
-        let watched_abs_path: Option<Arc<Path>> = if job.is_external {
-            self.fs
-                .canonicalize(job.abs_path.as_ref())
-                .await
-                .ok()
-                .map(|canonical| {
-                    let canonical: Arc<Path> = canonical.into();
-                    self.watcher.add(&canonical).log_err();
-                    canonical
-                })
-        } else {
-            self.watcher.add(job.abs_path.as_ref()).log_err();
-            Some(job.abs_path.clone())
-        };
-
-        let mut state = self.state.lock().await;
-        if let Some(watched_abs_path) = &watched_abs_path {
-            if job.is_external {
-                state
-                    .snapshot
-                    .external_canonical_to_relative
-                    .insert(watched_abs_path.clone(), job.path.clone());
-            }
-            if let Some(entry_id) = state
-                .snapshot
-                .entry_for_path(&job.path)
-                .map(|entry| entry.id)
-            {
-                state
-                    .watched_dir_abs_paths_by_entry_id
-                    .insert(entry_id, watched_abs_path.clone());
-            }
-        }
 
         for new_job in new_jobs.into_iter().flatten() {
             job.scan_queue

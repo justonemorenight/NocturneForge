@@ -109,8 +109,10 @@ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis
 
 pub(crate) mod elicitation;
 mod message_queue;
+mod subagent_card;
 mod thread_search_bar;
 mod thread_view;
+mod tool_call_groups;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -699,6 +701,15 @@ pub enum AcpServerViewEvent {
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
 
+struct SavedAgentInput {
+    session_id: acp::SessionId,
+    work_dirs: Option<PathList>,
+    title: Option<SharedString>,
+    draft: Vec<acp::ContentBlock>,
+    draft_read_only: bool,
+    queued: Vec<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>, bool)>,
+}
+
 pub struct ConversationView {
     agent: Rc<dyn AgentServer>,
     connection_store: Entity<AgentConnectionStore>,
@@ -710,6 +721,7 @@ pub struct ConversationView {
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp::SessionId>,
     server_state: ServerState,
+    saved_input: Option<SavedAgentInput>,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
@@ -870,13 +882,17 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn has_saved_input(&self) -> bool {
+        self.saved_input.is_some()
+    }
+
     pub fn updated_at(&self, cx: &App) -> Option<Instant> {
         self.as_connected()
             .and_then(|connected| connected.conversation.read(cx).updated_at)
     }
 
     pub(crate) fn can_unload_retained_thread(&self, cx: &App) -> bool {
-        if self.has_pending_selections() {
+        if self.has_pending_selections() || self.has_saved_input() {
             return false;
         }
         let Some(connected) = self.as_connected() else {
@@ -1144,6 +1160,7 @@ impl ConversationView {
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            saved_input: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
             pending_entry_updates: HashMap::default(),
@@ -1155,6 +1172,38 @@ impl ConversationView {
     }
 
     fn set_server_state(&mut self, state: ServerState, cx: &mut Context<Self>) {
+        if !matches!(state, ServerState::Connected(_))
+            && let Some(view) = self.root_thread_view()
+        {
+            let view = view.read(cx);
+            let editor = view.message_editor.read(cx);
+            let draft = editor.draft_content_blocks_snapshot(cx);
+            if !draft.is_empty() || !view.message_queue.is_empty() {
+                let thread = view.thread.read(cx);
+                self.saved_input = Some(SavedAgentInput {
+                    session_id: thread.session_id().clone(),
+                    work_dirs: thread.work_dirs().cloned(),
+                    title: thread.title(),
+                    draft,
+                    draft_read_only: editor.editor().read(cx).read_only(cx),
+                    queued: view
+                        .message_queue
+                        .iter()
+                        .map(|entry| {
+                            let editor = entry.editor.read(cx);
+                            let content = if editor.editor().read(cx).read_only(cx) {
+                                entry.content.clone()
+                            } else {
+                                editor.draft_content_blocks_snapshot(cx)
+                            };
+                            (content, entry.tracked_buffers.clone(), entry.steer)
+                        })
+                        .collect(),
+                });
+                self.draft_prompt_persist_task.take();
+            }
+        }
+
         let previous_request_elicitation_connection = self.request_elicitation_connection();
         let next_request_elicitation_connection =
             Self::request_elicitation_connection_for_state(&state);
@@ -1248,6 +1297,15 @@ impl ConversationView {
                     thread.work_dirs().cloned(),
                     thread.title(),
                 )
+            })
+            .or_else(|| {
+                self.saved_input.as_ref().map(|saved| {
+                    (
+                        Some(saved.session_id.clone()),
+                        saved.work_dirs.clone(),
+                        saved.title.clone(),
+                    )
+                })
             })
             .unwrap_or_else(|| {
                 let session_id = self.root_session_id.clone();
@@ -1452,6 +1510,28 @@ impl ConversationView {
                             cx,
                         );
 
+                        if this
+                            .saved_input
+                            .as_ref()
+                            .is_some_and(|saved| saved.session_id == root_session_id)
+                            && let Some(saved) = this.saved_input.take()
+                        {
+                            current.update(cx, |view, cx| {
+                                view.message_editor.update(cx, |editor, cx| {
+                                    editor.set_message(saved.draft, window, cx);
+                                    editor.set_read_only(saved.draft_read_only, cx);
+                                });
+                                for (content, buffers, steer) in saved.queued {
+                                    view.add_to_queue(content, buffers, window, cx);
+                                    if steer && let Some(id) = view.message_queue.last_id() {
+                                        view.message_queue.toggle_steer(id);
+                                    }
+                                }
+                                // Reconnection cannot prove what the server received; require explicit sending.
+                                view.message_queue.pause();
+                            });
+                        }
+
                         if this.has_pending_selections() {
                             current.update(cx, |thread, cx| {
                                 thread.message_editor.update(cx, |editor, cx| {
@@ -1549,6 +1629,18 @@ impl ConversationView {
         let count = thread.read(cx).entries().len();
         let list_state = ListState::new(0, gpui::ListAlignment::Top, px(2048.0));
         list_state.set_follow_mode(gpui::FollowMode::Tail);
+        list_state.set_item_measurement_readiness({
+            let thread = thread.downgrade();
+            move |index, cx| {
+                thread.upgrade().is_none_or(|thread| {
+                    thread
+                        .read(cx)
+                        .entries()
+                        .get(index)
+                        .is_none_or(|entry| !entry.has_pending_markdown_render(cx))
+                })
+            }
+        });
 
         entry_view_state.update(cx, |view_state, cx| {
             for ix in 0..count {
@@ -1560,7 +1652,11 @@ impl ConversationView {
             );
         });
 
-        if let Some(scroll_position) = thread.read(cx).ui_scroll_position() {
+        if let Some(scroll_position) = thread
+            .read(cx)
+            .ui_scroll_position()
+            .filter(|offset| offset.item_ix < count)
+        {
             list_state.scroll_to(scroll_position);
         } else {
             list_state.scroll_to_end();
@@ -1629,6 +1725,12 @@ impl ConversationView {
                     .map(|i| i.session_id.clone()),
                 _ => None,
             })
+            .chain(
+                thread
+                    .read(cx)
+                    .subagents()
+                    .map(|child| child.read(cx).session_id().clone()),
+            )
             .collect::<Vec<_>>();
 
         if !subagent_sessions.is_empty() {
@@ -1878,10 +1980,13 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         let session_id = thread.read(cx).session_id().clone();
-        let has_thread = self
-            .as_connected()
-            .is_some_and(|connected| connected.threads.contains_key(&session_id));
-        if !has_thread {
+        let is_current_owner = self.as_connected().is_some_and(|connected| {
+            connected
+                .threads
+                .get(&session_id)
+                .is_some_and(|view| view.read(cx).thread == *thread)
+        });
+        if !is_current_owner {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
@@ -2549,7 +2654,9 @@ impl ConversationView {
             .work_dirs()
             .cloned()
             .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let parent_thread = parent_thread.read(cx).thread.clone();
         let connection = connected.connection.clone();
+        let owner_connection = connection.clone();
         self.pending_subagent_loads.insert(subagent_id.clone());
 
         let subagent_thread_task = connection.load_session(
@@ -2565,12 +2672,35 @@ impl ConversationView {
             let result = subagent_thread_task.await;
             this.update_in(cx, |this, window, cx| {
                 this.pending_subagent_loads.remove(&subagent_id_for_cleanup);
-                let Ok(subagent_thread) = result else {
-                    return;
+                let mut subagent_thread = match result {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        log::error!("Failed to load subagent: {error:#}");
+                        return;
+                    }
                 };
                 let Some(connected) = this.as_connected() else {
                     return;
                 };
+                if !Rc::ptr_eq(&connected.connection, &owner_connection)
+                    || !connected
+                        .threads
+                        .get(&parent_session_id)
+                        .is_some_and(|view| view.read(cx).thread == parent_thread)
+                {
+                    return;
+                }
+                if subagent_thread.read(cx).parent_session_id() == Some(&parent_session_id) {
+                    let Some(owned) = parent_thread
+                        .update(cx, |parent, cx| {
+                            parent.register_subagent(subagent_thread.clone(), cx)
+                        })
+                        .log_err()
+                    else {
+                        return;
+                    };
+                    subagent_thread = owned;
+                }
                 let subagent_session_id = subagent_thread.read(cx).session_id().clone();
                 if connected.threads.contains_key(&subagent_session_id) {
                     return;
@@ -3174,6 +3304,22 @@ impl ConversationView {
                         this.retry_connection(window, cx);
                     })),
             )
+            .when(self.saved_input.is_some(), |actions| {
+                actions.child(Button::new("copy-saved-agent-input", "Copy saved input")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(saved) = &this.saved_input {
+                            let input = serde_json::json!({
+                                "session_id": saved.session_id,
+                                "draft": saved.draft,
+                                "queued": saved.queued.iter().map(|(content, _, _)| content).collect::<Vec<_>>()
+                            });
+                            match serde_json::to_string_pretty(&input) {
+                                Ok(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+                                Err(error) => log::error!("Failed to export saved agent input: {error}"),
+                            }
+                        }
+                    })))
+            })
             .child(self.create_copy_button(message.clone()))
             .into_any_element();
 
@@ -3798,9 +3944,7 @@ impl ConversationView {
     pub fn expand_tool_call(&mut self, tool_call_id: acp::ToolCallId, cx: &mut Context<Self>) {
         if let Some(active) = self.active_thread() {
             active.update(cx, |active, cx| {
-                active.entry_view_state.update(cx, |state, _cx| {
-                    state.expand_tool_call(tool_call_id);
-                });
+                active.expand_tool_call_for_test(tool_call_id, cx);
             });
             cx.notify();
         }
@@ -12238,6 +12382,46 @@ pub(crate) mod tests {
             closed_count > 0,
             "close_session should have been called for each thread"
         );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_restores_draft_and_pauses_saved_queue(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("unsent draft", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["queued follow-up".into()], Vec::new(), window, cx);
+        });
+        conversation_view.update(cx, |view, cx| {
+            view.set_server_state(
+                ServerState::LoadError {
+                    error: LoadError::Other("connection lost".into()),
+                },
+                cx,
+            );
+            assert!(view.has_saved_input());
+            assert!(!view.can_unload_retained_thread(cx));
+            let saved = view.saved_input.as_ref().expect("saved input");
+            assert_eq!(saved.queued.len(), 1);
+        });
+        conversation_view.update_in(cx, |view, window, cx| view.retry_connection(window, cx));
+        cx.run_until_parked();
+        conversation_view.read_with(cx, |view, _| assert!(!view.has_saved_input()));
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            assert!(view.message_queue.on_generation_stopped(false).is_none());
+            assert_eq!(view.message_editor.read(cx).text(cx), "unsent draft");
+            assert_eq!(view.message_queue.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&view.message_queue.first().expect("saved queue").content)
+                    .expect("queue serialization"),
+                serde_json::to_value(vec![acp::ContentBlock::from("queued follow-up")])
+                    .expect("expected queue")
+            );
+        });
     }
 
     #[gpui::test]

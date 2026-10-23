@@ -1,3 +1,4 @@
+use settings::ThreadsSidebarGroupBy;
 mod agent_profile;
 mod execution_policy;
 mod user_agents_md;
@@ -387,6 +388,7 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
+    pub threads_sidebar: ThreadsSidebarSettings,
     pub enabled: bool,
     pub enable_checkpoints: bool,
     pub cache_keepalive: bool,
@@ -427,6 +429,7 @@ pub struct AgentSettings {
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
+    pub tool_call_display: settings::ToolCallDisplay,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
@@ -945,6 +948,16 @@ impl Settings for AgentSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let agent = content.agent.clone().unwrap();
         Self {
+            threads_sidebar: ThreadsSidebarSettings {
+                auto_open: true,
+                position: agent.sidebar_side.unwrap(),
+                default_width: px(300.0),
+                group_by: agent
+                    .threads_sidebar
+                    .as_ref()
+                    .and_then(|sidebar| sidebar.group_by)
+                    .unwrap_or_default(),
+            },
             enabled: agent.enabled.unwrap(),
             enable_checkpoints: agent.enable_checkpoints.unwrap(),
             cache_keepalive: agent.cache_keepalive.unwrap_or(false),
@@ -1007,6 +1020,7 @@ impl Settings for AgentSettings {
             enable_feedback: agent.enable_feedback.unwrap(),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
+            tool_call_display: agent.tool_call_display.unwrap_or_default(),
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),
@@ -2353,4 +2367,12 @@ mod tests {
             assert_eq!(user_layout.project_panel_dock, Some(DockSide::Right));
         });
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ThreadsSidebarSettings {
+    pub auto_open: bool,
+    pub position: SidebarDockPosition,
+    pub default_width: Pixels,
+    pub group_by: ThreadsSidebarGroupBy,
 }

@@ -311,6 +311,10 @@ impl LanguageModel for DeepSeekLanguageModel {
         ]
     }
 
+    fn prompt_compaction_strategy(&self) -> language_model::PromptCompactionStrategy {
+        language_model::PromptCompactionStrategy::PreserveRequestPrefix
+    }
+
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
         true
     }

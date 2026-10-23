@@ -2084,7 +2084,7 @@ impl AgentPanel {
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
         let cv = draft.read(cx);
-        if cv.has_pending_selections() {
+        if cv.has_pending_selections() || cv.has_saved_input() {
             return true;
         }
         if let Some(thread_view) = cv.active_thread() {
