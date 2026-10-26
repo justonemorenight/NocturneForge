@@ -13,9 +13,9 @@ use language::CursorShape as EditorCursorShape;
 use settings::Settings;
 use std::time::Instant;
 use terminal::{
-    Cell, Color, Content, CursorShape, IndexedCell, Modes, NamedColor, Point, Range, Terminal,
-    TerminalBounds, is_app_chosen_exact_color as terminal_is_app_chosen_exact_color,
-    is_default_background_color,
+    Cell, Color, Content, CursorShape, IndexedCell, Modes, MouseInputMode, NamedColor, Point,
+    Range, Terminal, TerminalBounds,
+    is_app_chosen_exact_color as terminal_is_app_chosen_exact_color, is_default_background_color,
 };
 use theme::Theme;
 use theme_settings::ThemeSettings;
@@ -696,6 +696,7 @@ impl TerminalElement {
         mode: Modes,
         hitbox: &Hitbox,
         content_mode: &ContentMode,
+        mouse_input_mode: MouseInputMode,
         window: &mut Window,
     ) {
         let focus = self.focus.clone();
@@ -716,7 +717,7 @@ impl TerminalElement {
                     if scroll_top > Pixels::ZERO {
                         adjusted_event.position.y += scroll_top;
                     }
-                    terminal.mouse_down(&adjusted_event, cx);
+                    terminal.mouse_down_with_input_mode(&adjusted_event, mouse_input_mode, cx);
                     cx.notify();
                 })
             }
@@ -742,7 +743,12 @@ impl TerminalElement {
                             if scroll_top > Pixels::ZERO {
                                 adjusted_event.position.y += scroll_top;
                             }
-                            terminal.mouse_drag(&adjusted_event, hitbox.bounds, cx);
+                            terminal.mouse_drag_with_input_mode(
+                                &adjusted_event,
+                                hitbox.bounds,
+                                mouse_input_mode,
+                                cx,
+                            );
                             cx.notify();
                         }
                     })
@@ -750,7 +756,7 @@ impl TerminalElement {
 
                 if hitbox.is_hovered(window) {
                     terminal.update(cx, |terminal, cx| {
-                        terminal.mouse_move(e, cx);
+                        terminal.mouse_move_with_input_mode(e, mouse_input_mode, cx);
                     })
                 }
             }
@@ -763,21 +769,23 @@ impl TerminalElement {
                 focus.clone(),
                 false,
                 move |terminal, e, cx| {
-                    terminal.mouse_up(e, cx);
+                    terminal.mouse_up_with_input_mode(e, mouse_input_mode, cx);
                 },
             ),
         );
-        self.interactivity.on_mouse_down(
-            MouseButton::Middle,
-            TerminalElement::generic_button_handler(
-                terminal.clone(),
-                focus.clone(),
-                true,
-                move |terminal, e, cx| {
-                    terminal.mouse_down(e, cx);
-                },
-            ),
-        );
+        if mouse_input_mode == MouseInputMode::ReportToTerminal {
+            self.interactivity.on_mouse_down(
+                MouseButton::Middle,
+                TerminalElement::generic_button_handler(
+                    terminal.clone(),
+                    focus.clone(),
+                    true,
+                    move |terminal, e, cx| {
+                        terminal.mouse_down_with_input_mode(e, mouse_input_mode, cx);
+                    },
+                ),
+            );
+        }
 
         if content_mode.is_scrollable() {
             self.interactivity.on_scroll_wheel({
@@ -799,7 +807,9 @@ impl TerminalElement {
 
         // Mouse mode handlers:
         // All mouse modes need the extra click handlers
-        if mode.intersects(Modes::MOUSE_MODE) {
+        if mouse_input_mode == MouseInputMode::ReportToTerminal
+            && mode.intersects(Modes::MOUSE_MODE)
+        {
             self.interactivity.on_mouse_down(
                 MouseButton::Right,
                 TerminalElement::generic_button_handler(
@@ -807,7 +817,7 @@ impl TerminalElement {
                     focus.clone(),
                     true,
                     move |terminal, e, cx| {
-                        terminal.mouse_down(e, cx);
+                        terminal.mouse_down_with_input_mode(e, mouse_input_mode, cx);
                     },
                 ),
             );
@@ -818,7 +828,7 @@ impl TerminalElement {
                     focus.clone(),
                     false,
                     move |terminal, e, cx| {
-                        terminal.mouse_up(e, cx);
+                        terminal.mouse_up_with_input_mode(e, mouse_input_mode, cx);
                     },
                 ),
             );
@@ -829,7 +839,7 @@ impl TerminalElement {
                     focus,
                     false,
                     move |terminal, e, cx| {
-                        terminal.mouse_up(e, cx);
+                        terminal.mouse_up_with_input_mode(e, mouse_input_mode, cx);
                     },
                 ),
             );
@@ -1373,6 +1383,7 @@ impl Element for TerminalElement {
                 layout.mode,
                 &layout.hitbox,
                 &layout.content_mode,
+                terminal_view.mouse_input_mode(),
                 window,
             );
             if window.modifiers().secondary()
@@ -1532,10 +1543,13 @@ struct TerminalInputHandler {
 impl InputHandler for TerminalInputHandler {
     fn selected_text_range(
         &mut self,
-        _ignore_disabled_input: bool,
+        ignore_disabled_input: bool,
         _: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<UTF16Selection> {
+        if self.terminal_view.read(cx).is_read_only() && !ignore_disabled_input {
+            return None;
+        }
         // Always return a valid selection for IME positioning,
         // even in ALT_SCREEN mode (fullscreen TUI apps like opencode, vim, etc.)
         // The terminal still has a cursor position that should be used for IME candidate window placement.
@@ -1570,6 +1584,9 @@ impl InputHandler for TerminalInputHandler {
         window: &mut Window,
         cx: &mut App,
     ) {
+        if self.terminal_view.read(cx).is_read_only() {
+            return;
+        }
         self.terminal_view.update(cx, |view, view_cx| {
             view.clear_marked_text(view_cx);
             view.commit_text(text, view_cx);

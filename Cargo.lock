@@ -106,6 +106,7 @@ dependencies = [
  "chrono",
  "collections",
  "db",
+ "diffy",
  "env_logger 0.11.8",
  "feature_flags",
  "file_icons",
@@ -146,6 +147,7 @@ dependencies = [
 name = "acp_tools"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
  "agent-client-protocol",
  "agent_servers",
  "agent_ui",
@@ -336,33 +338,27 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "2.2.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13f780597b2c88ab83d02509bcc3e86366751f86fa12114005e35c55ed691763"
+checksum = "9bbe69c878aef64a3d92041e256e75acdb1bf2ea8e55ef3313e69dbb2f5bd75a"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
- "async-io",
- "async-process",
- "blocking",
  "futures 0.3.34",
  "futures-concurrency",
  "rustc-hash 2.1.1",
- "rustix 1.1.4",
  "schemars 1.0.4",
  "serde",
  "serde_json",
- "shell-words",
  "tracing",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "2.2.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de"
+checksum = "25b7ae92f0d1ba46ca61e7e03d4a9758e877d100b783aa1c62b140d5a9d59fb2"
 dependencies = [
  "quote",
  "syn 3.0.3",
@@ -370,9 +366,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "1.9.1"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d"
+checksum = "430e900fdb40a811c1a3e0d85b1134e485d96699f8b90889a15c1da6a0b26c3f"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -381,7 +377,6 @@ dependencies = [
  "serde_json",
  "serde_with",
  "strum 0.28.0",
- "tracing",
 ]
 
 [[package]]
@@ -416,6 +411,7 @@ dependencies = [
  "agent_settings",
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "chrono",
  "client",
  "collections",
@@ -2792,7 +2788,7 @@ dependencies = [
  "maybe-owned",
  "rustix 1.1.4",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -5339,7 +5335,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6148,7 +6144,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7368,7 +7364,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11343,7 +11339,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11781,7 +11777,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14533,7 +14529,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes 1.11.1",
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.11.0",
  "log",
  "multimap",
@@ -16037,7 +16033,7 @@ dependencies = [
  "errno 0.3.14",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17441,7 +17437,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -17510,7 +17506,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -18633,7 +18629,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -21642,7 +21638,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

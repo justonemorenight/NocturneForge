@@ -23,7 +23,7 @@ pub struct RunActivityProjection {
     pub last_event_seq: u64,
     pub resync_required: bool,
     #[serde(default)]
-    pub stale_session_ids: collections::HashSet<agent_client_protocol::schema::v1::SessionId>,
+    pub stale_session_ids: collections::HashSet<agent_client_protocol::schema::v2::SessionId>,
 }
 
 impl RunActivityProjection {

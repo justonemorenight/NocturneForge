@@ -1,11 +1,10 @@
 use std::time::{Duration, Instant};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk,
-    ContentBlock as RenderedContentBlock, ThreadStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ThreadStatus,
 };
 use agent::ThreadStore;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::HashMap;
@@ -284,10 +283,11 @@ impl ThreadTranscriptSearchStore {
         let subscription = cx.subscribe(
             &thread,
             move |this: &mut Self, thread, event: &AcpThreadEvent, cx| {
-                let should_index =
-                    matches!(event, AcpThreadEvent::Stopped(_) | AcpThreadEvent::Error)
-                        || matches!(event, AcpThreadEvent::EntriesRemoved(_))
-                            && thread.read(cx).status() == ThreadStatus::Idle;
+                let should_index = matches!(
+                    event,
+                    AcpThreadEvent::Stopped { .. } | AcpThreadEvent::Error
+                ) || matches!(event, AcpThreadEvent::EntriesRemoved(_))
+                    && thread.read(cx).status() == ThreadStatus::Idle;
                 if should_index {
                     this.index_live_thread(view_id, cx);
                 }
@@ -576,12 +576,12 @@ fn collect_backfill_candidates(cx: &App) -> Vec<BackfillCandidate> {
         .collect()
 }
 
-fn extract_acp_transcript(thread: &AcpThread, cx: &App) -> Vec<ThreadSearchDocument> {
+fn extract_acp_transcript(thread: &AcpThread, _cx: &App) -> Vec<ThreadSearchDocument> {
     let mut transcript = Vec::new();
     for entry in thread.entries() {
         match entry {
             AgentThreadEntry::UserMessage(message) => {
-                for chunk in &message.chunks {
+                for chunk in message.content.source_blocks() {
                     if let acp::ContentBlock::Text(text) = chunk
                         && !text.text.is_empty()
                     {
@@ -594,20 +594,24 @@ fn extract_acp_transcript(thread: &AcpThread, cx: &App) -> Vec<ThreadSearchDocum
             }
             AgentThreadEntry::AssistantMessage(message) if !message.is_subagent_output => {
                 for chunk in &message.chunks {
-                    if let AssistantMessageChunk::Message { block, .. } = chunk
-                        && matches!(block, RenderedContentBlock::Markdown { .. })
-                        && let Some(body) = block.text_content(cx).filter(|body| !body.is_empty())
-                    {
-                        transcript.push(ThreadSearchDocument {
-                            role: ThreadSearchRole::Assistant,
-                            body: body.to_string(),
-                        });
+                    if let AssistantMessageChunk::Message { block, .. } = chunk {
+                        for source in block.source_blocks() {
+                            if let acp::ContentBlock::Text(text) = source
+                                && !text.text.is_empty()
+                            {
+                                transcript.push(ThreadSearchDocument {
+                                    role: ThreadSearchRole::Assistant,
+                                    body: text.text.clone(),
+                                });
+                            }
+                        }
                     }
                 }
             }
             AgentThreadEntry::AssistantMessage(_)
             | AgentThreadEntry::ToolCall(_)
             | AgentThreadEntry::Elicitation(_)
+            | AgentThreadEntry::SessionMessage(_)
             | AgentThreadEntry::ContextCompaction(_) => {}
         }
     }

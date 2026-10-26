@@ -101,3 +101,11 @@
 - **Wrong:** Discover missing upstream test helpers only after linking several large release test binaries, then change the feature graph for each package.
 - **Right:** Check all selected test targets, including required integration-test features, before linking. Build their binaries with one feature graph and run focused filters against the discovered executables. Prefer the existing `release-fast` profile for iterative test builds; retain release source checks and external SSD target/temp paths.
 - **Seen:** Repeated GPUI, agent and terminal validation builds during the 2026-10-23 upstream port.
+
+### Scope Rust AST migrations by owner and exact item
+
+- **Pattern:** Bulk ACP migrations encounter repeated method names and trait implementations with the same target type; macro arguments are opaque to the Rust parser.
+- **Wrong:** Select an impl by target type alone, map methods globally by name, or extend an item replacement through adjacent declarations.
+- **Right:** Match the full owner and trait (including absence of a trait), retain primitive byte spans, handle macro fixtures separately, and inspect the exact diff before applying it. Keep upstream tests only once and preserve fork-specific assertions.
+- **Rule:** AST migration boundaries; preserve Rust attributes and UTF-8 byte offsets.
+- **Seen:** 3x — ACP v2 migration, 2026-10-26.

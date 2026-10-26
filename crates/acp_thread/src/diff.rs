@@ -1,10 +1,17 @@
-use anyhow::Result;
+mod patch;
+
+use agent_client_protocol::schema::v2 as acp_v2;
+use anyhow::{Result, anyhow, ensure};
 use buffer_diff::BufferDiff;
-use gpui::{App, AppContext, AsyncApp, Context, Entity, Subscription, Task, WeakEntity};
+use collections::{HashMap, HashSet};
+use gpui::{
+    App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity,
+};
 use itertools::Itertools;
 use language::{
     Anchor, Buffer, Capability, LanguageRegistry, OffsetRangeExt as _, Point, TextBuffer,
 };
+use markdown::Markdown;
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use std::{
     cell::OnceCell,
@@ -14,6 +21,265 @@ use std::{
     sync::Arc,
 };
 use util::ResultExt;
+
+#[derive(Debug)]
+pub struct DiffPatch {
+    pub files: Vec<DiffPatchFile>,
+    pub fallback: Option<Entity<Markdown>>,
+}
+
+#[derive(Debug)]
+pub struct DiffPatchFile {
+    pub change_index: usize,
+    pub hunks: Vec<DiffPatchHunk>,
+}
+
+#[derive(Debug)]
+pub struct DiffPatchHunk {
+    pub header: SharedString,
+    pub buffer: Entity<MultiBuffer>,
+    _update_diff: Task<()>,
+}
+
+impl DiffPatch {
+    pub(crate) fn new(
+        source: &acp_v2::Diff,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Self {
+        let mut files = source
+            .changes
+            .iter()
+            .enumerate()
+            .map(|(change_index, _)| DiffPatchFile {
+                change_index,
+                hunks: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        if source.patch.is_none() {
+            return Self {
+                files,
+                fallback: None,
+            };
+        }
+
+        match Self::parse(source) {
+            Ok(parsed) => {
+                for (change_index, file) in parsed {
+                    let path = file.new_path.or(file.old_path).unwrap_or_default();
+                    if let Some(render) = files.get_mut(change_index) {
+                        render.hunks = file
+                            .hunks
+                            .into_iter()
+                            .map(|hunk| {
+                                DiffPatchHunk::new(hunk, &path, language_registry.clone(), cx)
+                            })
+                            .collect();
+                    }
+                }
+                Self {
+                    files,
+                    fallback: None,
+                }
+            }
+            Err(error) => {
+                let preview = format!(
+                    "Diff preview unavailable: {error}\n\n{}",
+                    crate::ToolCallContent::patch_preview(source)
+                );
+                Self {
+                    files,
+                    fallback: Some(crate::ContentBlock::create_markdown(
+                        preview,
+                        language_registry,
+                        cx,
+                    )),
+                }
+            }
+        }
+    }
+
+    fn parse(source: &acp_v2::Diff) -> Result<Vec<(usize, patch::PatchFile)>> {
+        let patch = source
+            .patch
+            .as_ref()
+            .ok_or_else(|| anyhow!("no patch supplied"))?;
+        ensure!(
+            patch.format == acp_v2::DiffPatchFormat::GitPatch,
+            "unsupported patch format"
+        );
+        ensure!(
+            !source.changes.is_empty(),
+            "patch has no reported file changes"
+        );
+        let mut change_indices: HashMap<_, Option<usize>> = HashMap::default();
+        for (index, change) in source.changes.iter().enumerate() {
+            if let Some(paths) = diff_change_paths(change) {
+                change_indices
+                    .entry(paths)
+                    .and_modify(|index| *index = None)
+                    .or_insert(Some(index));
+            }
+        }
+        let mut seen = HashSet::default();
+        patch::parse_patch(&patch.text)?
+            .into_iter()
+            .map(|mut file| {
+                let paths = (
+                    file.old_path.as_deref().map(Path::new),
+                    file.new_path.as_deref().map(Path::new),
+                );
+                let anonymous = paths == (None, None);
+                let paths = if anonymous {
+                    let [change] = source.changes.as_slice() else {
+                        return Err(anyhow!(
+                            "patch without filenames requires exactly one file change"
+                        ));
+                    };
+                    diff_change_paths(change)
+                        .ok_or_else(|| anyhow!("unsupported file operation"))?
+                } else {
+                    paths
+                };
+                let index = change_indices
+                    .get(&paths)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "patch paths are ambiguous or do not match the reported file changes"
+                        )
+                    })?;
+                ensure!(seen.insert(index), "repeated patch file");
+                let change = source
+                    .changes
+                    .get(index)
+                    .ok_or_else(|| anyhow!("missing file change"))?;
+                ensure!(
+                    matches!(change.file_type, None | Some(acp_v2::DiffFileType::Text)),
+                    "text patch supplied for a non-text file"
+                );
+                if anonymous && let Some((old, new)) = diff_change_paths(change) {
+                    file.old_path = old.map(|path| path.to_string_lossy().into_owned());
+                    file.new_path = new.map(|path| path.to_string_lossy().into_owned());
+                }
+                ensure!(
+                    file.hunks.iter().all(|hunk| {
+                        (file.old_path.is_some() || hunk.old_count == 0)
+                            && (file.new_path.is_some() || hunk.new_count == 0)
+                    }),
+                    "hunk contents conflict with the reported file operation"
+                );
+                Ok((index, file))
+            })
+            .collect()
+    }
+}
+
+impl DiffPatchHunk {
+    fn new(
+        hunk: patch::PatchHunk,
+        path: &str,
+        language_registry: Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Self {
+        let range_label = |start, count| {
+            if count == 1 {
+                format!("{start}")
+            } else {
+                format!("{start},{count}")
+            }
+        };
+        let header = format!(
+            "@@ -{} +{} @@",
+            range_label(hunk.old_start, hunk.old_count),
+            range_label(hunk.new_start, hunk.new_count),
+        )
+        .into();
+        let new_buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local(hunk.new_text, cx);
+            buffer.set_capability(Capability::ReadOnly, cx);
+            buffer
+        });
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::without_headers(Capability::ReadOnly);
+            multibuffer.set_excerpts_for_path(
+                PathKey::for_buffer(&new_buffer, cx),
+                new_buffer.clone(),
+                [Point::new(0, 0)..new_buffer.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multibuffer
+        });
+        let task = cx.spawn({
+            let multibuffer = multibuffer.clone();
+            let path = path.to_owned();
+            async move |cx| {
+                let language = language_registry
+                    .load_language_for_file_path(Path::new(&path))
+                    .await
+                    .log_err();
+                new_buffer.update(cx, |buffer, cx| buffer.set_language(language.clone(), cx));
+                let snapshot = new_buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                let diff = cx.new(|cx| {
+                    // A hunk is only a snippet: it must never offer restore/apply operations.
+                    BufferDiff::new(&snapshot, language, Some(language_registry), cx)
+                });
+                diff.update(cx, |diff, cx| {
+                    diff.set_base_text(Some(hunk.old_text.into()), snapshot.text, cx)
+                })
+                .await;
+                multibuffer.update(cx, |buffer, cx| {
+                    buffer.add_diff(diff, cx);
+                    buffer.set_all_diff_hunks_expanded(cx);
+                });
+            }
+        });
+        Self {
+            header,
+            buffer: multibuffer,
+            _update_diff: task,
+        }
+    }
+}
+
+fn diff_change_paths(change: &acp_v2::DiffChange) -> Option<(Option<&Path>, Option<&Path>)> {
+    match &change.operation {
+        acp_v2::DiffChangeOperation::Add(change) => Some((None, Some(&change.path.0))),
+        acp_v2::DiffChangeOperation::Delete(change) => Some((Some(&change.path.0), None)),
+        acp_v2::DiffChangeOperation::Modify(change) => {
+            Some((Some(&change.path.0), Some(&change.path.0)))
+        }
+        acp_v2::DiffChangeOperation::Move(change) | acp_v2::DiffChangeOperation::Copy(change) => {
+            Some((Some(&change.old_path.0), Some(&change.path.0)))
+        }
+        _ => None,
+    }
+}
+
+pub fn diff_change_label(change: &acp_v2::DiffChange) -> String {
+    match &change.operation {
+        acp_v2::DiffChangeOperation::Add(change) => format!("Added {}", change.path.0.display()),
+        acp_v2::DiffChangeOperation::Delete(change) => {
+            format!("Deleted {}", change.path.0.display())
+        }
+        acp_v2::DiffChangeOperation::Modify(change) => {
+            format!("Modified {}", change.path.0.display())
+        }
+        acp_v2::DiffChangeOperation::Move(change) => format!(
+            "Moved {} → {}",
+            change.old_path.0.display(),
+            change.path.0.display()
+        ),
+        acp_v2::DiffChangeOperation::Copy(change) => format!(
+            "Copied {} → {}",
+            change.old_path.0.display(),
+            change.path.0.display()
+        ),
+        _ => "Unsupported file operation".to_owned(),
+    }
+}
 
 pub enum Diff {
     Pending(PendingDiff),

@@ -1,5 +1,5 @@
 use acp_thread::{Elicitation, ElicitationEntryId, ElicitationStatus};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
 use editor::{Editor, EditorElement, EditorStyle};
@@ -1098,7 +1098,13 @@ fn validate_string_pattern_and_format(
     schema: &acp::StringPropertySchema,
     value: &str,
 ) -> Result<(), SharedString> {
-    if schema.pattern.is_none() && schema.format.and_then(string_format_json_name).is_none() {
+    if schema.pattern.is_none()
+        && schema
+            .format
+            .clone()
+            .and_then(string_format_json_name)
+            .is_none()
+    {
         return Ok(());
     }
 
@@ -1113,7 +1119,7 @@ fn validate_string_pattern_and_format(
             serde_json::Value::String(pattern.clone()),
         );
     }
-    if let Some(format) = schema.format.and_then(string_format_json_name) {
+    if let Some(format) = schema.format.clone().and_then(string_format_json_name) {
         validation_schema.insert(
             "format".to_string(),
             serde_json::Value::String(format.into()),
@@ -1137,7 +1143,7 @@ fn validate_string_pattern_and_format(
 
     match (
         schema.pattern.is_some(),
-        schema.format.and_then(string_format_label),
+        schema.format.clone().and_then(string_format_label),
     ) {
         (true, Some(_)) => Err(format!("{title} does not match the requested constraints").into()),
         (true, None) => Err(format!("{title} does not match the requested pattern").into()),

@@ -8,7 +8,7 @@ use crate::plan_graph::{OrchestrationPlan, OrchestrationTask};
 use crate::projection::RunActivityProjection;
 use crate::residency::AgentResidencySnapshot;
 use crate::state::{RunState, TaskAttempt, TaskState, TaskStatus};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};

@@ -693,6 +693,7 @@ pub fn insert_zed_terminal_env(
 pub enum Event {
     TitleChanged,
     BreadcrumbsChanged,
+    OutputReplaced,
     CloseTerminal,
     Bell,
     Wakeup,
@@ -782,7 +783,7 @@ impl fmt::Debug for TerminalBackendEvent {
 }
 
 enum PtyEvent {
-    Event(TerminalBackendEvent),
+    Event(TerminalBackendEvent, u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -958,6 +959,12 @@ fn init_command_startup_marker_command(shell_kind: ShellKind, marker_id: u64) ->
 /// sender and receiver remain paired.
 pub struct TerminalMode(TerminalModeKind);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseInputMode {
+    ReportToTerminal,
+    LocalSelection,
+}
+
 enum TerminalModeKind {
     Interactive,
     InteractiveWithCompletion(Sender<Option<ExitStatus>>),
@@ -1034,7 +1041,13 @@ impl TerminalBuilder {
         let config = display_only_term_config(scrolling_history, cursor_shape);
 
         let (events_tx, events_rx) = unbounded();
-        let term = new_term(&config, terminal_bounds, events_tx, alternate_scroll);
+        let term = new_term(
+            &config,
+            terminal_bounds,
+            events_tx.clone(),
+            alternate_scroll,
+            0,
+        );
 
         let terminal = Terminal {
             profile_name: None,
@@ -1045,6 +1058,8 @@ impl TerminalBuilder {
             term,
             term_config: config,
             output_processor: None,
+            output_events_tx: Some(events_tx),
+            output_generation: 0,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1235,6 +1250,7 @@ impl TerminalBuilder {
                 TerminalBounds::default(),
                 events_tx.clone(),
                 alternate_scroll,
+                0,
             );
 
             // When `no_pty` is set (headless hosts), run the task as a plain
@@ -1329,6 +1345,8 @@ impl TerminalBuilder {
                 term,
                 term_config: config,
                 output_processor: None,
+                output_events_tx: None,
+                output_generation: 0,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1451,17 +1469,17 @@ impl TerminalBuilder {
                         .timer(std::time::Duration::from_millis(4))
                         .fuse();
 
-                    let mut wakeup = false;
+                    let mut wakeup = None;
                     loop {
                         futures::select_biased! {
                             _ = timer => break,
                             event = self.events_rx.next() => {
                                 if let Some(event) = event {
-                                    if matches!(event, PtyEvent::Event(TerminalBackendEvent::Wakeup))
-                                    {
-                                        wakeup = true;
-                                    } else {
-                                        events.push(event);
+                                    match event {
+                                        PtyEvent::Event(TerminalBackendEvent::Wakeup, generation) => {
+                                            wakeup = Some(generation);
+                                        }
+                                        event => events.push(event),
                                     }
 
                                     if events.len() > 100 {
@@ -1474,14 +1492,17 @@ impl TerminalBuilder {
                         }
                     }
 
-                    if events.is_empty() && !wakeup {
+                    if events.is_empty() && wakeup.is_none() {
                         yield_now().await;
                         break 'outer;
                     }
 
                     terminal.update(cx, |this, cx| {
-                        if wakeup {
-                            this.process_event(TerminalBackendEvent::Wakeup, cx);
+                        if let Some(generation) = wakeup {
+                            this.process_pty_event(
+                                PtyEvent::Event(TerminalBackendEvent::Wakeup, generation),
+                                cx,
+                            );
                         }
 
                         for event in events {
@@ -1540,6 +1561,8 @@ pub struct Terminal {
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
     output_processor: Option<Processor<StdSyncHandler>>,
+    output_events_tx: Option<futures::channel::mpsc::UnboundedSender<PtyEvent>>,
+    output_generation: u64,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1644,7 +1667,11 @@ impl Terminal {
 
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
-            PtyEvent::Event(event) => self.process_event(event, cx),
+            PtyEvent::Event(event, generation) => {
+                if self.output_events_tx.is_none() || generation == self.output_generation {
+                    self.process_event(event, cx);
+                }
+            }
         }
     }
 
@@ -1975,13 +2002,71 @@ impl Terminal {
         let mut previous_byte_was_cr = false;
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
+        self.write_raw_output(&converted, cx);
+    }
+
+    /// Terminal byte streams already contain their control sequences and must not be normalized.
+    pub fn write_raw_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let mut term = self.term.lock();
         self.output_processor
             .get_or_insert_with(Processor::<StdSyncHandler>::new)
-            .advance(&mut *term, &converted);
+            .advance(&mut *term, bytes);
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+    }
+
+    /// Replaces all display-only output while retaining the terminal entity and its dimensions.
+    pub fn replace_display_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Result<()> {
+        if !matches!(self.terminal_type, TerminalType::DisplayOnly) || self.subprocess.is_some() {
+            bail!("cannot replace output of a process-backed terminal");
+        }
+        let Some(events_tx) = &self.output_events_tx else {
+            bail!("display-only terminal has no output event channel");
+        };
+        let Some(generation) = self.output_generation.checked_add(1) else {
+            bail!("display output generation exhausted");
+        };
+        let bounds = self.last_content.terminal_bounds;
+        let term = new_term(
+            &self.term_config,
+            bounds,
+            events_tx.clone(),
+            self.template.alternate_scroll,
+            generation,
+        );
+        self.output_generation = generation;
+        self.term = term;
+        self.output_processor = None;
+        // The new emulator already has the latest requested size; older resizes can truncate it.
+        self.events.clear();
+        self.last_content = Content {
+            terminal_bounds: bounds,
+            ..Default::default()
+        };
+        self.last_mouse = None;
+        self.mouse_down_position = None;
+        self.matches.clear();
+        self.selection_head = None;
+        self.breadcrumb_text.clear();
+        self.scroll_px = px(0.);
+        self.next_link_id = 0;
+        self.selection_phase = SelectionPhase::Ended;
+        self.hyperlink_regex_searches = RegexSearches::new(
+            &self.template.path_hyperlink_regexes,
+            self.template.path_hyperlink_timeout_ms,
+        );
+        self.vi_mode_enabled = false;
+        self.last_hyperlink_search_position = None;
+        self.mouse_down_hyperlink = None;
+        self.write_raw_output(bytes, cx);
+        cx.emit(Event::BlinkChanged(
+            self.term.lock().cursor_style().blinking,
+        ));
+        cx.emit(Event::BreadcrumbsChanged);
+        cx.emit(Event::NewNavigationTarget(None));
+        cx.emit(Event::OutputReplaced);
+        Ok(())
     }
 
     pub fn total_lines(&self) -> usize {
@@ -2472,12 +2557,27 @@ impl Terminal {
     }
 
     pub fn mouse_mode(&self, shift: bool) -> bool {
-        self.last_content.mode.intersects(Modes::MOUSE_MODE) && !shift
+        self.mouse_mode_with_input_mode(shift, MouseInputMode::ReportToTerminal)
+    }
+
+    pub fn mouse_mode_with_input_mode(&self, shift: bool, input_mode: MouseInputMode) -> bool {
+        input_mode == MouseInputMode::ReportToTerminal
+            && self.last_content.mode.intersects(Modes::MOUSE_MODE)
+            && !shift
     }
 
     pub fn mouse_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.mouse_move_with_input_mode(e, MouseInputMode::ReportToTerminal, cx);
+    }
+
+    pub fn mouse_move_with_input_mode(
+        &mut self,
+        e: &MouseMoveEvent,
+        input_mode: MouseInputMode,
+        cx: &mut Context<Self>,
+    ) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode) {
             // A ctrl/cmd press on a link suppressed its button-press report in
             // `mouse_down`. Since the app never saw the press, we must swallow
             // the whole gesture rather than forward later motion/release
@@ -2559,8 +2659,18 @@ impl Terminal {
         region: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_drag_with_input_mode(e, region, MouseInputMode::ReportToTerminal, cx);
+    }
+
+    pub fn mouse_drag_with_input_mode(
+        &mut self,
+        e: &MouseMoveEvent,
+        region: Bounds<Pixels>,
+        input_mode: MouseInputMode,
+        cx: &mut Context<Self>,
+    ) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
-        if !self.mouse_mode(e.modifiers.shift) {
+        if !self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode) {
             if let Some(hyperlink) = &self.mouse_down_hyperlink {
                 let point = grid_point(
                     position,
@@ -2624,6 +2734,15 @@ impl Terminal {
     }
 
     pub fn mouse_down(&mut self, e: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.mouse_down_with_input_mode(e, MouseInputMode::ReportToTerminal, cx);
+    }
+
+    pub fn mouse_down_with_input_mode(
+        &mut self,
+        e: &MouseDownEvent,
+        input_mode: MouseInputMode,
+        cx: &mut Context<Self>,
+    ) {
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
         let point = grid_point(
             position,
@@ -2633,7 +2752,8 @@ impl Terminal {
 
         if e.button == MouseButton::Left
             && e.modifiers.secondary()
-            && (self.settings(cx).open_links_in_mouse_mode || !self.mouse_mode(e.modifiers.shift))
+            && (self.settings(cx).open_links_in_mouse_mode
+                || !self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode))
         {
             self.mouse_down_hyperlink = self.find_hyperlink_at_point(point);
 
@@ -2642,7 +2762,7 @@ impl Terminal {
             }
         }
 
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode) {
             let bytes =
                 mouse_button_report(point, e.button, e.modifiers, true, self.last_content.mode);
 
@@ -2693,7 +2813,9 @@ impl Terminal {
                 }
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 MouseButton::Middle => {
-                    if let Some(item) = cx.read_from_primary() {
+                    if input_mode == MouseInputMode::ReportToTerminal
+                        && let Some(item) = cx.read_from_primary()
+                    {
                         let text = item.text().unwrap_or_default();
                         self.paste(&text);
                     }
@@ -2704,6 +2826,15 @@ impl Terminal {
     }
 
     pub fn mouse_up(&mut self, e: &MouseUpEvent, cx: &Context<Self>) {
+        self.mouse_up_with_input_mode(e, MouseInputMode::ReportToTerminal, cx);
+    }
+
+    pub fn mouse_up_with_input_mode(
+        &mut self,
+        e: &MouseUpEvent,
+        input_mode: MouseInputMode,
+        cx: &Context<Self>,
+    ) {
         let setting = self.settings(cx);
 
         let position = e.position - self.last_content.terminal_bounds.bounds.origin;
@@ -2726,7 +2857,7 @@ impl Terminal {
                 return;
             }
 
-            if self.mouse_mode(e.modifiers.shift) {
+            if self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode) {
                 self.selection_phase = SelectionPhase::Ended;
                 self.last_mouse = None;
                 self.mouse_down_position = None;
@@ -2734,7 +2865,7 @@ impl Terminal {
             }
         }
 
-        if self.mouse_mode(e.modifiers.shift) {
+        if self.mouse_mode_with_input_mode(e.modifiers.shift, input_mode) {
             let point = grid_point(
                 position,
                 self.last_content.terminal_bounds,
@@ -2777,7 +2908,16 @@ impl Terminal {
 
     ///Scroll the terminal
     pub fn scroll_wheel(&mut self, e: &ScrollWheelEvent, scroll_multiplier: f32) {
-        let mouse_mode = self.mouse_mode(e.shift);
+        self.scroll_wheel_with_input_mode(e, scroll_multiplier, MouseInputMode::ReportToTerminal);
+    }
+
+    pub fn scroll_wheel_with_input_mode(
+        &mut self,
+        e: &ScrollWheelEvent,
+        scroll_multiplier: f32,
+        input_mode: MouseInputMode,
+    ) {
+        let mouse_mode = self.mouse_mode_with_input_mode(e.shift, input_mode);
         let scroll_multiplier = if mouse_mode { 1. } else { scroll_multiplier };
 
         if let Some(scroll_lines) = self.determine_scroll_lines(e, scroll_multiplier)
@@ -2796,10 +2936,11 @@ impl Terminal {
                         self.write_to_pty(scroll);
                     }
                 };
-            } else if self
-                .last_content
-                .mode
-                .contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL)
+            } else if input_mode == MouseInputMode::ReportToTerminal
+                && self
+                    .last_content
+                    .mode
+                    .contains(Modes::ALT_SCREEN | Modes::ALTERNATE_SCROLL)
                 && !e.shift
             {
                 self.write_to_pty(alt_scroll(scroll_lines));
@@ -3261,7 +3402,10 @@ fn spawn_task_subprocess(
                                     processor.advance(&mut *term, &converted);
                                 }
                                 events_tx
-                                    .unbounded_send(PtyEvent::Event(TerminalBackendEvent::Wakeup))
+                                    .unbounded_send(PtyEvent::Event(
+                                        TerminalBackendEvent::Wakeup,
+                                        0,
+                                    ))
                                     .ok();
                             }
                         }
@@ -3295,7 +3439,7 @@ fn spawn_task_subprocess(
                 Some(status) => TerminalBackendEvent::ChildExit(status),
                 None => TerminalBackendEvent::Exit,
             };
-            events_tx.unbounded_send(PtyEvent::Event(event)).ok();
+            events_tx.unbounded_send(PtyEvent::Event(event, 0)).ok();
         }
     });
 

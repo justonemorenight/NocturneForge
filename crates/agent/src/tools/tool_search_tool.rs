@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
 use gpui::{App, SharedString, Task, WeakEntity};
 use schemars::JsonSchema;
@@ -128,7 +128,7 @@ impl AgentTool for ToolSearchTool {
                 })
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())?;
-            event_stream.update_fields(acp::ToolCallUpdateFields::new().title("Tools discovered"));
+            event_stream.update_fields(|update| update.title("Tools discovered"));
             Ok(result)
         })
     }

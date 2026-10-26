@@ -1,9 +1,10 @@
 use super::*;
 use acp_thread::{
     AgentConnection, AgentModelGroupName, AgentModelList, ClientUserMessageId, PermissionOptions,
-    ThreadStatus,
+    ProcessOutput, ThreadStatus,
 };
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentProfileId, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT};
 use anyhow::Result;
 use client::{Client, RefreshLlmTokenListener, UserStore};
@@ -54,7 +55,7 @@ use std::{
 };
 use util::path;
 
-mod test_tools;
+pub(crate) mod test_tools;
 use test_tools::*;
 
 pub(crate) fn init_test(cx: &mut TestAppContext) {
@@ -78,9 +79,9 @@ pub(crate) struct FakeTerminalHandle {
     killed: Arc<AtomicBool>,
     stopped_by_user: Arc<AtomicBool>,
     exit_sender: std::cell::RefCell<Option<futures::channel::oneshot::Sender<()>>>,
-    wait_for_exit: Shared<Task<acp::TerminalExitStatus>>,
-    output: acp::TerminalOutputResponse,
-    id: acp::TerminalId,
+    wait_for_exit: Shared<Task<acp_v2::TerminalExitStatus>>,
+    output: ProcessOutput,
+    id: acp_v2::TerminalId,
 }
 
 impl FakeTerminalHandle {
@@ -94,7 +95,7 @@ impl FakeTerminalHandle {
             .spawn(async move |_cx| {
                 // Wait for the exit signal (sent when kill() is called)
                 let _ = exit_receiver.await;
-                acp::TerminalExitStatus::new()
+                acp_v2::TerminalExitStatus::new()
             })
             .shared();
 
@@ -103,8 +104,8 @@ impl FakeTerminalHandle {
             stopped_by_user,
             exit_sender: std::cell::RefCell::new(Some(exit_sender)),
             wait_for_exit,
-            output: acp::TerminalOutputResponse::new("partial output".to_string(), false),
-            id: acp::TerminalId::new("fake_terminal".to_string()),
+            output: ProcessOutput::new("partial output".to_string(), false),
+            id: acp_v2::TerminalId::new("fake_terminal".to_string()),
         }
     }
 
@@ -114,7 +115,7 @@ impl FakeTerminalHandle {
         let (exit_sender, _exit_receiver) = futures::channel::oneshot::channel();
 
         let wait_for_exit = cx
-            .spawn(async move |_cx| acp::TerminalExitStatus::new().exit_code(exit_code))
+            .spawn(async move |_cx| acp_v2::TerminalExitStatus::new().exit_code(exit_code))
             .shared();
 
         Self {
@@ -122,12 +123,12 @@ impl FakeTerminalHandle {
             stopped_by_user,
             exit_sender: std::cell::RefCell::new(Some(exit_sender)),
             wait_for_exit,
-            output: acp::TerminalOutputResponse::new("command output".to_string(), false),
-            id: acp::TerminalId::new("fake_terminal".to_string()),
+            output: ProcessOutput::new("command output".to_string(), false),
+            id: acp_v2::TerminalId::new("fake_terminal".to_string()),
         }
     }
 
-    pub(crate) fn with_output(mut self, output: acp::TerminalOutputResponse) -> Self {
+    pub(crate) fn with_output(mut self, output: ProcessOutput) -> Self {
         self.output = output;
         self
     }
@@ -148,15 +149,15 @@ impl FakeTerminalHandle {
 }
 
 impl crate::TerminalHandle for FakeTerminalHandle {
-    fn id(&self, _cx: &AsyncApp) -> Result<acp::TerminalId> {
+    fn id(&self, _cx: &AsyncApp) -> Result<acp_v2::TerminalId> {
         Ok(self.id.clone())
     }
 
-    fn current_output(&self, _cx: &AsyncApp) -> Result<acp::TerminalOutputResponse> {
+    fn current_output(&self, _cx: &AsyncApp) -> Result<ProcessOutput> {
         Ok(self.output.clone())
     }
 
-    fn wait_for_exit(&self, _cx: &AsyncApp) -> Result<Shared<Task<acp::TerminalExitStatus>>> {
+    fn wait_for_exit(&self, _cx: &AsyncApp) -> Result<Shared<Task<acp_v2::TerminalExitStatus>>> {
         Ok(self.wait_for_exit.clone())
     }
 
@@ -172,12 +173,12 @@ impl crate::TerminalHandle for FakeTerminalHandle {
 }
 
 struct FakeSubagentHandle {
-    session_id: acp::SessionId,
+    session_id: acp_v2::SessionId,
     send_task: Shared<Task<String>>,
 }
 
 impl SubagentHandle for FakeSubagentHandle {
-    fn id(&self) -> acp::SessionId {
+    fn id(&self) -> acp_v2::SessionId {
         self.session_id.clone()
     }
 
@@ -228,7 +229,7 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
     fn create_terminal(
         &self,
         _command: String,
-        _extra_env: Vec<acp::EnvVariable>,
+        _extra_env: Vec<(String, String)>,
         _cwd: Option<std::path::PathBuf>,
         output_byte_limit: Option<u64>,
         _sandbox_wrap: Option<acp_thread::SandboxWrap>,
@@ -283,7 +284,7 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
     fn create_terminal(
         &self,
         _command: String,
-        _extra_env: Vec<acp::EnvVariable>,
+        _extra_env: Vec<(String, String)>,
         _cwd: Option<std::path::PathBuf>,
         _output_byte_limit: Option<u64>,
         _sandbox_wrap: Option<acp_thread::SandboxWrap>,
@@ -370,7 +371,7 @@ async fn test_echo(cx: &mut TestAppContext) {
             "Hello\n"
         )
     });
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -405,10 +406,10 @@ async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
 
     let update = rx.expect_update_fields().await;
     assert!(
-        update.content.iter().any(|blocks| {
+        update.content.value().iter().any(|blocks| {
             blocks
                 .iter()
-                .any(|c| matches!(c, acp::ToolCallContent::Terminal(_)))
+                .any(|c| matches!(c, acp_v2::ToolCallContent::Terminal(_)))
         }),
         "expected tool call update to include terminal content"
     );
@@ -473,10 +474,10 @@ async fn test_terminal_tool_without_timeout_does_not_kill_handle(cx: &mut TestAp
 
     let update = rx.expect_update_fields().await;
     assert!(
-        update.content.iter().any(|blocks| {
+        update.content.value().iter().any(|blocks| {
             blocks
                 .iter()
-                .any(|c| matches!(c, acp::ToolCallContent::Terminal(_)))
+                .any(|c| matches!(c, acp_v2::ToolCallContent::Terminal(_)))
         }),
         "expected tool call update to include terminal content"
     );
@@ -537,7 +538,7 @@ async fn test_thinking(cx: &mut TestAppContext) {
             "}
         )
     });
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -831,7 +832,7 @@ async fn test_basic_tool_calls(cx: &mut TestAppContext) {
         .unwrap()
         .collect()
         .await;
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
 
     // Test a tool calls that's likely to complete *after* streaming stops.
     let events = thread
@@ -850,7 +851,7 @@ async fn test_basic_tool_calls(cx: &mut TestAppContext) {
         .unwrap()
         .collect()
         .await;
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
     thread.update(cx, |thread, _cx| {
         assert!(
             thread
@@ -888,7 +889,9 @@ async fn test_streaming_tool_calls(cx: &mut TestAppContext) {
 
     let mut saw_partial_tool_use = false;
     while let Some(event) = events.next().await {
-        if let Ok(ThreadEvent::ToolCall(tool_call)) = event {
+        if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(tool_call))) = event
+            && tool_call.status == MaybeUndefined::Value(acp_v2::ToolCallStatus::Pending)
+        {
             thread.update(cx, |thread, _cx| {
                 // Look for a tool use in the thread's last message
                 let message = thread.last_received_or_pending_message().unwrap();
@@ -896,29 +899,14 @@ async fn test_streaming_tool_calls(cx: &mut TestAppContext) {
                 let last_content = agent_message.content.last().unwrap();
                 if let AgentMessageContent::ToolUse(last_tool_use) = last_content {
                     assert_eq!(last_tool_use.name.as_ref(), "word_list");
-                    if tool_call.status == acp::ToolCallStatus::Pending {
-                        if !last_tool_use.is_input_complete
-                            && last_tool_use
-                                .input
-                                .as_json()
-                                .and_then(|input| input.get("g"))
-                                .is_none()
-                        {
-                            saw_partial_tool_use = true;
-                        }
-                    } else {
-                        last_tool_use
+                    if !last_tool_use.is_input_complete
+                        && last_tool_use
                             .input
                             .as_json()
-                            .expect("tool input should be JSON")
-                            .get("a")
-                            .expect("'a' has streamed because input is now complete");
-                        last_tool_use
-                            .input
-                            .as_json()
-                            .expect("tool input should be JSON")
-                            .get("g")
-                            .expect("'g' has streamed because input is now complete");
+                            .and_then(|input| input.get("g"))
+                            .is_none()
+                    {
+                        saw_partial_tool_use = true;
                     }
                 } else {
                     panic!("last content should be a tool use");
@@ -984,8 +972,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
     tool_call_auth_1
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ))
         .unwrap();
     cx.run_until_parked();
@@ -994,15 +982,15 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
     tool_call_auth_2
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("deny"),
-            acp::PermissionOptionKind::RejectOnce,
+            acp_v2::PermissionOptionId::new("deny"),
+            acp_v2::PermissionOptionKind::RejectOnce,
         ))
         .unwrap();
     interrupted_tool_call_auth
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new(FOLLOW_UP_PERMISSION_DENIED_OPTION_ID),
-            acp::PermissionOptionKind::RejectOnce,
+            acp_v2::PermissionOptionId::new(FOLLOW_UP_PERMISSION_DENIED_OPTION_ID),
+            acp_v2::PermissionOptionKind::RejectOnce,
         ))
         .unwrap();
     cx.run_until_parked();
@@ -1055,8 +1043,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
     tool_call_auth_3
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("always_allow:tool_requiring_permission"),
-            acp::PermissionOptionKind::AllowAlways,
+            acp_v2::PermissionOptionId::new("always_allow:tool_requiring_permission"),
+            acp_v2::PermissionOptionKind::AllowAlways,
         ))
         .unwrap();
     cx.run_until_parked();
@@ -1205,20 +1193,31 @@ async fn test_tool_hallucination(cx: &mut TestAppContext) {
     fake_model.end_last_completion_stream();
 
     let tool_call = expect_tool_call(&mut events).await;
-    assert_eq!(tool_call.title, "nonexistent_tool");
-    assert_eq!(tool_call.status, acp::ToolCallStatus::Pending);
+    assert_eq!(
+        tool_call.title,
+        MaybeUndefined::Value("nonexistent_tool".into())
+    );
+    assert_eq!(
+        tool_call.status,
+        MaybeUndefined::Value(acp_v2::ToolCallStatus::Pending)
+    );
     let update = expect_tool_call_update_fields(&mut events).await;
-    assert_eq!(update.fields.status, Some(acp::ToolCallStatus::Failed));
+    assert_eq!(
+        update.status,
+        MaybeUndefined::Value(acp_v2::ToolCallStatus::Failed)
+    );
 }
 
-async fn expect_tool_call(events: &mut UnboundedReceiver<Result<ThreadEvent>>) -> acp::ToolCall {
+async fn expect_tool_call(
+    events: &mut UnboundedReceiver<Result<ThreadEvent>>,
+) -> acp_v2::ToolCallUpdate {
     let event = events
         .next()
         .await
         .expect("no tool call authorization event received")
         .unwrap();
     match event {
-        ThreadEvent::ToolCall(tool_call) => tool_call,
+        ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(tool_call)) => tool_call,
         event => {
             panic!("Unexpected event {event:?}");
         }
@@ -1227,14 +1226,14 @@ async fn expect_tool_call(events: &mut UnboundedReceiver<Result<ThreadEvent>>) -
 
 async fn expect_tool_call_update_fields(
     events: &mut UnboundedReceiver<Result<ThreadEvent>>,
-) -> acp::ToolCallUpdate {
+) -> acp_v2::ToolCallUpdate {
     let event = events
         .next()
         .await
         .expect("no tool call authorization event received")
         .unwrap();
     match event {
-        ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) => update,
+        ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update)) => update,
         event => {
             panic!("Unexpected event {event:?}");
         }
@@ -1253,18 +1252,18 @@ async fn next_tool_call_authorization(
         if let ThreadEvent::ToolCallAuthorization(tool_call_authorization) = event {
             let permission_kinds = tool_call_authorization
                 .options
-                .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
-                .map(|option| option.kind);
+                .first_option_of_kind(acp_v2::PermissionOptionKind::AllowAlways)
+                .map(|option| option.kind.clone());
             let allow_once = tool_call_authorization
                 .options
-                .first_option_of_kind(acp::PermissionOptionKind::AllowOnce)
-                .map(|option| option.kind);
+                .first_option_of_kind(acp_v2::PermissionOptionKind::AllowOnce)
+                .map(|option| option.kind.clone());
 
             assert_eq!(
                 permission_kinds,
-                Some(acp::PermissionOptionKind::AllowAlways)
+                Some(acp_v2::PermissionOptionKind::AllowAlways)
             );
-            assert_eq!(allow_once, Some(acp::PermissionOptionKind::AllowOnce));
+            assert_eq!(allow_once, Some(acp_v2::PermissionOptionKind::AllowOnce));
             return tool_call_authorization;
         }
     }
@@ -1403,11 +1402,11 @@ fn test_permission_options_symlink_target_are_flat_once_only() {
     assert_eq!(options.len(), 2);
     assert!(options.iter().any(|option| {
         option.option_id.0.as_ref() == "allow"
-            && option.kind == acp::PermissionOptionKind::AllowOnce
+            && option.kind == acp_v2::PermissionOptionKind::AllowOnce
     }));
     assert!(options.iter().any(|option| {
         option.option_id.0.as_ref() == "deny"
-            && option.kind == acp::PermissionOptionKind::RejectOnce
+            && option.kind == acp_v2::PermissionOptionKind::RejectOnce
     }));
 }
 
@@ -1531,7 +1530,7 @@ async fn test_concurrent_tool_calls(cx: &mut TestAppContext) {
         .await;
 
     let stop_reasons = stop_events(events);
-    assert_eq!(stop_reasons, vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_reasons, vec![acp_v2::StopReason::EndTurn]);
 
     thread.update(cx, |thread, _cx| {
         let last_message = thread.last_received_or_pending_message().unwrap();
@@ -2168,15 +2167,11 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
     while let Some(event) = replay_events.next().await {
         let event = event.unwrap();
         match &event {
-            ThreadEvent::ToolCall(tc)
-                if tc.tool_call_id == scoped_tool_call_id(1, &"tool_1".into()) =>
-            {
-                found_tool_call = Some(tc.clone());
-            }
-            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update))
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update))
                 if update.tool_call_id == scoped_tool_call_id(1, &"tool_1".into()) =>
             {
-                if update.fields.raw_output.is_some() {
+                found_tool_call.get_or_insert_with(|| update.clone());
+                if update.raw_output.is_value() {
                     found_tool_call_update_with_output = Some(update.clone());
                 }
             }
@@ -2197,15 +2192,15 @@ async fn test_mcp_tool_result_displayed_when_server_disconnected(cx: &mut TestAp
 
     let update = found_tool_call_update_with_output.unwrap();
     assert_eq!(
-        update.fields.raw_output,
-        Some(expected_tool_output.into()),
+        update.raw_output,
+        MaybeUndefined::Value(expected_tool_output.into()),
         "raw_output should contain the saved tool result"
     );
 
     // Also verify the status is correct (completed, not failed)
     assert_eq!(
-        update.fields.status,
-        Some(acp::ToolCallStatus::Completed),
+        update.status,
+        MaybeUndefined::Value(acp_v2::ToolCallStatus::Completed),
         "Tool call status should reflect the original completion status"
     );
 }
@@ -2418,20 +2413,21 @@ async fn test_cancellation(cx: &mut TestAppContext) {
     let mut echo_completed = false;
     while let Some(event) = events.next().await {
         match event.unwrap() {
-            ThreadEvent::ToolCall(tool_call) => {
-                assert_eq!(tool_call.title, expected_tools.remove(0));
-                if tool_call.title == "Echo" {
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(tool_call))
+                if tool_call.status == MaybeUndefined::Value(acp_v2::ToolCallStatus::Pending) =>
+            {
+                assert_eq!(
+                    tool_call.title,
+                    MaybeUndefined::Value(expected_tools.remove(0).into())
+                );
+                if tool_call.title.value().map(String::as_str) == Some("Echo") {
                     echo_id = Some(tool_call.tool_call_id);
                 }
             }
-            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(
-                acp::ToolCallUpdate {
+            ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(
+                acp_v2::ToolCallUpdate {
                     tool_call_id,
-                    fields:
-                        acp::ToolCallUpdateFields {
-                            status: Some(acp::ToolCallStatus::Completed),
-                            ..
-                        },
+                    status: MaybeUndefined::Value(acp_v2::ToolCallStatus::Completed),
                     ..
                 },
             )) if Some(&tool_call_id) == echo_id.as_ref() => {
@@ -2453,7 +2449,7 @@ async fn test_cancellation(cx: &mut TestAppContext) {
     assert!(
         matches!(
             last_event,
-            Some(Ok(ThreadEvent::Stop(acp::StopReason::Cancelled)))
+            Some(Ok(ThreadEvent::Stop(acp_v2::StopReason::Cancelled)))
         ),
         "unexpected event {last_event:?}"
     );
@@ -2478,7 +2474,7 @@ async fn test_cancellation(cx: &mut TestAppContext) {
             vec![AgentMessageContent::Text("Hello".to_string())]
         );
     });
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -2511,7 +2507,7 @@ async fn test_incomplete_tool_input_cancel_preserves_user_cancellation(cx: &mut 
     thread.update(cx, |thread, cx| thread.cancel(cx)).await;
     assert_eq!(
         stop_events(events.collect().await),
-        vec![acp::StopReason::Cancelled]
+        vec![acp_v2::StopReason::Cancelled]
     );
     thread.read_with(cx, |thread, _cx| {
         let message = thread
@@ -2580,7 +2576,7 @@ async fn test_incomplete_tool_input_stream_error_preserves_interruption(cx: &mut
     thread.update(cx, |thread, cx| thread.cancel(cx)).await;
     assert_eq!(
         stop_events(events.collect().await),
-        vec![acp::StopReason::Cancelled]
+        vec![acp_v2::StopReason::Cancelled]
     );
 }
 
@@ -2641,7 +2637,7 @@ async fn test_terminal_tool_cancellation_captures_output(cx: &mut TestAppContext
     // Verify we got a cancellation stop event
     assert_eq!(
         stop_events(remaining_events),
-        vec![acp::StopReason::Cancelled],
+        vec![acp_v2::StopReason::Cancelled],
     );
 
     // Verify the tool result contains the terminal output, not just "Tool canceled by user"
@@ -2727,8 +2723,10 @@ async fn test_cancellation_aware_tool_responds_to_cancellation(cx: &mut TestAppC
         cx.run_until_parked();
 
         while let Some(Some(event)) = events.next().now_or_never() {
-            if let Ok(ThreadEvent::ToolCall(tool_call)) = &event {
-                if tool_call.title == "Cancellation Aware Tool" {
+            if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(tool_call))) =
+                &event
+            {
+                if tool_call.title.value().map(String::as_str) == Some("Cancellation Aware Tool") {
                     tool_started = true;
                     break;
                 }
@@ -2769,7 +2767,7 @@ async fn test_cancellation_aware_tool_responds_to_cancellation(cx: &mut TestAppC
     // Verify we got a cancellation stop event
     assert_eq!(
         stop_events(remaining_events),
-        vec![acp::StopReason::Cancelled],
+        vec![acp_v2::StopReason::Cancelled],
     );
 
     // Verify we can send a new message after cancellation
@@ -2806,7 +2804,7 @@ async fn verify_thread_recovery(
             vec![AgentMessageContent::Text("Hello".to_string())]
         );
     });
-    assert_eq!(stop_events(events), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::EndTurn]);
 }
 
 /// Waits for a terminal tool to start by watching for a ToolCallUpdate with terminal content.
@@ -2819,14 +2817,12 @@ async fn wait_for_terminal_tool_started(
         cx.run_until_parked();
 
         while let Some(Some(event)) = events.next().now_or_never() {
-            if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(
-                update,
-            ))) = &event
+            if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update))) = &event
             {
-                if update.fields.content.as_ref().is_some_and(|content| {
+                if update.content.value().is_some_and(|content| {
                     content
                         .iter()
-                        .any(|c| matches!(c, acp::ToolCallContent::Terminal(_)))
+                        .any(|c| matches!(c, acp_v2::ToolCallContent::Terminal(_)))
                 }) {
                     return;
                 }
@@ -2992,14 +2988,12 @@ async fn test_cancel_multiple_concurrent_terminal_tools(cx: &mut TestAppContext)
         cx.run_until_parked();
 
         while let Some(Some(event)) = events.next().now_or_never() {
-            if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(
-                update,
-            ))) = &event
+            if let Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update))) = &event
             {
-                if update.fields.content.as_ref().is_some_and(|content| {
+                if update.content.value().is_some_and(|content| {
                     content
                         .iter()
-                        .any(|c| matches!(c, acp::ToolCallContent::Terminal(_)))
+                        .any(|c| matches!(c, acp_v2::ToolCallContent::Terminal(_)))
                 }) {
                     terminals_started += 1;
                     if terminals_started >= 2 {
@@ -3046,7 +3040,7 @@ async fn test_cancel_multiple_concurrent_terminal_tools(cx: &mut TestAppContext)
     // Verify we got a cancellation stop event
     assert_eq!(
         stop_events(remaining_events),
-        vec![acp::StopReason::Cancelled],
+        vec![acp_v2::StopReason::Cancelled],
     );
 }
 
@@ -3114,7 +3108,7 @@ async fn test_terminal_tool_stopped_via_terminal_card_button(cx: &mut TestAppCon
     // Verify we got an EndTurn (not Cancelled, since we didn't cancel the thread)
     assert_eq!(
         stop_events(remaining_events),
-        vec![acp::StopReason::EndTurn],
+        vec![acp_v2::StopReason::EndTurn],
     );
 
     // Verify the tool result indicates user stopped
@@ -3213,7 +3207,7 @@ async fn test_terminal_tool_timeout_expires(cx: &mut TestAppContext) {
     // Verify we got an EndTurn (the tool completed, just with timeout)
     assert_eq!(
         stop_events(remaining_events),
-        vec![acp::StopReason::EndTurn],
+        vec![acp_v2::StopReason::EndTurn],
     );
 
     // Verify the tool result indicates timeout, not user stopped
@@ -3274,9 +3268,9 @@ async fn test_in_progress_send_canceled_by_next_send(cx: &mut TestAppContext) {
     fake_model.end_last_completion_stream();
 
     let events_1 = events_1.collect::<Vec<_>>().await;
-    assert_eq!(stop_events(events_1), vec![acp::StopReason::Cancelled]);
+    assert_eq!(stop_events(events_1), vec![acp_v2::StopReason::Cancelled]);
     let events_2 = events_2.collect::<Vec<_>>().await;
-    assert_eq!(stop_events(events_2), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events_2), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -3350,10 +3344,10 @@ async fn test_retry_cancelled_promptly_on_new_send(cx: &mut TestAppContext) {
     model_b.as_fake().end_last_completion_stream();
 
     let events_1 = events_1.collect::<Vec<_>>().await;
-    assert_eq!(stop_events(events_1), vec![acp::StopReason::Cancelled]);
+    assert_eq!(stop_events(events_1), vec![acp_v2::StopReason::Cancelled]);
 
     let events_2 = events_2.collect::<Vec<_>>().await;
-    assert_eq!(stop_events(events_2), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events_2), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -3385,8 +3379,8 @@ async fn test_subsequent_successful_sends_dont_cancel(cx: &mut TestAppContext) {
     fake_model.end_last_completion_stream();
     let events_2 = events_2.collect::<Vec<_>>().await;
 
-    assert_eq!(stop_events(events_1), vec![acp::StopReason::EndTurn]);
-    assert_eq!(stop_events(events_2), vec![acp::StopReason::EndTurn]);
+    assert_eq!(stop_events(events_1), vec![acp_v2::StopReason::EndTurn]);
+    assert_eq!(stop_events(events_2), vec![acp_v2::StopReason::EndTurn]);
 }
 
 #[gpui::test]
@@ -3432,7 +3426,7 @@ async fn test_refusal(cx: &mut TestAppContext) {
     fake_model
         .send_last_completion_stream_event(LanguageModelCompletionEvent::Stop(StopReason::Refusal));
     let events = events.collect::<Vec<_>>().await;
-    assert_eq!(stop_events(events), vec![acp::StopReason::Refusal]);
+    assert_eq!(stop_events(events), vec![acp_v2::StopReason::Refusal]);
     thread.read_with(cx, |thread, _| {
         assert_eq!(thread.to_markdown(), "");
     });
@@ -3812,7 +3806,7 @@ async fn test_cumulative_token_usage(cx: &mut TestAppContext) {
         let templates = thread.templates.clone();
         cx.new(|cx| {
             Thread::from_db(
-                acp::SessionId::new("restored"),
+                acp_v2::SessionId::new("restored"),
                 db_thread,
                 project,
                 project_context.clone(),
@@ -4352,7 +4346,8 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     });
 
     // Test cancel
-    cx.update(|cx| connection.cancel(&session_id, cx));
+    cx.update(|cx| connection.cancel(&session_id, cx))
+        .expect("cancellation succeeds");
     request.await.expect("prompt should fail gracefully");
 
     // Explicitly close the session and drop the ACP thread.
@@ -4360,12 +4355,9 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     release_dropped_entities(cx);
     let result = cx
         .update(|cx| {
-            acp_thread::AgentSessionClientUserMessageIds::prompt(
-                &connection,
-                acp_thread::ClientUserMessageId::new(),
-                acp::PromptRequest::new(session_id.clone(), vec!["ghi".into()]),
-                cx,
-            )
+            connection
+                .submit_native(session_id.clone(), Some(vec!["ghi".into()]), cx)
+                .0
         })
         .await;
     assert_eq!(
@@ -4422,38 +4414,33 @@ async fn test_tool_updates_to_completion(cx: &mut TestAppContext) {
     let tool_call = expect_tool_call(&mut events).await;
     assert_eq!(
         tool_call,
-        acp::ToolCall::new(tool_call_id.clone(), "Echo")
+        acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+            .title("Echo")
             .name("echo")
+            .kind(acp_v2::ToolKind::Other)
+            .status(acp_v2::ToolCallStatus::Pending)
             .raw_input(json!({}))
     );
     let update = expect_tool_call_update_fields(&mut events).await;
     assert_eq!(
         update,
-        acp::ToolCallUpdate::new(
-            tool_call_id.clone(),
-            acp::ToolCallUpdateFields::new()
-                .title("Echo")
-                .kind(acp::ToolKind::Other)
-                .raw_input(json!({ "text": "Hello!"}))
-        )
+        acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+            .title("Echo")
+            .kind(acp_v2::ToolKind::Other)
+            .raw_input(json!({ "text": "Hello!"}))
     );
     let update = expect_tool_call_update_fields(&mut events).await;
     assert_eq!(
         update,
-        acp::ToolCallUpdate::new(
-            tool_call_id.clone(),
-            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress)
-        )
+        acp_v2::ToolCallUpdate::new(tool_call_id.clone())
+            .status(acp_v2::ToolCallStatus::InProgress)
     );
     let update = expect_tool_call_update_fields(&mut events).await;
     assert_eq!(
         update,
-        acp::ToolCallUpdate::new(
-            tool_call_id,
-            acp::ToolCallUpdateFields::new()
-                .status(acp::ToolCallStatus::Completed)
-                .raw_output("Hello!")
-        )
+        acp_v2::ToolCallUpdate::new(tool_call_id)
+            .status(acp_v2::ToolCallStatus::Completed)
+            .raw_output("Hello!")
     );
 }
 
@@ -4952,7 +4939,7 @@ async fn test_streaming_tool_json_parse_error_is_forwarded_to_running_tool(
 }
 
 /// Filters out the stop events for asserting against in tests
-fn stop_events(result_events: Vec<Result<ThreadEvent>>) -> Vec<acp::StopReason> {
+fn stop_events(result_events: Vec<Result<ThreadEvent>>) -> Vec<acp_v2::StopReason> {
     result_events
         .into_iter()
         .filter_map(|event| match event.unwrap() {
@@ -5073,6 +5060,8 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
     let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
     let context_server_registry =
         cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    // Thread::new snapshots the default profile, so load the watched settings first.
+    cx.run_until_parked();
     let thread = cx.new(|cx| {
         Thread::new(
             project,
@@ -5495,10 +5484,10 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
 
         let update = rx.expect_update_fields().await;
         assert!(
-            update.content.iter().any(|blocks| {
+            update.content.value().iter().any(|blocks| {
                 blocks
                     .iter()
-                    .any(|c| matches!(c, acp::ToolCallContent::Terminal(_)))
+                    .any(|c| matches!(c, acp_v2::ToolCallContent::Terminal(_)))
             }),
             "expected terminal content (allow rule should skip confirmation and override default deny)"
         );
@@ -5666,7 +5655,9 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -5798,7 +5789,9 @@ async fn test_background_worker_steering_and_live_tokens(cx: &mut TestAppContext
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -5844,6 +5837,13 @@ async fn test_background_worker_steering_and_live_tokens(cx: &mut TestAppContext
             .acp_thread
             .upgrade()
             .expect("subagent thread should be alive")
+    });
+    acp_thread.read_with(cx, |parent, _| {
+        assert_eq!(
+            parent.subagent(&subagent_session_id),
+            Some(&subagent_thread),
+            "the parent thread owns the spawned subagent"
+        );
     });
 
     assert!(
@@ -6109,7 +6109,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
     cx.run_until_parked();
 
     // Spawn a subagent restricted to a read-only tool allowlist.
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6164,7 +6164,7 @@ async fn test_subagent_tool_filter_restricts_subagent_tools(cx: &mut TestAppCont
 
     // Resuming the session keeps the original filter even when the follow-up
     // spawn call passes a different `tools` list.
-    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Follow up", cx));
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Follow up".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("resuming subagent");
     let resume_tool_input = SpawnAgentToolInput {
@@ -6257,7 +6257,7 @@ async fn test_subagent_tool_filter_empty_list_gives_no_tools(cx: &mut TestAppCon
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6361,7 +6361,7 @@ async fn test_subagent_tool_filter_rejects_unknown_tool(cx: &mut TestAppContext)
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6481,7 +6481,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6613,7 +6613,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     });
     cx.run_until_parked();
 
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6654,8 +6654,18 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
             .upgrade()
             .expect("subagent thread should be alive")
     });
+    acp_thread.read_with(cx, |parent, _| {
+        assert_eq!(
+            parent.subagents().collect::<Vec<_>>(),
+            [&subagent_acp_thread],
+            "resuming keeps the one registered subagent"
+        );
+    });
 
-    acp_thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+    acp_thread
+        .update(cx, |thread, cx| thread.cancel(cx))
+        .await
+        .expect("cancel subagent thread");
 
     cx.run_until_parked();
 
@@ -6728,7 +6738,9 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // === First turn: create subagent ===
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("First prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| {
+        thread.send(vec!["First prompt".into()], cx)
+    });
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -6795,7 +6807,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     });
 
     // === Second turn: resume subagent with session_id ===
-    let send2 = acp_thread.update(cx, |thread, cx| thread.send_raw("Follow up", cx));
+    let send2 = acp_thread.update(cx, |thread, cx| thread.send(vec!["Follow up".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("resuming subagent");
     let resume_tool_input = SpawnAgentToolInput {
@@ -7107,7 +7119,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
             cx,
         );
         thread.set_subagent_context(SubagentContext {
-            parent_thread_id: acp::SessionId::new("parent-id"),
+            parent_thread_id: acp_v2::SessionId::new("parent-id"),
             depth: MAX_SUBAGENT_DEPTH - 1,
             role: None,
             root_session_id: None,
@@ -7227,7 +7239,7 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         );
     }
     assert!(
-        tool_names.iter().any(|t| t == RenameTool::NAME),
+        tool_names.iter().any(|t| t == RenameTool::NAME) == cfg!(debug_assertions),
         "expected rename tool to be visible (enabled_for_staff in debug builds), \
          but completion tools were: {tool_names:?}"
     );
@@ -7274,7 +7286,7 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
         );
     }
     assert!(
-        tool_names.iter().any(|t| t == RenameTool::NAME),
+        tool_names.iter().any(|t| t == RenameTool::NAME) == cfg!(debug_assertions),
         "expected rename tool to still be exposed, \
          but completion tools were: {tool_names:?}"
     );
@@ -7284,17 +7296,14 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
 async fn test_sibling_thread_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     init_test(cx);
 
-    // `CreateThreadToolFeatureFlag::enabled_for_staff()` returns true, which
-    // means tests in debug builds resolve it to ON unless we explicitly
-    // override it via `FeatureFlagsSettings`. Register the settings type and
-    // install an (empty) `FeatureFlagStore` global so the `cx.has_flag` path
-    // actually consults overrides instead of falling back to the
-    // staff-debug-build default.
+    // User overrides only apply to staff in release builds. Register the
+    // settings type and use staff mode so explicit on/off overrides work in
+    // both debug and release-fast test profiles.
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, _| {
             store.register_setting::<feature_flags::FeatureFlagsSettings>();
         });
-        cx.update_flags(false, vec![]);
+        cx.update_flags(true, vec![]);
     });
 
     fn set_flag_override(value: &str, cx: &mut TestAppContext) {
@@ -7509,7 +7518,7 @@ async fn test_subagent_continues_past_context_window_warning(cx: &mut TestAppCon
     cx.run_until_parked();
 
     // Start the parent turn
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["Prompt".into()], cx));
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -7652,7 +7661,9 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Start the parent turn
-    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    let send = cx.update(|cx| {
+        connection.send_and_wait_for_completion(acp_thread.clone(), vec!["Prompt".into()], cx)
+    });
     cx.run_until_parked();
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
@@ -8313,9 +8324,10 @@ async fn test_fetch_tool_prompts_for_ungranted_host(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let authorization = rx.expect_authorization().await;
-    let details =
-        acp_thread::sandbox_authorization_details_from_meta(&authorization.tool_call.meta)
-            .expect("an ungranted host should request a sandbox network grant");
+    let details = acp_thread::sandbox_authorization_details_from_meta(
+        &authorization.tool_call.meta.value().cloned(),
+    )
+    .expect("an ungranted host should request a sandbox network grant");
     assert_eq!(details.network_hosts, vec!["example.com".to_string()]);
     assert!(!details.network_all_hosts);
 }
@@ -8564,9 +8576,10 @@ async fn test_fetch_tool_reauthorizes_redirect_to_new_host(cx: &mut TestAppConte
     cx.run_until_parked();
 
     let authorization = rx.expect_authorization().await;
-    let details =
-        acp_thread::sandbox_authorization_details_from_meta(&authorization.tool_call.meta)
-            .expect("a redirect to an ungranted host should request a sandbox network grant");
+    let details = acp_thread::sandbox_authorization_details_from_meta(
+        &authorization.tool_call.meta.value().cloned(),
+    )
+    .expect("a redirect to an ungranted host should request a sandbox network grant");
     assert_eq!(
         details.network_hosts,
         vec!["redirect-target.example".to_string()]
@@ -8679,8 +8692,8 @@ async fn test_always_allow_resolves_pending_authorizations(cx: &mut TestAppConte
     tool_call_auth_1
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("always_allow:tool_requiring_permission"),
-            acp::PermissionOptionKind::AllowAlways,
+            acp_v2::PermissionOptionId::new("always_allow:tool_requiring_permission"),
+            acp_v2::PermissionOptionKind::AllowAlways,
         ))
         .unwrap();
     cx.run_until_parked();
@@ -8690,8 +8703,8 @@ async fn test_always_allow_resolves_pending_authorizations(cx: &mut TestAppConte
     let late_send = tool_call_auth_2
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ));
     assert!(
         late_send.is_err(),
@@ -8771,8 +8784,8 @@ async fn test_external_settings_edit_resolves_pending_authorization(cx: &mut Tes
     let late_send = tool_call_auth
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ));
     assert!(
         late_send.is_err(),
@@ -8841,8 +8854,8 @@ async fn test_external_deny_rule_resolves_pending_authorization(cx: &mut TestApp
     let late_send = tool_call_auth
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ));
     assert!(
         late_send.is_err(),
@@ -8910,8 +8923,8 @@ async fn test_unrelated_settings_change_does_not_resolve_pending_authorization(
     tool_call_auth
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ))
         .expect("response receiver should still be alive");
     cx.run_until_parked();
@@ -8989,8 +9002,8 @@ async fn test_always_allow_does_not_resolve_unrelated_tool_authorization(cx: &mu
     auth_for_tool_1
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("always_allow:tool_requiring_permission"),
-            acp::PermissionOptionKind::AllowAlways,
+            acp_v2::PermissionOptionId::new("always_allow:tool_requiring_permission"),
+            acp_v2::PermissionOptionKind::AllowAlways,
         ))
         .unwrap();
     cx.run_until_parked();
@@ -9000,8 +9013,8 @@ async fn test_always_allow_does_not_resolve_unrelated_tool_authorization(cx: &mu
     auth_for_tool_2
         .response
         .send(acp_thread::SelectedPermissionOutcome::new(
-            acp::PermissionOptionId::new("allow"),
-            acp::PermissionOptionKind::AllowOnce,
+            acp_v2::PermissionOptionId::new("allow"),
+            acp_v2::PermissionOptionKind::AllowOnce,
         ))
         .expect("tool 2's response receiver should still be alive");
     cx.run_until_parked();
@@ -9078,7 +9091,11 @@ async fn test_queued_message_ends_turn_at_boundary(cx: &mut TestAppContext) {
     let tool_call_ids: Vec<_> = all_events
         .iter()
         .filter_map(|e| match e {
-            Ok(ThreadEvent::ToolCall(tc)) => Some(tc.tool_call_id.to_string()),
+            Ok(ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(tc)))
+                if tc.status == MaybeUndefined::Value(acp_v2::ToolCallStatus::Pending) =>
+            {
+                Some(tc.tool_call_id.to_string())
+            }
             _ => None,
         })
         .collect();
@@ -9092,7 +9109,7 @@ async fn test_queued_message_ends_turn_at_boundary(cx: &mut TestAppContext) {
     let stop_reasons = stop_events(all_events);
     assert_eq!(
         stop_reasons,
-        vec![acp::StopReason::EndTurn],
+        vec![acp_v2::StopReason::EndTurn],
         "Turn should have ended after tool completion due to queued message"
     );
 
@@ -9170,7 +9187,7 @@ async fn test_queued_message_does_not_end_turn_without_boundary_flag(cx: &mut Te
     let stop_reasons = stop_events(all_events);
     assert_eq!(
         stop_reasons,
-        vec![acp::StopReason::EndTurn],
+        vec![acp_v2::StopReason::EndTurn],
         "Turn should end only after the agent finishes, not at the tool boundary"
     );
 }
@@ -9237,7 +9254,7 @@ async fn test_orchestrate_continues_until_parent_goal_is_complete(cx: &mut TestA
 
     assert_eq!(
         stop_events(collect_events_until_stop(&mut events, cx).await),
-        vec![acp::StopReason::EndTurn]
+        vec![acp_v2::StopReason::EndTurn]
     );
 }
 
@@ -9307,7 +9324,7 @@ async fn test_orchestrate_repairs_plaintext_tool_call(cx: &mut TestAppContext) {
 
     assert_eq!(
         stop_events(collect_events_until_stop(&mut events, cx).await),
-        vec![acp::StopReason::EndTurn]
+        vec![acp_v2::StopReason::EndTurn]
     );
 }
 
@@ -9729,7 +9746,7 @@ async fn test_subagent_compaction_respects_settings_and_context_window(cx: &mut 
 }
 
 #[gpui::test]
-async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint(
+async fn test_subagent_context_limit_preserves_terminal_result_with_git_job_queued(
     cx: &mut TestAppContext,
 ) {
     for provider_error in [false, true] {
@@ -9746,6 +9763,8 @@ async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint
                 .unwrap()
         });
         let (resume_checkpoint, checkpoint_gate) = oneshot::channel::<()>();
+        // A child ACP session has no rewind checkpoint of its own. Keep a Git
+        // job queued to ensure terminal worker output doesn't depend on it.
         let checkpoint_job = repository.update(cx, |repository, _| {
             repository.send_job("hold checkpoint", None, move |_, _| checkpoint_gate)
         });
@@ -9766,7 +9785,21 @@ async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint
 
         test.thread
             .read_with(cx, |thread, _| assert!(thread.is_turn_complete()));
-        assert!((&mut send).now_or_never().is_none());
+        let send_result = (&mut send)
+            .now_or_never()
+            .expect("terminal model result should settle the child task");
+        if provider_error {
+            assert_eq!(
+                send_result.unwrap_err().to_string(),
+                concat!(
+                    "terminal provider error\n\n",
+                    "Partial subagent output (last 3 messages, up to 4096 characters each):\n\n",
+                    "partial work",
+                ),
+            );
+        } else {
+            assert_eq!(send_result.unwrap(), "partial work");
+        }
         repository.read_with(cx, |repository, _| {
             let queue = repository.job_debug_queue().to_debug_value();
             assert_eq!(
@@ -9774,7 +9807,9 @@ async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint
                     .as_array()
                     .unwrap()
                     .iter()
-                    .filter(|job| job["description"] == "checkpoint" && job["status"] == "Pending")
+                    .filter(|job| {
+                        job["description"] == "hold checkpoint" && job["status"] == "Running"
+                    })
                     .count(),
                 1,
             );
@@ -9789,25 +9824,12 @@ async fn test_subagent_context_limit_preserves_terminal_result_during_checkpoint
             })));
         });
         cx.run_until_parked();
-        assert!((&mut send).now_or_never().is_none());
         test.parent.read_with(cx, |thread, cx| {
-            assert_eq!(thread.running_subagent_ids(cx), vec![test.handle.id()]);
+            assert!(thread.running_subagent_ids(cx).is_empty());
         });
 
         resume_checkpoint.send(()).unwrap();
         checkpoint_job.await.unwrap().unwrap();
-        if provider_error {
-            assert_eq!(
-                send.await.unwrap_err().to_string(),
-                concat!(
-                    "terminal provider error\n\n",
-                    "Partial subagent output (last 3 messages, up to 4096 characters each):\n\n",
-                    "partial work",
-                ),
-            );
-        } else {
-            assert_eq!(send.await.unwrap(), "partial work");
-        }
         test.assert_stopped(cx);
         assert_eq!(test.model.pending_completions(), Vec::new());
     }

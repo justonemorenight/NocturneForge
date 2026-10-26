@@ -852,7 +852,7 @@ async fn run_ping_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1 as acp;
+    use agent_client_protocol::schema::v2 as acp;
     use gpui::AppContext as _;
 
     fn warm_outcome() -> PingOutcome {

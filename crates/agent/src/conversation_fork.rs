@@ -1,5 +1,5 @@
 use crate::{AgentMessageContent, DbThread, Message};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 

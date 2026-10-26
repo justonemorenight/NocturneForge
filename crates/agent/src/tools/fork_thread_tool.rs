@@ -2,7 +2,7 @@ use crate::{
     AgentTool, SiblingThreadRequest, Thread, ThreadEnvironment, ToolCallEventStream, ToolInput,
     ToolPermissionContext, ToolPermissionDecision, ZED_AGENT_ID, decide_permission_from_settings,
 };
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use anyhow::{Result, ensure};
 use futures::FutureExt as _;

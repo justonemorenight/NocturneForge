@@ -2,7 +2,7 @@ use crate::budget::TaskBudgetState;
 use crate::ids::{RunId, TaskId};
 use crate::verification::VerificationResult;
 use crate::worker::{StructuredWaitReason, WorkerMetadata, WorkerTarget};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

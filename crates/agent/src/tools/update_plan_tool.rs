@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentExecutionStrategy;
 use anyhow::Result;
 use gpui::{App, SharedString, Task, WeakEntity};
@@ -121,7 +121,7 @@ impl AgentTool for UpdatePlanTool {
             } else {
                 "Plan updated"
             };
-            event_stream.update_fields(acp::ToolCallUpdateFields::new().title(title));
+            event_stream.update_fields(|update| update.title(title));
             Ok(UpdatePlanToolOutput::Success {
                 message: title.to_string(),
             })

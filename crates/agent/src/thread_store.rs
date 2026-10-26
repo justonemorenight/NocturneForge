@@ -1,5 +1,5 @@
 use crate::{DbThread, DbThreadMetadata, ThreadsDatabase};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::{Result, anyhow};
 use futures::{FutureExt, future::Shared};
 use gpui::{App, Context, Entity, Global, Task, prelude::*};
@@ -44,13 +44,16 @@ impl ThreadStore {
         self.reload_task.clone()
     }
 
-    pub fn thread_from_session_id(&self, session_id: &acp::SessionId) -> Option<&DbThreadMetadata> {
+    pub fn thread_from_session_id(
+        &self,
+        session_id: &acp_v2::SessionId,
+    ) -> Option<&DbThreadMetadata> {
         self.threads.iter().find(|thread| &thread.id == session_id)
     }
 
     pub fn load_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<DbThread>>> {
         let database_future = ThreadsDatabase::connect(cx);
@@ -62,7 +65,7 @@ impl ThreadStore {
 
     pub fn save_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         thread: crate::DbThread,
         folder_paths: PathList,
         cx: &mut Context<Self>,
@@ -77,7 +80,7 @@ impl ThreadStore {
 
     pub fn delete_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let database_future = ThreadsDatabase::connect(cx);
@@ -133,7 +136,7 @@ impl ThreadStore {
         self.threads.iter().cloned()
     }
 
-    pub fn entry_ids(&self) -> impl Iterator<Item = acp::SessionId> + '_ {
+    pub fn entry_ids(&self) -> impl Iterator<Item = acp_v2::SessionId> + '_ {
         self.threads.iter().map(|t| t.id.clone())
     }
 }
@@ -146,8 +149,8 @@ mod tests {
     use gpui::TestAppContext;
     use std::sync::Arc;
 
-    fn session_id(value: &str) -> acp::SessionId {
-        acp::SessionId::new(Arc::<str>::from(value))
+    fn session_id(value: &str) -> acp_v2::SessionId {
+        acp_v2::SessionId::new(Arc::<str>::from(value))
     }
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {

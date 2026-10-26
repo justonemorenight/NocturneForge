@@ -4,6 +4,9 @@ Branch: `codex/upstream-complete-20261023`, based on `b73af25220a4`.
 These are adapted source ports, including selected open proposals. They retain
 NocturneForge's ACP v1 transport and existing Claude Multi routing.
 
+This records the original `e39ddf67d6` port. The subsequent ACP v2 migration on
+`codex/acp-v2-20261023` supersedes its v1-only limitations; see [ACP v2 migration](acp-v2-migration.md).
+
 | Upstream PR | Fork implementation |
 | --- | --- |
 | [#65956](https://github.com/zed-industries/zed/pull/65956) | Update Wasmtime, TLS trust dependencies and managed Node. |

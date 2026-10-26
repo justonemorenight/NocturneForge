@@ -20,7 +20,7 @@ use crate::task_mutation::TaskMutationGateway;
 use crate::task_registry::TaskRegistry;
 use crate::worker::StructuredWaitReason;
 use crate::worktree_isolation::IsolatedWorktree;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentExecutionPolicy;
 use anyhow::{Context as _, Result};
 use chrono::Utc;
@@ -498,7 +498,7 @@ impl RunHandle {
 
     pub fn task_status_by_session_id(
         &self,
-        session_id: &agent_client_protocol::schema::v1::SessionId,
+        session_id: &agent_client_protocol::schema::v2::SessionId,
     ) -> Option<TaskStatus> {
         self.task_registry.status_by_session_id(session_id)
     }

@@ -1,5 +1,5 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::Result;
 use futures::future::LocalBoxFuture;
 use gpui::{App, SharedString, Task};
@@ -331,7 +331,7 @@ struct AgentDelivery {
 }
 
 type ActiveDeliveries =
-    Arc<parking_lot::RwLock<HashMap<acp::SessionId, async_channel::Sender<AgentDelivery>>>>;
+    Arc<parking_lot::RwLock<HashMap<acp_v2::SessionId, async_channel::Sender<AgentDelivery>>>>;
 
 /// Tracks which subagent sessions currently have a running turn. It is owned
 /// by the parent thread so that separate orchestration runs cannot drive the
@@ -340,7 +340,7 @@ type ActiveDeliveries =
 pub struct SubagentDeliveries(ActiveDeliveries);
 
 struct SteeringSession {
-    session_id: acp::SessionId,
+    session_id: acp_v2::SessionId,
     receiver: async_channel::Receiver<AgentDelivery>,
     active_deliveries: ActiveDeliveries,
 }
@@ -352,7 +352,7 @@ enum AgentTurnBoundary {
 
 impl SteeringSession {
     fn register(
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         active_deliveries: ActiveDeliveries,
         maximum_pending_deliveries: usize,
     ) -> Result<Self> {
@@ -521,7 +521,6 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                         cx,
                     )
                 }?;
-                event_stream.subagent_spawned(subagent.id());
                 let message_start_index = subagent.num_entries(cx);
                 anyhow::Ok((subagent, message_start_index))
             })?;
@@ -534,13 +533,16 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                     message_end_index: None,
                 };
                 session_info.lock().replace(info.clone());
-                event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new(),
-                    Some(acp::Meta::from_iter([(
+                event_stream.update_fields(|update| {
+                    let update = update;
+                    match Some(acp_v2::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(info),
-                    )])),
-                );
+                    )])) {
+                        Some(meta) => update.meta(meta),
+                        None => update,
+                    }
+                });
             }
             let steering_session = SteeringSession::register(
                 session_id.clone(),
@@ -593,13 +595,16 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
                     message_end_index: Some(subagent.num_entries(cx).saturating_sub(1)),
                 });
                 session_info.lock().replace(info.clone());
-                event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new(),
-                    Some(acp::Meta::from_iter([(
+                event_stream.update_fields(|update| {
+                    let update = update;
+                    match Some(acp_v2::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(info),
-                    )])),
-                );
+                    )])) {
+                        Some(meta) => update.meta(meta),
+                        None => update,
+                    }
+                });
             }
             let output = match send_result {
                 Ok(output) => output,
@@ -629,7 +634,7 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
     fn cancel(
         &self,
         _task: &agent_orchestration::OrchestrationTask,
-        session_id: Option<agent_client_protocol::schema::v1::SessionId>,
+        session_id: Option<agent_client_protocol::schema::v2::SessionId>,
     ) -> LocalBoxFuture<'static, Result<()>> {
         let environment = self.environment.clone();
         let app = self.app.clone();
@@ -650,7 +655,7 @@ impl agent_orchestration::TaskExecutor for SubagentRuntimeExecutor {
     fn deliver_message(
         &self,
         _task: &agent_orchestration::OrchestrationTask,
-        session_id: agent_client_protocol::schema::v1::SessionId,
+        session_id: agent_client_protocol::schema::v2::SessionId,
         message: String,
         interrupt: bool,
     ) -> LocalBoxFuture<'static, Result<()>> {
@@ -836,7 +841,7 @@ pub struct SpawnAgentToolInput {
     pub agent_type: Option<SubagentRole>,
     /// Session ID of an existing agent session to continue instead of creating a new one. Omit to create a new agent.
     #[serde(default, deserialize_with = "deserialize_session_id")]
-    pub session_id: Option<acp::SessionId>,
+    pub session_id: Option<acp_v2::SessionId>,
     /// Optional allowlist of tool names the subagent may use (e.g. ["read_file", "grep"]). When present, the subagent is restricted to only those tools; when omitted, it inherits your full tool set. An empty list gives the subagent no tools at all. Names must be a subset of your available tools. Ignored when resuming an existing session — the session keeps the filter it was created with.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
@@ -977,7 +982,7 @@ impl WorkspacePolicyInput {
         }
     }
 }
-fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
+fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp_v2::SessionId>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1311,7 +1316,7 @@ fn native_single_task_as_batch(input: &SpawnAgentToolInput) -> SpawnAgentTask {
 fn steer_running_session(
     deliveries: &SubagentDeliveries,
     environment: &dyn ThreadEnvironment,
-    session_id: acp::SessionId,
+    session_id: acp_v2::SessionId,
     message: &str,
     cx: &mut App,
 ) -> Option<Result<SpawnAgentToolOutput, SpawnAgentToolOutput>> {
@@ -1340,7 +1345,7 @@ fn steer_running_session(
 
 fn subagent_entry_count(
     environment: &dyn ThreadEnvironment,
-    session_id: &acp::SessionId,
+    session_id: &acp_v2::SessionId,
     cx: &mut App,
 ) -> usize {
     match environment.existing_subagent(session_id.clone(), cx) {
@@ -1359,7 +1364,7 @@ fn subagent_entry_count(
 /// onto the new run.
 fn live_run_recipient(
     thread: &Thread,
-    session_id: &acp::SessionId,
+    session_id: &acp_v2::SessionId,
 ) -> Option<(
     agent_orchestration::RunHandle,
     agent_orchestration::AgentPath,
@@ -1382,7 +1387,7 @@ async fn message_live_run_worker(
     run: agent_orchestration::RunHandle,
     recipient: agent_orchestration::AgentPath,
     state: agent_orchestration::TaskState,
-    session_id: acp::SessionId,
+    session_id: acp_v2::SessionId,
     message: String,
     environment: Rc<dyn ThreadEnvironment>,
     cx: &mut gpui::AsyncApp,
@@ -1460,14 +1465,14 @@ fn parse_persisted_native_role(role: &str) -> Result<Option<SubagentRole>> {
 #[serde(rename_all = "snake_case")]
 pub enum SpawnAgentToolOutput {
     Success {
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         output: String,
         session_info: SubagentSessionInfo,
     },
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
-        session_id: Option<acp::SessionId>,
+        session_id: Option<acp_v2::SessionId>,
         error: String,
         session_info: Option<SubagentSessionInfo>,
     },
@@ -1515,7 +1520,7 @@ fn batch_output_text(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnAgentBatchResult {
     pub task_id: String,
-    pub session_id: acp::SessionId,
+    pub session_id: acp_v2::SessionId,
     pub label: String,
     pub output: String,
 }
@@ -1803,7 +1808,7 @@ impl BatchRunCompletion {
         single_task: bool,
         session_info: &Option<Arc<parking_lot::Mutex<Option<SubagentSessionInfo>>>>,
         event_stream: &ToolCallEventStream,
-        session_id: Option<acp::SessionId>,
+        session_id: Option<acp_v2::SessionId>,
         error: String,
     ) -> SpawnAgentToolOutput {
         let session_info = session_info
@@ -1815,15 +1820,18 @@ impl BatchRunCompletion {
                 .map(|session_info| session_info.session_id.clone())
         });
         if single_task {
-            event_stream.update_fields_with_meta(
-                acp::ToolCallUpdateFields::new().content(vec![error.clone().into()]),
-                session_info.as_ref().map(|session_info| {
-                    acp::Meta::from_iter([(
+            event_stream.update_fields(|update| {
+                let update = update.content(vec![error.clone().into()]);
+                match session_info.as_ref().map(|session_info| {
+                    acp_v2::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(session_info),
                     )])
-                }),
-            );
+                }) {
+                    Some(meta) => update.meta(meta),
+                    None => update,
+                }
+            });
         }
         SpawnAgentToolOutput::Error {
             session_id,
@@ -1925,13 +1933,16 @@ impl BatchRunCompletion {
                     message_start_index: 0,
                     message_end_index: None,
                 });
-            self.event_stream.update_fields_with_meta(
-                acp::ToolCallUpdateFields::new().content(vec![result.output.clone().into()]),
-                Some(acp::Meta::from_iter([(
+            self.event_stream.update_fields(|update| {
+                let update = update.content(vec![result.output.clone().into()]);
+                match Some(acp_v2::Meta::from_iter([(
                     SUBAGENT_SESSION_INFO_META_KEY.into(),
                     serde_json::json!(&session_info),
-                )])),
-            );
+                )])) {
+                    Some(meta) => update.meta(meta),
+                    None => update,
+                }
+            });
             return Ok(SpawnAgentToolOutput::Success {
                 session_id: result.session_id,
                 output: result.output,
@@ -1947,11 +1958,11 @@ impl BatchRunCompletion {
             error: format!("Failed to serialize batch output: {error}"),
             session_info: None,
         })?;
-        self.event_stream.update_fields(
-            acp::ToolCallUpdateFields::new()
+        self.event_stream.update_fields(|update| {
+            update
                 .title("Parallel agents completed")
-                .raw_output(raw_output),
-        );
+                .raw_output(raw_output)
+        });
         Ok(SpawnAgentToolOutput::BatchSuccess {
             results: batch,
             failures,
@@ -2249,7 +2260,7 @@ async fn run_batch_tasks(
     shared_context: Option<String>,
     background: bool,
     single_task: bool,
-    initial_session_id: Option<acp::SessionId>,
+    initial_session_id: Option<acp_v2::SessionId>,
     event_stream: ToolCallEventStream,
     cx: &mut gpui::AsyncApp,
 ) -> Result<SpawnAgentToolOutput, SpawnAgentToolOutput> {
@@ -2452,7 +2463,7 @@ impl agent_orchestration::WorkerHost for LazyExternalWorkerHost {
 
     fn resume_worker(
         &self,
-        session_id: &acp::SessionId,
+        session_id: &acp_v2::SessionId,
         task: &agent_orchestration::OrchestrationTask,
         context: &agent_orchestration::TaskExecutionContext,
     ) -> futures::future::LocalBoxFuture<'static, Result<Box<dyn agent_orchestration::WorkerHandle>>>
@@ -2478,8 +2489,8 @@ impl AgentTool for SpawnAgentTool {
 
     const NAME: &'static str = "spawn_agent";
 
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
+    fn kind() -> acp_v2::ToolKind {
+        acp_v2::ToolKind::Other
     }
 
     fn initial_title(
@@ -2573,13 +2584,13 @@ impl AgentTool for SpawnAgentTool {
                         ..
                     }) = &result
                     {
-                        event_stream.update_fields_with_meta(
-                            acp::ToolCallUpdateFields::new().content(vec![output.clone().into()]),
-                            Some(acp::Meta::from_iter([(
+                        event_stream.update_fields(|update| {
+        let update = update.content(vec![output.clone().into()]);
+        match Some(acp_v2::Meta::from_iter([(
                                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                                 serde_json::json!(session_info),
-                            )])),
-                        );
+                            )])) { Some(meta) => update.meta(meta), None => update }
+    });
                     }
                     return result;
                 }
@@ -2600,13 +2611,13 @@ impl AgentTool for SpawnAgentTool {
                         ..
                     }) = &result
                     {
-                        event_stream.update_fields_with_meta(
-                            acp::ToolCallUpdateFields::new().content(vec![output.clone().into()]),
-                            Some(acp::Meta::from_iter([(
+                        event_stream.update_fields(|update| {
+        let update = update.content(vec![output.clone().into()]);
+        match Some(acp_v2::Meta::from_iter([(
                                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                                 serde_json::json!(session_info),
-                            )])),
-                        );
+                            )])) { Some(meta) => update.meta(meta), None => update }
+    });
                     }
                     return result;
                 }
@@ -2701,15 +2712,18 @@ impl AgentTool for SpawnAgentTool {
         };
 
         let meta = session_info.map(|session_info| {
-            acp::Meta::from_iter([(
+            acp_v2::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
             )])
         });
-        event_stream.update_fields_with_meta(
-            acp::ToolCallUpdateFields::new().content(vec![content]),
-            meta,
-        );
+        event_stream.update_fields(|update| {
+            let update = update.content(vec![content]);
+            match meta {
+                Some(meta) => update.meta(meta),
+                None => update,
+            }
+        });
 
         Ok(())
     }
@@ -2829,7 +2843,7 @@ mod tests {
     #[test]
     fn runs_sharing_parent_deliveries_cannot_drive_the_same_session() {
         let deliveries = SubagentDeliveries::default();
-        let session_id = acp::SessionId::new("shared-session");
+        let session_id = acp_v2::SessionId::new("shared-session");
         let first = SteeringSession::register(session_id.clone(), deliveries.0.clone(), 4)
             .expect("first run owns the session");
         let error = SteeringSession::register(session_id.clone(), deliveries.0.clone(), 4)
@@ -2855,7 +2869,7 @@ mod tests {
     fn batch_output_reports_failures_next_to_partial_results() {
         let results = vec![SpawnAgentBatchResult {
             task_id: "task-1".to_string(),
-            session_id: acp::SessionId::new("session-1"),
+            session_id: acp_v2::SessionId::new("session-1"),
             label: "one".to_string(),
             output: "done".to_string(),
         }];

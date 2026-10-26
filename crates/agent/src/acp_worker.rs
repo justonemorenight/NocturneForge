@@ -1,5 +1,5 @@
 use acp_thread::{AcpThread, AgentConnection};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp};
 use agent_orchestration::{
     CancellationReason, CapabilitySnapshot, IsolatedWorktree, TaskExecutionContext,
     TaskExecutionOutput, WorkerHandle, WorkerHost, WorkerMetadata, WorkerTarget,
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use util::ResultExt as _;
 
 const MAX_ACP_WORKER_OUTPUT_BYTES: usize = agent_orchestration::MAX_INLINE_OUTPUT_BYTES;
 
@@ -406,7 +407,7 @@ impl WorkerHost for AcpWorkerHost {
                 let mode_selector = app
                     .update(|cx| connection.session_modes(&session_id, cx))
                     .ok_or_else(|| anyhow::anyhow!("ACP worker does not support session modes"))?;
-                let mode_id = acp::SessionModeId::new(mode.as_str());
+                let mode_id = acp::SessionConfigValueId::new(mode.as_str());
                 let set_mode_task = app.update(|cx| mode_selector.set_mode(mode_id, cx));
                 set_mode_task
                     .await
@@ -512,7 +513,7 @@ impl WorkerHost for AcpWorkerHost {
                     .update(|cx| connection.session_modes(&session_id, cx))
                     .ok_or_else(|| anyhow::anyhow!("ACP worker does not support session modes"))?;
                 let set_mode_task = app.update(|cx| {
-                    mode_selector.set_mode(acp::SessionModeId::new(mode.as_str()), cx)
+                    mode_selector.set_mode(acp::SessionConfigValueId::new(mode.as_str()), cx)
                 });
                 set_mode_task
                     .await
@@ -567,7 +568,7 @@ impl WorkerHost for AcpWorkerHost {
             if let Some(state) = cancel_requested.read().get(&session_id) {
                 state.cancel_requested.store(true, Ordering::SeqCst);
             }
-            app.update(|cx| connection.cancel(&session_id, cx));
+            app.update(|cx| connection.cancel(&session_id, cx))?;
             Ok(())
         })
     }
@@ -638,8 +639,8 @@ fn setup_activity_subscription(
                             tool.tool_name.as_deref().unwrap_or("external_tool"),
                         );
                     }
-                    match &tool.status {
-                        ToolCallStatus::WaitingForConfirmation { .. } => {
+                    match tool.status() {
+                        ToolCallStatus::WaitingForConfirmation => {
                             reporter.set_phase("awaiting_permission")
                         }
                         ToolCallStatus::Pending | ToolCallStatus::InProgress => {
@@ -678,6 +679,11 @@ fn setup_activity_subscription(
     })
 }
 
+struct WorkerPromptCompletion {
+    stop_reason: acp::StopReason,
+    total_tokens: Option<u64>,
+}
+
 async fn run_single_prompt_turn(
     connection: &Rc<dyn AgentConnection>,
     session_id: &acp::SessionId,
@@ -687,15 +693,79 @@ async fn run_single_prompt_turn(
     deferred_messages: &mut Vec<String>,
     interrupt_requested: &mut bool,
     app: &AsyncApp,
-) -> Result<acp::PromptResponse> {
-    let content = acp::ContentBlock::Text(acp::TextContent::new(prompt_text));
-    app.update(|cx| {
-        thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(None, content.clone(), cx);
-        })
+) -> Result<WorkerPromptCompletion> {
+    let (stopped_sender, stopped_receiver) = futures::channel::oneshot::channel();
+    let mut stopped_sender = Some(stopped_sender);
+    let (subscription, submission) = app.update(|cx| {
+        let generation = thread.read(cx).activity_generation();
+        let subscription = cx.subscribe(
+            thread,
+            move |thread, event: &acp_thread::AcpThreadEvent, cx| {
+                let result = match event {
+                    acp_thread::AcpThreadEvent::Stopped {
+                        activity_generation,
+                        stop_reason,
+                        ..
+                    } if *activity_generation > generation => {
+                        Some(Ok(stop_reason.clone().unwrap_or(acp::StopReason::EndTurn)))
+                    }
+                    acp_thread::AcpThreadEvent::ConnectionLost
+                    | acp_thread::AcpThreadEvent::LoadError(_) => Some(Err(anyhow::anyhow!(
+                        "ACP worker connection lost before completion"
+                    ))),
+                    acp_thread::AcpThreadEvent::Error => thread
+                        .read(cx)
+                        .local_execution_error()
+                        .map(|error| Err(anyhow::anyhow!(error.to_string()))),
+                    _ => None,
+                };
+                if let Some(result) = result
+                    && let Some(sender) = stopped_sender.take()
+                    && sender.send(result).is_err()
+                {
+                    log::debug!("ACP worker completion observer was released");
+                }
+            },
+        );
+        let submission = thread.update(cx, |thread, cx| thread.send(vec![prompt_text.into()], cx));
+        (subscription, submission)
     });
-    let prompt_request = acp::PromptRequest::new(session_id.clone(), vec![content]);
-    let mut prompt_task = Box::pin(app.update(|cx| connection.prompt(prompt_request, cx)));
+    let thread = thread.clone();
+    let mut prompt_task = Box::pin(async move {
+        let _subscription = subscription;
+        match submission.await? {
+            Some(acp_thread::SubmissionResponse::LegacyCompleted(response)) => {
+                let stop_reason = match response.stop_reason {
+                    acp_v1::StopReason::EndTurn => acp::StopReason::EndTurn,
+                    acp_v1::StopReason::Cancelled => acp::StopReason::Cancelled,
+                    acp_v1::StopReason::Refusal => acp::StopReason::Refusal,
+                    acp_v1::StopReason::MaxTokens => acp::StopReason::MaxTokens,
+                    acp_v1::StopReason::MaxTurnRequests => acp::StopReason::MaxTurnRequests,
+                    reason => bail!("Unsupported ACP worker stop reason: {reason:?}"),
+                };
+                Ok(WorkerPromptCompletion {
+                    stop_reason,
+                    total_tokens: response.usage.map(|usage| usage.total_tokens),
+                })
+            }
+            Some(acp_thread::SubmissionResponse::Accepted(_)) => {
+                let stop_reason = stopped_receiver
+                    .await
+                    .context("ACP worker completion observer closed")??;
+                let total_tokens = app.update(|cx| {
+                    thread
+                        .read(cx)
+                        .token_usage()
+                        .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens))
+                });
+                Ok(WorkerPromptCompletion {
+                    stop_reason,
+                    total_tokens,
+                })
+            }
+            None => bail!("ACP worker prompt was cancelled before acceptance"),
+        }
+    });
 
     let response = loop {
         let delivery = delivery_receiver.recv();
@@ -709,7 +779,7 @@ async fn run_single_prompt_turn(
                 deferred_messages.push(delivery.message);
                 if delivery.interrupt && !*interrupt_requested {
                     *interrupt_requested = true;
-                    app.update(|cx| connection.cancel(session_id, cx));
+                    app.update(|cx| connection.cancel(session_id, cx))?;
                 }
             }
         }
@@ -726,7 +796,7 @@ async fn run_single_prompt_turn(
 }
 
 struct TurnLoopOutcome {
-    last_response: acp::PromptResponse,
+    last_response: WorkerPromptCompletion,
     tokens_used: Option<u64>,
 }
 
@@ -759,9 +829,9 @@ async fn run_turn_execution_loop(
         .await?;
 
         // Account for usage immediately after each prompt response, before processing its stop reason
-        if let Some(usage) = response.usage.as_ref() {
+        if let Some(tokens) = response.total_tokens {
             has_usage = true;
-            total_tokens = total_tokens.saturating_add(usage.total_tokens);
+            total_tokens = total_tokens.saturating_add(tokens);
         }
 
         if cancel_requested.load(Ordering::SeqCst) {
@@ -942,9 +1012,7 @@ impl WorkerHandle for AcpWorkerHandle {
 
         Box::pin(async move {
             cancel_requested.store(true, Ordering::SeqCst);
-            app.update(|cx| {
-                connection.cancel(&session_id, cx);
-            });
+            app.update(|cx| connection.cancel(&session_id, cx))?;
             prompt_active.store(false, Ordering::SeqCst);
             Ok(())
         })
@@ -986,7 +1054,9 @@ impl Drop for AcpWorkerHandle {
         if self.prompt_active.swap(false, Ordering::SeqCst) {
             let connection = self.connection.clone();
             let session_id = self.session_id.clone();
-            self.app.update(|cx| connection.cancel(&session_id, cx));
+            self.app
+                .update(|cx| connection.cancel(&session_id, cx))
+                .log_err();
         }
     }
 }
@@ -994,6 +1064,137 @@ impl Drop for AcpWorkerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn worker_cancel_propagates_transport_failure(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        let project = project::Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, util::path_list::PathList::default(), cx)
+            })
+            .await
+            .expect("worker session");
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let (delivery_receiver, active_deliveries, cancel_requested) =
+            register_delivery_channel(&Default::default(), session_id.clone())
+                .expect("delivery channel");
+        let mut worker = AcpWorkerHandle {
+            connection: connection.clone(),
+            session_id,
+            thread,
+            metadata: WorkerMetadata::new(WorkerTarget::acp("Test")),
+            app: cx.to_async(),
+            prompt_active: Arc::new(AtomicBool::new(true)),
+            cancel_requested,
+            delivery_receiver,
+            active_deliveries,
+            _process_lease: None,
+        };
+        connection.set_next_cancel_error(anyhow::anyhow!("cancel transport closed"));
+        let error = worker
+            .cancel(CancellationReason::UserRequested)
+            .await
+            .expect_err("failed cancellation must reach the scheduler");
+        assert!(error.to_string().contains("cancel transport closed"));
+        assert!(worker.prompt_active.load(Ordering::SeqCst));
+        worker
+            .cancel(CancellationReason::UserRequested)
+            .await
+            .expect("retry cancellation");
+        assert!(!worker.prompt_active.load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
+    async fn receipt_acceptance_waits_for_remote_completion_or_disconnect(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::FutureExt as _;
+        crate::tests::init_test(cx);
+        for disconnect in [false, true] {
+            let project = project::Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+            let connection =
+                Rc::new(acp_thread::StubAgentConnection::new().with_receipt_submissions(true));
+            let thread = cx
+                .update(|cx| {
+                    connection.clone().new_session(
+                        project,
+                        util::path_list::PathList::default(),
+                        cx,
+                    )
+                })
+                .await
+                .expect("worker session");
+            let receipt = connection.defer_next_receipt_response();
+            let (delivery_sender, delivery_receiver) = async_channel::unbounded();
+            let mut task = cx.spawn({
+                let thread = thread.clone();
+                let connection: Rc<dyn AgentConnection> = connection.clone();
+                async move |cx| {
+                    let session_id = thread.read_with(&cx, |thread, _| thread.session_id().clone());
+                    run_single_prompt_turn(
+                        &connection,
+                        &session_id,
+                        &thread,
+                        "inspect",
+                        &delivery_receiver,
+                        &mut Vec::new(),
+                        &mut false,
+                        &cx,
+                    )
+                    .await
+                }
+            });
+            cx.run_until_parked();
+            receipt
+                .send(Ok(acp::PromptResponse::new("accepted")))
+                .expect("receipt observer");
+            cx.run_until_parked();
+            assert!(
+                (&mut task).now_or_never().is_none(),
+                "acceptance must not complete the worker"
+            );
+            thread.update(cx, |thread, cx| {
+                if disconnect {
+                    thread.handle_connection_lost(cx);
+                } else {
+                    thread
+                        .update_session_state(
+                            acp::StateUpdate::Running(acp::RunningStateUpdate::new()),
+                            cx,
+                        )
+                        .expect("running");
+                    thread
+                        .update_session_state(
+                            acp::StateUpdate::Idle(
+                                acp::IdleStateUpdate::new().stop_reason(acp::StopReason::EndTurn),
+                            ),
+                            cx,
+                        )
+                        .expect("idle");
+                }
+            });
+            let result = task.await;
+            if disconnect {
+                assert!(
+                    result
+                        .err()
+                        .expect("lost worker must fail")
+                        .to_string()
+                        .contains("connection lost")
+                );
+            } else {
+                assert_eq!(
+                    result.expect("completed worker").stop_reason,
+                    acp::StopReason::EndTurn
+                );
+            }
+            drop(delivery_sender);
+        }
+    }
 
     #[test]
     fn task_prompt_includes_the_shared_verification_contract() {

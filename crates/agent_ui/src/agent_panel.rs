@@ -10,9 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::{v2 as acp, v2 as acp_v2};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{UserAgentsMd, UserAgentsTemplate, UserAgentsTemplateCustomization};
 use collections::HashSet;
@@ -695,14 +695,14 @@ pub fn init(cx: &mut App) {
                     let diff_uri = mention_uri.to_uri().to_string();
 
                     let content_blocks = vec![
-                        acp::ContentBlock::Text(acp::TextContent::new(
+                        acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                             "Please review this branch diff carefully. Point out any issues, \
                              potential bugs, or improvement opportunities you find.\n\n"
                                 .to_string(),
                         )),
-                        acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-                            acp::EmbeddedResourceResource::TextResourceContents(
-                                acp::TextResourceContents::new(
+                        acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+                            acp_v2::EmbeddedResourceResource::TextResourceContents(
+                                acp_v2::TextResourceContents::new(
                                     action.diff_text.to_string(),
                                     diff_uri,
                                 ),
@@ -1022,19 +1022,19 @@ fn mention_path_for_terminal(
     }
 }
 
-fn conflict_resource_block(conflict: &ConflictContent) -> acp::ContentBlock {
+fn conflict_resource_block(conflict: &ConflictContent) -> acp_v2::ContentBlock {
     let mention_uri = MentionUri::MergeConflict {
         file_path: conflict.file_path.clone(),
     };
-    acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-        acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+    acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+        acp_v2::EmbeddedResourceResource::TextResourceContents(acp_v2::TextResourceContents::new(
             conflict.conflict_text.clone(),
             mention_uri.to_uri().to_string(),
         )),
     ))
 }
 
-fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::ContentBlock> {
+fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp_v2::ContentBlock> {
     if conflicts.is_empty() {
         return Vec::new();
     }
@@ -1044,18 +1044,17 @@ fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::C
     if conflicts.len() == 1 {
         let conflict = &conflicts[0];
 
-        blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+        blocks.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
             "Please resolve the following merge conflict in ",
         )));
         let mention = MentionUri::File {
             abs_path: PathBuf::from(conflict.file_path.clone()),
         };
-        blocks.push(acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
-            mention.name(),
-            mention.to_uri(),
-        )));
+        blocks.push(acp_v2::ContentBlock::ResourceLink(
+            acp_v2::ResourceLink::new(mention.name(), mention.to_uri()),
+        ));
 
-        blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+        blocks.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
             indoc::formatdoc!(
                 "\nThe conflict is between branch `{ours}` (ours) and `{theirs}` (theirs).
 
@@ -1073,7 +1072,7 @@ fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::C
         let unique_files: HashSet<&str> = conflicts.iter().map(|c| c.file_path.as_str()).collect();
         let ours = &conflicts[0].ours_branch_name;
         let theirs = &conflicts[0].theirs_branch_name;
-        blocks.push(acp::ContentBlock::Text(acp::TextContent::new(
+        blocks.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
             indoc::formatdoc!(
                 "Please resolve all {n} merge conflicts below.
 
@@ -1098,7 +1097,7 @@ fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::C
 
 fn build_conflicted_files_resolution_prompt(
     conflicted_file_paths: &[String],
-) -> Vec<acp::ContentBlock> {
+) -> Vec<acp_v2::ContentBlock> {
     if conflicted_file_paths.is_empty() {
         return Vec::new();
     }
@@ -1115,16 +1114,17 @@ fn build_conflicted_files_resolution_prompt(
          ",
     );
 
-    let mut content = vec![acp::ContentBlock::Text(acp::TextContent::new(instruction))];
+    let mut content = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+        instruction,
+    ))];
     for path in conflicted_file_paths {
         let mention = MentionUri::File {
             abs_path: PathBuf::from(path),
         };
-        content.push(acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
-            mention.name(),
-            mention.to_uri(),
-        )));
-        content.push(acp::ContentBlock::Text(acp::TextContent::new("\n")));
+        content.push(acp_v2::ContentBlock::ResourceLink(
+            acp_v2::ResourceLink::new(mention.name(), mention.to_uri()),
+        ));
+        content.push(acp_v2::ContentBlock::Text(acp_v2::TextContent::new("\n")));
     }
     content
 }
@@ -1579,7 +1579,7 @@ impl AgentPanel {
                             let thread_id = store.read_with(cx, |store, _cx| {
                                 let primary = info.thread_id.and_then(|tid| store.entry(tid));
                                 let fallback = info.session_id.as_ref().and_then(|sid| {
-                                    store.entry_by_session(&acp::SessionId::new(sid.clone()))
+                                    store.entry_by_session(&acp_v2::SessionId::new(sid.clone()))
                                 });
                                 primary
                                     .or(fallback)
@@ -1920,7 +1920,7 @@ impl AgentPanel {
 
     pub fn open_thread(
         &mut self,
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         window: &mut Window,
@@ -1963,7 +1963,7 @@ impl AgentPanel {
     fn external_thread_by_session(
         &mut self,
         agent: Agent,
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         focus: bool,
@@ -2496,6 +2496,7 @@ impl AgentPanel {
                     this.request_close_terminal_from_terminal_event(terminal_id, window, cx);
                 }
                 TerminalEvent::BlinkChanged(_)
+                | TerminalEvent::OutputReplaced
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
                 | TerminalEvent::Open(_) => {}
@@ -3626,6 +3627,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(conversation_view) = self.conversation_view_for_id(&id, cx).cloned() {
+            conversation_view.update(cx, |view, cx| view.discard_draft_prompt(cx));
+        }
         self.remove_retained_thread(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
@@ -3722,7 +3726,7 @@ impl AgentPanel {
         &self,
         id: ThreadId,
         cx: &App,
-    ) -> Option<Vec<acp::ContentBlock>> {
+    ) -> Option<Vec<acp_v2::ContentBlock>> {
         let cv = self
             .retained_threads
             .get(&id)
@@ -3741,6 +3745,22 @@ impl AgentPanel {
             })?;
         let thread_view = cv.read(cx).root_thread_view()?;
         let thread_view = thread_view.read(cx);
+        if thread_view
+            .message_editor
+            .read(cx)
+            .editor()
+            .read(cx)
+            .read_only(cx)
+        {
+            return Some(
+                thread_view
+                    .thread
+                    .read(cx)
+                    .draft_prompt()
+                    .map(|blocks| blocks.to_vec())
+                    .unwrap_or_default(),
+            );
+        }
         Some(
             thread_view
                 .message_editor
@@ -3782,7 +3802,7 @@ impl AgentPanel {
     }
 
     fn initial_content_for_thread_summary(
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         cx: &App,
     ) -> Option<AgentInitialContent> {
         let thread = ThreadStore::global(cx)
@@ -4262,7 +4282,7 @@ impl AgentPanel {
         };
 
         let db_thread = shared_thread.to_db_thread();
-        let session_id = acp::SessionId::new(uuid::Uuid::new_v4().to_string());
+        let session_id = acp_v2::SessionId::new(uuid::Uuid::new_v4().to_string());
         let thread_store = self.thread_store.clone();
         let title = db_thread.title.clone();
         let workspace = self.workspace.clone();
@@ -4672,8 +4692,13 @@ impl AgentPanel {
     ) {
         let subscription = if let Some(acp_thread) = conversation_view.read(cx).root_thread(cx) {
             let subscription = cx.subscribe(&acp_thread, |this, acp_thread, event, cx| {
-                if matches!(event, AcpThreadEvent::StatusChanged)
-                    && acp_thread.read(cx).status() == ThreadStatus::Idle
+                if matches!(
+                    event,
+                    AcpThreadEvent::StatusChanged
+                        | AcpThreadEvent::SubmissionUpdated(_)
+                        | AcpThreadEvent::ToolAuthorizationReceived(_)
+                        | AcpThreadEvent::ElicitationResponded(_)
+                ) && acp_thread.read(cx).is_idle_for_retention()
                 {
                     this.cleanup_retained_threads(cx);
                 }
@@ -5013,7 +5038,7 @@ impl AgentPanel {
         &mut self,
         agent: Agent,
         server_override: Option<Rc<dyn AgentServer>>,
-        resume_session_id: acp::SessionId,
+        resume_session_id: acp_v2::SessionId,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
@@ -5041,7 +5066,7 @@ impl AgentPanel {
         agent: Agent,
         server_override: Option<Rc<dyn AgentServer>>,
         resume_thread_id: Option<ThreadId>,
-        resume_session_id: Option<acp::SessionId>,
+        resume_session_id: Option<acp_v2::SessionId>,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
         initial_content: Option<AgentInitialContent>,
@@ -5545,7 +5570,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             };
 
             let initial_content = AgentInitialContent::ContentBlock {
-                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                     request.prompt.clone(),
                 ))],
                 auto_submit: true,
@@ -7704,7 +7729,7 @@ impl AgentPanel {
     pub fn open_restored_thread_with_server(
         &mut self,
         server: Rc<dyn AgentServer>,
-        resume_session_id: acp::SessionId,
+        resume_session_id: acp_v2::SessionId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7936,6 +7961,7 @@ mod tests {
     };
     use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
+    use agent_client_protocol::schema::v2 as acp;
     use anyhow::{Result, anyhow};
     use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
@@ -8039,9 +8065,11 @@ mod tests {
     async fn test_review_feedback_creates_thread_when_none_is_active(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let connection = crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Review addressed".into()),
-        )]);
+        connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("Review addressed".into()),
+            ),
+        ]);
         panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
         assert!(panel.read_with(&cx, |panel, cx| panel.active_thread_view(cx).is_none()));
 
@@ -8077,7 +8105,17 @@ mod tests {
                     let acp_thread::AgentThreadEntry::UserMessage(message) = entry else {
                         return None;
                     };
-                    message.content.text_content(cx)
+                    Some(
+                        message
+                            .content
+                            .source_blocks()
+                            .iter()
+                            .filter_map(|block| match block {
+                                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    )
                 })
                 .expect("review should be submitted as a user message");
             assert_eq!(message, expected_message.trim_end());
@@ -8124,7 +8162,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct SessionTrackingConnection {
         next_session_number: Arc<Mutex<usize>>,
-        sessions: Arc<Mutex<HashSet<acp::SessionId>>>,
+        sessions: Arc<Mutex<HashSet<acp_v2::SessionId>>>,
     }
 
     impl SessionTrackingConnection {
@@ -8134,7 +8172,7 @@ mod tests {
 
         fn create_session(
             self: Rc<Self>,
-            session_id: acp::SessionId,
+            session_id: acp_v2::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
             title: Option<SharedString>,
@@ -8153,10 +8191,10 @@ mod tests {
                     action_log,
                     session_id,
                     watch::Receiver::constant(
-                        acp::PromptCapabilities::new()
-                            .image(true)
-                            .audio(true)
-                            .embedded_context(true),
+                        acp_v2::PromptCapabilities::new()
+                            .image(acp_v2::PromptImageCapabilities::new())
+                            .audio(acp_v2::PromptAudioCapabilities::new())
+                            .embedded_context(acp_v2::PromptEmbeddedContextCapabilities::new()),
                     ),
                     cx,
                 )
@@ -8181,7 +8219,7 @@ mod tests {
         ) -> Task<Result<Entity<AcpThread>>> {
             let session_id = {
                 let mut next_session_number = self.next_session_number.lock();
-                let session_id = acp::SessionId::new(format!(
+                let session_id = acp_v2::SessionId::new(format!(
                     "session-tracking-session-{}",
                     *next_session_number
                 ));
@@ -8198,7 +8236,7 @@ mod tests {
 
         fn load_session(
             self: Rc<Self>,
-            session_id: acp::SessionId,
+            session_id: acp_v2::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
             title: Option<SharedString>,
@@ -8208,17 +8246,21 @@ mod tests {
             thread.update(cx, |thread, cx| {
                 thread
                     .handle_session_update(
-                        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                            "Restored user message".into(),
-                        )),
+                        agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                "Restored user message".into(),
+                            ),
+                        ),
                         cx,
                     )
                     .expect("restored user message should be applied");
                 thread
                     .handle_session_update(
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            "Restored assistant message".into(),
-                        )),
+                        agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                "Restored assistant message".into(),
+                            ),
+                        ),
                         cx,
                     )
                     .expect("restored assistant message should be applied");
@@ -8232,34 +8274,43 @@ mod tests {
 
         fn close_session(
             self: Rc<Self>,
-            session_id: &acp::SessionId,
+            session_id: &acp_v2::SessionId,
             _cx: &mut App,
         ) -> Task<Result<()>> {
             self.sessions.lock().remove(session_id);
             Task::ready(Ok(()))
         }
 
-        fn auth_methods(&self) -> &[acp::AuthMethod] {
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
             &[]
         }
 
-        fn authenticate(&self, _method_id: acp::AuthMethodId, _cx: &mut App) -> Task<Result<()>> {
+        fn authenticate(
+            &self,
+            _method_id: acp_v2::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
             Task::ready(Ok(()))
         }
 
         fn prompt(
             &self,
-            params: acp::PromptRequest,
+            params: agent_client_protocol::schema::v2::PromptRequest,
             _cx: &mut App,
-        ) -> Task<Result<acp::PromptResponse>> {
-            if !self.sessions.lock().contains(&params.session_id) {
+        ) -> Task<Result<agent_client_protocol::schema::v1::PromptResponse>> {
+            let session_id = params.session_id;
+            if !self.sessions.lock().contains(&session_id) {
                 return Task::ready(Err(anyhow!("Session not found")));
             }
 
-            Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+            Task::ready(Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            )))
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+        fn cancel(&self, _session_id: &acp_v2::SessionId, _cx: &mut App) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
@@ -8298,29 +8349,40 @@ mod tests {
         open_thread_with_connection(&panel, connection.clone(), cx);
 
         let session_id = active_session_id(&panel, cx);
-        let tool_call_id = acp::ToolCallId::new("tool-call-output-focus-regression");
+        let tool_call_id = acp_v2::ToolCallId::new("tool-call-output-focus-regression");
         cx.update(|_window, cx| {
             connection.send_update(
                 session_id.clone(),
-                acp::SessionUpdate::ToolCall(
-                    acp::ToolCall::new(tool_call_id.clone(), "Read file")
-                        .kind(acp::ToolKind::Fetch)
-                        .status(acp::ToolCallStatus::InProgress),
+                agent_client_protocol::schema::v1::SessionUpdate::ToolCall(
+                    agent_client_protocol::schema::v1::ToolCall::new(
+                        agent_client_protocol::schema::v1::ToolCallId::new(tool_call_id.0.clone()),
+                        "Read file",
+                    )
+                    .kind(agent_client_protocol::schema::v1::ToolKind::Fetch)
+                    .status(agent_client_protocol::schema::v1::ToolCallStatus::InProgress),
                 ),
                 cx,
             );
             connection.send_update(
                 session_id,
-                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                    tool_call_id.clone(),
-                    acp::ToolCallUpdateFields::new()
-                        .status(acp::ToolCallStatus::Completed)
-                        .content(vec![acp::ToolCallContent::Content(acp::Content::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(
-                                "tool output text".to_string(),
-                            )),
-                        ))]),
-                )),
+                agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(
+                    agent_client_protocol::schema::v1::ToolCallUpdate::new(
+                        agent_client_protocol::schema::v1::ToolCallId::new(tool_call_id.0.clone()),
+                        agent_client_protocol::schema::v1::ToolCallUpdateFields::new()
+                            .status(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                            .content(vec![
+                                agent_client_protocol::schema::v1::ToolCallContent::Content(
+                                    agent_client_protocol::schema::v1::Content::new(
+                                        agent_client_protocol::schema::v1::ContentBlock::Text(
+                                            agent_client_protocol::schema::v1::TextContent::new(
+                                                "tool output text".to_string(),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ]),
+                    ),
+                ),
                 cx,
             );
         });
@@ -9181,7 +9243,7 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
 
         // Simulate a previous run that persisted metadata for this session.
-        let resume_session_id = acp::SessionId::new("persistent-session");
+        let resume_session_id = acp_v2::SessionId::new("persistent-session");
         cx.update(|_window, cx| {
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
@@ -9261,19 +9323,19 @@ mod tests {
     }
 
     /// Extracts the text from a Text content block, panicking if it's not Text.
-    fn expect_text_block(block: &acp::ContentBlock) -> &str {
+    fn expect_text_block(block: &acp_v2::ContentBlock) -> &str {
         match block {
-            acp::ContentBlock::Text(t) => t.text.as_str(),
+            acp_v2::ContentBlock::Text(t) => t.text.as_str(),
             other => panic!("expected Text block, got {:?}", other),
         }
     }
 
     /// Extracts the (text_content, uri) from a Resource content block, panicking
     /// if it's not a TextResourceContents resource.
-    fn expect_resource_block(block: &acp::ContentBlock) -> (&str, &str) {
+    fn expect_resource_block(block: &acp_v2::ContentBlock) -> (&str, &str) {
         match block {
-            acp::ContentBlock::Resource(r) => match &r.resource {
-                acp::EmbeddedResourceResource::TextResourceContents(t) => {
+            acp_v2::ContentBlock::Resource(r) => match &r.resource {
+                acp_v2::EmbeddedResourceResource::TextResourceContents(t) => {
                     (t.text.as_str(), t.uri.as_str())
                 }
                 other => panic!("expected TextResourceContents, got {:?}", other),
@@ -9333,7 +9395,7 @@ mod tests {
 
         thread.update(cx, |thread, cx| {
             thread.set_draft_prompt(
-                Some(vec![acp::ContentBlock::Text(acp::TextContent::new(
+                Some(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                     "stale prompt",
                 ))]),
                 cx,
@@ -9352,7 +9414,7 @@ mod tests {
 
         thread.update(cx, |thread, cx| {
             thread.set_draft_prompt(
-                Some(vec![acp::ContentBlock::Text(acp::TextContent::new(
+                Some(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
                     "stale prompt after clear",
                 ))]),
                 cx,
@@ -9391,7 +9453,10 @@ mod tests {
         let thread_id = active_thread_id(&panel, &cx);
 
         send_message(&panel, &mut cx);
-        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        connection.end_turn(
+            session_id.clone(),
+            agent_client_protocol::schema::v1::StopReason::EndTurn,
+        );
         cx.run_until_parked();
 
         crate::test_support::type_draft_prompt(&panel, "draft after first message", &mut cx);
@@ -9449,7 +9514,10 @@ mod tests {
         });
         thread_view.update_in(&mut cx, |view, window, cx| view.send(window, cx));
         cx.run_until_parked();
-        connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        connection.end_turn(
+            session_id.clone(),
+            agent_client_protocol::schema::v1::StopReason::EndTurn,
+        );
         cx.run_until_parked();
         cx.executor()
             .advance_clock(crate::conversation_view::DRAFT_PROMPT_PERSIST_DEBOUNCE * 2);
@@ -9581,7 +9649,7 @@ mod tests {
         );
 
         match &blocks[1] {
-            acp::ContentBlock::ResourceLink(link) => {
+            acp_v2::ContentBlock::ResourceLink(link) => {
                 assert!(
                     link.uri.contains("file://"),
                     "resource link URI should use file scheme"
@@ -9747,7 +9815,7 @@ mod tests {
             let newline_index = link_index + 1;
 
             match &blocks[link_index] {
-                acp::ContentBlock::ResourceLink(link) => {
+                acp_v2::ContentBlock::ResourceLink(link) => {
                     assert!(
                         link.uri.contains("file://"),
                         "resource link URI should use file scheme"
@@ -9818,7 +9886,7 @@ mod tests {
         panel: &Entity<AgentPanel>,
         connection: &StubAgentConnection,
         cx: &mut VisualTestContext,
-    ) -> (acp::SessionId, ThreadId) {
+    ) -> (acp_v2::SessionId, ThreadId) {
         open_thread_with_custom_connection(panel, connection.clone(), cx);
         let session_id = active_session_id(panel, cx);
         let thread_id = active_thread_id(panel, cx);
@@ -9826,7 +9894,9 @@ mod tests {
         cx.update(|_, cx| {
             connection.send_update(
                 session_id.clone(),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("done".into())),
+                agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new("done".into()),
+                ),
                 cx,
             );
         });
@@ -9838,14 +9908,16 @@ mod tests {
         panel: &Entity<AgentPanel>,
         connection: &StubAgentConnection,
         cx: &mut VisualTestContext,
-    ) -> (acp::SessionId, ThreadId) {
+    ) -> (acp_v2::SessionId, ThreadId) {
         open_thread_with_custom_connection(panel, connection.clone(), cx);
         let session_id = active_session_id(panel, cx);
         let thread_id = active_thread_id(panel, cx);
 
-        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("done".into()),
-        )]);
+        connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("done".into()),
+            ),
+        ]);
         send_message(panel, cx);
 
         (session_id, thread_id)
@@ -9888,9 +9960,11 @@ mod tests {
         // (and any reloaded draft) uses it.
         let stub_connection =
             crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
-        stub_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Response".into()),
-        )]);
+        stub_connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("Response".into()),
+            ),
+        ]);
         panel.update_in(cx, |panel, window, cx| {
             panel.selected_agent = Agent::Stub;
             panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
@@ -10076,9 +10150,11 @@ mod tests {
         // post-reload rehydrations) reaches Connected synchronously.
         let stub_connection =
             crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
-        stub_connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("ok".into()),
-        )]);
+        stub_connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("ok".into()),
+            ),
+        ]);
 
         // 1. Create a real thread by sending a message.
         panel.update_in(cx, |panel, window, cx| {
@@ -10590,8 +10666,8 @@ mod tests {
         let selections = contents
             .iter()
             .filter_map(|block| match block {
-                acp::ContentBlock::Resource(resource) => match &resource.resource {
-                    acp::EmbeddedResourceResource::TextResourceContents(content) => {
+                acp_v2::ContentBlock::Resource(resource) => match &resource.resource {
+                    acp_v2::EmbeddedResourceResource::TextResourceContents(content) => {
                         Some(content.text.as_str())
                     }
                     _ => None,
@@ -12584,7 +12660,9 @@ mod tests {
         cx.update(|_, cx| {
             connection_a.send_update(
                 session_id_a.clone(),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("chunk".into())),
+                agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new("chunk".into()),
+                ),
                 cx,
             );
         });
@@ -12619,9 +12697,11 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
 
         let connection_a = StubAgentConnection::new();
-        connection_a.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Response".into()),
-        )]);
+        connection_a.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("Response".into()),
+            ),
+        ]);
         open_thread_with_connection(&panel, connection_a, &mut cx);
         send_message(&panel, &mut cx);
 
@@ -12673,7 +12753,9 @@ mod tests {
         cx.update(|_, cx| {
             connection_a.send_update(
                 session_id_a.clone(),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("chunk".into())),
+                agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                    agent_client_protocol::schema::v1::ContentChunk::new("chunk".into()),
+                ),
                 cx,
             );
         });
@@ -12788,7 +12870,7 @@ mod tests {
             language_model::LanguageModelRegistry::test(cx);
         });
 
-        let source_session_id = acp::SessionId::new("source-thread-session");
+        let source_session_id = acp_v2::SessionId::new("source-thread-session");
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
             title: source_title.clone(),
@@ -12867,7 +12949,7 @@ mod tests {
         // Unknown session ids should still produce no content.
         let missing = cx.update(|cx| {
             AgentPanel::initial_content_for_thread_summary(
-                acp::SessionId::new("does-not-exist"),
+                acp_v2::SessionId::new("does-not-exist"),
                 cx,
             )
         });
@@ -12883,7 +12965,10 @@ mod tests {
         let connection = StubAgentConnection::new().with_supports_load_session(true);
         let (session_id, thread_id) =
             open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
-        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        connection.end_turn(
+            session_id,
+            agent_client_protocol::schema::v1::StopReason::EndTurn,
+        );
         cx.run_until_parked();
         let thread_view = panel.read_with(&cx, |panel, cx| {
             panel.active_thread_view(cx).expect("thread should be open")
@@ -12947,7 +13032,10 @@ mod tests {
         let connection = StubAgentConnection::new().with_supports_load_session(true);
         let (session_id, thread_id) =
             open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
-        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        connection.end_turn(
+            session_id,
+            agent_client_protocol::schema::v1::StopReason::EndTurn,
+        );
         cx.run_until_parked();
         let (project, action_log) = panel.read_with(&cx, |panel, cx| {
             let thread = panel
@@ -13013,7 +13101,10 @@ mod tests {
         let base_time = Instant::now();
 
         for session_id in session_ids.iter().take(2) {
-            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+            connection.end_turn(
+                session_id.clone(),
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            );
         }
         cx.run_until_parked();
 
@@ -13083,7 +13174,10 @@ mod tests {
         let base_time = Instant::now();
 
         for session_id in session_ids.iter().take(6) {
-            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+            connection.end_turn(
+                session_id.clone(),
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            );
         }
         cx.run_until_parked();
 
@@ -13149,7 +13243,10 @@ mod tests {
         }
 
         for session_id in session_ids.iter() {
-            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+            connection.end_turn(
+                session_id.clone(),
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            );
         }
         cx.run_until_parked();
 
@@ -13169,6 +13266,46 @@ mod tests {
             assert!(
                 panel.retained_threads.is_empty(),
                 "changing the retained thread limit should unload idle threads immediately"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_disconnected_saved_input_is_not_evicted_as_idle(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_receipt_submissions(true)
+            .with_supports_load_session(true);
+        open_thread_with_custom_connection(&panel, connection.clone(), &mut cx);
+        let saved = panel.read_with(&cx, |panel, _| {
+            panel
+                .active_conversation_view()
+                .expect("conversation")
+                .clone()
+        });
+        let _response = connection.defer_next_receipt_response();
+        send_message(&panel, &mut cx);
+        let thread = saved.read_with(&cx, |view, cx| view.root_thread(cx).expect("thread"));
+        thread.update(&mut cx, |thread, cx| thread.handle_connection_lost(cx));
+        cx.run_until_parked();
+        assert!(saved.read_with(&cx, |view, _| view.has_saved_input()));
+
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 0,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads(cx);
+            assert!(
+                panel
+                    .retained_threads
+                    .contains_key(&saved.read(cx).thread_id)
             );
         });
     }
@@ -13202,7 +13339,10 @@ mod tests {
             );
         });
 
-        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        connection.end_turn(
+            session_id,
+            agent_client_protocol::schema::v1::StopReason::EndTurn,
+        );
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _cx| {
@@ -13257,7 +13397,10 @@ mod tests {
         let base_time = Instant::now();
 
         for session_id in loadable_session_ids.iter().take(6) {
-            loadable_connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+            loadable_connection.end_turn(
+                session_id.clone(),
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            );
         }
         cx.run_until_parked();
 
@@ -13416,9 +13559,11 @@ mod tests {
         // Open thread C — thread A (generating) moves to background.
         // Thread C completes immediately (idle), then opening B moves C to background too.
         let connection_c = StubAgentConnection::new().with_agent_id("agent-c".into());
-        connection_c.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("done".into()),
-        )]);
+        connection_c.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("done".into()),
+            ),
+        ]);
         open_thread_with_custom_connection(&panel, connection_c.clone(), &mut cx);
         send_message(&panel, &mut cx);
         let thread_id_c = active_thread_id(&panel, &cx);
@@ -14965,9 +15110,11 @@ mod tests {
 
         // Open thread A and send a message so it is retained.
         let connection_a = StubAgentConnection::new();
-        connection_a.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("response a".into()),
-        )]);
+        connection_a.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("response a".into()),
+            ),
+        ]);
         open_thread_with_connection(&panel, connection_a, &mut cx);
         let _session_id_a = active_session_id(&panel, &cx);
         let thread_id_a = active_thread_id(&panel, &cx);
@@ -14985,9 +15132,11 @@ mod tests {
         let connection_b = StubAgentConnection::new()
             .with_agent_id("my-custom-agent".into())
             .with_telemetry_id("my-custom-agent".into());
-        connection_b.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("response b".into()),
-        )]);
+        connection_b.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("response b".into()),
+            ),
+        ]);
         open_thread_with_custom_connection(&panel, connection_b, &mut cx);
         send_message(&panel, &mut cx);
         cx.run_until_parked();
@@ -15222,9 +15371,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct DisassociationTrackingConnection {
         next_session_number: Arc<Mutex<usize>>,
-        sessions: Arc<Mutex<HashSet<acp::SessionId>>>,
-        closed_sessions: Arc<Mutex<Vec<acp::SessionId>>>,
-        missing_prompt_sessions: Arc<Mutex<Vec<acp::SessionId>>>,
+        sessions: Arc<Mutex<HashSet<acp_v2::SessionId>>>,
+        closed_sessions: Arc<Mutex<Vec<acp_v2::SessionId>>>,
+        missing_prompt_sessions: Arc<Mutex<Vec<acp_v2::SessionId>>>,
     }
 
     impl DisassociationTrackingConnection {
@@ -15234,7 +15383,7 @@ mod tests {
 
         fn create_session(
             self: Rc<Self>,
-            session_id: acp::SessionId,
+            session_id: acp_v2::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
             title: Option<SharedString>,
@@ -15253,10 +15402,10 @@ mod tests {
                     action_log,
                     session_id,
                     watch::Receiver::constant(
-                        acp::PromptCapabilities::new()
-                            .image(true)
-                            .audio(true)
-                            .embedded_context(true),
+                        acp_v2::PromptCapabilities::new()
+                            .image(acp_v2::PromptImageCapabilities::new())
+                            .audio(acp_v2::PromptAudioCapabilities::new())
+                            .embedded_context(acp_v2::PromptEmbeddedContextCapabilities::new()),
                     ),
                     cx,
                 )
@@ -15281,7 +15430,7 @@ mod tests {
         ) -> Task<Result<Entity<AcpThread>>> {
             let session_id = {
                 let mut next_session_number = self.next_session_number.lock();
-                let session_id = acp::SessionId::new(format!(
+                let session_id = acp_v2::SessionId::new(format!(
                     "disassociation-tracking-session-{}",
                     *next_session_number
                 ));
@@ -15298,7 +15447,7 @@ mod tests {
 
         fn load_session(
             self: Rc<Self>,
-            session_id: acp::SessionId,
+            session_id: acp_v2::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
             title: Option<SharedString>,
@@ -15308,17 +15457,21 @@ mod tests {
             thread.update(cx, |thread, cx| {
                 thread
                     .handle_session_update(
-                        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                            "Restored user message".into(),
-                        )),
+                        agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                "Restored user message".into(),
+                            ),
+                        ),
                         cx,
                     )
                     .expect("restored user message should be applied");
                 thread
                     .handle_session_update(
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            "Restored assistant message".into(),
-                        )),
+                        agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                            agent_client_protocol::schema::v1::ContentChunk::new(
+                                "Restored assistant message".into(),
+                            ),
+                        ),
                         cx,
                     )
                     .expect("restored assistant message should be applied");
@@ -15332,7 +15485,7 @@ mod tests {
 
         fn close_session(
             self: Rc<Self>,
-            session_id: &acp::SessionId,
+            session_id: &acp_v2::SessionId,
             _cx: &mut App,
         ) -> Task<Result<()>> {
             self.sessions.lock().remove(session_id);
@@ -15340,28 +15493,37 @@ mod tests {
             Task::ready(Ok(()))
         }
 
-        fn auth_methods(&self) -> &[acp::AuthMethod] {
+        fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
             &[]
         }
 
-        fn authenticate(&self, _method_id: acp::AuthMethodId, _cx: &mut App) -> Task<Result<()>> {
+        fn authenticate(
+            &self,
+            _method_id: acp_v2::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
             Task::ready(Ok(()))
         }
 
         fn prompt(
             &self,
-            params: acp::PromptRequest,
+            params: acp_v2::PromptRequest,
             _cx: &mut App,
-        ) -> Task<Result<acp::PromptResponse>> {
-            if !self.sessions.lock().contains(&params.session_id) {
-                self.missing_prompt_sessions.lock().push(params.session_id);
+        ) -> Task<Result<agent_client_protocol::schema::v1::PromptResponse>> {
+            let session_id = params.session_id;
+            if !self.sessions.lock().contains(&session_id) {
+                self.missing_prompt_sessions.lock().push(session_id);
                 return Task::ready(Err(anyhow!("Session not found")));
             }
 
-            Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+            Task::ready(Ok(agent_client_protocol::schema::v1::PromptResponse::new(
+                agent_client_protocol::schema::v1::StopReason::EndTurn,
+            )))
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+        fn cancel(&self, _session_id: &acp_v2::SessionId, _cx: &mut App) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
@@ -16024,6 +16186,93 @@ mod tests {
                 panel.selected_agent,
                 Agent::Stub,
                 "selected_agent should be restored to the original after an agent override"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resubmitting_edited_message_keeps_zoomed_agent_panel_open(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("Response".into()),
+            ),
+        ]);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+        open_thread_with_connection(&panel, connection.clone(), cx);
+        send_message(&panel, cx);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_zoom(&ToggleZoom, window, cx);
+        });
+        cx.run_until_parked();
+
+        let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        let user_message_editor = thread_view.read_with(cx, |thread_view, cx| {
+            thread_view
+                .entry_view_state
+                .read(cx)
+                .entry(0)
+                .unwrap()
+                .message_editor()
+                .unwrap()
+                .clone()
+        });
+        cx.focus(&user_message_editor);
+        cx.run_until_parked();
+        user_message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Edited message", window, cx);
+        });
+
+        connection.set_next_prompt_updates(vec![
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new("New response".into()),
+            ),
+        ]);
+        user_message_editor.update_in(cx, |_editor, window, cx| {
+            window.dispatch_action(Box::new(zed_actions::agent::Chat), cx);
+        });
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let position = panel.read(cx).position(window, cx);
+            assert!(
+                workspace.dock_at_position(position).read(cx).is_open(),
+                "resubmitting an edited message should not hide the agent panel"
+            );
+            assert!(
+                panel.read(cx).is_zoomed(window, cx),
+                "resubmitting an edited message should not close Zen Mode"
+            );
+            assert!(
+                panel.read(cx).focus_handle(cx).contains_focused(window, cx),
+                "focus should stay within the agent panel after resubmitting"
             );
         });
     }

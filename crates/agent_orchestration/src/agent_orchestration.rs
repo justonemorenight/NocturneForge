@@ -92,7 +92,7 @@ pub use worktree_isolation::{IsolatedWorktree, WorktreeManager, WorktreeOwnershi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1 as acp;
+    use agent_client_protocol::schema::v2 as acp;
     use agent_settings::{AgentAutonomy, AgentExecutionPolicy, AgentExecutionStrategy};
     use std::rc::Rc;
     use std::sync::Arc;

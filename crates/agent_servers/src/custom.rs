@@ -1,6 +1,5 @@
 use crate::{AgentServer, AgentServerDelegate, load_proxy_env};
 use acp_thread::AgentConnection;
-use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::{AgentSettings, AutoCompactThreshold};
 use anyhow::{Context as _, Result};
@@ -41,7 +40,7 @@ impl AgentServer for CustomAgentServer {
         IconName::Terminal
     }
 
-    fn default_mode(&self, cx: &App) -> Option<acp::SessionModeId> {
+    fn default_mode(&self, cx: &App) -> Option<acp_v2::SessionConfigValueId> {
         let settings = cx.read_global(|settings: &SettingsStore, _| {
             settings
                 .get::<AllAgentServersSettings>(None)
@@ -51,7 +50,7 @@ impl AgentServer for CustomAgentServer {
 
         settings
             .as_ref()
-            .and_then(|s| s.default_mode().map(acp::SessionModeId::new))
+            .and_then(|s| s.default_mode().map(acp_v2::SessionConfigValueId::new))
     }
 
     fn favorite_config_option_value_ids(
@@ -126,7 +125,12 @@ impl AgentServer for CustomAgentServer {
         });
     }
 
-    fn set_default_mode(&self, mode_id: Option<acp::SessionModeId>, fs: Arc<dyn Fs>, cx: &mut App) {
+    fn set_default_mode(
+        &self,
+        mode_id: Option<acp_v2::SessionConfigValueId>,
+        fs: Arc<dyn Fs>,
+        cx: &mut App,
+    ) {
         let agent_id = self.agent_id();
         update_settings_file(fs, cx, move |settings, _cx| {
             let settings = settings

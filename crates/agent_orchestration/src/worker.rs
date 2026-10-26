@@ -3,7 +3,7 @@ use crate::executor::{TaskExecutionContext, TaskExecutionOutput, TaskExecutor};
 use crate::ids::TaskId;
 use crate::plan_graph::OrchestrationTask;
 use crate::verification::VerificationResult;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use collections::HashMap;

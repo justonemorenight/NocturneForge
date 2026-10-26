@@ -15,7 +15,7 @@ use crate::thread_transcript_search::{
 use crate::{Agent, ArchiveSelectedThread, RemoveSelectedThread};
 
 use agent::ThreadStore;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use chrono::{DateTime, Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use collections::HashMap;

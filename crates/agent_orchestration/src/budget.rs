@@ -2,7 +2,7 @@ use crate::events::{RuntimeEvent, RuntimeEventContext, RuntimeEventStream};
 use crate::ids::{RunId, TaskId};
 use crate::task_registry::TaskRegistry;
 use crate::worker::WorkerMetadata;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

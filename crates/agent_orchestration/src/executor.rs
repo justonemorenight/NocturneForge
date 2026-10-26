@@ -7,7 +7,7 @@ use crate::ids::{CorrelationId, RunId, TaskId};
 use crate::plan_graph::OrchestrationTask;
 use crate::verification::VerificationResult;
 use crate::worker::WorkerMetadata;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Result;
 use futures::future::LocalBoxFuture;
 use serde::{Deserialize, Serialize};

@@ -9,7 +9,7 @@ use crate::residency::AgentResidencyRecord;
 use crate::state::RunState;
 use crate::verification::VerificationResult;
 use crate::worker::{StructuredWaitReason, WorkerMetadata};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentExecutionPolicy;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};

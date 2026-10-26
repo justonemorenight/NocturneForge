@@ -1,5 +1,6 @@
-use acp_thread::{AgentConnection, StubAgentConnection};
-use agent_client_protocol::schema::v1 as acp;
+use acp_thread::{AcpThread, AgentConnection, StubAgentConnection};
+use action_log::ActionLog;
+use agent_client_protocol::schema::v2 as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
@@ -42,6 +43,29 @@ pub fn stub_agent_connection() -> StubAgentConnection {
     })
 }
 
+pub fn create_test_acp_thread(
+    parent_session_id: Option<acp::SessionId>,
+    session_id: &str,
+    connection: Rc<dyn AgentConnection>,
+    project: Entity<Project>,
+    cx: &mut App,
+) -> Entity<AcpThread> {
+    let action_log = cx.new(|_| ActionLog::new(project.clone()));
+    cx.new(|cx| {
+        AcpThread::new(
+            parent_session_id,
+            None,
+            None,
+            connection,
+            project,
+            action_log,
+            acp::SessionId::new(session_id),
+            watch::Receiver::constant(acp::PromptCapabilities::new()),
+            cx,
+        )
+    })
+}
+
 pub struct StubAgentServer<C> {
     connection: C,
     agent_id: AgentId,
@@ -67,9 +91,12 @@ where
 impl StubAgentServer<StubAgentConnection> {
     pub fn default_response() -> Self {
         let conn = StubAgentConnection::new();
-        conn.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new("Default response".into()),
-        )]);
+        conn.set_next_prompt_action(|thread, cx| {
+            thread.upsert_assistant_message(
+                acp::AgentMessage::new("default-response").content(vec!["Default response".into()]),
+                cx,
+            )
+        });
         Self::new(conn)
     }
 }

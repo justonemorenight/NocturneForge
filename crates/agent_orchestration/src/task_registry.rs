@@ -3,7 +3,7 @@ use crate::ids::TaskId;
 use crate::state::{TaskAttempt, TaskState, TaskStatus};
 use crate::verification::VerificationResult;
 use crate::worker::{StructuredWaitReason, WorkerMetadata, WorkerTarget};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use chrono::Utc;
 use collections::{HashMap, HashSet};
 use parking_lot::RwLock;

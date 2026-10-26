@@ -26,6 +26,7 @@ buffer_diff.workspace = true
 chrono.workspace = true
 collections.workspace = true
 db.workspace = true
+diffy.workspace = true
 feature_flags.workspace = true
 multi_buffer.workspace = true
 file_icons.workspace = true

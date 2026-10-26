@@ -15,10 +15,10 @@ pub(crate) enum SubagentStatus {
 
 impl SubagentStatus {
     pub(crate) fn from_tool_call(tool_call: &ToolCall, cx: &App) -> Self {
-        match tool_call.status {
+        match tool_call.status() {
             ToolCallStatus::Pending
             | ToolCallStatus::InProgress
-            | ToolCallStatus::WaitingForConfirmation { .. } => Self::Running,
+            | ToolCallStatus::WaitingForConfirmation => Self::Running,
             _ if has_user_canceled_output(tool_call, cx) => Self::Canceled,
             ToolCallStatus::Canceled => Self::Canceled,
             ToolCallStatus::Failed | ToolCallStatus::Rejected => Self::Failed,
@@ -103,7 +103,7 @@ fn has_user_canceled_output(tool_call: &ToolCall, cx: &App) -> bool {
         .content_for_display()
         .iter()
         .any(|content| match content {
-            ToolCallContent::ContentBlock(block) => {
+            ToolCallContent::ContentBlock { block, .. } => {
                 block.text_content(cx) == Some(USER_CANCELED_OUTPUT)
             }
             _ => false,
@@ -111,11 +111,11 @@ fn has_user_canceled_output(tool_call: &ToolCall, cx: &App) -> bool {
 }
 
 fn tool_call_error(tool_call: &ToolCall, cx: &App) -> Option<SharedString> {
-    if !matches!(tool_call.status, ToolCallStatus::Failed) {
+    if !matches!(tool_call.status(), ToolCallStatus::Failed) {
         return None;
     }
     tool_call.content_for_display().iter().find_map(|content| {
-        let ToolCallContent::ContentBlock(block) = content else {
+        let ToolCallContent::ContentBlock { block, .. } = content else {
             return None;
         };
         block

@@ -1,7 +1,7 @@
 use crate::control_plane::AgentPath;
 use crate::events::{RuntimeEvent, RuntimeEventStream};
 use crate::ids::RunId;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use collections::HashMap;

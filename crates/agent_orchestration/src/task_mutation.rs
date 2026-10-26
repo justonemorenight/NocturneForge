@@ -5,7 +5,7 @@ use crate::ids::{RunId, TaskId};
 use crate::state::{TaskState, TaskStatus};
 use crate::task_registry::TaskRegistry;
 use crate::verification::VerificationResult;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use parking_lot::Mutex;
 use std::sync::Arc;
 

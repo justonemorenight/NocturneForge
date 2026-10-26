@@ -54,7 +54,10 @@ pub(super) type AlacrittyGridIterator<'a> = GridIterator<'a, AlacCell>;
 pub(super) type AlacrittyHyperlink = AlacHyperlink;
 
 #[derive(Clone)]
-pub(super) struct ZedListener(UnboundedSender<PtyEvent>);
+pub(super) struct ZedListener {
+    sender: UnboundedSender<PtyEvent>,
+    generation: u64,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct AlacrittySearch {
@@ -187,8 +190,16 @@ pub(super) fn new_term(
     bounds: TerminalBounds,
     events_tx: UnboundedSender<PtyEvent>,
     alternate_scroll: AlternateScroll,
+    generation: u64,
 ) -> Arc<AlacrittyTermLock> {
-    let mut term = Term::new(config.clone(), &bounds, ZedListener(events_tx));
+    let mut term = Term::new(
+        config.clone(),
+        &bounds,
+        ZedListener {
+            sender: events_tx,
+            generation,
+        },
+    );
 
     if let AlternateScroll::Off = alternate_scroll {
         term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::AlternateScroll));
@@ -203,8 +214,17 @@ pub(super) fn spawn_event_loop(
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
-    let event_loop = EventLoop::new(term, ZedListener(events_tx), pty, drain_on_exit, false)
-        .context("failed to create event loop")?;
+    let event_loop = EventLoop::new(
+        term,
+        ZedListener {
+            sender: events_tx,
+            generation: 0,
+        },
+        pty,
+        drain_on_exit,
+        false,
+    )
+    .context("failed to create event loop")?;
     let pty_tx = event_loop.channel();
     let _io_thread = event_loop.spawn();
 
@@ -322,7 +342,9 @@ impl From<AlacTermEvent> for TerminalBackendEvent {
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
-        self.0.unbounded_send(PtyEvent::Event(event.into())).ok();
+        self.sender
+            .unbounded_send(PtyEvent::Event(event.into(), self.generation))
+            .ok();
     }
 }
 
